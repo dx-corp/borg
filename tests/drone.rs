@@ -172,8 +172,8 @@ async fn runs_a_granted_lease_cleans_up_and_reports_the_result() {
     );
     let lease_id = name.rsplit('-').next().unwrap().to_owned();
     assert!(
-        !rig.path("work").join(&lease_id).exists(),
-        "work dir removed after the job"
+        !rig.path("work/slot-0").exists(),
+        "slot dir removed after the job"
     );
     assert_eq!(
         fs::read_to_string(rig.path("cache/sccache/entry")).unwrap(),
@@ -431,9 +431,11 @@ async fn jobs_share_cache_dirs_and_a_git_mirror_that_survive_cleanup() {
         )
     );
     let installs = read("install-");
-    assert_ne!(
-        installs[0], installs[1],
-        "cargo install roots are per lease"
+    let slot_install = format!("{}/slot-0/cargo-install", rig.path("work").display());
+    assert_eq!(
+        installs,
+        [slot_install.clone(), slot_install],
+        "cargo install roots live in the lease's slot, never in the shared CARGO_HOME"
     );
     let bazelrc = fs::read_to_string(rig.path("bazelrc")).unwrap();
     assert!(bazelrc.contains(&format!("--disk_cache={}/bazel/disk", cache.display())));
@@ -504,4 +506,74 @@ async fn the_mirror_timer_picks_up_new_commits() {
         clone.to_str().unwrap(),
     ]);
     assert!(clone.join(".git/objects/info/alternates").exists());
+}
+
+#[tokio::test]
+async fn leases_get_distinct_slots_while_concurrent_and_the_same_path_when_a_slot_is_reused() {
+    let rig = Rig::new().await;
+    rig.install_runner(
+        "pwd > $OUT/pwd-$BORG_LEASE_ID.txt\necho $BORG_SLOT > $OUT/slot-$BORG_LEASE_ID.txt\nsleep 1",
+    );
+    let drone = rig.drone(json!({}));
+    let mut tasks = JoinSet::new();
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+
+    rig.h.queue_job(1, "borg-ci-light", 1);
+    rig.h.queue_job(2, "borg-ci-light", 1);
+    rig.h.tick().await;
+    assert_eq!(drone.heartbeat_once(true, &mut tasks).await.unwrap(), 2);
+    let during = drone.slot_assignments();
+    assert_eq!(
+        during.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        [0, 1],
+        "distinct slots while concurrent"
+    );
+    drain(&mut tasks).await;
+    assert!(
+        drone.slot_assignments().is_empty(),
+        "slots are released after cleanup"
+    );
+
+    let read_all = |prefix: &str| -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = fs::read_dir(rig.path("out"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                (
+                    name,
+                    fs::read_to_string(e.path()).unwrap().trim().to_owned(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let first_pwds: Vec<String> = read_all("pwd-").into_iter().map(|(_, p)| p).collect();
+    let work = rig.path("work");
+    let mut want = vec![
+        work.join("slot-0").display().to_string(),
+        work.join("slot-1").display().to_string(),
+    ];
+    let mut got = first_pwds.clone();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want);
+
+    // A later lease alone takes slot 0 again, at exactly the same path.
+    rig.h.state().jobs.clear();
+    rig.h.queue_job(3, "borg-ci-light", 1);
+    rig.h.tick().await;
+    assert_eq!(drone.heartbeat_once(true, &mut tasks).await.unwrap(), 1);
+    drain(&mut tasks).await;
+    let all = read_all("pwd-");
+    assert_eq!(all.len(), 3);
+    let slot_files = read_all("slot-");
+    assert_eq!(
+        slot_files.iter().filter(|(_, s)| s == "0").count(),
+        2,
+        "slot 0 was used twice"
+    );
+    assert_eq!(fs::read_dir(rig.path("work")).unwrap().count(), 0);
 }

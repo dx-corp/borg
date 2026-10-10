@@ -1,6 +1,6 @@
 //! Run one lease as an ephemeral GitHub Actions runner in a private directory.
 //!
-//! The pinned runner install is cloned into `<work_root>/<lease_id>` (hard
+//! The pinned runner install is cloned into the lease's slot directory (hard
 //! links where the filesystem allows, copies otherwise), `run.sh` is started in
 //! its own process group with the JIT config in the environment (never argv),
 //! and the group is killed on timeout or abort. This module never cleans up;
@@ -27,7 +27,9 @@ pub struct RunSpec<'a> {
     pub lease_id: &'a str,
     pub jit_config: &'a Secret,
     pub runner_dir: &'a Path,
-    pub work_root: &'a Path,
+    /// The lease's private directory, `<work_root>/slot-<N>`; it never
+    /// contains the lease id, so a reused slot has an identical path.
+    pub lease_dir: &'a Path,
     pub cache_root: &'a Path,
     /// Extra job environment (cache directories, git mirrors).
     pub extra_env: &'a [(String, String)],
@@ -142,11 +144,17 @@ pub async fn run_lease(
             "unsafe lease id",
         ));
     }
-    let lease_dir: PathBuf = spec.work_root.join(spec.lease_id);
+    let lease_dir: PathBuf = spec.lease_dir.to_owned();
     let (src, dst) = (spec.runner_dir.to_owned(), lease_dir.clone());
-    tokio::task::spawn_blocking(move || clone_tree(&src, &dst))
-        .await
-        .map_err(io::Error::other)??;
+    tokio::task::spawn_blocking(move || {
+        // A slot is reused, so make sure nothing of an earlier lease remains.
+        if dst.symlink_metadata().is_ok() {
+            fs::remove_dir_all(&dst)?;
+        }
+        clone_tree(&src, &dst)
+    })
+    .await
+    .map_err(io::Error::other)??;
 
     let prefix = docker_prefix(spec.lease_id);
     #[allow(
@@ -249,14 +257,14 @@ mod tests {
             lease_id: "lease1",
             jit_config: &secret,
             runner_dir: &runner,
-            work_root: &work,
+            lease_dir: &work.join("slot-0"),
             cache_root: &dir.join("cache"),
             extra_env: &[],
             max_job,
             proc_root: Path::new("/proc"),
         };
         let out = run_lease(&spec, &SystemExec, rx).await.unwrap();
-        (out, work.join("lease1"))
+        (out, work.join("slot-0"))
     }
 
     #[tokio::test]
@@ -299,7 +307,7 @@ mod tests {
             fs::read_to_string(lease_dir.join("cwd.txt"))
                 .unwrap()
                 .trim()
-                .ends_with("work/lease1")
+                .ends_with("work/slot-0")
         );
         assert_eq!(
             fs::read_to_string(lease_dir.join("bin/marker")).unwrap(),
@@ -357,7 +365,7 @@ mod tests {
             lease_id: "lease2",
             jit_config: &secret,
             runner_dir: &runner,
-            work_root: &work,
+            lease_dir: &work.join("slot-0"),
             cache_root: &cache,
             extra_env: &[],
             max_job: Duration::from_secs(60),
@@ -383,7 +391,7 @@ mod tests {
             lease_id: "../escape",
             jit_config: &secret,
             runner_dir: &runner,
-            work_root: &dir.path().join("work"),
+            lease_dir: &dir.path().join("work/slot-0"),
             cache_root: dir.path(),
             extra_env: &[],
             max_job: Duration::from_secs(1),

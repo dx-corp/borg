@@ -11,6 +11,8 @@ pub mod bazel;
 pub mod gc;
 pub mod git;
 pub mod kinds;
+pub mod rustflags;
+pub mod sccache;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -52,10 +54,14 @@ struct Track {
     size_bytes: u64,
     evicted_bytes: u64,
     last_gc_at: Option<i64>,
+    /// sccache only, from the host server.
+    hits: Option<u64>,
+    misses: Option<u64>,
 }
 
 pub struct Caches {
     cfg: Arc<DroneConfig>,
+    exec: Arc<dyn Exec>,
     host: Arc<dyn Host + Send + Sync>,
     sccache_size: OnceCell<String>,
     git: GitMirrors,
@@ -77,9 +83,10 @@ impl Caches {
         exec: Arc<dyn Exec>,
         host: Arc<dyn Host + Send + Sync>,
     ) -> Self {
-        let git = GitMirrors::new(&cfg.caches.git, &cfg.cache_root, exec);
+        let git = GitMirrors::new(&cfg.caches.git, &cfg.cache_root, Arc::clone(&exec));
         Self {
             cfg,
+            exec,
             host,
             sccache_size: OnceCell::new(),
             git,
@@ -119,7 +126,12 @@ impl Caches {
     async fn init(&self) -> &str {
         self.sccache_size
             .get_or_init(|| async {
-                let (cfg, host) = (Arc::clone(&self.cfg), Arc::clone(&self.host));
+                let (cfg, host, exec) = (
+                    Arc::clone(&self.cfg),
+                    Arc::clone(&self.host),
+                    Arc::clone(&self.exec),
+                );
+                let flags = self.remap_flags();
                 let enabled: Vec<Kind> =
                     Kind::ALL.into_iter().filter(|k| self.enabled(*k)).collect();
                 let made = tokio::task::spawn_blocking(move || {
@@ -137,13 +149,46 @@ impl Caches {
                     if cfg.caches.bazel.enabled {
                         write_bazelrc(&cfg);
                     }
+                    if cfg.caches.cargo.enabled
+                        && cfg.caches.cargo.export_rustflags
+                        && rustflags::flags_are_passable(&flags)
+                        && let Err(e) =
+                            rustflags::write_config(&Kind::Cargo.dir(&cfg.cache_root), &flags)
+                    {
+                        tracing::warn!("cargo config.toml: {e}");
+                    }
                     let free = probe::free_disk_mib_at(host.as_ref(), &cfg.cache_root);
-                    cache_size_for(free, cfg.caches.sccache.max_size.as_deref())
+                    let size = cache_size_for(free, cfg.caches.sccache.max_size.as_deref());
+                    if let (true, Some(server)) =
+                        (cfg.caches.sccache.enabled, &cfg.caches.sccache.server)
+                    {
+                        let dir = Kind::Sccache
+                            .dir(&cfg.cache_root)
+                            .to_string_lossy()
+                            .into_owned();
+                        let env = sccache::server_env(&dir, &size, server.port);
+                        if !sccache::start_server(exec.as_ref(), &server.bin, &env) {
+                            tracing::warn!(
+                                "could not start the sccache server on port {}",
+                                server.port
+                            );
+                        }
+                    }
+                    size
                 })
                 .await;
                 made.unwrap_or_else(|_| FALLBACK_CACHE_SIZE.to_owned())
             })
             .await
+    }
+
+    /// The remap flags for every slot and the cargo home (identical for all leases).
+    fn remap_flags(&self) -> Vec<String> {
+        rustflags::remap_flags(
+            &self.cfg.work_root,
+            self.cfg.slot_count(),
+            &Kind::Cargo.dir(&self.cfg.cache_root),
+        )
     }
 
     /// Held for the whole life of a lease (refresh, run, cleanup).
@@ -161,7 +206,49 @@ impl Caches {
             env.extend(kind.env(&self.cfg.cache_root, lease_dir, &size));
         }
         env.extend(self.git.env());
+        if self.cfg.caches.cargo.enabled && self.cfg.caches.cargo.export_rustflags {
+            let flags = self.remap_flags();
+            if rustflags::flags_are_passable(&flags) {
+                let joined = flags.join(" ");
+                env.push(("BORG_RUSTFLAGS".to_owned(), joined.clone()));
+                env.push(("RUSTFLAGS".to_owned(), joined));
+            } else {
+                tracing::warn!(
+                    "work_root or cache_root contains whitespace; not exporting RUSTFLAGS"
+                );
+            }
+        }
+        if let (true, Some(server)) = (
+            self.cfg.caches.sccache.enabled,
+            &self.cfg.caches.sccache.server,
+        ) {
+            env.push(("SCCACHE_SERVER_PORT".to_owned(), server.port.to_string()));
+            env.push(("SCCACHE_IDLE_TIMEOUT".to_owned(), "0".to_owned()));
+        }
         env
+    }
+
+    /// Cumulative hits and misses of the host sccache server, if configured.
+    async fn sccache_counts(&self) -> Option<(u64, u64)> {
+        let (true, Some(server)) = (
+            self.cfg.caches.sccache.enabled,
+            self.cfg.caches.sccache.server.clone(),
+        ) else {
+            return None;
+        };
+        let size = self.init().await.to_owned();
+        let exec = Arc::clone(&self.exec);
+        let dir = Kind::Sccache
+            .dir(&self.cfg.cache_root)
+            .to_string_lossy()
+            .into_owned();
+        tokio::task::spawn_blocking(move || {
+            let env = sccache::server_env(&dir, &size, server.port);
+            sccache::show_stats(exec.as_ref(), &server.bin, &env)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Re-measure every cache and, if no lease is running, evict least recently
@@ -169,6 +256,15 @@ impl Caches {
     /// active.
     pub async fn maintain(&self) {
         let _ = self.init().await;
+        // Hit counters are cheap to read and live in the server, so they are
+        // refreshed even while leases run.
+        if let Some((hits, misses)) = self.sccache_counts().await
+            && let Ok(mut tracks) = self.tracks.lock()
+        {
+            let t = tracks.entry("sccache").or_default();
+            t.hits = Some(hits);
+            t.misses = Some(misses);
+        }
         let Ok(_idle) = self.gate.try_write() else {
             return;
         };
@@ -235,15 +331,19 @@ impl Caches {
                         .or_else(|| k.default_max_bytes()),
                     None => None,
                 };
-                let git = name == "git";
+                let (hits, misses) = if name == "git" {
+                    (Some(served), Some(missed))
+                } else {
+                    (t.hits, t.misses)
+                };
                 CacheStat {
                     name: name.to_owned(),
                     size_bytes: t.size_bytes,
                     max_bytes,
                     evicted_bytes: t.evicted_bytes,
                     last_gc_at: t.last_gc_at,
-                    hits: git.then_some(served),
-                    misses: git.then_some(missed),
+                    hits,
+                    misses,
                 }
             })
             .collect()
