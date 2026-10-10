@@ -107,6 +107,14 @@ struct InstallArgs {
     /// Install under this root instead of / (staging and tests).
     #[arg(long, default_value = "/")]
     root: PathBuf,
+    /// Keep a host-local bare git mirror of this repository (owner/name);
+    /// repeatable. Jobs get its path in BORG_GIT_MIRROR_<OWNER>_<NAME>.
+    #[arg(long = "git-mirror")]
+    git_mirrors: Vec<String>,
+    /// Where mirrors fetch from (default https://github.com). Use an ssh base
+    /// such as git@host: with a read-only deploy key for private repositories.
+    #[arg(long)]
+    git_remote_base: Option<String>,
     /// Print what would change without changing anything.
     #[arg(long)]
     dry_run: bool,
@@ -215,6 +223,8 @@ fn install_drone(a: InstallArgs) -> Result<()> {
         binary: std::env::current_exe().context("locate this binary")?,
         dry_run: a.dry_run,
         drain_timeout_secs: 3600,
+        git_mirrors: a.git_mirrors,
+        git_remote_base: a.git_remote_base,
     };
     for line in install::install(&opts, &SystemExec)? {
         println!("{line}");

@@ -29,6 +29,8 @@ pub struct RunSpec<'a> {
     pub runner_dir: &'a Path,
     pub work_root: &'a Path,
     pub cache_root: &'a Path,
+    /// Extra job environment (cache directories, git mirrors).
+    pub extra_env: &'a [(String, String)],
     pub max_job: Duration,
     /// `/proc` (a different root is used by tests).
     pub proc_root: &'a Path,
@@ -160,6 +162,7 @@ pub async fn run_lease(
         // user can read from `ps` or `/proc/<pid>/cmdline`.
         .env("ACTIONS_RUNNER_INPUT_JITCONFIG", spec.jit_config.expose())
         .current_dir(&lease_dir)
+        .envs(spec.extra_env.iter().map(|(k, v)| (k, v)))
         .env("BORG_LEASE_ID", spec.lease_id)
         .env("BORG_DOCKER_PREFIX", &prefix)
         .env("COMPOSE_PROJECT_NAME", &prefix)
@@ -248,6 +251,7 @@ mod tests {
             runner_dir: &runner,
             work_root: &work,
             cache_root: &dir.join("cache"),
+            extra_env: &[],
             max_job,
             proc_root: Path::new("/proc"),
         };
@@ -355,6 +359,7 @@ mod tests {
             runner_dir: &runner,
             work_root: &work,
             cache_root: &cache,
+            extra_env: &[],
             max_job: Duration::from_secs(60),
             proc_root: Path::new("/proc"),
         };
@@ -380,6 +385,7 @@ mod tests {
             runner_dir: &runner,
             work_root: &dir.path().join("work"),
             cache_root: dir.path(),
+            extra_env: &[],
             max_job: Duration::from_secs(1),
             proc_root: Path::new("/proc"),
         };

@@ -13,6 +13,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use crate::allocator::HostCaps;
+use crate::api::CacheStat;
 use crate::classes::{Class, Scope};
 use crate::probe::Capacity;
 use crate::secret::Secret;
@@ -25,7 +26,8 @@ CREATE TABLE IF NOT EXISTS drones (
     last_heartbeat INTEGER,
     capacity       TEXT,
     caps           TEXT,
-    accepting      INTEGER NOT NULL DEFAULT 1
+    accepting      INTEGER NOT NULL DEFAULT 1,
+    cache_stats    TEXT
 );
 CREATE TABLE IF NOT EXISTS leases (
     id           TEXT PRIMARY KEY,
@@ -100,6 +102,7 @@ pub struct DroneRow {
     pub capacity: Option<Capacity>,
     pub caps: HostCaps,
     pub accepting: bool,
+    pub cache_stats: Vec<CacheStat>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +173,15 @@ impl Store {
             .connect_with(opts)
             .await?;
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+        // Databases created before cache stats existed lack the column.
+        // sqlx-runtime-query: one-off additive migration, no data involved
+        if let Err(e) = sqlx::query("ALTER TABLE drones ADD COLUMN cache_stats TEXT")
+            .execute(&pool)
+            .await
+            && !e.to_string().contains("duplicate column")
+        {
+            return Err(e.into());
+        }
         Ok(Self { pool })
     }
 
@@ -208,14 +220,16 @@ impl Store {
         capacity: &Capacity,
         caps: &HostCaps,
         accepting: bool,
+        cache_stats: &[CacheStat],
         now: i64,
     ) -> Result<(), StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
-        sqlx::query("UPDATE drones SET last_heartbeat = ?, capacity = ?, caps = ?, accepting = ? WHERE name = ?")
+        sqlx::query("UPDATE drones SET last_heartbeat = ?, capacity = ?, caps = ?, accepting = ?, cache_stats = ? WHERE name = ?")
             .bind(now)
             .bind(to_text(capacity)?)
             .bind(to_text(caps)?)
             .bind(i64::from(accepting))
+            .bind(to_text(&cache_stats)?)
             .bind(name)
             .execute(&self.pool)
             .await?;
@@ -225,7 +239,7 @@ impl Store {
     pub async fn drones(&self) -> Result<Vec<DroneRow>, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         let rows = sqlx::query(
-            "SELECT name, last_heartbeat, capacity, caps, accepting FROM drones ORDER BY name",
+            "SELECT name, last_heartbeat, capacity, caps, accepting, cache_stats FROM drones ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -233,6 +247,7 @@ impl Store {
             .map(|r| {
                 let capacity: Option<String> = r.get("capacity");
                 let caps: Option<String> = r.get("caps");
+                let stats: Option<String> = r.get("cache_stats");
                 Ok(DroneRow {
                     name: r.get("name"),
                     last_heartbeat: r.get("last_heartbeat"),
@@ -243,6 +258,11 @@ impl Store {
                         .transpose()?
                         .unwrap_or_default(),
                     accepting: r.get::<i64, _>("accepting") != 0,
+                    cache_stats: stats
+                        .as_deref()
+                        .map(from_text)
+                        .transpose()?
+                        .unwrap_or_default(),
                 })
             })
             .collect()
@@ -512,11 +532,28 @@ mod tests {
             mise_version: None,
             git_version: None,
         };
-        s.record_heartbeat("d1", &cap, &HostCaps::default(), false, 123)
-            .await
-            .unwrap();
+        let stat = CacheStat {
+            name: "cargo".into(),
+            size_bytes: 5,
+            max_bytes: Some(10),
+            evicted_bytes: 1,
+            last_gc_at: Some(100),
+            hits: None,
+            misses: None,
+        };
+        s.record_heartbeat(
+            "d1",
+            &cap,
+            &HostCaps::default(),
+            false,
+            std::slice::from_ref(&stat),
+            123,
+        )
+        .await
+        .unwrap();
         let d = &s.drones().await.unwrap()[0];
         assert_eq!((d.last_heartbeat, d.accepting), (Some(123), false));
+        assert_eq!(d.cache_stats, [stat]);
         assert_eq!(d.capacity.as_ref(), Some(&cap));
     }
 }

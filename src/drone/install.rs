@@ -76,6 +76,10 @@ pub struct InstallOptions {
     /// Skip the "must be root" check (tests, `--root` staging).
     pub skip_root_check: bool,
     pub drain_timeout_secs: u64,
+    /// Repositories (`owner/name`) to mirror on the host.
+    pub git_mirrors: Vec<String>,
+    /// Remote base for mirrors; the drone default (`https://github.com`) if none.
+    pub git_remote_base: Option<String>,
 }
 
 /// Where everything lives, as paths on the real host.
@@ -527,6 +531,17 @@ impl Installer<'_> {
             max_mem_mib: o.max_mem_mib,
             max_leases: o.max_leases,
             reserve_mem_mib: crate::allocator::HostCaps::default().reserve_mem_mib,
+            caches: crate::drone::config::CachesConfig {
+                git: crate::drone::config::GitCaches {
+                    mirrors: o.git_mirrors.clone(),
+                    remote_base: o
+                        .git_remote_base
+                        .clone()
+                        .unwrap_or_else(|| "https://github.com".to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
         };
         cfg.validate()
             .map_err(|e| InstallError::Preflight(e.to_string()))?;
@@ -702,6 +717,8 @@ mod tests {
             dry_run: false,
             skip_root_check: true,
             drain_timeout_secs: 3600,
+            git_mirrors: vec!["example-org/app".into()],
+            git_remote_base: None,
         }
     }
 
@@ -808,6 +825,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!((cfg.max_vcpu, cfg.max_mem_mib), (Some(8), Some(24576)));
+        assert_eq!(cfg.caches.git.mirrors, ["example-org/app"]);
         assert!(
             e.root
                 .join("var/lib/borg/runner/.borg-runner-version")

@@ -20,6 +20,109 @@ pub enum DroneConfigError {
     Invalid(String),
 }
 
+/// One cache directory the drone manages. Present-by-default; set
+/// `enabled: false` to skip it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheEntry {
+    pub enabled: bool,
+    /// Size cap such as `512M` or `50G`. Enforced by LRU garbage collection
+    /// between leases (sccache enforces its own via `SCCACHE_CACHE_SIZE`).
+    /// Each kind has a default; sccache's is 25% of the free disk, at most 100G.
+    pub max_size: Option<String>,
+}
+
+impl Default for CacheEntry {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_size: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BazelCache {
+    pub enabled: bool,
+    /// Cap for the disk cache and repository cache together.
+    pub max_size: Option<String>,
+    /// The rc file the drone writes `--disk_cache` and `--repository_cache`
+    /// into (a managed block). Default: `$HOME/.bazelrc`.
+    pub bazelrc: Option<PathBuf>,
+}
+
+impl Default for BazelCache {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_size: None,
+            bazelrc: None,
+        }
+    }
+}
+
+/// Bare git mirrors, one per repository. Off unless `mirrors` is non-empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitCaches {
+    /// Repositories (`owner/name`). Jobs get each mirror's path in
+    /// `BORG_GIT_MIRROR_<OWNER>_<NAME>`.
+    pub mirrors: Vec<String>,
+    /// Where mirrors fetch from; `<base>/<owner>/<name>.git`. Credentials are
+    /// the host's business (a credential helper, or an ssh base such as
+    /// `git@host:` with a read-only deploy key for the service user).
+    pub remote_base: String,
+    pub bin: String,
+    pub interval_secs: u64,
+}
+
+impl Default for GitCaches {
+    fn default() -> Self {
+        Self {
+            mirrors: Vec::new(),
+            remote_base: "https://github.com".to_owned(),
+            bin: "git".to_owned(),
+            interval_secs: 600,
+        }
+    }
+}
+
+/// Every cache kind the drone can manage. All kinds except git are on by
+/// default; a cache nobody uses costs only the disk it fills, up to its cap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CachesConfig {
+    pub git: GitCaches,
+    pub sccache: CacheEntry,
+    /// `CARGO_HOME` registry and git data. `bin` is never shared between leases.
+    pub cargo: CacheEntry,
+    pub bazel: BazelCache,
+    pub pnpm: CacheEntry,
+    pub go: CacheEntry,
+    pub uv: CacheEntry,
+    pub mise: CacheEntry,
+    /// How often sizes are re-measured and garbage collection is attempted
+    /// while the drone is idle.
+    pub maintenance_interval_secs: u64,
+}
+
+impl Default for CachesConfig {
+    fn default() -> Self {
+        Self {
+            git: GitCaches::default(),
+            sccache: CacheEntry::default(),
+            cargo: CacheEntry::default(),
+            bazel: BazelCache::default(),
+            pnpm: CacheEntry::default(),
+            go: CacheEntry::default(),
+            uv: CacheEntry::default(),
+            mise: CacheEntry::default(),
+            maintenance_interval_secs: 600,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DroneConfig {
@@ -61,6 +164,9 @@ pub struct DroneConfig {
     pub max_leases: Option<u32>,
     #[serde(default = "default_reserve")]
     pub reserve_mem_mib: u64,
+    /// Host-level caches the drone manages under `cache_root`.
+    #[serde(default)]
+    pub caches: CachesConfig,
 }
 
 fn default_docker() -> String {
@@ -112,6 +218,63 @@ impl DroneConfig {
         }
         if self.ca_cert_path.is_some() && http {
             return bad("ca_cert_path only applies to an https:// queen_url");
+        }
+        self.validate_caches()
+    }
+
+    fn validate_caches(&self) -> Result<(), DroneConfigError> {
+        let bad = |m: String| Err(DroneConfigError::Invalid(m));
+        let c = &self.caches;
+        if c.git.interval_secs == 0 || c.maintenance_interval_secs == 0 {
+            return bad("cache intervals must be positive".to_owned());
+        }
+        // The work root is wiped on start and after every job; caches must
+        // never sit inside it, nor it inside them.
+        if self.cache_root.starts_with(&self.work_root)
+            || self.work_root.starts_with(&self.cache_root)
+        {
+            return bad("cache_root and work_root must not contain one another".to_owned());
+        }
+        let sizes = [
+            ("sccache", &c.sccache.max_size),
+            ("cargo", &c.cargo.max_size),
+            ("bazel", &c.bazel.max_size),
+            ("pnpm", &c.pnpm.max_size),
+            ("go", &c.go.max_size),
+            ("uv", &c.uv.max_size),
+            ("mise", &c.mise.max_size),
+        ];
+        for (name, size) in sizes {
+            if let Some(size) = size
+                && crate::drone::caches::gc::parse_size(size).is_none()
+            {
+                return bad(format!(
+                    "caches.{name}.max_size {size:?} must look like 512M or 50G"
+                ));
+            }
+        }
+        let mut vars = Vec::new();
+        for repo in &c.git.mirrors {
+            let parts: Vec<&str> = repo.split('/').collect();
+            let part_ok = |p: &&str| {
+                !p.is_empty()
+                    && *p != "."
+                    && *p != ".."
+                    && p.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            };
+            if parts.len() != 2 || !parts.iter().all(part_ok) {
+                return bad(format!(
+                    "caches.git.mirrors entry {repo:?} must look like owner/name"
+                ));
+            }
+            let var = crate::drone::caches::git::mirror_var(repo);
+            if vars.contains(&var) {
+                return bad(format!(
+                    "caches.git.mirrors entry {repo:?} maps to the same variable {var} as another entry"
+                ));
+            }
+            vars.push(var);
         }
         Ok(())
     }
@@ -185,6 +348,48 @@ mod tests {
             .replace("https://", "http://")
             .replace('}', r#","allow_insecure":true,"ca_cert_path":"/ca.pem"}"#);
         assert!(DroneConfig::from_json(&http_ca).is_err());
+    }
+
+    #[test]
+    fn cache_settings_have_defaults_and_are_validated() {
+        let with = |extra: &str| BASE.replace('}', &format!(",{extra}}}"));
+        let defaults = DroneConfig::from_json(BASE).unwrap().caches;
+        assert!(defaults.sccache.enabled && defaults.bazel.enabled && defaults.mise.enabled);
+        assert!(defaults.git.mirrors.is_empty());
+        assert_eq!(
+            (
+                defaults.git.remote_base.as_str(),
+                defaults.git.interval_secs
+            ),
+            ("https://github.com", 600)
+        );
+
+        let ok = with(
+            r#""caches":{"git":{"mirrors":["example-org/app"]},"sccache":{"max_size":"50G"},"uv":{"enabled":false}}"#,
+        );
+        let cfg = DroneConfig::from_json(&ok).unwrap().caches;
+        assert_eq!(cfg.git.mirrors, ["example-org/app"]);
+        assert!(!cfg.uv.enabled && cfg.go.enabled);
+        for bad in [
+            r#""caches":{"git":{"mirrors":["noslash"]}}"#,
+            r#""caches":{"git":{"mirrors":["a/b/c"]}}"#,
+            r#""caches":{"git":{"mirrors":["../x"]}}"#,
+            r#""caches":{"git":{"mirrors":["a-b/c","a/b-c"]}}"#,
+            r#""caches":{"sccache":{"max_size":"50"}}"#,
+            r#""caches":{"bazel":{"max_size":"G"}}"#,
+            r#""caches":{"git":{"interval_secs":0}}"#,
+            r#""caches":{"npm":{}}"#,
+        ] {
+            assert!(DroneConfig::from_json(&with(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn caches_may_not_overlap_the_wiped_work_root() {
+        let nested = BASE.replace(r#""cache_root":"/c""#, r#""cache_root":"/w/cache""#);
+        assert!(DroneConfig::from_json(&nested).is_err());
+        let parent = BASE.replace(r#""work_root":"/w""#, r#""work_root":"/c/work""#);
+        assert!(DroneConfig::from_json(&parent).is_err());
     }
 
     #[test]

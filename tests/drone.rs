@@ -10,7 +10,7 @@ use std::time::Duration;
 use borg::drone::Drone;
 use borg::drone::client::QueenClient;
 use borg::drone::config::DroneConfig;
-use borg::drone::exec::{Exec, Output};
+use borg::drone::exec::{Exec, Output, SystemExec};
 use borg::probe::Host;
 use borg::secret::Secret;
 use serde_json::{Value, json};
@@ -96,6 +96,10 @@ impl Rig {
     }
 
     fn drone(&self, extra: Value) -> Drone {
+        self.drone_with(extra, Arc::clone(&self.exec) as Arc<dyn Exec>)
+    }
+
+    fn drone_with(&self, extra: Value, exec: Arc<dyn Exec>) -> Drone {
         let mut cfg = json!({
             "queen_url": self.h.url,
             "allow_insecure": true,
@@ -108,14 +112,17 @@ impl Rig {
         for (k, v) in extra.as_object().cloned().unwrap_or_default() {
             cfg[k] = v;
         }
+        // Never let a test write the real user's ~/.bazelrc.
+        if cfg["caches"].is_null() {
+            cfg["caches"] = json!({});
+        }
+        if cfg["caches"]["bazel"].is_null() {
+            cfg["caches"]["bazel"] = json!({});
+        }
+        cfg["caches"]["bazel"]["bazelrc"] = json!(self.path("bazelrc"));
         let cfg = DroneConfig::from_json(&cfg.to_string()).unwrap();
         let client = QueenClient::new(&cfg, Secret::new(self.token.clone())).unwrap();
-        Drone::new(
-            cfg,
-            client,
-            Arc::new(FixedHost),
-            Arc::clone(&self.exec) as Arc<dyn Exec>,
-        )
+        Drone::new(cfg, client, Arc::new(FixedHost), exec)
     }
 
     async fn lease_state(&self) -> Vec<String> {
@@ -288,4 +295,213 @@ async fn shutdown_stops_taking_leases_and_lets_the_running_job_finish() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// Real `git` for mirror work; everything else is recorded, not executed.
+struct GitOnlyExec(RecordingExec);
+
+impl Exec for GitOnlyExec {
+    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        if program == "git" {
+            SystemExec.run(program, args)
+        } else {
+            self.0.run(program, args)
+        }
+    }
+}
+
+fn git(args: &[&str]) -> String {
+    let out = SystemExec.run("git", args).unwrap();
+    assert!(out.success, "git {args:?} failed");
+    out.stdout
+}
+
+/// A bare origin at `<base>/example-org/app.git` with one commit on `main`;
+/// returns (base, work clone dir).
+fn origin(root: &Path) -> (PathBuf, PathBuf) {
+    let base = root.join("origin");
+    let bare = base.join("example-org/app.git");
+    let work = root.join("work-clone");
+    fs::create_dir_all(bare.parent().unwrap()).unwrap();
+    git(&[
+        "init",
+        "--bare",
+        "--quiet",
+        "-b",
+        "main",
+        bare.to_str().unwrap(),
+    ]);
+    git(&["init", "--quiet", "-b", "main", work.to_str().unwrap()]);
+    git(&[
+        "-C",
+        work.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        bare.to_str().unwrap(),
+    ]);
+    commit(&work, "one");
+    (base, work)
+}
+
+fn commit(work: &Path, msg: &str) -> String {
+    let w = work.to_str().unwrap();
+    git(&[
+        "-C",
+        w,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.test",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        msg,
+    ]);
+    git(&["-C", w, "push", "--quiet", "origin", "main"]);
+    git(&["-C", w, "rev-parse", "HEAD"])
+}
+
+#[tokio::test]
+async fn jobs_share_cache_dirs_and_a_git_mirror_that_survive_cleanup() {
+    let rig = Rig::new().await;
+    let (base, _work) = origin(rig.dir.path());
+    rig.install_runner(
+        "printf '%s' \"$BORG_GIT_MIRROR_EXAMPLE_ORG_APP\" > $OUT/mirror-$BORG_LEASE_ID.txt\n\
+         git --git-dir \"$BORG_GIT_MIRROR_EXAMPLE_ORG_APP\" rev-parse main > $OUT/head-$BORG_LEASE_ID.txt\n\
+         echo \"$SCCACHE_DIR|$CARGO_HOME|$SCCACHE_CACHE_SIZE\" > $OUT/caches-$BORG_LEASE_ID.txt\n\
+         echo \"$UV_CACHE_DIR|$GOCACHE|$GOMODCACHE|$MISE_DATA_DIR|$PNPM_STORE_DIR|$BAZELISK_HOME\" > $OUT/more-$BORG_LEASE_ID.txt\n\
+         echo \"$CARGO_INSTALL_ROOT\" > $OUT/install-$BORG_LEASE_ID.txt\n\
+         touch \"$SCCACHE_DIR/entry-$BORG_LEASE_ID\"",
+    );
+    let exec = Arc::new(GitOnlyExec(RecordingExec::default()));
+    let drone = rig.drone_with(
+        json!({"caches": {
+            "git": {"mirrors": ["example-org/app"], "remote_base": base.to_str().unwrap()},
+            "sccache": {"max_size": "7G"},
+        }}),
+        exec,
+    );
+    let mut tasks = JoinSet::new();
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+
+    for job in [1, 2] {
+        rig.h.state().jobs.clear();
+        rig.h.queue_job(job, "borg-ci-light", 1);
+        rig.h.tick().await;
+        assert_eq!(drone.heartbeat_once(true, &mut tasks).await.unwrap(), 1);
+        drain(&mut tasks).await;
+    }
+
+    let read = |prefix: &str| -> Vec<String> {
+        let mut found: Vec<String> = fs::read_dir(rig.path("out"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| fs::read_to_string(e.path()).unwrap().trim().to_owned())
+            .collect();
+        found.sort();
+        found
+    };
+    let cache = rig.path("cache");
+    let mirror = cache.join("git/example-org/app.git").display().to_string();
+    assert_eq!(
+        read("mirror-"),
+        [mirror.clone(), mirror],
+        "both leases see the mirror"
+    );
+    let caches = read("caches-");
+    assert_eq!(caches.len(), 2);
+    assert_eq!(
+        caches[0], caches[1],
+        "same cache paths and size for every lease"
+    );
+    assert_eq!(
+        caches[0],
+        format!("{0}/sccache|{0}/cargo|7G", cache.display())
+    );
+    let more = read("more-");
+    assert_eq!(more[0], more[1]);
+    assert_eq!(
+        more[0],
+        format!(
+            "{0}/uv|{0}/go/build|{0}/go/mod|{0}/mise|{0}/pnpm|{0}/bazel/bazelisk",
+            cache.display()
+        )
+    );
+    let installs = read("install-");
+    assert_ne!(
+        installs[0], installs[1],
+        "cargo install roots are per lease"
+    );
+    let bazelrc = fs::read_to_string(rig.path("bazelrc")).unwrap();
+    assert!(bazelrc.contains(&format!("--disk_cache={}/bazel/disk", cache.display())));
+    let heads = read("head-");
+    assert_eq!(heads[0], heads[1]);
+    assert_eq!(heads[0].len(), 40, "mirror serves the origin commit");
+
+    assert!(
+        cache.join("git/example-org/app.git/HEAD").exists(),
+        "mirror survives cleanup"
+    );
+    let entries = fs::read_dir(cache.join("sccache")).unwrap().count();
+    assert_eq!(
+        entries, 2,
+        "compile cache entries from both leases survive cleanup"
+    );
+    assert_eq!(fs::read_dir(rig.path("work")).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn the_mirror_timer_picks_up_new_commits() {
+    let rig = Rig::new().await;
+    let (base, work) = origin(rig.dir.path());
+    let json_cfg = json!({
+        "queen_url": "http://127.0.0.1:1", "allow_insecure": true,
+        "runner_dir": rig.path("runner"), "work_root": rig.path("work"), "cache_root": rig.path("cache"),
+        "caches": {
+            "git": {"mirrors": ["example-org/app"], "remote_base": base.to_str().unwrap(), "interval_secs": 1},
+            "bazel": {"enabled": false},
+        },
+    });
+    let cfg = Arc::new(DroneConfig::from_json(&json_cfg.to_string()).unwrap());
+    let caches = Arc::new(borg::drone::caches::Caches::new(
+        cfg,
+        Arc::new(SystemExec),
+        Arc::new(FixedHost),
+    ));
+    let timer = caches.spawn_background();
+    let mirror = rig.path("cache/git/example-org/app.git");
+    let head = |expected: &str| {
+        let m = mirror.to_str().unwrap().to_owned();
+        let expected = expected.to_owned();
+        async move {
+            for _ in 0..100 {
+                let out = SystemExec.run("git", &["--git-dir", &m, "rev-parse", "main"]);
+                if out.is_ok_and(|o| o.success && o.stdout == expected) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            false
+        }
+    };
+    let first = git(&["-C", work.to_str().unwrap(), "rev-parse", "HEAD"]);
+    assert!(head(&first).await, "initial clone");
+    let second = commit(&work, "two");
+    assert!(head(&second).await, "timer refresh fetched the new commit");
+    timer.abort();
+
+    // A job can borrow the mirror's objects.
+    let clone = rig.path("job-clone");
+    git(&[
+        "clone",
+        "--quiet",
+        "--reference",
+        mirror.to_str().unwrap(),
+        base.join("example-org/app.git").to_str().unwrap(),
+        clone.to_str().unwrap(),
+    ]);
+    assert!(clone.join(".git/objects/info/alternates").exists());
 }
