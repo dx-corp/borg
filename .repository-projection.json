@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "projection": "borg",
+  "projectionSchemaVersion": 1,
+  "sourceRepository": "dx-corp/mono",
+  "sourceSha": "a5293e119fc29a43fef8e2f3fb3e06f8db5a931b",
+  "destinationRepository": "dx-corp/borg",
+  "priorProjectedBase": "bb547084fc1e8c6827704c24b9165fa148c84945",
+  "definitionDigest": "0ede17fcc026faff85cd66bb9e941fa3db5f1792165aae945b7b76b57cfd9c9a",
+  "toolDigest": "535e3cb77f0b59898e63a5f097fb3308564bafbc",
+  "contentDigest": "38a3bf905bd076b969e0df500b40705791f6e6b163d9fc992462efaed7943c75",
+  "publicationEligible": true
+}

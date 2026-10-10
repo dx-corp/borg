@@ -1,0 +1,382 @@
+//! Host probe: what this machine can lend to the fleet.
+//!
+//! Every host interaction goes through the [`Host`] trait so detection logic
+//! is tested against fake filesystems and command outputs.
+
+pub mod system;
+
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+/// What kind of machine the drone runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostKind {
+    Wsl,
+    Lxc,
+    Vm,
+    Bare,
+}
+
+/// Read-only view of the machine. Reads and commands return `None` on any
+/// failure; the probe degrades field by field rather than failing.
+pub trait Host {
+    fn read_to_string(&self, path: &Path) -> Option<String>;
+    fn exists(&self, path: &Path) -> bool;
+    /// Run `program` and return trimmed stdout if it exited 0.
+    fn run(&self, program: &str, args: &[&str]) -> Option<String>;
+    /// Operating system, as in `std::env::consts::OS` (`linux`, `macos`).
+    fn os(&self) -> &'static str;
+    /// CPU architecture, as in `std::env::consts::ARCH`.
+    fn arch(&self) -> &'static str;
+    /// CPUs this process may use (honours cgroup quotas).
+    fn available_parallelism(&self) -> Option<u32>;
+}
+
+/// The capacity record a drone reports to the queen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capacity {
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub kind: HostKind,
+    pub vcpu: u32,
+    pub mem_mib: u64,
+    /// Free space on the filesystem holding the work directory.
+    pub free_disk_mib: Option<u64>,
+    /// `docker info` reached a daemon.
+    pub docker_usable: bool,
+    pub mise_version: Option<String>,
+    pub git_version: Option<String>,
+}
+
+/// Directory whose filesystem free space is reported.
+const DISK_PROBE_PATH: &str = "/";
+
+pub fn probe(host: &dyn Host) -> Capacity {
+    Capacity {
+        hostname: hostname(host),
+        os: host.os().to_owned(),
+        arch: host.arch().to_owned(),
+        kind: host_kind(host),
+        vcpu: host.available_parallelism().unwrap_or(1).max(1),
+        mem_mib: mem_mib(host).unwrap_or(0),
+        free_disk_mib: free_disk_mib(host),
+        docker_usable: host
+            .run("docker", &["info", "--format", "{{.ServerVersion}}"])
+            .is_some(),
+        mise_version: host.run("mise", &["--version"]),
+        git_version: host.run("git", &["--version"]),
+    }
+}
+
+fn hostname(host: &dyn Host) -> String {
+    host.read_to_string(Path::new("/proc/sys/kernel/hostname"))
+        .or_else(|| host.run("hostname", &[]))
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Detect WSL, then LXC, then a hypervisor guest, else bare metal.
+pub fn host_kind(host: &dyn Host) -> HostKind {
+    if is_wsl(host) {
+        HostKind::Wsl
+    } else if is_lxc(host) {
+        HostKind::Lxc
+    } else if is_vm(host) {
+        HostKind::Vm
+    } else {
+        HostKind::Bare
+    }
+}
+
+fn is_wsl(host: &dyn Host) -> bool {
+    host.exists(Path::new("/proc/sys/fs/binfmt_misc/WSLInterop"))
+        || host.exists(Path::new("/run/WSL"))
+        || host
+            .read_to_string(Path::new("/proc/version"))
+            .is_some_and(|v| {
+                let v = v.to_ascii_lowercase();
+                v.contains("microsoft") || v.contains("wsl")
+            })
+}
+
+fn is_lxc(host: &dyn Host) -> bool {
+    if host
+        .read_to_string(Path::new("/run/systemd/container"))
+        .is_some_and(|c| c.trim().starts_with("lxc"))
+    {
+        return true;
+    }
+    host.read_to_string(Path::new("/proc/1/environ"))
+        .is_some_and(|env| env.split('\0').any(|kv| kv.starts_with("container=lxc")))
+}
+
+fn is_vm(host: &dyn Host) -> bool {
+    if host.os() == "macos" {
+        return host
+            .run("sysctl", &["-n", "kern.hv_vmm_present"])
+            .as_deref()
+            == Some("1");
+    }
+    const VM_MARKERS: [&str; 7] = [
+        "qemu",
+        "kvm",
+        "vmware",
+        "virtualbox",
+        "xen",
+        "microsoft corporation",
+        "bochs",
+    ];
+    let dmi = ["product_name", "sys_vendor"].iter().any(|field| {
+        host.read_to_string(&Path::new("/sys/class/dmi/id").join(field))
+            .is_some_and(|v| {
+                let v = v.to_ascii_lowercase();
+                VM_MARKERS.iter().any(|m| v.contains(m))
+            })
+    });
+    dmi || host
+        .read_to_string(Path::new("/proc/cpuinfo"))
+        .is_some_and(|c| {
+            c.lines()
+                .any(|l| l.starts_with("flags") && l.split_whitespace().any(|f| f == "hypervisor"))
+        })
+}
+
+/// Total memory in MiB, clamped by any cgroup limit (LXC and containers
+/// report the host's `MemTotal` unless lxcfs is mounted).
+fn mem_mib(host: &dyn Host) -> Option<u64> {
+    let total = if host.os() == "macos" {
+        host.run("sysctl", &["-n", "hw.memsize"])?
+            .parse::<u64>()
+            .ok()
+            .map(|bytes| bytes / (1024 * 1024))?
+    } else {
+        let meminfo = host.read_to_string(Path::new("/proc/meminfo"))?;
+        let kib = meminfo
+            .lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()?;
+        kib / 1024
+    };
+    Some(match cgroup_mem_limit_mib(host) {
+        Some(limit) if limit < total => limit,
+        _ => total,
+    })
+}
+
+fn cgroup_mem_limit_mib(host: &dyn Host) -> Option<u64> {
+    [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .iter()
+    .find_map(|path| {
+        host.read_to_string(Path::new(path))?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    })
+    .map(|bytes| bytes / (1024 * 1024))
+}
+
+fn free_disk_mib(host: &dyn Host) -> Option<u64> {
+    // POSIX `df -Pk`: header line, then `fs blocks used avail cap mount`.
+    let out = host.run("df", &["-Pk", DISK_PROBE_PATH])?;
+    let avail_kib = out
+        .lines()
+        .nth(1)?
+        .split_whitespace()
+        .nth(3)?
+        .parse::<u64>()
+        .ok()?;
+    Some(avail_kib / 1024)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeHost {
+        files: HashMap<&'static str, &'static str>,
+        commands: HashMap<&'static str, &'static str>,
+        os: &'static str,
+        cpus: Option<u32>,
+    }
+
+    impl Host for FakeHost {
+        fn read_to_string(&self, path: &Path) -> Option<String> {
+            self.files.get(path.to_str()?).map(|s| (*s).to_owned())
+        }
+        fn exists(&self, path: &Path) -> bool {
+            path.to_str().is_some_and(|p| self.files.contains_key(p))
+        }
+        fn run(&self, program: &str, _args: &[&str]) -> Option<String> {
+            self.commands.get(program).map(|s| (*s).to_owned())
+        }
+        fn os(&self) -> &'static str {
+            self.os
+        }
+        fn arch(&self) -> &'static str {
+            "x86_64"
+        }
+        fn available_parallelism(&self) -> Option<u32> {
+            self.cpus
+        }
+    }
+
+    fn linux() -> FakeHost {
+        FakeHost {
+            os: "linux",
+            cpus: Some(16),
+            ..FakeHost::default()
+        }
+    }
+
+    const MEMINFO_28G: &str = "MemTotal:       29360128 kB\nMemFree: 1 kB\n";
+
+    #[test]
+    fn detects_wsl_from_interop_or_kernel_string() {
+        let mut h = linux();
+        h.files.insert("/proc/sys/fs/binfmt_misc/WSLInterop", "");
+        assert_eq!(host_kind(&h), HostKind::Wsl);
+
+        let mut h = linux();
+        h.files.insert(
+            "/proc/version",
+            "Linux version 5.15.0-microsoft-standard-WSL2",
+        );
+        assert_eq!(host_kind(&h), HostKind::Wsl);
+    }
+
+    #[test]
+    fn detects_lxc_from_systemd_or_init_environ() {
+        let mut h = linux();
+        h.files.insert("/run/systemd/container", "lxc\n");
+        assert_eq!(host_kind(&h), HostKind::Lxc);
+
+        let mut h = linux();
+        h.files
+            .insert("/proc/1/environ", "PATH=/bin\0container=lxc\0TERM=linux\0");
+        assert_eq!(host_kind(&h), HostKind::Lxc);
+    }
+
+    #[test]
+    fn detects_vm_from_dmi_or_hypervisor_flag() {
+        let mut h = linux();
+        h.files.insert("/sys/class/dmi/id/sys_vendor", "QEMU\n");
+        assert_eq!(host_kind(&h), HostKind::Vm);
+
+        let mut h = linux();
+        h.files.insert(
+            "/proc/cpuinfo",
+            "processor : 0\nflags : fpu vme hypervisor lm\n",
+        );
+        assert_eq!(host_kind(&h), HostKind::Vm);
+    }
+
+    #[test]
+    fn detects_macos_vm_and_bare() {
+        let mut h = FakeHost {
+            os: "macos",
+            cpus: Some(8),
+            ..FakeHost::default()
+        };
+        assert_eq!(host_kind(&h), HostKind::Bare);
+        h.commands.insert("sysctl", "1");
+        assert_eq!(host_kind(&h), HostKind::Vm);
+    }
+
+    #[test]
+    fn bare_metal_is_the_fallback_and_wsl_wins_over_vm() {
+        assert_eq!(host_kind(&linux()), HostKind::Bare);
+
+        let mut h = linux();
+        h.files.insert("/run/WSL", "");
+        h.files.insert("/proc/cpuinfo", "flags : hypervisor\n");
+        assert_eq!(host_kind(&h), HostKind::Wsl);
+    }
+
+    #[test]
+    fn memory_comes_from_meminfo() {
+        let mut h = linux();
+        h.files.insert("/proc/meminfo", MEMINFO_28G);
+        assert_eq!(mem_mib(&h), Some(28672));
+    }
+
+    #[test]
+    fn cgroup_limit_clamps_memory_but_max_does_not() {
+        let mut h = linux();
+        h.files.insert("/proc/meminfo", MEMINFO_28G);
+        h.files.insert("/sys/fs/cgroup/memory.max", "8589934592\n");
+        assert_eq!(mem_mib(&h), Some(8192));
+
+        h.files.insert("/sys/fs/cgroup/memory.max", "max\n");
+        assert_eq!(mem_mib(&h), Some(28672));
+    }
+
+    #[test]
+    fn macos_memory_comes_from_sysctl() {
+        let mut h = FakeHost {
+            os: "macos",
+            cpus: Some(8),
+            ..FakeHost::default()
+        };
+        h.commands.insert("sysctl", "17179869184");
+        assert_eq!(mem_mib(&h), Some(16384));
+    }
+
+    #[test]
+    fn free_disk_parses_posix_df() {
+        let mut h = linux();
+        h.commands.insert(
+            "df",
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 100000000 1000000 52428800 2% /",
+        );
+        assert_eq!(free_disk_mib(&h), Some(51200));
+    }
+
+    #[test]
+    fn probe_assembles_capacity_and_degrades_per_field() {
+        let mut h = linux();
+        h.files.insert("/proc/meminfo", MEMINFO_28G);
+        h.files.insert("/proc/sys/kernel/hostname", "host-a\n");
+        h.commands.insert("docker", "27.0.1");
+        h.commands.insert("git", "git version 2.45.0");
+
+        let c = probe(&h);
+        assert_eq!(c.hostname, "host-a");
+        assert_eq!((c.vcpu, c.mem_mib), (16, 28672));
+        assert!(c.docker_usable);
+        assert_eq!(c.git_version.as_deref(), Some("git version 2.45.0"));
+        assert_eq!(c.mise_version, None);
+        assert_eq!(c.free_disk_mib, None);
+        assert_eq!(c.kind, HostKind::Bare);
+    }
+
+    #[test]
+    fn probe_of_an_empty_host_still_reports_something() {
+        let c = probe(&FakeHost {
+            os: "linux",
+            ..FakeHost::default()
+        });
+        assert_eq!((c.hostname.as_str(), c.vcpu, c.mem_mib), ("unknown", 1, 0));
+        assert!(!c.docker_usable);
+    }
+
+    #[test]
+    fn capacity_serializes_as_json() {
+        let c = probe(&linux());
+        let v: serde_json::Value = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["kind"], "bare");
+        assert_eq!(v["vcpu"], 16);
+    }
+}
