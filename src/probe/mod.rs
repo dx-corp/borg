@@ -186,8 +186,13 @@ fn cgroup_mem_limit_mib(host: &dyn Host) -> Option<u64> {
 }
 
 fn free_disk_mib(host: &dyn Host) -> Option<u64> {
+    free_disk_mib_at(host, Path::new(DISK_PROBE_PATH))
+}
+
+/// Free space, in MiB, on the filesystem holding `path`.
+pub fn free_disk_mib_at(host: &dyn Host, path: &Path) -> Option<u64> {
     // POSIX `df -Pk`: header line, then `fs blocks used avail cap mount`.
-    let out = host.run("df", &["-Pk", DISK_PROBE_PATH])?;
+    let out = host.run("df", &["-Pk", &path.to_string_lossy()])?;
     let avail_kib = out
         .lines()
         .nth(1)?

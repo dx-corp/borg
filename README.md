@@ -148,6 +148,92 @@ budget, so an owner can say "this PC gives at most 8 cores and 24 GiB".
 5. The exit code, duration and peak RSS of the runner's process group (Linux)
    are reported to the queen.
 
+### Host caches
+
+The drone owns one stable directory per cache kind under `cache_root`. The
+path is identical for every lease on the host, is exported to every job, is
+never touched by per-job cleanup, and is size-capped by least-recently-used
+garbage collection that runs only while no lease is running. `cache_root` and
+`work_root` must not contain one another. Everything is configured in the
+`caches` section of the drone config; every kind except `git` is on by default.
+
+| Kind | Environment for jobs | Default cap | Collected |
+| --- | --- | --- | --- |
+| `sccache` | `SCCACHE_DIR`, `SCCACHE_CACHE_SIZE` | 25% of free disk at start, at most 100G | never by the drone; sccache enforces its own size |
+| `cargo` | `CARGO_HOME` (registry and git), `CARGO_INSTALL_ROOT` per lease | 20G | crates, unpacked sources, git db and checkouts |
+| `bazel` | `BAZELISK_HOME`; `--disk_cache` and `--repository_cache` via a managed block in `~/.bazelrc` | 50G | `disk/cas`, `disk/ac`, repository cache entries |
+| `pnpm` | `PNPM_STORE_DIR`, `npm_config_store_dir` | 20G | store files (the index is kept) |
+| `go` | `GOMODCACHE`, `GOCACHE` | 20G | build cache only; the module cache is read-only trees and is left alone |
+| `uv` | `UV_CACHE_DIR` | 10G | entries of each versioned bucket |
+| `mise` | `MISE_DATA_DIR` | 20G | installed tool versions and downloads; shims are kept |
+| `git` | `BORG_GIT_MIRROR_<OWNER>_<NAME>` per mirror | none | never (objects only accumulate) |
+
+```json
+"caches": {
+  "git": { "mirrors": ["example-org/app"], "remote_base": "https://github.com" },
+  "sccache": { "max_size": "50G" },
+  "bazel": { "max_size": "40G", "bazelrc": "/var/lib/borg/.bazelrc" },
+  "uv": { "enabled": false }
+}
+```
+
+Notes on each kind:
+
+* **Garbage collection** removes whole entries (a crate, a content-addressed
+  blob, an installed tool version), oldest use first, until the collectable data
+  is at most 90% of the cap. It takes a lock that every lease holds for its whole
+  life, so it never overlaps a job; under constant load it simply waits for an
+  idle moment, and caps are soft in the meantime.
+* **cargo** shares only the registry and git data. `cargo install` is pointed at
+  a per-lease root so no installed binary ever leaks between leases.
+* **bazel**: the drone writes a marked block into the service user's `~/.bazelrc`
+  (or `caches.bazel.bazelrc`) and leaves the rest of the file alone. The user rc
+  is read after the workspace rc, so these two flags win. Bazel's disk cache is
+  safe for concurrent builds: entries are written to a temporary file and renamed
+  into place, and a collision between processes is harmless. A collected entry is
+  a cache miss.
+* **go**: the module cache is never collected; the build cache is.
+* **uv** and **mise** collection is coarse: it removes entries those tools
+  re-create on demand. mise serializes installs of one tool version with a lock
+  file.
+* **git mirrors**: for each `caches.git.mirrors` entry (`owner/name`) the drone
+  keeps a bare mirror of the branches and tags at
+  `<cache_root>/git/<owner>/<name>.git`, refreshed every
+  `caches.git.interval_secs` (default 600) and before a lease starts (at most
+  once per 15 seconds). The variable name is upper-cased with every other
+  character replaced by `_`, and it is set only while the mirror exists, so a job
+  can test it and fall back to a normal clone:
+
+  ```
+  if [ -n "${BORG_GIT_MIRROR_EXAMPLE_ORG_APP:-}" ]; then
+    git clone --reference "$BORG_GIT_MIRROR_EXAMPLE_ORG_APP" <url> src
+  else
+    git clone <url> src
+  fi
+  ```
+
+  Mirrors fetch from `remote_base` (default `https://github.com`) plus
+  `<owner>/<name>.git`. The drone holds no GitHub credentials: for a private
+  repository give the service user a credential helper, or set `remote_base` to
+  an ssh base such as `git@host:` with a read-only deploy key. A failed refresh
+  keeps the previous mirror and never blocks a job.
+
+What the drone does not do: it does not inject `RUSTFLAGS`. A
+`--remap-path-prefix` can only make paths stable if the path it names is stable,
+and a lease's work directory contains the lease id; workspace crates therefore
+do not share compile-cache entries across leases, while dependencies built from
+the shared registry do. It does not collect sccache hit rates, because sccache
+servers are job-scoped.
+
+Every heartbeat carries each cache's size, cap, evicted bytes and last
+collection time (and, for git, how many leases were given a mirror and how many
+ran without one). The queen shows them under each drone in `/status` and as
+`borg_cache_*` metrics. Sizes are re-measured every
+`caches.maintenance_interval_secs` (default 600) and after leases.
+
+`borg drone install` takes `--git-mirror owner/name` (repeatable) and
+`--git-remote-base`; edit `/etc/borg/drone.json` for the rest.
+
 On start the drone deletes leftover lease directories and borg-labelled docker
 resources from a previous run. On `SIGTERM` it stops accepting leases and waits
 up to `drain_timeout_secs` for running jobs before stopping them.

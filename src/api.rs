@@ -38,6 +38,23 @@ pub struct HeartbeatRequest {
     /// Lease ids the drone currently holds; acknowledges their JIT configs.
     #[serde(default)]
     pub active_leases: Vec<String>,
+    /// Size and garbage-collection state of the drone's host caches.
+    #[serde(default)]
+    pub cache_stats: Vec<CacheStat>,
+}
+
+/// One host cache as measured by its drone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheStat {
+    pub name: String,
+    pub size_bytes: u64,
+    /// The cap garbage collection enforces (sccache: its own cache size).
+    pub max_bytes: Option<u64>,
+    pub evicted_bytes: u64,
+    pub last_gc_at: Option<i64>,
+    /// Git mirrors only: leases that were handed a mirror / ran without one.
+    pub hits: Option<u64>,
+    pub misses: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -132,7 +149,14 @@ async fn heartbeat(
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let store = queen.store();
     store
-        .record_heartbeat(&drone, &req.capacity, &req.caps, req.accepting, now)
+        .record_heartbeat(
+            &drone,
+            &req.capacity,
+            &req.caps,
+            req.accepting,
+            &req.cache_stats,
+            now,
+        )
         .await?;
     store.acknowledge(&drone, &req.active_leases).await?;
     let leases = store
@@ -201,6 +225,7 @@ pub struct DroneStatus {
     pub vcpu: Option<u32>,
     pub mem_mib: Option<u64>,
     pub active_leases: u32,
+    pub caches: Vec<CacheStat>,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,6 +268,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             mem_mib: d.capacity.as_ref().map(|c| c.mem_mib),
             active_leases: u32::try_from(active.iter().filter(|l| l.drone == d.name).count())
                 .unwrap_or(u32::MAX),
+            caches: d.cache_stats.clone(),
         });
     }
 
@@ -408,6 +434,45 @@ pub fn render_metrics(status: &Status) -> String {
         "Unix time of the last reconciliation pass.",
         vec![(String::new(), status.last_tick_at.unwrap_or(0) as f64)],
     );
+    let cache_rows = |f: &dyn Fn(&CacheStat) -> Option<f64>| -> Vec<(String, f64)> {
+        status
+            .drones
+            .iter()
+            .flat_map(|d| {
+                d.caches.iter().filter_map(move |c| {
+                    f(c).map(|v| (format!("drone=\"{}\",cache=\"{}\"", d.name, c.name), v))
+                })
+            })
+            .collect()
+    };
+    #[allow(clippy::cast_precision_loss, reason = "byte counts far below 2^52")]
+    {
+        gauge(
+            "borg_cache_size_bytes",
+            "Size of a drone host cache.",
+            cache_rows(&|c| Some(c.size_bytes as f64)),
+        );
+        gauge(
+            "borg_cache_max_bytes",
+            "Size cap of a drone host cache.",
+            cache_rows(&|c| c.max_bytes.map(|v| v as f64)),
+        );
+        gauge(
+            "borg_cache_evicted_bytes",
+            "Bytes evicted from a drone host cache by garbage collection.",
+            cache_rows(&|c| Some(c.evicted_bytes as f64)),
+        );
+        gauge(
+            "borg_cache_hits",
+            "Leases that were handed a git mirror.",
+            cache_rows(&|c| c.hits.map(|v| v as f64)),
+        );
+        gauge(
+            "borg_cache_misses",
+            "Leases that ran without a git mirror.",
+            cache_rows(&|c| c.misses.map(|v| v as f64)),
+        );
+    }
     gauge(
         "borg_last_tick_ok",
         "1 if the last reconciliation pass had no error.",

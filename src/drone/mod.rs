@@ -5,6 +5,7 @@
 //! private directory. Cleanup after each job is unconditional. On shutdown it
 //! stops accepting leases and lets in-flight jobs finish, up to a timeout.
 
+pub mod caches;
 pub mod cleanup;
 pub mod client;
 pub mod config;
@@ -22,6 +23,7 @@ use tokio::task::JoinSet;
 
 use crate::api::{HeartbeatRequest, LeaseGrant, ResultRequest};
 use crate::probe::{self, Host};
+use caches::Caches;
 use cleanup::{Scope, cleanup_docker, remove_lease_dir, sweep_work_root, valid_lease_id};
 use client::{ClientError, QueenClient};
 use config::DroneConfig;
@@ -56,6 +58,7 @@ pub struct Drone {
     held: Held,
     abort: tokio::sync::watch::Sender<bool>,
     proc_root: Arc<Path>,
+    caches: Arc<Caches>,
 }
 
 impl Drone {
@@ -66,11 +69,18 @@ impl Drone {
         exec: Arc<dyn Exec>,
     ) -> Self {
         let (abort, _) = tokio::sync::watch::channel(false);
+        let cfg = Arc::new(cfg);
+        let caches = Arc::new(Caches::new(
+            Arc::clone(&cfg),
+            Arc::clone(&exec),
+            Arc::clone(&host),
+        ));
         Self {
-            cfg: Arc::new(cfg),
+            cfg,
             client: Arc::new(client),
             host,
             exec,
+            caches,
             held: Held::default(),
             abort,
             proc_root: Arc::from(Path::new("/proc")),
@@ -132,6 +142,7 @@ impl Drone {
             caps: self.cfg.host_caps(),
             accepting,
             active_leases: self.held_ids(),
+            cache_stats: self.caches.stats(),
         };
         let resp = self.client.heartbeat(&req).await?;
         let mut started = 0;
@@ -145,6 +156,7 @@ impl Drone {
                 exec: Arc::clone(&self.exec),
                 abort: self.abort.subscribe(),
                 proc_root: Arc::clone(&self.proc_root),
+                caches: Arc::clone(&self.caches),
                 _held: HeldGuard {
                     held: Arc::clone(&self.held),
                     id: grant.lease_id.clone(),
@@ -185,6 +197,7 @@ impl Drone {
     pub async fn run(self, shutdown: impl std::future::Future<Output = ()>) {
         self.startup_sweep().await;
         let mut tasks = JoinSet::new();
+        let cache_background = self.caches.spawn_background();
         let mut every = tokio::time::interval(Duration::from_secs(self.cfg.heartbeat_secs));
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tokio::pin!(shutdown);
@@ -223,6 +236,7 @@ impl Drone {
                 }
             }
         }
+        cache_background.abort();
     }
 }
 
@@ -232,17 +246,25 @@ struct LeaseContext {
     exec: Arc<dyn Exec>,
     abort: tokio::sync::watch::Receiver<bool>,
     proc_root: Arc<Path>,
+    caches: Arc<Caches>,
     _held: HeldGuard,
 }
 
 /// Run one lease, clean up unconditionally, report the result.
 async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
+    // Held for the whole lease: cache garbage collection waits for it.
+    let lease_guard = ctx.caches.begin_lease().await;
+    // Refresh stale git mirrors and learn the shared cache environment. Cache
+    // trouble never blocks a job; it just runs without the speedup.
+    let lease_dir = ctx.cfg.work_root.join(&grant.lease_id);
+    let extra_env = ctx.caches.prepare_lease(&lease_dir).await;
     let spec = RunSpec {
         lease_id: &grant.lease_id,
         jit_config: &grant.jit_config,
         runner_dir: &ctx.cfg.runner_dir,
         work_root: &ctx.cfg.work_root,
         cache_root: &ctx.cfg.cache_root,
+        extra_env: &extra_env,
         max_job: Duration::from_secs(ctx.cfg.max_job_secs),
         proc_root: &ctx.proc_root,
     };
@@ -271,6 +293,13 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         }
         Err(e) => tracing::warn!("lease {} cleanup task failed: {e}", grant.lease_id),
     }
+
+    // Between leases: let the caches re-measure and, if nothing else is
+    // running, evict. Skipped by `maintain` itself while another lease holds
+    // the gate.
+    drop(lease_guard);
+    let caches = Arc::clone(&ctx.caches);
+    tokio::spawn(async move { caches.maintain().await });
 
     let result = match outcome {
         Ok(o) => ResultRequest {
