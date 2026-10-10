@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 use crate::allocator::{WarmFloor, default_warm_floors};
 use crate::classes::{Classes, ClassesError};
+use crate::schedule::WarmSchedule;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -49,6 +50,36 @@ fn default_runner_group() -> u64 {
     1
 }
 
+/// The opt-in supersede janitor (see [`crate::janitor`]). Present means
+/// enabled; it starts in dry-run so enabling it cannot cancel anything until
+/// the operator has read its log and set `dry_run` to false.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JanitorSettings {
+    /// File holding a token with `actions: write` on the listed repositories.
+    /// If absent, `BORG_JANITOR_TOKEN` must hold the token.
+    #[serde(default)]
+    pub token_path: Option<PathBuf>,
+    /// Log what would be cancelled without cancelling.
+    #[serde(default = "yes")]
+    pub dry_run: bool,
+    #[serde(default = "default_janitor_interval")]
+    pub interval_secs: u64,
+    /// Hard cap on cancellations (or dry-run matches) per pass.
+    #[serde(default = "default_janitor_max")]
+    pub max_cancels_per_pass: u32,
+}
+
+fn yes() -> bool {
+    true
+}
+fn default_janitor_interval() -> u64 {
+    60
+}
+fn default_janitor_max() -> u32 {
+    20
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueenConfig {
@@ -80,10 +111,19 @@ pub struct QueenConfig {
     pub classes: Classes,
     #[serde(default = "default_warm_floors")]
     pub warm_floors: Vec<WarmFloor>,
+    /// Time-of-day raises to the warm floors; see [`crate::schedule`].
+    #[serde(default)]
+    pub warm_schedule: WarmSchedule,
+    /// Job telemetry older than this is deleted.
+    #[serde(default = "default_telemetry_days")]
+    pub telemetry_retention_days: u32,
     /// The borg version drones should run. Only reported (`/metrics`,
     /// `/status`): drones update themselves, the queen never forces it.
     #[serde(default)]
     pub rollout_target_version: Option<String>,
+    /// Absent (the default) disables the supersede janitor.
+    #[serde(default)]
+    pub supersede_janitor: Option<JanitorSettings>,
 }
 
 fn default_listen() -> SocketAddr {
@@ -111,6 +151,9 @@ fn default_drone_stale() -> i64 {
     clippy::unnecessary_wraps,
     reason = "serde default for an Option field"
 )]
+fn default_telemetry_days() -> u32 {
+    30
+}
 fn default_starvation() -> Option<u64> {
     Some(120)
 }
@@ -157,6 +200,16 @@ impl QueenConfig {
         if self.poll_interval_secs == 0 || self.lease_ttl_secs <= 0 || self.lease_max_secs <= 0 {
             return bad("poll_interval_secs, lease_ttl_secs and lease_max_secs must be positive");
         }
+        self.warm_schedule
+            .validate()
+            .map_err(ConfigError::Invalid)?;
+        if let Some(j) = &self.supersede_janitor
+            && (j.interval_secs == 0 || j.max_cancels_per_pass == 0)
+        {
+            return bad(
+                "supersede_janitor interval_secs and max_cancels_per_pass must be positive",
+            );
+        }
         Ok(())
     }
 }
@@ -186,6 +239,33 @@ mod tests {
             MIN.replace("\"repos\":[\"example-org/app\"]", "\"repos\":[]"),
         ] {
             assert!(QueenConfig::from_json(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn janitor_is_off_by_default_and_dry_run_when_enabled() {
+        assert!(
+            QueenConfig::from_json(MIN)
+                .unwrap()
+                .supersede_janitor
+                .is_none()
+        );
+        let c =
+            QueenConfig::from_json(&MIN.replace("\"repos\"", "\"supersede_janitor\":{},\"repos\""))
+                .unwrap();
+        let j = c.supersede_janitor.unwrap();
+        assert!(j.dry_run);
+        assert_eq!((j.interval_secs, j.max_cancels_per_pass), (60, 20));
+        for bad in [
+            "{\"interval_secs\":0}",
+            "{\"max_cancels_per_pass\":0}",
+            "{\"nope\":1}",
+        ] {
+            let json = MIN.replace(
+                "\"repos\"",
+                &format!("\"supersede_janitor\":{bad},\"repos\""),
+            );
+            assert!(QueenConfig::from_json(&json).is_err(), "{bad}");
         }
     }
 

@@ -390,3 +390,161 @@ async fn github_failure_before_minting_aborts_the_tick() {
     assert!(h.queen.tick(OffsetDateTime::now_utc()).await.is_err());
     assert!(h.state().mints.is_empty());
 }
+
+#[tokio::test]
+async fn warm_schedule_raises_the_floor_only_inside_its_window() {
+    use time::macros::datetime;
+
+    // The ticks use a fake clock days from the real heartbeat time.
+    let h = Harness::start(
+        json!({"drone_stale_secs": 100_000_000, "warm_schedule": {"windows": [
+            {"class": "light", "scope": "pr", "count": 2, "start": "08:00", "end": "20:00"}
+        ]}}),
+    )
+    .await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+
+    h.queen.tick(datetime!(2026-10-12 07:59 UTC)).await.unwrap();
+    assert!(h.state().mints.is_empty());
+    assert_eq!(h.status().await["warm_floors"], json!([]));
+
+    h.queen.tick(datetime!(2026-10-12 08:00 UTC)).await.unwrap();
+    assert_eq!(h.state().mints.len(), 2);
+    let metrics = h.metrics().await;
+    assert!(
+        metrics.contains("borg_warm_floor{class=\"light\",scope=\"pr\"} 2"),
+        "{metrics}"
+    );
+
+    // The window closing does not revoke leases already minted.
+    h.queen.tick(datetime!(2026-10-12 20:00 UTC)).await.unwrap();
+    assert_eq!(h.state().mints.len(), 2);
+}
+
+async fn lease_for(h: &Harness, token: &str, label: &str, id: u64) -> String {
+    h.queue_job(id, label, 5);
+    h.tick().await;
+    h.leases(token, &[]).await[0]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+async fn post_result(h: &Harness, token: &str, lease: &str, body: Value) -> reqwest::StatusCode {
+    h.http
+        .post(format!("{}/v1/leases/{lease}/result", h.url))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn telemetry_is_stored_and_reported_per_job_class_and_drone() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    let lease = lease_for(&h, &token, "borg-ci-light-pr", 1).await;
+
+    let status = post_result(
+        &h,
+        &token,
+        &lease,
+        json!({"exit_code": 1, "duration_secs": 120, "telemetry": {
+            "job_name": "lint", "repo": "example-org/app", "run_id": 9,
+            "conclusion": "failure", "failure_class": "host", "queue_wait_secs": 25,
+            "steps": [{"name": "setup", "duration_secs": 20, "conclusion": "success"},
+                      {"name": "cargo clippy", "duration_secs": 90, "conclusion": "failure"}]}}),
+    )
+    .await;
+    assert_eq!(status, 204);
+
+    let r: Value = h
+        .http
+        .get(format!("{}/report?since_secs=3600", h.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["jobs"], 1);
+    assert_eq!(r["by_job"][0]["job_name"], "lint");
+    assert_eq!(r["by_job"][0]["total_secs"], 120);
+    assert_eq!(r["by_step"][0]["step"], "cargo clippy");
+    assert_eq!(r["queue_wait"][0]["class"], "light");
+    assert_eq!(r["queue_wait"][0]["max_secs"], 25);
+    assert_eq!(r["drones"][0]["drone"], "d1");
+    assert_eq!(r["drones"][0]["host_failures"], 1);
+    assert_eq!(r["cancellation"]["cancelled"], 0);
+}
+
+#[tokio::test]
+async fn results_without_or_with_unusable_telemetry_are_still_accepted() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    let lease = lease_for(&h, &token, "borg-ci-light-pr", 1).await;
+    let status = post_result(
+        &h,
+        &token,
+        &lease,
+        json!({"exit_code": 0, "duration_secs": 5, "telemetry": {"job_name": "", "repo": "x"}}),
+    )
+    .await;
+    assert_eq!(status, 204);
+    assert_eq!(
+        post_result(
+            &h,
+            &token,
+            &lease,
+            json!({"exit_code": 0, "duration_secs": 5})
+        )
+        .await,
+        204
+    );
+    let r: Value = h
+        .http
+        .get(format!("{}/report", h.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["jobs"], 0);
+}
+
+#[tokio::test]
+async fn old_telemetry_is_pruned_by_the_tick() {
+    let h = Harness::start(json!({"telemetry_retention_days": 1})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    let lease = lease_for(&h, &token, "borg-ci-light-pr", 1).await;
+    post_result(
+        &h,
+        &token,
+        &lease,
+        json!({"exit_code": 0, "duration_secs": 5,
+               "telemetry": {"job_name": "j", "repo": "o/r", "conclusion": "success"}}),
+    )
+    .await;
+    assert_eq!(
+        h.queen.store().telemetry_since(0, 10).await.unwrap().len(),
+        1
+    );
+    // Two days later the one-day retention drops it.
+    let later = OffsetDateTime::now_utc() + time::Duration::days(2);
+    h.queen.tick(later).await.unwrap();
+    assert!(
+        h.queen
+            .store()
+            .telemetry_since(0, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

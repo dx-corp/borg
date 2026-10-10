@@ -338,6 +338,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
             exit_code: o.exit_code,
             duration_secs: o.duration_secs,
             peak_rss_mib: o.peak_rss_mib,
+            telemetry: None,
         },
         Err(e) => {
             tracing::warn!("lease {} could not run: {e}", grant.lease_id);
@@ -345,6 +346,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
                 exit_code: -1,
                 duration_secs: 0,
                 peak_rss_mib: None,
+                telemetry: None,
             }
         }
     };

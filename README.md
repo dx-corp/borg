@@ -79,6 +79,42 @@ config to have `/metrics` and `/status` report how many drones run that borg
 version (drones report theirs in every heartbeat; the queen never forces an
 update).
 
+`warm_floors` keep idle runners alive per class and scope; the optional
+`warm_schedule` raises them in time-of-day windows (`{"class": "light", "scope":
+"pr", "count": 4, "start": "08:00", "end": "20:00", "days": ["mon", "tue"]}`)
+at a fixed `utc_offset_minutes`. A window never lowers a floor.
+
+### Job telemetry
+
+A drone may add a `telemetry` object to `POST /v1/leases/{id}/result`:
+
+```json
+{
+  "exit_code": 1, "duration_secs": 412,
+  "telemetry": {
+    "job_name": "rust-test (shard 2)", "repo": "example-org/app", "run_id": 123456789,
+    "conclusion": "failure", "failure_class": "host", "queue_wait_secs": 18,
+    "steps": [{ "name": "cargo test", "duration_secs": 401, "conclusion": "failure" }]
+  }
+}
+```
+
+`conclusion` is `success`, `failure`, `cancelled`, `skipped`, `timed_out` or
+`unknown`; `failure_class` is `host` (machine or runner failure), `code` (the
+job's own failure) or `unknown`. Unrecognized values read as `unknown`; at most
+64 steps and 120 characters per name are kept; `job_name` and a `owner/name`
+`repo` are required, otherwise the telemetry is dropped and the result still
+recorded. The queen keeps it for `telemetry_retention_days` (default 30).
+`borg report --queen <url>` (or `--config queen.json` on the queen host) and
+`GET /report` summarize time by job and step, queue wait per class, the
+cancellation share and host-caused failures per drone.
+
+The optional supersede janitor cancels queued pull-request workflow runs whose
+head commit is no longer the pull request's head. Add a `supersede_janitor`
+block (`token_path` or `BORG_JANITOR_TOKEN` for a token with `actions: write`,
+`dry_run` defaulting to true, `interval_secs`, `max_cancels_per_pass`) to turn
+it on. It never cancels a run that has started.
+
 The GitHub App needs organization self-hosted runners: read and write, plus
 read access to Actions on the listed repositories. Set
 `BORG_APP_PRIVATE_KEY` instead of `private_key_path` to pass the PEM in the

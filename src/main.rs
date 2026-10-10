@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use borg::api;
-use borg::config::QueenConfig;
+use borg::config::{JanitorSettings, QueenConfig};
 use borg::drone::client::QueenClient;
 use borg::drone::config::DroneConfig;
 use borg::drone::exec::SystemExec;
@@ -11,6 +11,7 @@ use borg::drone::install::{self, InstallOptions, Platform};
 use borg::drone::{Drone, pins};
 use borg::enroll;
 use borg::github::GithubClient;
+use borg::janitor::Janitor;
 use borg::probe::{self, system::SystemHost};
 use borg::queen::Queen;
 use borg::store::Store;
@@ -36,11 +37,33 @@ enum Command {
         #[command(subcommand)]
         command: DroneCommand,
     },
+    /// Summarize stored job telemetry: time by job and step, queue wait per
+    /// class, cancellation share and host-caused failures per drone.
+    Report(ReportArgs),
     /// Run or administer the queen (the coordinator).
     Queen {
         #[command(subcommand)]
         command: QueenCommand,
     },
+}
+
+#[derive(Args)]
+struct ReportArgs {
+    /// Fetch from a running queen, e.g. http://queen.internal:8080
+    #[arg(long, conflicts_with = "config", required_unless_present = "config")]
+    queen: Option<String>,
+    /// Read the queen's SQLite file directly (run on the queen host).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Look back this many hours (capped by the queen's retention).
+    #[arg(long, default_value_t = 24)]
+    since_hours: u32,
+    /// Rows in the by-job and by-step lists.
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
+    /// Print the JSON report instead of text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -148,6 +171,20 @@ fn private_key(cfg: &QueenConfig) -> Result<Vec<u8>> {
     }
 }
 
+fn janitor_token(settings: &JanitorSettings) -> Result<borg::secret::Secret> {
+    let raw = match &settings.token_path {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("read janitor token {}", path.display()))?,
+        None => std::env::var("BORG_JANITOR_TOKEN")
+            .context("set supersede_janitor.token_path or BORG_JANITOR_TOKEN")?,
+    };
+    let token = raw.trim();
+    if token.is_empty() {
+        bail!("the janitor token is empty");
+    }
+    Ok(borg::secret::Secret::new(token))
+}
+
 async fn open_store(cfg: &QueenConfig) -> Result<Store> {
     Store::open(&cfg.db_path)
         .await
@@ -182,7 +219,26 @@ async fn run_queen(path: &Path) -> Result<()> {
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
     tracing::info!("queen listening on {}", cfg.listen);
-    let queen = Arc::new(Queen::new(cfg, store, github));
+    let janitor = match &cfg.supersede_janitor {
+        Some(settings) => {
+            let token = janitor_token(settings)?;
+            tracing::info!(
+                "supersede janitor enabled ({})",
+                if settings.dry_run {
+                    "dry-run"
+                } else {
+                    "cancelling"
+                }
+            );
+            Some(Janitor::new(&cfg.github.api_base, token, settings.clone())?)
+        }
+        None => None,
+    };
+    let mut queen = Queen::new(cfg, store, github);
+    if let Some(j) = janitor {
+        queen = queen.with_janitor(j);
+    }
+    let queen = Arc::new(queen);
     api::serve(queen, listener, wait_for_shutdown()).await?;
     Ok(())
 }
@@ -202,6 +258,42 @@ async fn enroll_drone(path: &Path, name: &str) -> Result<()> {
         .await?;
     eprintln!("Enrolled drone {name}. The token is shown once; the queen stores only its hash.");
     println!("{one_time_code}");
+    Ok(())
+}
+
+async fn report(a: ReportArgs) -> Result<()> {
+    let window = i64::from(a.since_hours.max(1)) * 3600;
+    let report = match (&a.queen, &a.config) {
+        (Some(url), _) => {
+            let url = format!(
+                "{}/report?since_secs={window}&limit={}",
+                url.trim_end_matches('/'),
+                a.limit
+            );
+            reqwest::get(&url)
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .with_context(|| format!("GET {url}"))?
+                .json::<borg::telemetry::Report>()
+                .await
+                .context("decode report")?
+        }
+        (None, Some(path)) => {
+            let cfg = QueenConfig::load(path)?;
+            let store = open_store(&cfg).await?;
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let rows = store
+                .telemetry_since(now - window, borg::telemetry::MAX_REPORT_ROWS)
+                .await?;
+            borg::telemetry::build_report(&rows, now, window, a.limit)
+        }
+        (None, None) => bail!("give --queen or --config"),
+    };
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", borg::telemetry::render_text(&report));
+    }
     Ok(())
 }
 
@@ -276,6 +368,7 @@ async fn main() -> Result<()> {
             println!("{json}");
             Ok(())
         }
+        Command::Report(a) => report(a).await,
         Command::Drone { command } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
