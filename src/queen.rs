@@ -166,7 +166,7 @@ impl Queen {
                 .is_some_and(|t| now_ts - t <= self.cfg.drone_stale_secs);
             if let (true, Some(cap)) = (fresh, &d.capacity) {
                 let mut state = DroneState::from_capacity(d.name.clone(), cap, &d.caps);
-                state.accepting = d.accepting;
+                state.accepting = d.schedulable();
                 drones.push(state);
                 capacities.insert(d.name.clone(), cap.clone());
             }

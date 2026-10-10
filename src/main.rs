@@ -61,6 +61,23 @@ enum QueenCommand {
         /// Drone name: lowercase letters, digits and dashes.
         name: String,
     },
+    /// Stop granting a drone new leases (running jobs finish).
+    Quarantine {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Why the drone is quarantined; shown in `/status`.
+        #[arg(long, default_value = "operator")]
+        reason: String,
+        /// Drone name.
+        name: String,
+    },
+    /// Lift a quarantine.
+    Release {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Drone name.
+        name: String,
+    },
 }
 
 #[derive(Args)]
@@ -188,6 +205,19 @@ async fn enroll_drone(path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+async fn set_quarantine(path: &Path, name: &str, reason: Option<&str>) -> Result<()> {
+    let cfg = QueenConfig::load(path)?;
+    let store = open_store(&cfg).await?;
+    if !store.set_quarantine(name, reason).await? {
+        bail!("no enrolled drone named {name}");
+    }
+    match reason {
+        Some(r) => eprintln!("Quarantined drone {name} ({r}); it gets no new leases."),
+        None => eprintln!("Released drone {name}."),
+    }
+    Ok(())
+}
+
 async fn run_drone(path: &Path) -> Result<()> {
     let cfg = DroneConfig::load(path)?;
     let token = cfg.load_token()?;
@@ -268,6 +298,14 @@ async fn main() -> Result<()> {
             match command {
                 QueenCommand::Run(c) => run_queen(&c.config).await,
                 QueenCommand::Enroll { config, name } => enroll_drone(&config.config, &name).await,
+                QueenCommand::Quarantine {
+                    config,
+                    reason,
+                    name,
+                } => set_quarantine(&config.config, &name, Some(&reason)).await,
+                QueenCommand::Release { config, name } => {
+                    set_quarantine(&config.config, &name, None).await
+                }
             }
         }
     }

@@ -80,6 +80,10 @@ pub struct QueenConfig {
     pub classes: Classes,
     #[serde(default = "default_warm_floors")]
     pub warm_floors: Vec<WarmFloor>,
+    /// The borg version drones should run. Only reported (`/metrics`,
+    /// `/status`): drones update themselves, the queen never forces it.
+    #[serde(default)]
+    pub rollout_target_version: Option<String>,
 }
 
 fn default_listen() -> SocketAddr {

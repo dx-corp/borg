@@ -27,7 +27,10 @@ CREATE TABLE IF NOT EXISTS drones (
     capacity       TEXT,
     caps           TEXT,
     accepting      INTEGER NOT NULL DEFAULT 1,
-    cache_stats    TEXT
+    cache_stats    TEXT,
+    quarantined    INTEGER NOT NULL DEFAULT 0,
+    quarantine_reason TEXT,
+    version        TEXT
 );
 CREATE TABLE IF NOT EXISTS leases (
     id           TEXT PRIMARY KEY,
@@ -103,6 +106,18 @@ pub struct DroneRow {
     pub caps: HostCaps,
     pub accepting: bool,
     pub cache_stats: Vec<CacheStat>,
+    /// Set by an operator; a quarantined drone gets no new leases.
+    pub quarantined: bool,
+    pub quarantine_reason: Option<String>,
+    /// The borg version the drone last reported, if it reports one.
+    pub version: Option<String>,
+}
+
+impl DroneRow {
+    /// Whether the allocator may hand this drone new leases.
+    pub fn schedulable(&self) -> bool {
+        self.accepting && !self.quarantined
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -173,14 +188,19 @@ impl Store {
             .connect_with(opts)
             .await?;
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
-        // Databases created before cache stats existed lack the column.
-        // sqlx-runtime-query: one-off additive migration, no data involved
-        if let Err(e) = sqlx::query("ALTER TABLE drones ADD COLUMN cache_stats TEXT")
-            .execute(&pool)
-            .await
-            && !e.to_string().contains("duplicate column")
-        {
-            return Err(e.into());
+        // Databases created before these columns existed lack them.
+        for ddl in [
+            "ALTER TABLE drones ADD COLUMN cache_stats TEXT",
+            "ALTER TABLE drones ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE drones ADD COLUMN quarantine_reason TEXT",
+            "ALTER TABLE drones ADD COLUMN version TEXT",
+        ] {
+            // sqlx-runtime-query: one-off additive migration, no data involved
+            if let Err(e) = sqlx::query(ddl).execute(&pool).await
+                && !e.to_string().contains("duplicate column")
+            {
+                return Err(e.into());
+            }
         }
         Ok(Self { pool })
     }
@@ -239,7 +259,7 @@ impl Store {
     pub async fn drones(&self) -> Result<Vec<DroneRow>, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         let rows = sqlx::query(
-            "SELECT name, last_heartbeat, capacity, caps, accepting, cache_stats FROM drones ORDER BY name",
+            "SELECT name, last_heartbeat, capacity, caps, accepting, cache_stats, quarantined, quarantine_reason, version FROM drones ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -263,9 +283,41 @@ impl Store {
                         .map(from_text)
                         .transpose()?
                         .unwrap_or_default(),
+                    quarantined: r.get::<i64, _>("quarantined") != 0,
+                    quarantine_reason: r.get("quarantine_reason"),
+                    version: r.get("version"),
                 })
             })
             .collect()
+    }
+
+    /// Quarantine (`Some(reason)`) or release (`None`) a drone. False if no
+    /// such drone is enrolled.
+    pub async fn set_quarantine(
+        &self,
+        name: &str,
+        reason: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        const SQL: &str = "UPDATE drones SET quarantined = ?, quarantine_reason = ? WHERE name = ?";
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let r = sqlx::query(SQL)
+            .bind(i64::from(reason.is_some()))
+            .bind(reason)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Record the borg version a drone reported in its heartbeat.
+    pub async fn set_version(&self, name: &str, version: Option<&str>) -> Result<(), StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query("UPDATE drones SET version = ? WHERE name = ?")
+            .bind(version)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn insert_lease(&self, l: &LeaseRow) -> Result<(), StoreError> {
@@ -515,6 +567,22 @@ mod tests {
             s.lease("l1").await.unwrap().unwrap().state,
             LeaseStatus::Expired
         );
+    }
+
+    #[tokio::test]
+    async fn quarantine_and_version_round_trip_and_survive_heartbeats() {
+        let s = store_with("d1").await;
+        assert!(!s.set_quarantine("nope", Some("x")).await.unwrap());
+        assert!(s.set_quarantine("d1", Some("bad disk")).await.unwrap());
+        s.set_version("d1", Some("1.2.3")).await.unwrap();
+        let d = &s.drones().await.unwrap()[0];
+        assert!(d.accepting && d.quarantined && !d.schedulable());
+        assert_eq!(d.quarantine_reason.as_deref(), Some("bad disk"));
+        assert_eq!(d.version.as_deref(), Some("1.2.3"));
+        assert!(s.set_quarantine("d1", None).await.unwrap());
+        let d = &s.drones().await.unwrap()[0];
+        assert!(!d.quarantined && d.schedulable());
+        assert_eq!(d.quarantine_reason, None);
     }
 
     #[tokio::test]

@@ -298,6 +298,28 @@ impl Harness {
             .unwrap()
     }
 
+    /// Heartbeat reporting `version`.
+    pub async fn heartbeat_version(&self, token: &str, version: &str) -> reqwest::Response {
+        self.http
+            .post(format!("{}/v1/heartbeat", self.url))
+            .bearer_auth(token)
+            .json(&json!({"capacity": capacity(), "version": version}))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    pub async fn metrics(&self) -> String {
+        self.http
+            .get(format!("{}/metrics", self.url))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    }
+
     pub async fn leases(&self, token: &str, active: &[&str]) -> Vec<Value> {
         let body: Value = self.heartbeat(token, active).await.json().await.unwrap();
         body["leases"].as_array().cloned().unwrap_or_default()
