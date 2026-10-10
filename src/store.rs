@@ -50,6 +50,22 @@ CREATE TABLE IF NOT EXISTS leases (
     peak_rss_mib INTEGER
 );
 CREATE INDEX IF NOT EXISTS leases_state ON leases(state);
+CREATE TABLE IF NOT EXISTS job_telemetry (
+    lease_id        TEXT PRIMARY KEY,
+    drone           TEXT NOT NULL,
+    class           TEXT NOT NULL,
+    scope           TEXT NOT NULL,
+    repo            TEXT NOT NULL,
+    run_id          INTEGER NOT NULL,
+    job_name        TEXT NOT NULL,
+    conclusion      TEXT NOT NULL,
+    failure_class   TEXT NOT NULL,
+    duration_secs   INTEGER NOT NULL,
+    queue_wait_secs INTEGER,
+    steps           TEXT NOT NULL,
+    finished_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS job_telemetry_finished ON job_telemetry(finished_at);
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -145,7 +161,7 @@ pub struct LeaseResult {
 
 #[derive(Clone)]
 pub struct Store {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 fn to_text<T: Serialize>(v: &T) -> Result<String, StoreError> {

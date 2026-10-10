@@ -21,11 +21,12 @@ use time::OffsetDateTime;
 
 use crate::allocator::{
     ActiveLease, AllocatorInput, Demand, DroneState, LeaseState, QueueAge, Reservation, Unmet,
-    allocate, max_slots,
+    WarmFloor, allocate, max_slots,
 };
 use crate::classes::{Class, Scope};
 use crate::config::QueenConfig;
 use crate::github::{GithubClient, GithubError, QueuedJob, Runner};
+use crate::janitor::Janitor;
 use crate::probe::Capacity;
 use crate::store::{LeaseRow, LeaseStatus, Store, StoreError};
 
@@ -45,6 +46,8 @@ pub struct Snapshot {
     pub queue: Vec<QueueEntry>,
     pub reserved_for: Vec<Reservation>,
     pub unmet: Vec<Unmet>,
+    /// The warm floors in force at the last pass (base plus schedule).
+    pub warm_floors: Vec<WarmFloor>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,6 +64,7 @@ pub struct Queen {
     pub(crate) store: Store,
     github: GithubClient,
     snapshot: RwLock<Snapshot>,
+    janitor: Option<Janitor>,
     tick_lock: tokio::sync::Mutex<()>,
 }
 
@@ -102,8 +106,20 @@ impl Queen {
             store,
             github,
             snapshot: RwLock::new(Snapshot::default()),
+            janitor: None,
             tick_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Attach the opt-in supersede janitor; `api::serve` runs it.
+    #[must_use]
+    pub fn with_janitor(mut self, janitor: Janitor) -> Self {
+        self.janitor = Some(janitor);
+        self
+    }
+
+    pub fn janitor(&self) -> Option<&Janitor> {
+        self.janitor.as_ref()
     }
 
     pub fn config(&self) -> &QueenConfig {
@@ -184,12 +200,16 @@ impl Queen {
                 },
             })
             .collect();
+        let warm_floors = self
+            .cfg
+            .warm_schedule
+            .effective_floors(&self.cfg.warm_floors, now);
         let allocation = allocate(&AllocatorInput {
             classes: self.cfg.classes.clone(),
             demand,
             drones,
             leases,
-            warm_floors: self.cfg.warm_floors.clone(),
+            warm_floors: warm_floors.clone(),
             queue_ages,
             starvation_after_secs: self.cfg.starvation_after_secs,
         });
@@ -245,7 +265,12 @@ impl Queen {
             s.queue = queue;
             s.reserved_for = allocation.reserved_for.clone();
             s.unmet = allocation.unmet.clone();
+            s.warm_floors = warm_floors;
         });
+        let keep = i64::from(self.cfg.telemetry_retention_days) * 86_400;
+        if let Err(e) = self.store.prune_telemetry(now_ts - keep).await {
+            tracing::warn!("prune telemetry failed: {e}");
+        }
         Ok(())
     }
 

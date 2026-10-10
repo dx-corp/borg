@@ -26,6 +26,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub const INSTALLATION_TOKEN: &str = "ghs_installation_for_tests";
+pub const JANITOR_TOKEN: &str = "ghp_janitor_for_tests";
 pub const ORG: &str = "example-org";
 
 #[derive(Default)]
@@ -40,6 +41,16 @@ pub struct MockState {
     pub jwt_rejections: u32,
     pub fail_mint: bool,
     pub fail_runner_list: bool,
+    /// Queued `pull_request` runs as the janitor lists them.
+    pub pr_runs: Vec<Value>,
+    /// Current head sha per pull request number.
+    pub pulls: HashMap<u64, String>,
+    /// Status the single-run endpoint reports instead of the listed one.
+    pub fresh_status: HashMap<u64, String>,
+    /// Runs the janitor cancelled.
+    pub cancelled: Vec<u64>,
+    /// Runs whose cancel answers 409.
+    pub uncancellable: Vec<u64>,
     next_runner_id: u64,
 }
 
@@ -127,11 +138,21 @@ async fn access_token(State(s): State<Shared>, h: HeaderMap) -> Result<Json<Valu
     ))
 }
 
+fn check_janitor(headers: &HeaderMap) -> Result<(), StatusCode> {
+    (bearer(headers) == Some(JANITOR_TOKEN))
+        .then_some(())
+        .ok_or(StatusCode::UNAUTHORIZED)
+}
+
 async fn runs(
     State(s): State<Shared>,
     h: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, StatusCode> {
+    if q.get("event").map(String::as_str) == Some("pull_request") {
+        check_janitor(&h)?;
+        return Ok(Json(json!({"workflow_runs": lock(&s).pr_runs.clone()})));
+    }
     check_token(&h)?;
     let ids: Vec<Value> = if q.get("status").map(String::as_str) == Some("queued") {
         lock(&s)
@@ -152,6 +173,56 @@ async fn jobs(
 ) -> Result<Json<Value>, StatusCode> {
     check_token(&h)?;
     Ok(Json(json!({"jobs": lock(&s).jobs.clone()})))
+}
+
+async fn one_run(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_o, _r, id)): Path<(String, String, u64)>,
+) -> Result<Json<Value>, StatusCode> {
+    check_janitor(&h)?;
+    let st = lock(&s);
+    let mut run = st
+        .pr_runs
+        .iter()
+        .find(|r| r["id"].as_u64() == Some(id))
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if let Some(status) = st.fresh_status.get(&id) {
+        run["status"] = json!(status);
+    }
+    Ok(Json(run))
+}
+
+async fn cancel_run(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_o, _r, id)): Path<(String, String, u64)>,
+) -> StatusCode {
+    if check_janitor(&h).is_err() {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let mut st = lock(&s);
+    if st.uncancellable.contains(&id) {
+        return StatusCode::CONFLICT;
+    }
+    st.cancelled.push(id);
+    st.pr_runs.retain(|r| r["id"].as_u64() != Some(id));
+    StatusCode::ACCEPTED
+}
+
+async fn pull(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_o, _r, n)): Path<(String, String, u64)>,
+) -> Result<Json<Value>, StatusCode> {
+    check_janitor(&h)?;
+    let sha = lock(&s)
+        .pulls
+        .get(&n)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(json!({"state": "open", "head": {"sha": sha}})))
 }
 
 async fn list_runners(State(s): State<Shared>, h: HeaderMap) -> Result<Json<Value>, StatusCode> {
@@ -236,6 +307,12 @@ impl Harness {
             .route("/app/installations/{id}/access_tokens", post(access_token))
             .route("/repos/{owner}/{repo}/actions/runs", get(runs))
             .route("/repos/{owner}/{repo}/actions/runs/{run}/jobs", get(jobs))
+            .route("/repos/{owner}/{repo}/actions/runs/{run}", get(one_run))
+            .route(
+                "/repos/{owner}/{repo}/actions/runs/{run}/cancel",
+                post(cancel_run),
+            )
+            .route("/repos/{owner}/{repo}/pulls/{n}", get(pull))
             .route("/orgs/{org}/actions/runners", get(list_runners))
             .route(
                 "/orgs/{org}/actions/runners/generate-jitconfig",
@@ -259,7 +336,15 @@ impl Harness {
         let cfg = QueenConfig::from_json(&cfg.to_string()).unwrap();
         let github = GithubClient::new(&gh_url, ORG, "12345", private_pem.as_bytes()).unwrap();
         let store = Store::open_in_memory().await.unwrap();
-        let queen = Arc::new(Queen::new(cfg, store, github));
+        let janitor = cfg.supersede_janitor.clone().map(|settings| {
+            borg::janitor::Janitor::new(&gh_url, borg::secret::Secret::new(JANITOR_TOKEN), settings)
+                .unwrap()
+        });
+        let mut queen = Queen::new(cfg, store, github);
+        if let Some(j) = janitor {
+            queen = queen.with_janitor(j);
+        }
+        let queen = Arc::new(queen);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -334,6 +419,22 @@ impl Harness {
             .json()
             .await
             .unwrap()
+    }
+
+    /// Add a queued pull-request run on `sha` for pull request `pr`; `head`
+    /// is the pull request's current head.
+    pub fn queue_pr_run(&self, id: u64, pr: u64, sha: &str, head: &str) {
+        let mut st = self.state();
+        st.pulls.insert(pr, head.to_owned());
+        st.pr_runs.push(json!({
+            "id": id, "status": "queued", "event": "pull_request",
+            "head_sha": sha, "pull_requests": [{"number": pr}]
+        }));
+    }
+
+    pub async fn janitor_pass(&self) -> borg::janitor::PassReport {
+        let repos = self.queen.config().repos.clone();
+        self.queen.janitor().unwrap().pass(&repos).await
     }
 
     pub async fn tick(&self) {

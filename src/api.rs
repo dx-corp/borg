@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -26,6 +26,7 @@ use crate::probe::Capacity;
 use crate::queen::{Queen, QueenError, QueueEntry};
 use crate::secret::Secret;
 use crate::store::{LeaseResult, LeaseStatus, StoreError};
+use crate::telemetry::{JobTelemetry, MAX_REPORT_ROWS, Report, build_report};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
@@ -92,6 +93,9 @@ pub struct ResultRequest {
     pub duration_secs: u64,
     #[serde(default)]
     pub peak_rss_mib: Option<u64>,
+    /// Compact per-job summary; see [`crate::telemetry`] for the wire format.
+    #[serde(default)]
+    pub telemetry: Option<JobTelemetry>,
 }
 
 #[derive(Debug)]
@@ -130,6 +134,7 @@ pub fn router(queen: Arc<Queen>) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/metrics", get(metrics))
+        .route("/report", get(report))
         .route("/v1/heartbeat", post(heartbeat))
         .route("/v1/leases/{id}/result", post(lease_result))
         .with_state(queen)
@@ -208,6 +213,19 @@ async fn lease_result(
         .finish_lease(&id, &drone, &result, now)
         .await?
     {
+        if let Some(t) = req.telemetry {
+            match t.sanitized() {
+                Some(t) => {
+                    if let Some(lease) = queen.store().lease(&id).await? {
+                        queen
+                            .store()
+                            .record_telemetry(&lease, &t, req.duration_secs, now)
+                            .await?;
+                    }
+                }
+                None => tracing::warn!("lease {id}: dropped unusable telemetry"),
+            }
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::NotFound)
@@ -267,6 +285,7 @@ pub struct Status {
     /// Drones held back for starving demand.
     pub reserved_for: Vec<Reservation>,
     pub rollout: RolloutStatus,
+    pub warm_floors: Vec<crate::allocator::WarmFloor>,
 }
 
 pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError> {
@@ -354,7 +373,36 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         unmet: snap.unmet,
         reserved_for: snap.reserved_for,
         rollout,
+        warm_floors: snap.warm_floors,
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct ReportQuery {
+    since_secs: Option<i64>,
+    limit: Option<usize>,
+}
+
+/// `GET /report?since_secs=86400&limit=20`: job time, queue wait, cancellation
+/// share and host failures from stored telemetry. Unauthenticated like
+/// `/status`.
+async fn report(
+    State(queen): State<Arc<Queen>>,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<Report>, ApiError> {
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let max = i64::from(queen.config().telemetry_retention_days) * 86_400;
+    let window = q.since_secs.unwrap_or(86_400).clamp(1, max);
+    let rows = queen
+        .store()
+        .telemetry_since(now - window, MAX_REPORT_ROWS)
+        .await?;
+    Ok(Json(build_report(
+        &rows,
+        now,
+        window,
+        q.limit.unwrap_or(20).min(500),
+    )))
 }
 
 async fn status(State(queen): State<Arc<Queen>>) -> Result<Json<Status>, ApiError> {
@@ -518,6 +566,20 @@ pub fn render_metrics(status: &Status) -> String {
         },
     );
     gauge(
+        "borg_warm_floor",
+        "Idle runners the queen keeps warm per class and scope right now (base floors plus the schedule).",
+        status
+            .warm_floors
+            .iter()
+            .map(|f| {
+                (
+                    format!("class=\"{}\",scope=\"{}\"", f.class, scope_name(f.scope)),
+                    f64::from(f.count),
+                )
+            })
+            .collect(),
+    );
+    gauge(
         "borg_reservations",
         "Drones held back for starving demand.",
         vec![(
@@ -627,6 +689,7 @@ pub async fn serve(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let stop_rx_janitor = stop_rx.clone();
     let ticker = {
         let queen = Arc::clone(&queen);
         tokio::spawn(async move {
@@ -652,6 +715,29 @@ pub async fn serve(
             }
         })
     };
+    let janitor_task = queen.janitor().map(|_| {
+        let queen = Arc::clone(&queen);
+        let mut stop_rx = stop_rx_janitor;
+        tokio::spawn(async move {
+            let Some(janitor) = queen.janitor() else {
+                return;
+            };
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(
+                janitor.settings().interval_secs,
+            ));
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                // Cancel-safe for the same reason as the ticker above.
+                tokio::select! {
+                    _ = every.tick() => {
+                        let report = janitor.pass(&queen.config().repos).await;
+                        tracing::debug!("janitor pass: {report:?}");
+                    }
+                    _ = stop_rx.changed() => break,
+                }
+            }
+        })
+    });
     let served = axum::serve(listener, router(queen))
         .with_graceful_shutdown(async move {
             shutdown.await;
@@ -659,5 +745,8 @@ pub async fn serve(
         })
         .await;
     let _ = ticker.await;
+    if let Some(task) = janitor_task {
+        let _ = task.await;
+    }
     served
 }
