@@ -1,0 +1,1038 @@
+//! The lease allocator: a pure function from fleet state to lease grants.
+//!
+//! Inputs are queued demand per (class, scope), the drones' usable capacity,
+//! leases already in flight, warm floors and per-host caps. The output says
+//! which drone should run which runner, with the exact label set to mint it
+//! with. Nothing here does I/O, reads a clock or draws a random number, so the
+//! same input always yields the same grants.
+//!
+//! Rules, in priority order:
+//!
+//! 1. Main demand (bare label) is satisfied before pull-request demand, and
+//!    within a scope larger classes are placed first so they are not starved
+//!    of contiguous room by small ones.
+//! 2. A main grant carries only the bare label; a pull-request grant carries
+//!    both labels (see [`Classes::runner_labels`]).
+//! 3. Queued demand is first offset by leases that were granted but have not
+//!    yet taken a job ([`LeaseState::Pending`]); only the shortfall is minted.
+//! 4. A warm floor keeps that many pending leases of a (class, scope) alive
+//!    even with nothing queued, so the first job never waits on a cold mint.
+//! 5. A grant is only made if the drone still has the memory, vCPU and lease
+//!    slots for it after every in-flight lease and earlier grant. Hosts are
+//!    carved dynamically: the same drone can end up as one heavy, two medium
+//!    or several light slots depending on what is queued.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::classes::{Class, ClassSpec, Classes, Scope};
+use crate::probe::Capacity;
+
+/// Owner-set limits for one host ("this PC gives at most 8 cores / 24 GiB").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HostCaps {
+    pub max_vcpu: Option<u32>,
+    pub max_mem_mib: Option<u64>,
+    /// Maximum concurrent leases on the host, whatever their size.
+    pub max_leases: Option<u32>,
+    /// Memory kept back for the operating system and the drone itself.
+    pub reserve_mem_mib: u64,
+}
+
+impl Default for HostCaps {
+    fn default() -> Self {
+        Self {
+            max_vcpu: None,
+            max_mem_mib: None,
+            max_leases: None,
+            reserve_mem_mib: 2048,
+        }
+    }
+}
+
+/// One drone as the allocator sees it: budgets already net of caps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DroneState {
+    pub id: String,
+    pub vcpu: u32,
+    pub mem_mib: u64,
+    pub docker: bool,
+    /// False while the drone drains (SIGTERM) or yields to its owner.
+    pub accepting: bool,
+    pub max_leases: Option<u32>,
+}
+
+impl DroneState {
+    /// Budget a probed host: apply the OS reserve and the owner's caps.
+    pub fn from_capacity(id: impl Into<String>, capacity: &Capacity, caps: &HostCaps) -> Self {
+        let mem = capacity.mem_mib.saturating_sub(caps.reserve_mem_mib);
+        Self {
+            id: id.into(),
+            vcpu: caps
+                .max_vcpu
+                .map_or(capacity.vcpu, |m| m.min(capacity.vcpu)),
+            mem_mib: caps.max_mem_mib.map_or(mem, |m| m.min(mem)),
+            docker: capacity.docker_usable,
+            accepting: true,
+            max_leases: caps.max_leases,
+        }
+    }
+}
+
+/// Whether a lease's runner has picked up a job yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LeaseState {
+    /// Granted or minted, runner idle: can still absorb queued demand.
+    Pending,
+    /// Runner is executing a job: only consumes capacity.
+    Running,
+}
+
+/// A lease already granted and not yet finished.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveLease {
+    pub drone_id: String,
+    pub class: Class,
+    pub scope: Scope,
+    pub state: LeaseState,
+}
+
+/// Queued jobs waiting for a runner of `(class, scope)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Demand {
+    pub class: Class,
+    pub scope: Scope,
+    pub count: u32,
+}
+
+/// Keep at least `count` pending leases of `(class, scope)` alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarmFloor {
+    pub class: Class,
+    pub scope: Scope,
+    pub count: u32,
+}
+
+/// Default floor: one idle main-only medium runner.
+pub fn default_warm_floors() -> Vec<WarmFloor> {
+    vec![WarmFloor {
+        class: Class::Medium,
+        scope: Scope::Main,
+        count: 1,
+    }]
+}
+
+/// Age of the oldest queued job for `(class, scope)`, from the queen's view of
+/// the jobs' `created_at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueAge {
+    pub class: Class,
+    pub scope: Scope,
+    pub oldest_age_secs: u64,
+}
+
+/// Everything the allocator needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocatorInput {
+    pub classes: Classes,
+    pub demand: Vec<Demand>,
+    pub drones: Vec<DroneState>,
+    pub leases: Vec<ActiveLease>,
+    pub warm_floors: Vec<WarmFloor>,
+    pub queue_ages: Vec<QueueAge>,
+    /// Demand that has waited at least this long is starving; `None` turns
+    /// the guard off.
+    pub starvation_after_secs: Option<u64>,
+}
+
+/// An instruction to mint one runner and hand it to one drone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grant {
+    pub drone_id: String,
+    pub class: Class,
+    pub scope: Scope,
+    /// Exact label set to mint the runner with.
+    pub labels: Vec<String>,
+    pub mem_mib: u64,
+    pub vcpu: u32,
+}
+
+/// Demand that could not be placed this round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unmet {
+    pub class: Class,
+    pub scope: Scope,
+    pub count: u32,
+}
+
+/// A drone held back for starving demand: it takes no new lease except one of
+/// this `(class, scope)` until that lease fits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reservation {
+    pub drone_id: String,
+    pub class: Class,
+    pub scope: Scope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Allocation {
+    pub grants: Vec<Grant>,
+    pub unmet: Vec<Unmet>,
+    pub reserved_for: Vec<Reservation>,
+}
+
+/// How many leases of `spec` this drone could hold if it were empty.
+pub fn max_slots(drone: &DroneState, spec: &ClassSpec) -> u32 {
+    if spec.docker && !drone.docker {
+        return 0;
+    }
+    let by_mem = drone.mem_mib / spec.mem_mib.max(1);
+    let by_cpu = u64::from(drone.vcpu / spec.vcpu.max(1));
+    let by_cap = drone.max_leases.map_or(u64::MAX, u64::from);
+    u32::try_from(by_mem.min(by_cpu).min(by_cap)).unwrap_or(u32::MAX)
+}
+
+/// Remaining room on a drone while allocating.
+struct Free<'a> {
+    drone: &'a DroneState,
+    mem_mib: u64,
+    vcpu: u32,
+    leases_left: Option<u32>,
+    in_flight: u32,
+}
+
+impl Free<'_> {
+    fn fits(&self, spec: &ClassSpec) -> bool {
+        self.drone.accepting
+            && (!spec.docker || self.drone.docker)
+            && self.mem_mib >= spec.mem_mib
+            && self.vcpu >= spec.vcpu
+            && self.leases_left != Some(0)
+    }
+
+    /// Could this drone ever hold `spec` if it were empty?
+    fn could_ever_fit(&self, spec: &ClassSpec) -> bool {
+        self.drone.accepting
+            && (!spec.docker || self.drone.docker)
+            && self.drone.mem_mib >= spec.mem_mib
+            && self.drone.vcpu >= spec.vcpu
+            && self.drone.max_leases != Some(0)
+    }
+
+    fn take(&mut self, spec: &ClassSpec) {
+        self.mem_mib = self.mem_mib.saturating_sub(spec.mem_mib);
+        self.vcpu = self.vcpu.saturating_sub(spec.vcpu);
+        self.leases_left = self.leases_left.map(|n| n.saturating_sub(1));
+    }
+}
+
+type Counts = BTreeMap<(Class, Scope), u32>;
+
+fn sum_counts<I: IntoIterator<Item = (Class, Scope, u32)>>(items: I) -> Counts {
+    let mut map = BTreeMap::new();
+    for (class, scope, count) in items {
+        let slot: &mut u32 = map.entry((class, scope)).or_default();
+        *slot = slot.saturating_add(count);
+    }
+    map
+}
+
+/// Place up to `wanted` runners of `(class, scope)` on the tightest-fitting
+/// drones, skipping drones reserved for something else. Returns how many fit.
+fn place(
+    input: &AllocatorInput,
+    free: &mut BTreeMap<&str, Free<'_>>,
+    reserved: &BTreeMap<String, (Class, Scope)>,
+    (scope, class): (Scope, Class),
+    wanted: u32,
+    out: &mut Vec<Grant>,
+) -> u32 {
+    let spec = input.classes.spec(class);
+    let mut placed = 0;
+    for _ in 0..wanted {
+        // Tightest fit, then id: keeps hosts packed and output stable.
+        let best = free
+            .iter_mut()
+            .filter(|(id, f)| {
+                f.fits(spec)
+                    && reserved
+                        .get(**id)
+                        .is_none_or(|held| *held == (class, scope))
+            })
+            .min_by_key(|(id, f)| (f.mem_mib - spec.mem_mib, **id))
+            .map(|(_, f)| f);
+        let Some(f) = best else { break };
+        f.take(spec);
+        placed += 1;
+        out.push(Grant {
+            drone_id: f.drone.id.clone(),
+            class,
+            scope,
+            labels: input.classes.runner_labels(class, scope),
+            mem_mib: spec.mem_mib,
+            vcpu: spec.vcpu,
+        });
+    }
+    placed
+}
+
+/// Decide which runners to mint and where. Pure and deterministic.
+pub fn allocate(input: &AllocatorInput) -> Allocation {
+    // Remaining room per drone after leases already in flight. Duplicate
+    // drone ids collapse to the first entry.
+    let mut free: BTreeMap<&str, Free<'_>> = BTreeMap::new();
+    for drone in &input.drones {
+        free.entry(drone.id.as_str()).or_insert(Free {
+            drone,
+            mem_mib: drone.mem_mib,
+            vcpu: drone.vcpu,
+            leases_left: drone.max_leases,
+            in_flight: 0,
+        });
+    }
+    for lease in &input.leases {
+        if let Some(f) = free.get_mut(lease.drone_id.as_str()) {
+            f.take(input.classes.spec(lease.class));
+            f.in_flight += 1;
+        }
+    }
+
+    let queued = sum_counts(input.demand.iter().map(|d| (d.class, d.scope, d.count)));
+    let floors = sum_counts(
+        input
+            .warm_floors
+            .iter()
+            .map(|w| (w.class, w.scope, w.count)),
+    );
+    let pending = sum_counts(
+        input
+            .leases
+            .iter()
+            .filter(|l| l.state == LeaseState::Pending && free.contains_key(l.drone_id.as_str()))
+            .map(|l| (l.class, l.scope, 1)),
+    );
+    let get = |m: &Counts, c, s| m.get(&(c, s)).copied().unwrap_or(0);
+
+    // How many runners each (scope, class) still has to mint.
+    let mut need: BTreeMap<(Scope, Class), u32> = BTreeMap::new();
+    for class in Class::ALL {
+        let pending_main = get(&pending, class, Scope::Main);
+        let pending_pr = get(&pending, class, Scope::Pr);
+
+        // Main demand uses main-only pending runners first, then spare
+        // pull-request runners (they carry the bare label too).
+        let main_total = get(&queued, class, Scope::Main).max(get(&floors, class, Scope::Main));
+        let after_main_pending = main_total.saturating_sub(pending_main);
+        let from_pr_pending = after_main_pending.min(pending_pr);
+        let main_need = after_main_pending - from_pr_pending;
+        let pending_pr_left = pending_pr - from_pr_pending;
+
+        let pr_total = get(&queued, class, Scope::Pr).max(get(&floors, class, Scope::Pr));
+        let pr_need = pr_total.saturating_sub(pending_pr_left);
+
+        need.insert((Scope::Main, class), main_need);
+        need.insert((Scope::Pr, class), pr_need);
+    }
+
+    let initial_need = need.clone();
+    let mut out = Allocation::default();
+    let mut placed: BTreeMap<(Scope, Class), u32> = BTreeMap::new();
+    let mut reserved: BTreeMap<String, (Class, Scope)> = BTreeMap::new();
+
+    // Starvation guard. Demand that has waited too long is placed first; if it
+    // still cannot fit, hold back the drone that will free up soonest so the
+    // stream of smaller jobs cannot keep it full.
+    if let Some(after) = input.starvation_after_secs {
+        let aged = |class, scope| {
+            input
+                .queue_ages
+                .iter()
+                .any(|a| a.class == class && a.scope == scope && a.oldest_age_secs >= after)
+        };
+        for scope in Scope::ALL {
+            for class in Class::ALL.into_iter().rev() {
+                let wanted = need.get(&(scope, class)).copied().unwrap_or(0);
+                if wanted == 0 || get(&queued, class, scope) == 0 || !aged(class, scope) {
+                    continue;
+                }
+                let n = place(
+                    input,
+                    &mut free,
+                    &reserved,
+                    (scope, class),
+                    wanted,
+                    &mut out.grants,
+                );
+                placed.insert((scope, class), n);
+                need.insert((scope, class), 0);
+                if n < wanted {
+                    let spec = input.classes.spec(class);
+                    let target = free
+                        .iter()
+                        .filter(|(id, f)| !reserved.contains_key(**id) && f.could_ever_fit(spec))
+                        .min_by_key(|(id, f)| (f.in_flight, **id))
+                        .map(|(id, _)| (*id).to_owned());
+                    if let Some(id) = target {
+                        reserved.insert(id.clone(), (class, scope));
+                        out.reserved_for.push(Reservation {
+                            drone_id: id,
+                            class,
+                            scope,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    for scope in Scope::ALL {
+        for class in Class::ALL.into_iter().rev() {
+            let wanted = need.get(&(scope, class)).copied().unwrap_or(0);
+            let n = place(
+                input,
+                &mut free,
+                &reserved,
+                (scope, class),
+                wanted,
+                &mut out.grants,
+            );
+            *placed.entry((scope, class)).or_default() += n;
+        }
+    }
+
+    // Only real queued demand is reported as unmet, not unfilled floors.
+    for scope in Scope::ALL {
+        for class in Class::ALL.into_iter().rev() {
+            let got = placed.get(&(scope, class)).copied().unwrap_or(0);
+            let wanted = initial_need.get(&(scope, class)).copied().unwrap_or(0);
+            let unmet = get(&queued, class, scope).min(wanted).saturating_sub(got);
+            if unmet > 0 {
+                out.unmet.push(Unmet {
+                    class,
+                    scope,
+                    count: unmet,
+                });
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 28 GiB host with 16 vCPU and Docker, already net of the OS reserve.
+    fn host(id: &str) -> DroneState {
+        DroneState {
+            id: id.into(),
+            vcpu: 16,
+            mem_mib: 28 * 1024,
+            docker: true,
+            accepting: true,
+            max_leases: None,
+        }
+    }
+
+    fn input(demand: &[(Class, Scope, u32)], drones: Vec<DroneState>) -> AllocatorInput {
+        AllocatorInput {
+            classes: Classes::default(),
+            demand: demand
+                .iter()
+                .map(|&(class, scope, count)| Demand {
+                    class,
+                    scope,
+                    count,
+                })
+                .collect(),
+            drones,
+            leases: vec![],
+            warm_floors: vec![],
+            queue_ages: vec![],
+            starvation_after_secs: None,
+        }
+    }
+
+    fn count(a: &Allocation, class: Class, scope: Scope) -> usize {
+        a.grants
+            .iter()
+            .filter(|g| g.class == class && g.scope == scope)
+            .count()
+    }
+
+    fn lease(drone: &str, class: Class, scope: Scope, state: LeaseState) -> ActiveLease {
+        ActiveLease {
+            drone_id: drone.into(),
+            class,
+            scope,
+            state,
+        }
+    }
+
+    fn assert_within_budget(i: &AllocatorInput, a: &Allocation) {
+        for d in &i.drones {
+            let spec = |c| i.classes.spec(c);
+            let mut mem = 0;
+            let mut vcpu = 0;
+            let mut n = 0u32;
+            for l in i.leases.iter().filter(|l| l.drone_id == d.id) {
+                mem += spec(l.class).mem_mib;
+                vcpu += spec(l.class).vcpu;
+                n += 1;
+            }
+            for g in a.grants.iter().filter(|g| g.drone_id == d.id) {
+                mem += g.mem_mib;
+                vcpu += g.vcpu;
+                n += 1;
+                assert!(d.accepting, "grant to non-accepting drone");
+                assert!(
+                    d.docker || !spec(g.class).docker,
+                    "docker-less drone got docker class"
+                );
+            }
+            if a.grants.iter().any(|g| g.drone_id == d.id) {
+                assert!(
+                    mem <= d.mem_mib,
+                    "{} over-granted memory: {mem} > {}",
+                    d.id,
+                    d.mem_mib
+                );
+                assert!(
+                    vcpu <= d.vcpu,
+                    "{} over-granted vcpu: {vcpu} > {}",
+                    d.id,
+                    d.vcpu
+                );
+                if let Some(cap) = d.max_leases {
+                    assert!(n <= cap, "{} over lease cap", d.id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_demand_no_floor_no_grants() {
+        let a = allocate(&input(&[], vec![host("a")]));
+        assert_eq!(a, Allocation::default());
+    }
+
+    #[test]
+    fn warm_floor_alone_grants_exactly_the_floor() {
+        let mut i = input(&[], vec![host("a")]);
+        i.warm_floors = default_warm_floors();
+        let a = allocate(&i);
+        assert_eq!(a.grants.len(), 1);
+        assert_eq!(
+            (a.grants[0].class, a.grants[0].scope),
+            (Class::Medium, Scope::Main)
+        );
+        assert_eq!(a.grants[0].labels, ["borg-ci-medium"]);
+        assert!(a.unmet.is_empty(), "an unfilled floor is not unmet demand");
+    }
+
+    #[test]
+    fn warm_floor_is_satisfied_by_an_existing_pending_lease() {
+        let mut i = input(&[], vec![host("a")]);
+        i.warm_floors = default_warm_floors();
+        i.leases = vec![lease("a", Class::Medium, Scope::Main, LeaseState::Pending)];
+        assert!(allocate(&i).grants.is_empty());
+    }
+
+    #[test]
+    fn running_lease_does_not_satisfy_the_floor() {
+        let mut i = input(&[], vec![host("a")]);
+        i.warm_floors = default_warm_floors();
+        i.leases = vec![lease("a", Class::Medium, Scope::Main, LeaseState::Running)];
+        assert_eq!(allocate(&i).grants.len(), 1);
+    }
+
+    #[test]
+    fn floor_and_queued_demand_do_not_double_count() {
+        let mut i = input(&[(Class::Medium, Scope::Main, 1)], vec![host("a")]);
+        i.warm_floors = default_warm_floors();
+        assert_eq!(allocate(&i).grants.len(), 1);
+    }
+
+    #[test]
+    fn main_demand_is_placed_before_pr_demand_when_room_is_short() {
+        // Room for exactly one heavy; main must win over pr.
+        let i = input(
+            &[(Class::Heavy, Scope::Pr, 1), (Class::Heavy, Scope::Main, 1)],
+            vec![host("a")],
+        );
+        let a = allocate(&i);
+        assert_eq!(a.grants.len(), 1);
+        assert_eq!(a.grants[0].scope, Scope::Main);
+        assert_eq!(
+            a.unmet,
+            [Unmet {
+                class: Class::Heavy,
+                scope: Scope::Pr,
+                count: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn small_main_beats_large_pr() {
+        // 24 GiB budget: main medium x2 fills it, leaving no room for pr heavy.
+        let mut h = host("a");
+        h.mem_mib = 24 * 1024;
+        let i = input(
+            &[
+                (Class::Heavy, Scope::Pr, 1),
+                (Class::Medium, Scope::Main, 2),
+            ],
+            vec![h],
+        );
+        let a = allocate(&i);
+        assert_eq!(count(&a, Class::Medium, Scope::Main), 2);
+        assert_eq!(count(&a, Class::Heavy, Scope::Pr), 0);
+    }
+
+    #[test]
+    fn main_grants_carry_only_the_bare_label() {
+        let a = allocate(&input(&[(Class::Light, Scope::Main, 1)], vec![host("a")]));
+        assert_eq!(a.grants[0].labels, ["borg-ci-light"]);
+    }
+
+    #[test]
+    fn pr_grants_carry_both_labels() {
+        let a = allocate(&input(&[(Class::Light, Scope::Pr, 1)], vec![host("a")]));
+        assert_eq!(a.grants[0].labels, ["borg-ci-light", "borg-ci-light-pr"]);
+    }
+
+    #[test]
+    fn labels_follow_the_configured_prefix() {
+        let mut i = input(&[(Class::Light, Scope::Pr, 1)], vec![host("a")]);
+        i.classes.label_prefix = "example-ci-".into();
+        assert_eq!(
+            allocate(&i).grants[0].labels,
+            ["example-ci-light", "example-ci-light-pr"]
+        );
+    }
+
+    #[test]
+    fn carves_one_28gib_host_into_one_heavy() {
+        let i = input(&[(Class::Heavy, Scope::Main, 3)], vec![host("a")]);
+        let a = allocate(&i);
+        assert_eq!(count(&a, Class::Heavy, Scope::Main), 1);
+        assert_eq!(
+            a.unmet,
+            [Unmet {
+                class: Class::Heavy,
+                scope: Scope::Main,
+                count: 2
+            }]
+        );
+        assert_within_budget(&i, &a);
+    }
+
+    #[test]
+    fn carves_one_28gib_host_into_two_medium() {
+        let i = input(&[(Class::Medium, Scope::Pr, 5)], vec![host("a")]);
+        let a = allocate(&i);
+        assert_eq!(count(&a, Class::Medium, Scope::Pr), 2);
+        assert_within_budget(&i, &a);
+    }
+
+    #[test]
+    fn carves_one_28gib_host_into_eight_light() {
+        // Memory alone would allow 11; the 16 vCPU budget caps it at 8.
+        let i = input(&[(Class::Light, Scope::Pr, 20)], vec![host("a")]);
+        let a = allocate(&i);
+        assert_eq!(count(&a, Class::Light, Scope::Pr), 8);
+        assert_within_budget(&i, &a);
+    }
+
+    #[test]
+    fn mixed_demand_fills_remaining_room_after_the_big_class() {
+        let i = input(
+            &[
+                (Class::Light, Scope::Main, 4),
+                (Class::Heavy, Scope::Main, 1),
+            ],
+            vec![host("a")],
+        );
+        let a = allocate(&i);
+        assert_eq!(count(&a, Class::Heavy, Scope::Main), 1);
+        // 28 - 24 = 4 GiB left: one light (2.5 GiB) fits.
+        assert_eq!(count(&a, Class::Light, Scope::Main), 1);
+        assert_within_budget(&i, &a);
+    }
+
+    #[test]
+    fn in_flight_leases_reduce_available_room() {
+        let mut i = input(&[(Class::Medium, Scope::Main, 2)], vec![host("a")]);
+        i.leases = vec![lease("a", Class::Medium, Scope::Pr, LeaseState::Running)];
+        let a = allocate(&i);
+        assert_eq!(a.grants.len(), 1);
+        assert_within_budget(&i, &a);
+    }
+
+    #[test]
+    fn pending_leases_absorb_queued_demand_of_the_same_label() {
+        let mut i = input(&[(Class::Light, Scope::Main, 2)], vec![host("a")]);
+        i.leases = vec![lease("a", Class::Light, Scope::Main, LeaseState::Pending)];
+        assert_eq!(allocate(&i).grants.len(), 1);
+    }
+
+    #[test]
+    fn pending_main_lease_cannot_serve_pr_demand() {
+        let mut i = input(&[(Class::Light, Scope::Pr, 1)], vec![host("a")]);
+        i.leases = vec![lease("a", Class::Light, Scope::Main, LeaseState::Pending)];
+        assert_eq!(allocate(&i).grants.len(), 1);
+    }
+
+    #[test]
+    fn pending_pr_lease_can_serve_main_demand() {
+        let mut i = input(&[(Class::Light, Scope::Main, 1)], vec![host("a")]);
+        i.leases = vec![lease("a", Class::Light, Scope::Pr, LeaseState::Pending)];
+        assert!(allocate(&i).grants.is_empty());
+    }
+
+    #[test]
+    fn a_pending_pr_lease_is_not_counted_twice() {
+        let mut i = input(
+            &[(Class::Light, Scope::Main, 1), (Class::Light, Scope::Pr, 1)],
+            vec![host("a")],
+        );
+        i.leases = vec![lease("a", Class::Light, Scope::Pr, LeaseState::Pending)];
+        let a = allocate(&i);
+        assert_eq!(a.grants.len(), 1);
+        assert_eq!(a.grants[0].scope, Scope::Pr);
+    }
+
+    #[test]
+    fn host_lease_cap_limits_grants() {
+        let mut h = host("a");
+        h.max_leases = Some(3);
+        let i = input(&[(Class::Light, Scope::Main, 8)], vec![h]);
+        let a = allocate(&i);
+        assert_eq!(a.grants.len(), 3);
+        assert_within_budget(&i, &a);
+    }
+
+    #[test]
+    fn host_lease_cap_counts_in_flight_leases() {
+        let mut h = host("a");
+        h.max_leases = Some(2);
+        let mut i = input(&[(Class::Light, Scope::Main, 8)], vec![h]);
+        i.leases = vec![lease("a", Class::Light, Scope::Pr, LeaseState::Running)];
+        assert_eq!(allocate(&i).grants.len(), 1);
+    }
+
+    #[test]
+    fn owner_caps_shrink_the_budget() {
+        let capacity = Capacity {
+            hostname: "h".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            kind: crate::probe::HostKind::Wsl,
+            vcpu: 20,
+            mem_mib: 64 * 1024,
+            free_disk_mib: None,
+            docker_usable: true,
+            mise_version: None,
+            git_version: None,
+        };
+        let caps = HostCaps {
+            max_vcpu: Some(8),
+            max_mem_mib: Some(24 * 1024),
+            ..HostCaps::default()
+        };
+        let d = DroneState::from_capacity("pc", &capacity, &caps);
+        assert_eq!((d.vcpu, d.mem_mib), (8, 24 * 1024));
+
+        let i = input(&[(Class::Light, Scope::Main, 20)], vec![d]);
+        let a = allocate(&i);
+        assert_eq!(a.grants.len(), 4); // 8 vCPU / 2
+        assert_within_budget(&i, &a);
+    }
+
+    #[test]
+    fn reserve_is_subtracted_from_total_memory() {
+        let capacity = Capacity {
+            hostname: "h".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            kind: crate::probe::HostKind::Bare,
+            vcpu: 16,
+            mem_mib: 28 * 1024,
+            free_disk_mib: None,
+            docker_usable: true,
+            mise_version: None,
+            git_version: None,
+        };
+        let d = DroneState::from_capacity("a", &capacity, &HostCaps::default());
+        assert_eq!(d.mem_mib, 26 * 1024);
+        // Still fits one heavy.
+        let a = allocate(&input(&[(Class::Heavy, Scope::Main, 1)], vec![d]));
+        assert_eq!(a.grants.len(), 1);
+    }
+
+    #[test]
+    fn docker_classes_skip_hosts_without_docker() {
+        let mut nodocker = host("a");
+        nodocker.docker = false;
+        let i = input(
+            &[
+                (Class::Medium, Scope::Main, 1),
+                (Class::Light, Scope::Main, 1),
+            ],
+            vec![nodocker, host("b")],
+        );
+        let a = allocate(&i);
+        let medium = a.grants.iter().find(|g| g.class == Class::Medium).unwrap();
+        assert_eq!(medium.drone_id, "b");
+        assert_within_budget(&i, &a);
+    }
+
+    #[test]
+    fn draining_drones_get_nothing() {
+        let mut h = host("a");
+        h.accepting = false;
+        let a = allocate(&input(&[(Class::Light, Scope::Main, 2)], vec![h]));
+        assert!(a.grants.is_empty());
+        assert_eq!(
+            a.unmet,
+            [Unmet {
+                class: Class::Light,
+                scope: Scope::Main,
+                count: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn spreads_over_hosts_when_one_is_full_and_prefers_the_tightest_fit() {
+        let mut small = host("small");
+        small.mem_mib = 13 * 1024;
+        let i = input(&[(Class::Medium, Scope::Main, 3)], vec![host("big"), small]);
+        let a = allocate(&i);
+        assert_eq!(a.grants.len(), 3);
+        // The first medium goes to the tighter 13 GiB host.
+        assert_eq!(a.grants[0].drone_id, "small");
+        assert_within_budget(&i, &a);
+    }
+
+    #[test]
+    fn leases_on_unknown_drones_are_ignored() {
+        let mut i = input(&[(Class::Light, Scope::Main, 1)], vec![host("a")]);
+        i.leases = vec![lease(
+            "gone",
+            Class::Heavy,
+            Scope::Main,
+            LeaseState::Pending,
+        )];
+        assert_eq!(allocate(&i).grants.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_demand_entries_are_summed() {
+        let i = input(
+            &[
+                (Class::Light, Scope::Main, 1),
+                (Class::Light, Scope::Main, 2),
+            ],
+            vec![host("a")],
+        );
+        assert_eq!(allocate(&i).grants.len(), 3);
+    }
+
+    #[test]
+    fn allocation_is_deterministic() {
+        let i = input(
+            &[
+                (Class::Light, Scope::Pr, 5),
+                (Class::Medium, Scope::Main, 1),
+            ],
+            vec![host("b"), host("a")],
+        );
+        assert_eq!(allocate(&i), allocate(&i));
+    }
+
+    fn aged(i: &mut AllocatorInput, class: Class, scope: Scope, secs: u64) {
+        i.queue_ages.push(QueueAge {
+            class,
+            scope,
+            oldest_age_secs: secs,
+        });
+        i.starvation_after_secs = Some(120);
+    }
+
+    /// Two 28 GiB drones, each too full for a heavy lease; `a` carries more
+    /// leases than `b`.
+    fn crowded() -> AllocatorInput {
+        let mut i = input(
+            &[
+                (Class::Heavy, Scope::Pr, 1),
+                (Class::Light, Scope::Main, 10),
+            ],
+            vec![host("a"), host("b")],
+        );
+        i.leases = vec![
+            lease("a", Class::Medium, Scope::Pr, LeaseState::Running),
+            lease("a", Class::Light, Scope::Pr, LeaseState::Running),
+            lease("b", Class::Medium, Scope::Pr, LeaseState::Running),
+        ];
+        i
+    }
+
+    #[test]
+    fn starving_heavy_reserves_the_drone_with_fewest_leases() {
+        let mut i = crowded();
+        aged(&mut i, Class::Heavy, Scope::Pr, 300);
+        let a = allocate(&i);
+        assert_eq!(
+            a.reserved_for,
+            [Reservation {
+                drone_id: "b".into(),
+                class: Class::Heavy,
+                scope: Scope::Pr
+            }]
+        );
+        assert!(
+            a.grants.iter().all(|g| g.drone_id != "b"),
+            "reserved drone got a new lease"
+        );
+        assert!(
+            count(&a, Class::Light, Scope::Main) > 0,
+            "other drone keeps working"
+        );
+        assert!(a.unmet.contains(&Unmet {
+            class: Class::Heavy,
+            scope: Scope::Pr,
+            count: 1
+        }));
+        assert_within_budget(&i, &a);
+    }
+
+    #[test]
+    fn reservation_ties_break_by_drone_id() {
+        let mut i = crowded();
+        i.leases = vec![
+            lease("b", Class::Medium, Scope::Pr, LeaseState::Running),
+            lease("a", Class::Medium, Scope::Pr, LeaseState::Running),
+        ];
+        aged(&mut i, Class::Heavy, Scope::Pr, 300);
+        assert_eq!(allocate(&i).reserved_for[0].drone_id, "a");
+    }
+
+    #[test]
+    fn young_demand_is_not_starving() {
+        let mut i = crowded();
+        aged(&mut i, Class::Heavy, Scope::Pr, 119);
+        let a = allocate(&i);
+        assert!(a.reserved_for.is_empty());
+        assert!(a.grants.iter().any(|g| g.drone_id == "b"));
+    }
+
+    #[test]
+    fn guard_can_be_disabled() {
+        let mut i = crowded();
+        aged(&mut i, Class::Heavy, Scope::Pr, 9999);
+        i.starvation_after_secs = None;
+        assert!(allocate(&i).reserved_for.is_empty());
+    }
+
+    #[test]
+    fn starving_demand_that_fits_is_granted_first_without_reservation() {
+        let mut i = input(
+            &[
+                (Class::Light, Scope::Main, 20),
+                (Class::Heavy, Scope::Pr, 1),
+            ],
+            vec![host("a")],
+        );
+        aged(&mut i, Class::Heavy, Scope::Pr, 500);
+        let a = allocate(&i);
+        assert_eq!(count(&a, Class::Heavy, Scope::Pr), 1);
+        assert!(a.reserved_for.is_empty());
+        assert_within_budget(&i, &a);
+    }
+
+    #[test]
+    fn drones_that_could_never_fit_are_not_reserved() {
+        let mut small = host("small");
+        small.mem_mib = 8 * 1024;
+        let mut nodocker = host("nodocker");
+        nodocker.docker = false;
+        let mut i = input(&[(Class::Heavy, Scope::Main, 1)], vec![small, nodocker]);
+        aged(&mut i, Class::Heavy, Scope::Main, 500);
+        let a = allocate(&i);
+        assert!(a.reserved_for.is_empty());
+        assert!(a.grants.is_empty());
+    }
+
+    #[test]
+    fn starving_medium_also_reserves() {
+        let mut h = host("a");
+        h.mem_mib = 14 * 1024;
+        let mut i = input(
+            &[
+                (Class::Medium, Scope::Main, 1),
+                (Class::Light, Scope::Pr, 5),
+            ],
+            vec![h],
+        );
+        i.leases = vec![lease("a", Class::Light, Scope::Pr, LeaseState::Running)];
+        aged(&mut i, Class::Medium, Scope::Main, 200);
+        let a = allocate(&i);
+        assert_eq!(a.reserved_for.len(), 1);
+        assert!(
+            a.grants.is_empty(),
+            "nothing else may land on the reserved drone"
+        );
+    }
+
+    #[test]
+    fn never_over_grants_across_a_demand_sweep() {
+        let drones = vec![
+            host("a"),
+            DroneState {
+                id: "b".into(),
+                vcpu: 4,
+                mem_mib: 8 * 1024,
+                docker: false,
+                accepting: true,
+                max_leases: Some(2),
+            },
+            DroneState {
+                id: "c".into(),
+                vcpu: 8,
+                mem_mib: 14 * 1024,
+                docker: true,
+                accepting: true,
+                max_leases: None,
+            },
+        ];
+        for lm in 0..3 {
+            for mm in 0..3 {
+                for hm in 0..3 {
+                    for lp in [0, 4] {
+                        for hp in [0, 2] {
+                            let mut i = input(
+                                &[
+                                    (Class::Light, Scope::Main, lm),
+                                    (Class::Medium, Scope::Main, mm),
+                                    (Class::Heavy, Scope::Main, hm),
+                                    (Class::Light, Scope::Pr, lp),
+                                    (Class::Heavy, Scope::Pr, hp),
+                                ],
+                                drones.clone(),
+                            );
+                            i.warm_floors = default_warm_floors();
+                            i.leases =
+                                vec![lease("c", Class::Light, Scope::Pr, LeaseState::Running)];
+                            assert_within_budget(&i, &allocate(&i));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
