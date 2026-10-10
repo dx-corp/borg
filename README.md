@@ -159,8 +159,8 @@ garbage collection that runs only while no lease is running. `cache_root` and
 
 | Kind | Environment for jobs | Default cap | Collected |
 | --- | --- | --- | --- |
-| `sccache` | `SCCACHE_DIR`, `SCCACHE_CACHE_SIZE` | 25% of free disk at start, at most 100G | never by the drone; sccache enforces its own size |
-| `cargo` | `CARGO_HOME` (registry and git), `CARGO_INSTALL_ROOT` per lease | 20G | crates, unpacked sources, git db and checkouts |
+| `sccache` | `SCCACHE_DIR`, `SCCACHE_CACHE_SIZE` (and `SCCACHE_SERVER_PORT` with the optional host server) | 25% of free disk at start, at most 100G | never by the drone; sccache enforces its own size |
+| `cargo` | `CARGO_HOME` (registry and git), `CARGO_INSTALL_ROOT` per lease, `BORG_RUSTFLAGS` and `RUSTFLAGS` | 20G | crates, unpacked sources, git db and checkouts |
 | `bazel` | `BAZELISK_HOME`; `--disk_cache` and `--repository_cache` via a managed block in `~/.bazelrc` | 50G | `disk/cas`, `disk/ac`, repository cache entries |
 | `pnpm` | `PNPM_STORE_DIR`, `npm_config_store_dir` | 20G | store files (the index is kept) |
 | `go` | `GOMODCACHE`, `GOCACHE` | 20G | build cache only; the module cache is read-only trees and is left alone |
@@ -218,12 +218,46 @@ Notes on each kind:
   an ssh base such as `git@host:` with a read-only deploy key. A failed refresh
   keeps the previous mirror and never blocks a job.
 
-What the drone does not do: it does not inject `RUSTFLAGS`. A
-`--remap-path-prefix` can only make paths stable if the path it names is stable,
-and a lease's work directory contains the lease id; workspace crates therefore
-do not share compile-cache entries across leases, while dependencies built from
-the shared registry do. It does not collect sccache hit rates, because sccache
-servers are job-scoped.
+#### Slots, path remapping and compile-cache keys
+
+A lease runs in `<work_root>/slot-<N>` and takes the lowest free slot
+(`slots` in the drone config, default `max_leases`, else 16; it is also the most
+leases that run at once). The path never contains the lease id, concurrent
+leases always get distinct slots, and a slot is fully cleaned before it is
+reused, so the next lease in a slot sees exactly the same absolute paths. The
+lease-to-slot mapping is logged (`lease X -> slot N`) and kept in drone state.
+Jobs see `BORG_SLOT`.
+
+Jobs also get `BORG_RUSTFLAGS` and `RUSTFLAGS`: `--remap-path-prefix` flags that
+map **every** slot directory onto `/borg/work`, and `CARGO_HOME`, its registry
+and its git data onto fixed virtual prefixes. The string lists all slots, so it
+is byte-identical for every lease (a per-slot flag would itself differ between
+slots and change the cache key). The same flags are written to
+`$CARGO_HOME/config.toml` as `[build] rustflags`, as a fallback. Two cautions:
+
+* Cargo ignores `build.rustflags` and `target.*.rustflags` from config files
+  whenever `RUSTFLAGS` is set. A workflow that sets its own `RUSTFLAGS` replaces
+  ours; it should append the remap instead, e.g.
+  `RUSTFLAGS: "-D warnings ${BORG_RUSTFLAGS}"`. Repositories that depend on
+  config-file rustflags can turn the export off with
+  `caches.cargo.export_rustflags: false`.
+* The remap does **not** make workspace crates hit the compile cache across
+  different slots. sccache hashes the compile's working directory and every
+  `CARGO_*` variable, including `CARGO_MANIFEST_DIR` (read from sccache's
+  `generate_hash_key`, v0.16), and no rustc flag changes those. What slots buy is
+  that a *reused* slot recompiles at identical paths and hits, and that
+  registry dependencies, whose paths are in the shared `CARGO_HOME`, hit from any
+  slot. `tests/sccache_slots.rs` compiles one crate in slot 0, again in a cleaned
+  slot 0, and in slot 1, and prints the hit counts for each.
+
+sccache keeps hit and miss counters only in the server's memory, so after a
+lease's own server exits there is nothing on disk to read. Set
+`caches.sccache.server: {"port": 4226}` to have the drone run one long-lived
+sccache server per host (its configuration then applies to all jobs, and a job
+whose sccache version differs from the host binary's restarts it); the drone
+reads its totals with `sccache --show-stats --stats-format json` and reports
+hits and misses for `sccache` in heartbeats, `/status` and `borg_cache_hits`.
+Without it those fields stay empty.
 
 Every heartbeat carries each cache's size, cap, evicted bytes and last
 collection time (and, for git, how many leases were given a mirror and how many

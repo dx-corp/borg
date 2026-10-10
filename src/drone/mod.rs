@@ -13,6 +13,7 @@ pub mod exec;
 pub mod install;
 pub mod pins;
 pub mod runner;
+pub mod slots;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -29,6 +30,7 @@ use client::{ClientError, QueenClient};
 use config::DroneConfig;
 use exec::Exec;
 use runner::{RunSpec, run_lease};
+use slots::{SlotGuard, Slots, slot_dir, slot_name};
 
 /// Attempts to deliver a lease result before giving up (the lease then
 /// expires on the queen's side).
@@ -59,6 +61,7 @@ pub struct Drone {
     abort: tokio::sync::watch::Sender<bool>,
     proc_root: Arc<Path>,
     caches: Arc<Caches>,
+    slots: Arc<Slots>,
 }
 
 impl Drone {
@@ -69,6 +72,7 @@ impl Drone {
         exec: Arc<dyn Exec>,
     ) -> Self {
         let (abort, _) = tokio::sync::watch::channel(false);
+        let slot_count = cfg.slot_count();
         let cfg = Arc::new(cfg);
         let caches = Arc::new(Caches::new(
             Arc::clone(&cfg),
@@ -81,10 +85,16 @@ impl Drone {
             host,
             exec,
             caches,
+            slots: Slots::new(slot_count),
             held: Held::default(),
             abort,
             proc_root: Arc::from(Path::new("/proc")),
         }
+    }
+
+    /// `(slot, lease id)` for every lease currently holding a slot.
+    pub fn slot_assignments(&self) -> Vec<(usize, String)> {
+        self.slots.assignments()
     }
 
     fn held_ids(&self) -> Vec<String> {
@@ -150,6 +160,17 @@ impl Drone {
             if !accepting || !self.admit(&grant.lease_id) {
                 continue;
             }
+            let held = HeldGuard {
+                held: Arc::clone(&self.held),
+                id: grant.lease_id.clone(),
+            };
+            let Some(slot) = self.slots.acquire(&grant.lease_id) else {
+                tracing::warn!(
+                    "no free slot for lease {}; leaving it unstarted",
+                    grant.lease_id
+                );
+                continue;
+            };
             let ctx = LeaseContext {
                 cfg: Arc::clone(&self.cfg),
                 client: Arc::clone(&self.client),
@@ -157,10 +178,8 @@ impl Drone {
                 abort: self.abort.subscribe(),
                 proc_root: Arc::clone(&self.proc_root),
                 caches: Arc::clone(&self.caches),
-                _held: HeldGuard {
-                    held: Arc::clone(&self.held),
-                    id: grant.lease_id.clone(),
-                },
+                slot,
+                _held: held,
             };
             tasks.spawn(handle_lease(ctx, grant));
             started += 1;
@@ -179,6 +198,13 @@ impl Drone {
             return false;
         };
         if held.contains(lease_id) {
+            return false;
+        }
+        if held.len() >= self.cfg.slot_count() {
+            tracing::warn!(
+                "all {} slots are busy; leaving lease {lease_id} unstarted",
+                self.cfg.slot_count()
+            );
             return false;
         }
         if self
@@ -247,6 +273,8 @@ struct LeaseContext {
     abort: tokio::sync::watch::Receiver<bool>,
     proc_root: Arc<Path>,
     caches: Arc<Caches>,
+    /// Dropped before `_held`, so the slot is free whenever the id is.
+    slot: SlotGuard,
     _held: HeldGuard,
 }
 
@@ -256,13 +284,15 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     let lease_guard = ctx.caches.begin_lease().await;
     // Refresh stale git mirrors and learn the shared cache environment. Cache
     // trouble never blocks a job; it just runs without the speedup.
-    let lease_dir = ctx.cfg.work_root.join(&grant.lease_id);
-    let extra_env = ctx.caches.prepare_lease(&lease_dir).await;
+    let slot = ctx.slot.index();
+    let lease_dir = slot_dir(&ctx.cfg.work_root, slot);
+    let mut extra_env = ctx.caches.prepare_lease(&lease_dir).await;
+    extra_env.push(("BORG_SLOT".to_owned(), slot.to_string()));
     let spec = RunSpec {
         lease_id: &grant.lease_id,
         jit_config: &grant.jit_config,
         runner_dir: &ctx.cfg.runner_dir,
-        work_root: &ctx.cfg.work_root,
+        lease_dir: &lease_dir,
         cache_root: &ctx.cfg.cache_root,
         extra_env: &extra_env,
         max_job: Duration::from_secs(ctx.cfg.max_job_secs),
@@ -271,15 +301,16 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     let outcome = run_lease(&spec, ctx.exec.as_ref(), ctx.abort.clone()).await;
 
     // Runs whether the job passed, failed, timed out, was aborted or never started.
-    let (work_root, id, docker, exec) = (
+    let (work_root, id, slot_name, docker, exec) = (
         ctx.cfg.work_root.clone(),
         grant.lease_id.clone(),
+        slot_name(slot),
         ctx.cfg.docker_bin.clone(),
         Arc::clone(&ctx.exec),
     );
     let cleaned = tokio::task::spawn_blocking(move || {
         let docker = cleanup_docker(exec.as_ref(), &docker, Scope::Lease(&id));
-        (remove_lease_dir(&work_root, &id), docker)
+        (remove_lease_dir(&work_root, &slot_name), docker)
     })
     .await;
     match cleaned {

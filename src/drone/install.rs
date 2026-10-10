@@ -531,6 +531,7 @@ impl Installer<'_> {
             max_mem_mib: o.max_mem_mib,
             max_leases: o.max_leases,
             reserve_mem_mib: crate::allocator::HostCaps::default().reserve_mem_mib,
+            slots: None,
             caches: crate::drone::config::CachesConfig {
                 git: crate::drone::config::GitCaches {
                     mirrors: o.git_mirrors.clone(),
