@@ -41,6 +41,15 @@ pub struct HeartbeatRequest {
     /// Size and garbage-collection state of the drone's host caches.
     #[serde(default)]
     pub cache_stats: Vec<CacheStat>,
+    /// The borg version the drone runs (reported for rollout tracking).
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// A drone-reported version is shown in metric labels, so accept only short
+/// printable ASCII.
+fn sanitize_version(v: Option<&str>) -> Option<&str> {
+    v.filter(|v| !v.is_empty() && v.len() <= 64 && v.bytes().all(|b| b.is_ascii_graphic()))
 }
 
 /// One host cache as measured by its drone.
@@ -158,6 +167,9 @@ async fn heartbeat(
             now,
         )
         .await?;
+    store
+        .set_version(&drone, sanitize_version(req.version.as_deref()))
+        .await?;
     store.acknowledge(&drone, &req.active_leases).await?;
     let leases = store
         .undelivered(&drone)
@@ -226,6 +238,21 @@ pub struct DroneStatus {
     pub mem_mib: Option<u64>,
     pub active_leases: u32,
     pub caches: Vec<CacheStat>,
+    pub quarantined: bool,
+    pub quarantine_reason: Option<String>,
+    pub version: Option<String>,
+}
+
+/// How many enrolled drones run the configured target version.
+#[derive(Debug, Default, Serialize)]
+pub struct RolloutStatus {
+    pub target_version: Option<String>,
+    /// Drones reporting exactly the target.
+    pub current: u32,
+    /// Drones reporting another version.
+    pub outdated: u32,
+    /// Drones that report no version.
+    pub unknown: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -239,6 +266,7 @@ pub struct Status {
     pub unmet: Vec<Unmet>,
     /// Drones held back for starving demand.
     pub reserved_for: Vec<Reservation>,
+    pub rollout: RolloutStatus,
 }
 
 pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError> {
@@ -254,7 +282,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         let fresh = age.is_some_and(|a| a <= cfg.drone_stale_secs);
         if let (true, Some(cap)) = (fresh, &d.capacity) {
             let mut s = DroneState::from_capacity(d.name.clone(), cap, &d.caps);
-            s.accepting = d.accepting;
+            s.accepting = d.schedulable();
             states.push(s);
         }
         drones.push(DroneStatus {
@@ -269,6 +297,9 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             active_leases: u32::try_from(active.iter().filter(|l| l.drone == d.name).count())
                 .unwrap_or(u32::MAX),
             caches: d.cache_stats.clone(),
+            quarantined: d.quarantined,
+            quarantine_reason: d.quarantine_reason.clone(),
+            version: d.version.clone(),
         });
     }
 
@@ -302,6 +333,17 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             },
         );
     }
+    let mut rollout = RolloutStatus {
+        target_version: cfg.rollout_target_version.clone(),
+        ..RolloutStatus::default()
+    };
+    for d in &drones {
+        match (&d.version, &cfg.rollout_target_version) {
+            (None, _) => rollout.unknown += 1,
+            (Some(v), Some(t)) if v == t => rollout.current += 1,
+            (Some(_), _) => rollout.outdated += 1,
+        }
+    }
     Ok(Status {
         now,
         last_tick_at: snap.last_tick_at,
@@ -311,6 +353,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         drones,
         unmet: snap.unmet,
         reserved_for: snap.reserved_for,
+        rollout,
     })
 }
 
@@ -399,23 +442,80 @@ pub fn render_metrics(status: &Status) -> String {
         "Active leases per class and state.",
         lease_rows,
     );
+    let count = |f: &dyn Fn(&DroneStatus) -> bool| {
+        f64::from(u32::try_from(status.drones.iter().filter(|d| f(d)).count()).unwrap_or(0))
+    };
     gauge(
         "borg_drones",
-        "Enrolled drones by freshness.",
+        "Enrolled drones by state. fresh and stale split by heartbeat age; quarantined \
+         counts operator-quarantined drones regardless of heartbeat.",
         vec![
+            ("state=\"fresh\"".to_owned(), count(&|d| d.fresh)),
+            ("state=\"stale\"".to_owned(), count(&|d| !d.fresh)),
             (
-                "state=\"fresh\"".to_owned(),
-                f64::from(
-                    u32::try_from(status.drones.iter().filter(|d| d.fresh).count()).unwrap_or(0),
-                ),
-            ),
-            (
-                "state=\"stale\"".to_owned(),
-                f64::from(
-                    u32::try_from(status.drones.iter().filter(|d| !d.fresh).count()).unwrap_or(0),
-                ),
+                "state=\"quarantined\"".to_owned(),
+                count(&|d| d.quarantined),
             ),
         ],
+    );
+    gauge(
+        "borg_drone_quarantined",
+        "1 while the drone is quarantined and gets no new leases.",
+        status
+            .drones
+            .iter()
+            .map(|d| {
+                (
+                    format!("drone=\"{}\"", label_value(&d.name)),
+                    f64::from(u8::from(d.quarantined)),
+                )
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_drone_info",
+        "The borg version each drone reported (always 1).",
+        status
+            .drones
+            .iter()
+            .filter_map(|d| {
+                d.version.as_ref().map(|v| {
+                    (
+                        format!(
+                            "drone=\"{}\",version=\"{}\"",
+                            label_value(&d.name),
+                            label_value(v)
+                        ),
+                        1.0,
+                    )
+                })
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_rollout_target_info",
+        "The configured target borg version (always 1; absent when unset).",
+        status
+            .rollout
+            .target_version
+            .iter()
+            .map(|v| (format!("version=\"{}\"", label_value(v)), 1.0))
+            .collect(),
+    );
+    gauge(
+        "borg_rollout_drones",
+        "Drones by rollout state against the target version (absent when no target is set).",
+        if status.rollout.target_version.is_some() {
+            [
+                ("current", status.rollout.current),
+                ("outdated", status.rollout.outdated),
+                ("unknown", status.rollout.unknown),
+            ]
+            .map(|(state, n)| (format!("state=\"{state}\""), f64::from(n)))
+            .to_vec()
+        } else {
+            Vec::new()
+        },
     );
     gauge(
         "borg_reservations",
@@ -440,7 +540,16 @@ pub fn render_metrics(status: &Status) -> String {
             .iter()
             .flat_map(|d| {
                 d.caches.iter().filter_map(move |c| {
-                    f(c).map(|v| (format!("drone=\"{}\",cache=\"{}\"", d.name, c.name), v))
+                    f(c).map(|v| {
+                        (
+                            format!(
+                                "drone=\"{}\",cache=\"{}\"",
+                                label_value(&d.name),
+                                label_value(&c.name)
+                            ),
+                            v,
+                        )
+                    })
                 })
             })
             .collect()
@@ -486,6 +595,13 @@ pub fn render_metrics(status: &Status) -> String {
         )],
     );
     out
+}
+
+/// Escape a Prometheus label value.
+fn label_value(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn scope_name(s: Scope) -> &'static str {

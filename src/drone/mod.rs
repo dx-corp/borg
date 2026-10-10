@@ -153,6 +153,7 @@ impl Drone {
             accepting,
             active_leases: self.held_ids(),
             cache_stats: self.caches.stats(),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         };
         let resp = self.client.heartbeat(&req).await?;
         let mut started = 0;

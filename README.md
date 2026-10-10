@@ -72,6 +72,13 @@ optional):
 }
 ```
 
+Operators can stop new leases to one drone with `borg queen quarantine
+--config queen.json --reason "<why>" <drone>` and lift it with `borg queen
+release --config queen.json <drone>`. Set `rollout_target_version` in the queen
+config to have `/metrics` and `/status` report how many drones run that borg
+version (drones report theirs in every heartbeat; the queen never forces an
+update).
+
 The GitHub App needs organization self-hosted runners: read and write, plus
 read access to Actions on the listed repositories. Set
 `BORG_APP_PRIVATE_KEY` instead of `private_key_path` to pass the PEM in the

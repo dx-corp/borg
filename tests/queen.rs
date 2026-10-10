@@ -287,6 +287,84 @@ async fn metrics_and_status_report_the_queue() {
 }
 
 #[tokio::test]
+async fn quarantined_drones_get_no_leases_and_are_counted() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    assert!(
+        h.queen
+            .store()
+            .set_quarantine("d1", Some("bad disk"))
+            .await
+            .unwrap()
+    );
+    h.queue_job(1, "borg-ci-medium-pr", 30);
+    h.tick().await;
+
+    assert!(h.leases(&token, &[]).await.is_empty());
+    let metrics = h.metrics().await;
+    for line in [
+        "borg_drones{state=\"fresh\"} 1",
+        "borg_drones{state=\"quarantined\"} 1",
+        "borg_drone_quarantined{drone=\"d1\"} 1",
+        "borg_class_slots{class=\"medium\"} 0",
+        "borg_oldest_queued_age_seconds{class=\"medium\",scope=\"pr\"} 30",
+    ] {
+        assert!(metrics.contains(line), "missing {line}\n{metrics}");
+    }
+    let status = h.status().await;
+    assert_eq!(status["drones"][0]["quarantined"], true);
+    assert_eq!(status["drones"][0]["quarantine_reason"], "bad disk");
+
+    h.queen.store().set_quarantine("d1", None).await.unwrap();
+    h.tick().await;
+    assert_eq!(h.leases(&token, &[]).await.len(), 1);
+    assert!(
+        h.metrics()
+            .await
+            .contains("borg_drones{state=\"quarantined\"} 0")
+    );
+}
+
+#[tokio::test]
+async fn rollout_metrics_compare_reported_versions_with_the_target() {
+    let h = Harness::start(json!({"rollout_target_version": "2.0.0"})).await;
+    let (a, b, c) = (
+        h.enroll("d1").await,
+        h.enroll("d2").await,
+        h.enroll("d3").await,
+    );
+    h.heartbeat_version(&a, "2.0.0").await;
+    h.heartbeat_version(&b, "1.9.0\"x").await;
+    h.heartbeat(&c, &[]).await;
+
+    let metrics = h.metrics().await;
+    for line in [
+        "borg_rollout_target_info{version=\"2.0.0\"} 1",
+        "borg_rollout_drones{state=\"current\"} 1",
+        "borg_rollout_drones{state=\"outdated\"} 1",
+        "borg_rollout_drones{state=\"unknown\"} 1",
+        "borg_drone_info{drone=\"d1\",version=\"2.0.0\"} 1",
+    ] {
+        assert!(metrics.contains(line), "missing {line}\n{metrics}");
+    }
+    // A quote in a drone-reported version must be escaped, not break the format.
+    assert!(metrics.contains("version=\"1.9.0\\\"x\""), "{metrics}");
+    assert_eq!(h.status().await["rollout"]["current"], 1);
+}
+
+#[tokio::test]
+async fn no_rollout_series_without_a_target() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat_version(&token, "1.0.0").await;
+    let metrics = h.metrics().await;
+    assert!(!metrics.contains("borg_rollout_drones{"), "{metrics}");
+    assert!(!metrics.contains("borg_rollout_target_info{"), "{metrics}");
+    assert!(metrics.contains("borg_drone_info{drone=\"d1\",version=\"1.0.0\"} 1"));
+}
+
+#[tokio::test]
 async fn mint_failure_is_reported_and_leaves_no_lease() {
     let h = Harness::start(json!({})).await;
     let token = h.enroll("d1").await;
