@@ -10,13 +10,17 @@ pub mod cleanup;
 pub mod client;
 pub mod config;
 pub mod exec;
+pub mod fsops;
 pub mod install;
+pub mod jobuser;
 pub mod pins;
 pub mod runner;
+pub mod selfupdate;
 pub mod slots;
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,12 +33,16 @@ use cleanup::{Scope, cleanup_docker, remove_lease_dir, sweep_work_root, valid_le
 use client::{ClientError, QueenClient};
 use config::DroneConfig;
 use exec::Exec;
+use fsops::{ExecFs, FsOps, LocalFs};
+use jobuser::JobExec;
 use runner::{RunSpec, run_lease};
+use selfupdate::{Handled, Plan, SelfUpdate};
 use slots::{SlotGuard, Slots, slot_dir, slot_name};
 
 /// Attempts to deliver a lease result before giving up (the lease then
-/// expires on the queen's side).
-const RESULT_ATTEMPTS: u32 = 5;
+/// expires on the queen's side). The waits grow to a minute, so a queen that
+/// is down for a few minutes does not lose results.
+const RESULT_ATTEMPTS: u32 = 20;
 
 type Held = Arc<Mutex<HashSet<String>>>;
 
@@ -57,11 +65,19 @@ pub struct Drone {
     client: Arc<QueenClient>,
     host: Arc<dyn Host + Send + Sync>,
     exec: Arc<dyn Exec>,
+    /// Runs commands as the job user (or as the drone when none is configured).
+    job_exec: Arc<dyn Exec>,
+    /// File operations on job-owned directories.
+    fs_ops: Arc<dyn FsOps>,
     held: Held,
     abort: tokio::sync::watch::Sender<bool>,
     proc_root: Arc<Path>,
     caches: Arc<Caches>,
     slots: Arc<Slots>,
+    /// Self-update hand-off; present when `state_dir` is configured.
+    selfupdate: Option<SelfUpdate>,
+    /// The queen wants another version: stop taking leases until idle.
+    update_wanted: AtomicBool,
 }
 
 impl Drone {
@@ -74,16 +90,36 @@ impl Drone {
         let (abort, _) = tokio::sync::watch::channel(false);
         let slot_count = cfg.slot_count();
         let cfg = Arc::new(cfg);
+        let (job_exec, fs_ops): (Arc<dyn Exec>, Arc<dyn FsOps>) = match &cfg.job_user {
+            Some(user) => {
+                let job_exec: Arc<dyn Exec> =
+                    Arc::new(JobExec::new(Arc::clone(&exec), user.clone()));
+                let fs_ops: Arc<dyn FsOps> = Arc::new(ExecFs::new(Arc::clone(&job_exec)));
+                (job_exec, fs_ops)
+            }
+            None => {
+                tracing::warn!(
+                    "no job_user configured: jobs run as the drone's own user and can read its token"
+                );
+                (Arc::clone(&exec), Arc::new(LocalFs))
+            }
+        };
         let caches = Arc::new(Caches::new(
             Arc::clone(&cfg),
-            Arc::clone(&exec),
+            Arc::clone(&job_exec),
+            Arc::clone(&fs_ops),
             Arc::clone(&host),
         ));
+        let selfupdate = cfg.state_dir.clone().map(SelfUpdate::new);
         Self {
             cfg,
+            selfupdate,
+            update_wanted: AtomicBool::new(false),
             client: Arc::new(client),
             host,
             exec,
+            job_exec,
+            fs_ops,
             caches,
             slots: Slots::new(slot_count),
             held: Held::default(),
@@ -110,13 +146,14 @@ impl Drone {
     /// Remove leftovers of a previous run: no lease is held yet, so every
     /// lease directory and borg-labelled docker resource is stale.
     pub async fn startup_sweep(&self) {
-        let (work_root, exec, docker) = (
+        let (work_root, exec, docker, fs_ops) = (
             self.cfg.work_root.clone(),
             Arc::clone(&self.exec),
             self.cfg.docker_bin.clone(),
+            Arc::clone(&self.fs_ops),
         );
         let swept = tokio::task::spawn_blocking(move || {
-            let dirs = sweep_work_root(&work_root);
+            let dirs = sweep_work_root(fs_ops.as_ref(), &work_root);
             let docker = cleanup_docker(exec.as_ref(), &docker, Scope::AnyLease);
             (dirs, docker)
         })
@@ -140,6 +177,9 @@ impl Drone {
         accepting: bool,
         tasks: &mut JoinSet<()>,
     ) -> Result<usize, ClientError> {
+        // Between jobs the drone obeys `desired_version`: once the queen wants
+        // another version it stops accepting and updates when idle.
+        let accepting = accepting && !self.update_wanted.load(Ordering::Relaxed);
         let host = Arc::clone(&self.host);
         let capacity = tokio::task::spawn_blocking(move || probe::probe(host.as_ref()))
             .await
@@ -154,11 +194,21 @@ impl Drone {
             active_leases: self.held_ids(),
             cache_stats: self.caches.stats(),
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            extra_labels: self.cfg.extra_labels.clone(),
+            bids: Vec::new(),
+            reclaim: None,
+            update_report: self
+                .selfupdate
+                .as_ref()
+                .and_then(SelfUpdate::pending_report),
+            active_units: Vec::new(),
+            env_facts: None,
         };
         let resp = self.client.heartbeat(&req).await?;
+        let defer = self.after_heartbeat(&req, resp.desired_version.as_deref());
         let mut started = 0;
         for grant in resp.leases {
-            if !accepting || !self.admit(&grant.lease_id) {
+            if !accepting || defer || !self.admit(&grant.lease_id) {
                 continue;
             }
             let held = HeldGuard {
@@ -176,6 +226,8 @@ impl Drone {
                 cfg: Arc::clone(&self.cfg),
                 client: Arc::clone(&self.client),
                 exec: Arc::clone(&self.exec),
+                job_exec: Arc::clone(&self.job_exec),
+                fs_ops: Arc::clone(&self.fs_ops),
                 abort: self.abort.subscribe(),
                 proc_root: Arc::clone(&self.proc_root),
                 caches: Arc::clone(&self.caches),
@@ -186,6 +238,60 @@ impl Drone {
             started += 1;
         }
         Ok(started)
+    }
+
+    /// What a successful heartbeat means for self-update: the queen has the
+    /// updater's report, the running binary is demonstrably working, and the
+    /// queen may want another version (older ones included). Returns true when
+    /// leases granted in this response must be left unstarted because an update
+    /// is being handed to the updater.
+    fn after_heartbeat(&self, req: &HeartbeatRequest, desired: Option<&str>) -> bool {
+        let Some(su) = &self.selfupdate else {
+            return false;
+        };
+        let own = env!("CARGO_PKG_VERSION");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        if let Err(e) = su.record_health(own, now) {
+            tracing::warn!("write health record: {e}");
+        }
+        if req.update_report.is_some() {
+            su.acknowledge_report();
+        }
+        let held = self.held_ids().len();
+        let desired = match selfupdate::plan(desired, own, held) {
+            Plan::Stay => {
+                self.update_wanted.store(false, Ordering::Relaxed);
+                return false;
+            }
+            Plan::FinishJobsFirst => {
+                // No new jobs meanwhile.
+                self.update_wanted.store(true, Ordering::Relaxed);
+                return false;
+            }
+            Plan::UpdateNow => desired.unwrap_or(own),
+        };
+        match su.handle(desired, own) {
+            Ok(Handled::Requested) => {
+                tracing::info!("update to {desired} requested");
+                self.update_wanted.store(true, Ordering::Relaxed);
+                true
+            }
+            Ok(Handled::InFlight) => {
+                self.update_wanted.store(true, Ordering::Relaxed);
+                true
+            }
+            Ok(Handled::Blocked) => {
+                tracing::warn!("not retrying the failed update to {desired}");
+                self.update_wanted.store(false, Ordering::Relaxed);
+                false
+            }
+            Ok(Handled::UpToDate) => false,
+            Err(e) => {
+                tracing::warn!("request update to {desired}: {e}");
+                self.update_wanted.store(false, Ordering::Relaxed);
+                false
+            }
+        }
     }
 
     /// Whether a granted lease may start: well-formed, not already running,
@@ -229,11 +335,24 @@ impl Drone {
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tokio::pin!(shutdown);
         // `interval.tick`, `shutdown` and `JoinSet::join_next` are cancel-safe.
+        // While the queen is unreachable, running leases carry on, no new lease
+        // arrives, and heartbeats are retried with backoff.
+        let mut failures = 0u32;
+        let mut retry_at = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 _ = every.tick() => {
-                    if let Err(e) = self.heartbeat_once(true, &mut tasks).await {
-                        tracing::warn!("heartbeat failed: {e}");
+                    if tokio::time::Instant::now() < retry_at {
+                        continue;
+                    }
+                    match self.heartbeat_once(true, &mut tasks).await {
+                        Ok(_) => failures = 0,
+                        Err(e) => {
+                            failures = failures.saturating_add(1);
+                            let wait = selfupdate::backoff(self.cfg.heartbeat_secs, failures);
+                            retry_at = tokio::time::Instant::now() + Duration::from_secs(wait);
+                            tracing::warn!("heartbeat failed ({failures} in a row), retrying in {wait}s: {e}");
+                        }
                     }
                 }
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
@@ -271,6 +390,8 @@ struct LeaseContext {
     cfg: Arc<DroneConfig>,
     client: Arc<QueenClient>,
     exec: Arc<dyn Exec>,
+    job_exec: Arc<dyn Exec>,
+    fs_ops: Arc<dyn FsOps>,
     abort: tokio::sync::watch::Receiver<bool>,
     proc_root: Arc<Path>,
     caches: Arc<Caches>,
@@ -287,7 +408,8 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     // trouble never blocks a job; it just runs without the speedup.
     let slot = ctx.slot.index();
     let lease_dir = slot_dir(&ctx.cfg.work_root, slot);
-    let mut extra_env = ctx.caches.prepare_lease(&lease_dir).await;
+    let mut extra_env = ctx.cfg.runner_environment();
+    extra_env.extend(ctx.caches.prepare_lease(&lease_dir).await);
     extra_env.push(("BORG_SLOT".to_owned(), slot.to_string()));
     let spec = RunSpec {
         lease_id: &grant.lease_id,
@@ -297,21 +419,32 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         cache_root: &ctx.cfg.cache_root,
         extra_env: &extra_env,
         max_job: Duration::from_secs(ctx.cfg.max_job_secs),
+        job_user: ctx.cfg.job_user.as_ref(),
         proc_root: &ctx.proc_root,
     };
-    let outcome = run_lease(&spec, ctx.exec.as_ref(), ctx.abort.clone()).await;
+    let outcome = run_lease(
+        &spec,
+        ctx.job_exec.as_ref(),
+        Arc::clone(&ctx.fs_ops),
+        ctx.abort.clone(),
+    )
+    .await;
 
     // Runs whether the job passed, failed, timed out, was aborted or never started.
-    let (work_root, id, slot_name, docker, exec) = (
+    let (work_root, id, slot_name, docker, exec, fs_ops) = (
         ctx.cfg.work_root.clone(),
         grant.lease_id.clone(),
         slot_name(slot),
         ctx.cfg.docker_bin.clone(),
         Arc::clone(&ctx.exec),
+        Arc::clone(&ctx.fs_ops),
     );
     let cleaned = tokio::task::spawn_blocking(move || {
         let docker = cleanup_docker(exec.as_ref(), &docker, Scope::Lease(&id));
-        (remove_lease_dir(&work_root, &slot_name), docker)
+        (
+            remove_lease_dir(fs_ops.as_ref(), &work_root, &slot_name),
+            docker,
+        )
     })
     .await;
     match cleaned {
@@ -358,7 +491,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
                     "reporting lease {} failed (attempt {attempt}): {e}",
                     grant.lease_id
                 );
-                tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
+                tokio::time::sleep(Duration::from_secs((u64::from(attempt) * 5).min(60))).await;
             }
         }
     }

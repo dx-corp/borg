@@ -548,3 +548,144 @@ async fn old_telemetry_is_pruned_by_the_tick() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn bids_gate_leases_on_published_pressure_and_expired_bids_are_ignored() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    let shy = |expires_at: i64| {
+        json!({"bids": [{"class": "light", "scope": "pr", "available_slots": 4,
+                         "min_pressure": 1000, "expires_at": expires_at}]})
+    };
+    let far = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+
+    h.heartbeat_with(&token, shy(far)).await;
+    h.queue_job(1, "borg-ci-light-pr", 5);
+    h.tick().await;
+    // One queued job against a mostly idle host is low pressure: the shy bid
+    // stays out, and the queen publishes the pressure it computed.
+    let resp = h.heartbeat_with(&token, shy(far)).await;
+    assert!(resp["leases"].as_array().unwrap().is_empty(), "{resp}");
+    let light = resp["pressure"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["class"] == "light")
+        .unwrap();
+    assert!(light["pressure"].as_u64().unwrap() < 1000, "{resp}");
+    assert!(
+        h.metrics()
+            .await
+            .contains("borg_demand_pressure{class=\"light\"}")
+    );
+
+    // The same bid, expired, is ignored and the drone is a legacy drone.
+    h.heartbeat_with(&token, shy(1)).await;
+    h.tick().await;
+    let resp = h.heartbeat_with(&token, shy(1)).await;
+    assert_eq!(resp["leases"].as_array().unwrap().len(), 1, "{resp}");
+}
+
+#[tokio::test]
+async fn homeostasis_raises_warm_floors_under_sustained_queueing_and_stays_off_by_default() {
+    let cfg = json!({"drone_stale_secs": 100_000_000, "homeostasis": {
+        "enabled": true, "target_secs": 60, "raise_after_secs": 100, "cooldown_secs": 10,
+        "max_floor": {"light": 3}}});
+    let h = Harness::start(cfg).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    let base = OffsetDateTime::now_utc();
+    // One job queued for 5 minutes at the start: far over the 60s target.
+    h.queue_job(1, "borg-ci-light-pr", 300);
+
+    for secs in [0, 50, 100, 110, 220] {
+        h.queen
+            .tick(base + time::Duration::seconds(secs))
+            .await
+            .unwrap();
+    }
+    let status = h.status().await;
+    let light_pr = status["homeostasis"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["class"] == "light" && r["scope"] == "pr")
+        .unwrap();
+    assert_eq!(light_pr["level"], 2, "{light_pr}");
+    assert_eq!(light_pr["effective_floor"], 2);
+    // Two floors against one queued job: the second is an extra warm runner.
+    assert_eq!(h.state().mints.len(), 2);
+    let metrics = h.metrics().await;
+    assert!(
+        metrics.contains("borg_warm_floor_dynamic{class=\"light\",scope=\"pr\"} 2"),
+        "{metrics}"
+    );
+    assert!(metrics.contains("borg_warm_floor{class=\"light\",scope=\"pr\"} 2"));
+
+    // Off by default: the same load changes nothing.
+    let off = Harness::start(json!({"drone_stale_secs": 100_000_000})).await;
+    let t = off.enroll("d1").await;
+    off.heartbeat(&t, &[]).await;
+    off.queue_job(1, "borg-ci-light-pr", 300);
+    for secs in [0, 130, 260] {
+        off.queen
+            .tick(base + time::Duration::seconds(secs))
+            .await
+            .unwrap();
+    }
+    assert_eq!(off.state().mints.len(), 1);
+    assert!(
+        off.status().await["homeostasis"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn reclaim_reports_are_audited_once_and_shown_in_status_and_metrics() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("devbox").await;
+    let stats = |entries: Value, total: u64| {
+        json!({"reclaim": {
+            "enabled": true, "dry_run": false, "reclaimed_bytes_total": total,
+            "last_run_at": 100, "last_run_reclaimed_bytes": total,
+            "last_run_would_reclaim_bytes": 0, "last_run_errors": 1,
+            "usage_pct": 91, "last_run_mode": "pressure",
+            "kept": {"busy": 2}, "recent": entries
+        }})
+    };
+    let entries = json!([
+        {"seq": 1, "at": 100, "path": "/srv/devdata/cargo-target/old-branch", "kind": "cargo_target",
+         "size_bytes": 5_368_709_120u64, "reason": "disk 91% >= 85% high water", "outcome": "deleted"},
+        {"seq": 2, "at": 101, "path": "/srv/devdata/worktrees/x", "kind": "worktree",
+         "size_bytes": 1_073_741_824u64, "reason": "r", "outcome": "failed", "error": "permission denied"}
+    ]);
+    h.heartbeat_with(&token, stats(entries.clone(), 5_368_709_120))
+        .await;
+    // The same entries again (a repeated heartbeat) must not duplicate.
+    h.heartbeat_with(&token, stats(entries, 5_368_709_120))
+        .await;
+
+    let status = h.status().await;
+    assert_eq!(
+        status["reclaim"]["reclaimed_bytes_logged"],
+        5_368_709_120u64
+    );
+    let events = status["reclaim"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0]["drone"], "devbox");
+    assert_eq!(events[1]["path"], "/srv/devdata/cargo-target/old-branch");
+    assert_eq!(events[1]["outcome"], "deleted");
+    assert_eq!(status["drones"][0]["reclaim"]["usage_pct"], 91);
+    assert_eq!(status["drones"][0]["reclaim"]["recent"], json!([]));
+
+    let metrics = h.metrics().await;
+    for line in [
+        "borg_reclaim_bytes_total{drone=\"devbox\"} 5368709120",
+        "borg_reclaim_disk_usage_percent{drone=\"devbox\"} 91",
+        "borg_reclaim_errors{drone=\"devbox\"} 1",
+    ] {
+        assert!(metrics.contains(line), "missing {line}\n{metrics}");
+    }
+}

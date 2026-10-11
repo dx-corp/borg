@@ -67,7 +67,11 @@ struct Rig {
 
 impl Rig {
     async fn new() -> Self {
-        let h = Harness::start(json!({})).await;
+        Self::with_queen(json!({})).await
+    }
+
+    async fn with_queen(queen: Value) -> Self {
+        let h = Harness::start(queen).await;
         let token = h.enroll("d1").await;
         Self {
             h,
@@ -310,6 +314,19 @@ impl Exec for GitOnlyExec {
     }
 }
 
+/// Runs everything except docker, which is only recorded.
+struct AllButDocker(RecordingExec);
+
+impl Exec for AllButDocker {
+    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        if program == "docker" {
+            self.0.run(program, args)
+        } else {
+            SystemExec.run(program, args)
+        }
+    }
+}
+
 fn git(args: &[&str]) -> String {
     let out = SystemExec.run("git", args).unwrap();
     assert!(out.success, "git {args:?} failed");
@@ -471,6 +488,7 @@ async fn the_mirror_timer_picks_up_new_commits() {
     let caches = Arc::new(borg::drone::caches::Caches::new(
         cfg,
         Arc::new(SystemExec),
+        Arc::new(borg::drone::fsops::LocalFs),
         Arc::new(FixedHost),
     ));
     let timer = caches.spawn_background();
@@ -551,7 +569,7 @@ async fn leases_get_distinct_slots_while_concurrent_and_the_same_path_when_a_slo
         v
     };
     let first_pwds: Vec<String> = read_all("pwd-").into_iter().map(|(_, p)| p).collect();
-    let work = rig.path("work");
+    let work = fs::canonicalize(rig.path("work")).unwrap();
     let mut want = vec![
         work.join("slot-0").display().to_string(),
         work.join("slot-1").display().to_string(),
@@ -576,4 +594,201 @@ async fn leases_get_distinct_slots_while_concurrent_and_the_same_path_when_a_slo
         "slot 0 was used twice"
     );
     assert_eq!(fs::read_dir(rig.path("work")).unwrap().count(), 0);
+}
+
+/// A stand-in for `setpriv` that records its arguments, then runs the command
+/// after `--` as the current user.
+fn fake_setpriv(dir: &Path, log: &Path) -> PathBuf {
+    let path = dir.join("fake-setpriv");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {}\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn with_a_job_user_the_runner_and_its_file_operations_go_through_setpriv() {
+    let rig = Rig::new().await;
+    let log = rig.path("setpriv.log");
+    let setpriv = fake_setpriv(rig.dir.path(), &log);
+    rig.install_runner(
+        "printf '%s' \"$ACTIONS_RUNNER_INPUT_JITCONFIG\" > $OUT/jit.txt\necho \"$HOME|$USER\" > $OUT/who.txt\necho \"$@\" > $OUT/args.txt",
+    );
+    let drone = rig.drone_with(
+        json!({"job_user": {
+            "name": "borg-job",
+            "home": rig.path("job-home"),
+            "priv_bin": setpriv,
+        }}),
+        Arc::new(AllButDocker(RecordingExec::default())),
+    );
+    let mut tasks = JoinSet::new();
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    rig.h.queue_job(1, "borg-ci-light", 1);
+    rig.h.tick().await;
+    assert_eq!(drone.heartbeat_once(true, &mut tasks).await.unwrap(), 1);
+    drain(&mut tasks).await;
+
+    let calls = fs::read_to_string(&log).unwrap();
+    let prefix = "--reuid borg-job --regid borg-job --init-groups --inh-caps=-all --ambient-caps=-all --bounding-set=-all --";
+    // File contents passed as arguments can span lines; only count call starts.
+    let lines: Vec<&str> = calls.lines().collect();
+    let starts: Vec<&&str> = lines.iter().filter(|l| l.starts_with("--reuid")).collect();
+    assert!(starts.len() >= 5, "{calls}");
+    assert!(
+        starts.iter().all(|l| l.starts_with(prefix)),
+        "every call drops to the job user: {calls}"
+    );
+    let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
+    assert!(
+        has("cp -al"),
+        "the runner install is cloned as the job user: {calls}"
+    );
+    assert!(
+        has("/work/slot-0/run.sh"),
+        "run.sh is started through setpriv: {calls}"
+    );
+    assert!(
+        has("rm -rf -- ") && has("/work/slot-0"),
+        "cleanup removes the slot as the job user: {calls}"
+    );
+
+    let name = rig.h.state().mints[0]["name"].as_str().unwrap().to_owned();
+    assert_eq!(
+        fs::read_to_string(rig.path("out/jit.txt")).unwrap(),
+        format!("jit-{name}")
+    );
+    assert_eq!(
+        fs::read_to_string(rig.path("out/args.txt")).unwrap().trim(),
+        ""
+    );
+    assert_eq!(
+        fs::read_to_string(rig.path("out/who.txt")).unwrap().trim(),
+        format!("{}|borg-job", rig.path("job-home").display()),
+        "the job sees the job user's home"
+    );
+    assert!(!rig.path("work/slot-0").exists());
+}
+
+#[tokio::test]
+async fn extra_labels_reach_the_minted_runner_but_class_labels_are_dropped() {
+    let rig = Rig::new().await;
+    rig.install_runner("true");
+    let drone = rig.drone(json!({"extra_labels": ["on-prem", "legacy-lane"]}));
+    let mut tasks = JoinSet::new();
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    rig.h.queue_job(1, "borg-ci-light-pr", 1);
+    rig.h.tick().await;
+    let labels: Vec<String> = rig.h.state().mints[0]["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "self-hosted",
+            "Linux",
+            "X64",
+            "on-prem",
+            "legacy-lane",
+            "borg-ci-light",
+            "borg-ci-light-pr"
+        ]
+    );
+    drain(&mut tasks).await;
+
+    // A drone cannot smuggle a class label past the queen: a PR runner stays PR-scoped.
+    let req = json!({"capacity": support::capacity(), "extra_labels": ["borg-ci-light", "borg-ci-heavy-pr", "ok-label"]});
+    let r = rig
+        .h
+        .http
+        .post(format!("{}/v1/heartbeat", rig.h.url))
+        .bearer_auth(&rig.token)
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    rig.h.state().jobs.clear();
+    rig.h.state().mints.clear();
+    rig.h.queue_job(2, "borg-ci-medium-pr", 1);
+    rig.h.tick().await;
+    let labels: Vec<String> = rig.h.state().mints[0]["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "self-hosted",
+            "Linux",
+            "X64",
+            "ok-label",
+            "borg-ci-medium",
+            "borg-ci-medium-pr"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn runner_env_and_hooks_are_exported_to_every_lease() {
+    let rig = Rig::new().await;
+    rig.install_runner(
+        "echo \"$HTTP_PROXY|$ACTIONS_RUNNER_HOOK_JOB_STARTED|$ACTIONS_RUNNER_HOOK_JOB_COMPLETED\" > $OUT/env.txt",
+    );
+    let drone = rig.drone(json!({
+        "runner_env": {"HTTP_PROXY": "http://proxy.example.test:3128"},
+        "job_started_hook": "/etc/borg/hooks/start.sh",
+        "job_completed_hook": "/etc/borg/hooks/done.sh",
+    }));
+    let mut tasks = JoinSet::new();
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    rig.h.queue_job(1, "borg-ci-light", 1);
+    rig.h.tick().await;
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    drain(&mut tasks).await;
+    assert_eq!(
+        fs::read_to_string(rig.path("out/env.txt")).unwrap().trim(),
+        "http://proxy.example.test:3128|/etc/borg/hooks/start.sh|/etc/borg/hooks/done.sh"
+    );
+}
+
+fn request_version(dir: &Path) -> Option<String> {
+    let v: Value = serde_json::from_slice(&fs::read(dir.join("update-request")).ok()?).ok()?;
+    v["version"].as_str().map(str::to_owned)
+}
+
+#[tokio::test]
+async fn an_idle_drone_asks_for_the_version_the_queen_wants_and_takes_no_lease() {
+    let rig = Rig::with_queen(json!({"rollout_target_version": "9.9.9"})).await;
+    rig.install_runner("exit 0");
+    let state = rig.path("state");
+    fs::create_dir_all(&state).unwrap();
+    let drone = rig.drone(json!({"state_dir": state}));
+    let mut tasks = JoinSet::new();
+
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    assert_eq!(request_version(&state).as_deref(), Some("9.9.9"));
+    assert!(
+        state.join("health.json").exists(),
+        "health evidence is written"
+    );
+
+    rig.h.queue_job(1, "borg-ci-light-pr", 3);
+    rig.h.tick().await;
+    assert_eq!(
+        drone.heartbeat_once(true, &mut tasks).await.unwrap(),
+        0,
+        "no new lease while an update is pending"
+    );
 }

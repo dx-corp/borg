@@ -272,7 +272,24 @@ async fn delete_runner(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Records wake-on-LAN sends instead of using the network.
+#[derive(Default)]
+pub struct RecordingWake(pub Mutex<Vec<([u8; 6], Vec<std::net::SocketAddrV4>)>>);
+
+impl borg::wake::WakeSender for RecordingWake {
+    fn send<'a>(
+        &'a self,
+        mac: [u8; 6],
+        to: &'a [std::net::SocketAddrV4],
+    ) -> borg::wake::BoxFuture<'a, Result<Vec<std::net::SocketAddrV4>, String>> {
+        self.0.lock().unwrap().push((mac, to.to_vec()));
+        let sent = to.to_vec();
+        Box::pin(async move { Ok(sent) })
+    }
+}
+
 pub struct Harness {
+    pub wakes: Arc<RecordingWake>,
     pub mock: Shared,
     pub queen: Arc<Queen>,
     pub url: String,
@@ -298,6 +315,12 @@ pub fn capacity() -> Capacity {
 impl Harness {
     /// `extra` is merged into the queen config; warm floors default to none.
     pub async fn start(extra: Value) -> Self {
+        Self::start_with(extra, borg::tailnet::StaticIdentities::default()).await
+    }
+
+    /// Like `start`, with a fake tailnet identity table (callers all connect
+    /// from 127.0.0.1) behind `tailnet_enroll` when the config enables it.
+    pub async fn start_with(extra: Value, identities: borg::tailnet::StaticIdentities) -> Self {
         let mock: Shared = Arc::default();
         let (private_pem, public_pem) = generate_key();
         lock(&mock).public_pem = public_pem;
@@ -340,17 +363,31 @@ impl Harness {
             borg::janitor::Janitor::new(&gh_url, borg::secret::Secret::new(JANITOR_TOKEN), settings)
                 .unwrap()
         });
-        let mut queen = Queen::new(cfg, store, github);
+        let wakes = Arc::new(RecordingWake::default());
+        let mut queen = Queen::new(cfg, store, github).with_wake_sender(wakes.clone());
         if let Some(j) = janitor {
             queen = queen.with_janitor(j);
+        }
+        if let Some(settings) = queen.config().tailnet_enroll.clone() {
+            queen = queen.with_tailnet_enroll(borg::tailnet::TailnetEnroll {
+                verifier: Arc::new(identities),
+                settings,
+            });
         }
         let queen = Arc::new(queen);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let router = api::router(Arc::clone(&queen));
-        tokio::spawn(async move { axum::serve(listener, router).await });
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+        });
         Self {
+            wakes,
             mock,
             queen,
             url,
@@ -390,6 +427,24 @@ impl Harness {
             .bearer_auth(token)
             .json(&json!({"capacity": capacity(), "version": version}))
             .send()
+            .await
+            .unwrap()
+    }
+
+    /// Heartbeat with extra request fields (e.g. `bids`) merged in.
+    pub async fn heartbeat_with(&self, token: &str, extra: Value) -> Value {
+        let mut body = json!({"capacity": capacity()});
+        for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+            body[k] = v;
+        }
+        self.http
+            .post(format!("{}/v1/heartbeat", self.url))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
             .await
             .unwrap()
     }

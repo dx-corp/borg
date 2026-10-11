@@ -1,10 +1,12 @@
 //! Drone configuration, a JSON file written by `borg drone install`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::allocator::HostCaps;
+use crate::drone::jobuser::JobUser;
 use crate::secret::Secret;
 
 #[derive(Debug, thiserror::Error)]
@@ -229,9 +231,36 @@ pub struct DroneConfig {
     /// run at once. Default: `max_leases`, else 16.
     #[serde(default)]
     pub slots: Option<u32>,
+    /// Directory for self-update hand-off and health evidence (`update-request`,
+    /// `update-result.json`, `health.json`). Absent: no self-update.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+    /// Run leases as this unprivileged user instead of the drone's own, so job
+    /// code cannot read the drone's token or config. Linux only.
+    #[serde(default)]
+    pub job_user: Option<JobUser>,
+    /// Labels added to every runner this drone registers, for lanes that still
+    /// route by label (for example `on-prem`). Labels of the job classes are
+    /// ignored by the queen so they cannot change a runner's scope.
+    #[serde(default)]
+    pub extra_labels: Vec<String>,
+    /// Environment injected into every lease's runner.
+    #[serde(default)]
+    pub runner_env: BTreeMap<String, String>,
+    /// Absolute path of a script (`.sh`) the runner runs when a job starts;
+    /// exported as `ACTIONS_RUNNER_HOOK_JOB_STARTED`.
+    #[serde(default)]
+    pub job_started_hook: Option<PathBuf>,
+    /// Same for job completion (`ACTIONS_RUNNER_HOOK_JOB_COMPLETED`).
+    #[serde(default)]
+    pub job_completed_hook: Option<PathBuf>,
     /// Host-level caches the drone manages under `cache_root`.
     #[serde(default)]
     pub caches: CachesConfig,
+    /// Build-box reclaim of abandoned worktrees and cargo directories; off
+    /// unless a host opts in, and dry-run by default. See [`crate::reclaim`].
+    #[serde(default)]
+    pub reclaim: crate::reclaim::ReclaimSettings,
 }
 
 /// Slot directories when neither `slots` nor `max_leases` is set.
@@ -288,7 +317,75 @@ impl DroneConfig {
         if self.ca_cert_path.is_some() && http {
             return bad("ca_cert_path only applies to an https:// queen_url");
         }
+        if let Some(user) = &self.job_user {
+            user.validate().map_err(DroneConfigError::Invalid)?;
+        }
+        self.validate_job_settings()?;
+        self.reclaim.validate().map_err(DroneConfigError::Invalid)?;
         self.validate_caches()
+    }
+
+    fn validate_job_settings(&self) -> Result<(), DroneConfigError> {
+        let bad = |m: String| Err(DroneConfigError::Invalid(m));
+        for label in &self.extra_labels {
+            if !crate::classes::valid_extra_label(label) {
+                return bad(format!(
+                    "extra_labels entry {label:?} is not a valid runner label"
+                ));
+            }
+        }
+        if self.extra_labels.len() > crate::classes::MAX_EXTRA_LABELS {
+            return bad(format!(
+                "at most {} extra_labels",
+                crate::classes::MAX_EXTRA_LABELS
+            ));
+        }
+        for (key, value) in &self.runner_env {
+            let name_ok = key
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            let reserved = key.starts_with("BORG_")
+                || key.starts_with("ACTIONS_RUNNER_")
+                || key == "COMPOSE_PROJECT_NAME"
+                || key == "DISABLE_RUNNER_UPDATE";
+            if !name_ok || reserved || value.contains('\0') {
+                return bad(format!("runner_env key {key:?} is invalid or reserved"));
+            }
+        }
+        for (name, hook) in [
+            ("job_started_hook", &self.job_started_hook),
+            ("job_completed_hook", &self.job_completed_hook),
+        ] {
+            if let Some(path) = hook
+                && !(path.is_absolute() && path.extension().is_some_and(|e| e == "sh"))
+            {
+                return bad(format!("{name} must be an absolute path ending in .sh"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The runner hook and `runner_env` variables for a lease.
+    pub fn runner_environment(&self) -> Vec<(String, String)> {
+        let mut env: Vec<(String, String)> = self
+            .runner_env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (var, hook) in [
+            ("ACTIONS_RUNNER_HOOK_JOB_STARTED", &self.job_started_hook),
+            (
+                "ACTIONS_RUNNER_HOOK_JOB_COMPLETED",
+                &self.job_completed_hook,
+            ),
+        ] {
+            if let Some(path) = hook {
+                env.push((var.to_owned(), path.to_string_lossy().into_owned()));
+            }
+        }
+        env
     }
 
     fn validate_caches(&self) -> Result<(), DroneConfigError> {
@@ -507,6 +604,45 @@ mod tests {
         assert!(!c.cargo.export_rustflags);
         let d = DroneConfig::from_json(BASE).unwrap().caches;
         assert!(d.sccache.server.is_none() && d.cargo.export_rustflags);
+    }
+
+    #[test]
+    fn job_settings_are_validated_and_exported() {
+        let with = |extra: &str| BASE.replace('}', &format!(",{extra}}}"));
+        let ok = with(
+            r#""extra_labels":["on-prem","legacy-lane"],"runner_env":{"HTTP_PROXY":"http://proxy.example.test:3128"},"job_started_hook":"/etc/borg/hooks/start.sh","job_completed_hook":"/etc/borg/hooks/done.sh","job_user":{"name":"borg-job","home":"/var/lib/borg-job"}"#,
+        );
+        let cfg = DroneConfig::from_json(&ok).unwrap();
+        assert_eq!(
+            cfg.job_user.as_ref().map(|u| u.priv_bin.as_str()),
+            Some("setpriv")
+        );
+        let env = cfg.runner_environment();
+        assert!(env.contains(&(
+            "HTTP_PROXY".to_owned(),
+            "http://proxy.example.test:3128".to_owned()
+        )));
+        assert!(env.contains(&(
+            "ACTIONS_RUNNER_HOOK_JOB_STARTED".to_owned(),
+            "/etc/borg/hooks/start.sh".to_owned()
+        )));
+        assert!(env.contains(&(
+            "ACTIONS_RUNNER_HOOK_JOB_COMPLETED".to_owned(),
+            "/etc/borg/hooks/done.sh".to_owned()
+        )));
+        for bad in [
+            r#""job_started_hook":"/etc/hook.py""#,
+            r#""job_started_hook":"hook.sh""#,
+            r#""job_completed_hook":"/etc/hook""#,
+            r#""runner_env":{"BORG_LEASE_ID":"x"}"#,
+            r#""runner_env":{"ACTIONS_RUNNER_INPUT_JITCONFIG":"x"}"#,
+            r#""runner_env":{"A B":"x"}"#,
+            r#""extra_labels":["has space"]"#,
+            r#""extra_labels":["self-hosted"]"#,
+            r#""job_user":{"name":"x","home":"relative"}"#,
+        ] {
+            assert!(DroneConfig::from_json(&with(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

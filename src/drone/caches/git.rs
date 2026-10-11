@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::drone::config::GitCaches;
 use crate::drone::exec::Exec;
+use crate::drone::fsops::FsOps;
 
 /// A mirror refreshed this recently is not refreshed again for a new lease.
 const MIN_REFRESH_GAP: Duration = Duration::from_secs(15);
@@ -61,9 +62,17 @@ fn run_git(exec: &dyn Exec, git: &str, args: &[&str]) -> Result<(), String> {
 
 /// Create the mirror if needed, point it at `url`, and fetch every branch and
 /// tag into it. Idempotent, so an interrupted first clone heals on the next run.
-fn refresh_mirror(exec: &dyn Exec, git: &str, path: &Path, url: &str) -> Result<(), String> {
+fn refresh_mirror(
+    exec: &dyn Exec,
+    fs_ops: &dyn FsOps,
+    git: &str,
+    path: &Path,
+    url: &str,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        fs_ops
+            .mkdir_p(parent)
+            .map_err(|e| format!("{}: {e}", parent.display()))?;
     }
     let p = path.to_string_lossy();
     if !path.join("HEAD").exists() {
@@ -114,6 +123,7 @@ struct Mirror {
 pub struct GitMirrors {
     git: String,
     exec: Arc<dyn Exec>,
+    fs_ops: Arc<dyn FsOps>,
     mirrors: Vec<Mirror>,
     /// Leases that were handed a mirror / ran without one.
     served: AtomicU64,
@@ -121,7 +131,12 @@ pub struct GitMirrors {
 }
 
 impl GitMirrors {
-    pub fn new(cfg: &GitCaches, cache_root: &Path, exec: Arc<dyn Exec>) -> Self {
+    pub fn new(
+        cfg: &GitCaches,
+        cache_root: &Path,
+        exec: Arc<dyn Exec>,
+        fs_ops: Arc<dyn FsOps>,
+    ) -> Self {
         let mirrors = cfg
             .mirrors
             .iter()
@@ -135,6 +150,7 @@ impl GitMirrors {
         Self {
             git: cfg.bin.clone(),
             exec,
+            fs_ops,
             mirrors,
             served: AtomicU64::new(0),
             missed: AtomicU64::new(0),
@@ -150,14 +166,16 @@ impl GitMirrors {
         if !force && last.is_some_and(|t| t.elapsed() < MIN_REFRESH_GAP) {
             return;
         }
-        let (exec, git, path, url) = (
+        let (exec, fs_ops, git, path, url) = (
             Arc::clone(&self.exec),
+            Arc::clone(&self.fs_ops),
             self.git.clone(),
             mirror.path.clone(),
             mirror.url.clone(),
         );
-        let job =
-            tokio::task::spawn_blocking(move || refresh_mirror(exec.as_ref(), &git, &path, &url));
+        let job = tokio::task::spawn_blocking(move || {
+            refresh_mirror(exec.as_ref(), fs_ops.as_ref(), &git, &path, &url)
+        });
         match tokio::time::timeout(REFRESH_TIMEOUT, job).await {
             Ok(Ok(Ok(()))) => *last = Some(Instant::now()),
             Ok(Ok(Err(e))) => tracing::warn!("git mirror {} refresh failed: {e}", mirror.repo),
@@ -205,6 +223,7 @@ impl GitMirrors {
 mod tests {
     use super::*;
     use crate::drone::cleanup::testing::FakeExec;
+    use crate::drone::fsops::LocalFs;
 
     fn cfg(mirrors: &[&str]) -> GitCaches {
         GitCaches {
@@ -243,7 +262,12 @@ mod tests {
     async fn refresh_runs_the_expected_steps_and_is_rate_limited() {
         let root = tempfile::tempdir().unwrap();
         let x = Arc::new(FakeExec::default());
-        let m = GitMirrors::new(&cfg(&["example-org/app"]), root.path(), x.clone());
+        let m = GitMirrors::new(
+            &cfg(&["example-org/app"]),
+            root.path(),
+            x.clone(),
+            Arc::new(LocalFs),
+        );
         let path = mirror_path(root.path(), "example-org/app")
             .display()
             .to_string();
@@ -292,7 +316,12 @@ mod tests {
         x.fail(&format!(
             "git -C {path} -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 fetch --prune --tags --force --quiet origin"
         ));
-        let m = GitMirrors::new(&cfg(&["example-org/app"]), root.path(), x.clone());
+        let m = GitMirrors::new(
+            &cfg(&["example-org/app"]),
+            root.path(),
+            x.clone(),
+            Arc::new(LocalFs),
+        );
         m.refresh_stale().await;
         let after_first = x.calls().len();
         m.refresh_stale().await;
@@ -309,6 +338,7 @@ mod tests {
             &cfg(&["example-org/app", "example-org/other"]),
             root.path(),
             Arc::new(FakeExec::default()),
+            Arc::new(LocalFs),
         );
         let present = mirror_path(root.path(), "example-org/app");
         std::fs::create_dir_all(&present).unwrap();

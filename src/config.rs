@@ -9,7 +9,15 @@ use serde::Deserialize;
 
 use crate::allocator::{WarmFloor, default_warm_floors};
 use crate::classes::{Classes, ClassesError};
+use crate::envcontract::ContractSettings;
+use crate::health::HealthSettings;
+use crate::homeostasis::HomeostasisSettings;
+use crate::profile::ProfileSettings;
+use crate::rollout::RolloutSettings;
 use crate::schedule::WarmSchedule;
+use crate::tailnet::TailnetEnrollSettings;
+use crate::units::UnitSettings;
+use crate::wake::WakeSettings;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -114,6 +122,35 @@ pub struct QueenConfig {
     /// Time-of-day raises to the warm floors; see [`crate::schedule`].
     #[serde(default)]
     pub warm_schedule: WarmSchedule,
+    /// Absent (the default) disables `POST /v1/enroll`; see [`crate::tailnet`].
+    #[serde(default)]
+    pub tailnet_enroll: Option<TailnetEnrollSettings>,
+    /// Demand-responsive warm floors; off by default. See
+    /// [`crate::homeostasis`].
+    #[serde(default)]
+    pub homeostasis: HomeostasisSettings,
+    /// The build environment contract checked before work is placed on a drone;
+    /// off by default. See [`crate::envcontract`].
+    #[serde(default)]
+    pub env_contract: ContractSettings,
+    /// Work units (gate and hook runs) and their API; off by default. See
+    /// [`crate::units`].
+    #[serde(default)]
+    pub units: UnitSettings,
+    /// Wake-on-LAN for sleeping hosts when demand goes unmet; off by default.
+    /// See [`crate::wake`].
+    #[serde(default)]
+    pub wake: WakeSettings,
+    /// Gating of the rollout of `rollout_target_version`; see
+    /// [`crate::rollout`]. Gated only when `previous_version` is set.
+    #[serde(default)]
+    pub rollout: RolloutSettings,
+    /// Learned per-drone profiles that feed placement; see [`crate::profile`].
+    #[serde(default)]
+    pub profiles: ProfileSettings,
+    /// Host-health thresholds, decay and cooldown; see [`crate::health`].
+    #[serde(default)]
+    pub health: HealthSettings,
     /// Job telemetry older than this is deleted.
     #[serde(default = "default_telemetry_days")]
     pub telemetry_retention_days: u32,
@@ -200,6 +237,19 @@ impl QueenConfig {
         if self.poll_interval_secs == 0 || self.lease_ttl_secs <= 0 || self.lease_max_secs <= 0 {
             return bad("poll_interval_secs, lease_ttl_secs and lease_max_secs must be positive");
         }
+        if self.telemetry_retention_days == 0 {
+            return bad("telemetry_retention_days must be at least 1");
+        }
+        self.env_contract.validate().map_err(ConfigError::Invalid)?;
+        self.units.validate().map_err(ConfigError::Invalid)?;
+        self.wake.validate().map_err(ConfigError::Invalid)?;
+        self.rollout.validate().map_err(ConfigError::Invalid)?;
+        self.profiles.validate().map_err(ConfigError::Invalid)?;
+        self.homeostasis.validate().map_err(ConfigError::Invalid)?;
+        self.health.validate().map_err(ConfigError::Invalid)?;
+        if let Some(t) = &self.tailnet_enroll {
+            t.validate().map_err(ConfigError::Invalid)?;
+        }
         self.warm_schedule
             .validate()
             .map_err(ConfigError::Invalid)?;
@@ -267,6 +317,51 @@ mod tests {
             );
             assert!(QueenConfig::from_json(&json).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn health_settings_default_and_validate() {
+        let c = QueenConfig::from_json(MIN).unwrap();
+        assert!(c.health.auto_quarantine);
+        let with = |h: &str| {
+            QueenConfig::from_json(&MIN.replace("\"repos\"", &format!("\"health\":{h},\"repos\"")))
+        };
+        assert!(with(r#"{"half_life_secs":0}"#).is_err());
+        assert!(with(r#"{"nope":1}"#).is_err());
+        assert!(
+            !with(r#"{"auto_quarantine":false}"#)
+                .unwrap()
+                .health
+                .auto_quarantine
+        );
+    }
+
+    #[test]
+    fn zero_telemetry_retention_is_rejected() {
+        let json = MIN.replace("\"repos\"", "\"telemetry_retention_days\":0,\"repos\"");
+        assert!(QueenConfig::from_json(&json).is_err());
+    }
+
+    #[test]
+    fn tailnet_enroll_is_off_by_default_and_needs_an_allowlist() {
+        assert!(
+            QueenConfig::from_json(MIN)
+                .unwrap()
+                .tailnet_enroll
+                .is_none()
+        );
+        let with = |t: &str| {
+            QueenConfig::from_json(
+                &MIN.replace("\"repos\"", &format!("\"tailnet_enroll\":{t},\"repos\"")),
+            )
+        };
+        assert!(with("{}").is_err());
+        assert!(with(r#"{"allowed_tags":["ci"]}"#).is_err());
+        let ok = with(r#"{"allowed_tags":["tag:ci"]}"#).unwrap();
+        assert_eq!(
+            ok.tailnet_enroll.unwrap().socket_path.to_str(),
+            Some("/var/run/tailscale/tailscaled.sock")
+        );
     }
 
     #[test]

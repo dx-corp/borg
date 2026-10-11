@@ -7,9 +7,10 @@
 //! it is not collected again after the next job.
 
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+use crate::drone::fsops::FsOps;
 
 /// Collection stops once the cache is at or below this share of its cap.
 const TARGET_PERCENT: u64 = 90;
@@ -91,44 +92,6 @@ pub fn collect_units(buckets: &[(PathBuf, usize)]) -> Vec<Unit> {
     units
 }
 
-/// Directory contents may be read-only (module caches); make them removable.
-fn make_writable(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut stack = vec![path.to_owned()];
-        while let Some(p) = stack.pop() {
-            let Ok(meta) = fs::symlink_metadata(&p) else {
-                continue;
-            };
-            if meta.is_dir() {
-                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o755));
-                if let Ok(rd) = fs::read_dir(&p) {
-                    stack.extend(rd.flatten().map(|e| e.path()));
-                }
-            }
-        }
-    }
-}
-
-fn remove_unit(path: &Path) -> io::Result<()> {
-    let is_dir = fs::symlink_metadata(path)?.is_dir();
-    let attempt = |p: &Path| {
-        if is_dir {
-            fs::remove_dir_all(p)
-        } else {
-            fs::remove_file(p)
-        }
-    };
-    match attempt(path) {
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && is_dir => {
-            make_writable(path);
-            attempt(path)
-        }
-        other => other,
-    }
-}
-
 /// Result of one collection.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Collected {
@@ -139,7 +102,12 @@ pub struct Collected {
 /// Evict least-recently-used `units` until `total_bytes` (the combined size of
 /// all `units`; data that is never evicted does not count) is at most 90% of
 /// `cap_bytes`. Does nothing while the units are within the cap.
-pub fn evict_lru(mut units: Vec<Unit>, total_bytes: u64, cap_bytes: u64) -> Collected {
+pub fn evict_lru(
+    fs: &dyn FsOps,
+    mut units: Vec<Unit>,
+    total_bytes: u64,
+    cap_bytes: u64,
+) -> Collected {
     let mut out = Collected::default();
     if total_bytes <= cap_bytes {
         return out;
@@ -151,7 +119,7 @@ pub fn evict_lru(mut units: Vec<Unit>, total_bytes: u64, cap_bytes: u64) -> Coll
         if remaining <= target {
             break;
         }
-        match remove_unit(&unit.path) {
+        match fs.remove_all(&unit.path) {
             Ok(()) => {
                 remaining = remaining.saturating_sub(unit.size);
                 out.removed_units += 1;
@@ -237,7 +205,7 @@ mod tests {
         let units = collect_units(&[(dir.path().join("b"), 1)]);
         let total: u64 = units.iter().map(|u| u.size).sum();
         // A cap of half the total must drop the two oldest units.
-        let got = evict_lru(units, total, total / 2);
+        let got = evict_lru(&crate::drone::fsops::LocalFs, units, total, total / 2);
         assert!(got.removed_units >= 2, "{got:?}");
         assert!(!dir.path().join("b/oldest").exists() && !dir.path().join("b/old").exists());
         assert!(
@@ -252,7 +220,10 @@ mod tests {
         file(&dir.path().join("b/u/data"), 1000, 100);
         let units = collect_units(&[(dir.path().join("b"), 1)]);
         let total: u64 = units.iter().map(|u| u.size).sum();
-        assert_eq!(evict_lru(units, total, total), Collected::default());
+        assert_eq!(
+            evict_lru(&crate::drone::fsops::LocalFs, units, total, total),
+            Collected::default()
+        );
         assert!(dir.path().join("b/u").exists());
     }
 
@@ -274,7 +245,7 @@ mod tests {
         .unwrap();
         let units = collect_units(&[(dir.path().join("b"), 1)]);
         let total: u64 = units.iter().map(|u| u.size).sum();
-        let got = evict_lru(units, total, 1);
+        let got = evict_lru(&crate::drone::fsops::LocalFs, units, total, 1);
         assert_eq!(got.removed_units, 1);
         assert!(!dir.path().join("b/mod@v1").exists());
     }

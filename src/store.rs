@@ -12,10 +12,15 @@ use serde::de::DeserializeOwned;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
-use crate::allocator::HostCaps;
+use crate::allocator::{DroneState, HostCaps};
 use crate::api::CacheStat;
+use crate::bid::DroneBid;
 use crate::classes::{Class, Scope};
+use crate::envcontract::EnvFacts;
+use crate::health::{Action, Hold};
 use crate::probe::Capacity;
+use crate::reclaim::{DeletionRecord, ReclaimStats};
+use crate::rollout::RolloutState;
 use crate::secret::Secret;
 
 const SCHEMA: &str = "
@@ -30,7 +35,93 @@ CREATE TABLE IF NOT EXISTS drones (
     cache_stats    TEXT,
     quarantined    INTEGER NOT NULL DEFAULT 0,
     quarantine_reason TEXT,
-    version        TEXT
+    version        TEXT,
+    extra_labels   TEXT,
+    bids           TEXT,
+    quarantine_source TEXT,
+    quarantined_at INTEGER,
+    probation_since INTEGER,
+    quarantine_strikes INTEGER NOT NULL DEFAULT 0,
+    health_cleared_at INTEGER,
+    version_since INTEGER,
+    reclaim TEXT,
+    env_facts TEXT
+);
+CREATE TABLE IF NOT EXISTS reclaim_log (
+    drone      TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    at         INTEGER NOT NULL,
+    path       TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    reason     TEXT NOT NULL,
+    outcome    TEXT NOT NULL,
+    error      TEXT,
+    PRIMARY KEY (drone, seq)
+);
+CREATE INDEX IF NOT EXISTS reclaim_log_at ON reclaim_log(at);
+CREATE TABLE IF NOT EXISTS clients (
+    name       TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS units (
+    id               TEXT PRIMARY KEY,
+    key              TEXT NOT NULL,
+    repo             TEXT NOT NULL,
+    tree_sha         TEXT NOT NULL,
+    argv             TEXT NOT NULL,
+    platform         TEXT NOT NULL,
+    toolchain        TEXT NOT NULL,
+    rust_toolchain   TEXT,
+    class            TEXT NOT NULL,
+    timeout_secs     INTEGER NOT NULL,
+    client           TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    drone            TEXT,
+    attempt          INTEGER NOT NULL DEFAULT 0,
+    created_at       INTEGER NOT NULL,
+    leased_at        INTEGER,
+    started_at       INTEGER,
+    finished_at      INTEGER,
+    exit_code        INTEGER,
+    duration_secs    INTEGER,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    failure          TEXT,
+    log_bytes        INTEGER NOT NULL DEFAULT 0,
+    awaiting_bundle  INTEGER NOT NULL DEFAULT 0,
+    bundle_bytes     INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS unit_bundles (
+    unit_id    TEXT PRIMARY KEY,
+    data       BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS units_active_key ON units(key) WHERE state IN ('queued', 'leased', 'running');
+CREATE INDEX IF NOT EXISTS units_state ON units(state, created_at);
+CREATE TABLE IF NOT EXISTS unit_logs (
+    unit_id TEXT NOT NULL,
+    offset  INTEGER NOT NULL,
+    data    BLOB NOT NULL,
+    PRIMARY KEY (unit_id, offset)
+);
+CREATE TABLE IF NOT EXISTS rollout_state (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    state      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rollout_log (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    at    INTEGER NOT NULL,
+    event TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS health_log (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    at       INTEGER NOT NULL,
+    drone    TEXT NOT NULL,
+    event    TEXT NOT NULL,
+    reason   TEXT,
+    evidence TEXT
 );
 CREATE TABLE IF NOT EXISTS leases (
     id           TEXT PRIMARY KEY,
@@ -127,13 +218,94 @@ pub struct DroneRow {
     pub quarantine_reason: Option<String>,
     /// The borg version the drone last reported, if it reports one.
     pub version: Option<String>,
+    pub extra_labels: Vec<String>,
+    /// The drone's last reported bids (may have expired; see `expires_at`).
+    pub bids: Vec<DroneBid>,
+    /// `operator` or `auto` while quarantined.
+    pub quarantine_source: Option<String>,
+    pub quarantined_at: Option<i64>,
+    /// Set while an auto-quarantined drone is on probation.
+    pub probation_since: Option<i64>,
+    pub quarantine_strikes: u32,
+    /// Evidence at or before this time was cleared by a return to service.
+    pub health_cleared_at: Option<i64>,
+    /// When the queen first saw the drone report its current `version`.
+    pub version_since: Option<i64>,
+    /// The drone's last reported build-box reclaim stats (audit entries are
+    /// in `reclaim_log`, not here).
+    pub reclaim: Option<ReclaimStats>,
+    /// The build environment the drone last reported.
+    pub env_facts: Option<EnvFacts>,
 }
 
 impl DroneRow {
+    /// Quarantined and not on probation: no new leases at all.
+    pub fn held(&self) -> bool {
+        self.quarantined && self.probation_since.is_none()
+    }
+
+    /// On probation after an automatic quarantine: one lease at a time.
+    pub fn on_probation(&self) -> bool {
+        self.quarantined && self.probation_since.is_some()
+    }
+
     /// Whether the allocator may hand this drone new leases.
     pub fn schedulable(&self) -> bool {
-        self.accepting && !self.quarantined
+        self.accepting && !self.held()
     }
+
+    /// Why the drone is held, for the health evaluation.
+    pub fn hold(&self) -> Hold {
+        if !self.quarantined {
+            return Hold::None;
+        }
+        if self.quarantine_source.as_deref() != Some("auto") {
+            return Hold::Operator;
+        }
+        let strikes = self.quarantine_strikes;
+        match (self.probation_since, self.quarantined_at) {
+            (Some(since), _) => Hold::Probation { since, strikes },
+            (None, since) => Hold::Auto {
+                since: since.unwrap_or(0),
+                strikes,
+            },
+        }
+    }
+
+    /// The allocator's view of a fresh drone with a known capacity.
+    pub fn allocator_state(&self, cap: &Capacity, now: i64) -> DroneState {
+        let mut s = DroneState::from_capacity(self.name.clone(), cap, &self.caps);
+        s.accepting = self.schedulable();
+        if self.on_probation() {
+            s.max_leases = Some(s.max_leases.map_or(1, |m| m.min(1)));
+        }
+        s.bids = self
+            .bids
+            .iter()
+            .filter(|b| b.expires_at > now)
+            .copied()
+            .collect();
+        s
+    }
+}
+
+/// One stored build-box reclaim audit entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReclaimLogRow {
+    pub drone: String,
+    #[serde(flatten)]
+    pub record: DeletionRecord,
+}
+
+/// One entry of the quarantine and health audit trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HealthLogRow {
+    pub at: i64,
+    pub drone: String,
+    pub event: String,
+    pub reason: Option<String>,
+    /// The failures that justified an automatic action (JSON).
+    pub evidence: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +382,16 @@ impl Store {
             "ALTER TABLE drones ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE drones ADD COLUMN quarantine_reason TEXT",
             "ALTER TABLE drones ADD COLUMN version TEXT",
+            "ALTER TABLE drones ADD COLUMN extra_labels TEXT",
+            "ALTER TABLE drones ADD COLUMN bids TEXT",
+            "ALTER TABLE drones ADD COLUMN quarantine_source TEXT",
+            "ALTER TABLE drones ADD COLUMN quarantined_at INTEGER",
+            "ALTER TABLE drones ADD COLUMN probation_since INTEGER",
+            "ALTER TABLE drones ADD COLUMN quarantine_strikes INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE drones ADD COLUMN health_cleared_at INTEGER",
+            "ALTER TABLE drones ADD COLUMN version_since INTEGER",
+            "ALTER TABLE drones ADD COLUMN reclaim TEXT",
+            "ALTER TABLE drones ADD COLUMN env_facts TEXT",
         ] {
             // sqlx-runtime-query: one-off additive migration, no data involved
             if let Err(e) = sqlx::query(ddl).execute(&pool).await
@@ -272,10 +454,56 @@ impl Store {
         Ok(())
     }
 
+    /// Labels the drone asks to have added to its runners.
+    pub async fn set_extra_labels(&self, name: &str, labels: &[String]) -> Result<(), StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query("UPDATE drones SET extra_labels = ? WHERE name = ?")
+            .bind(to_text(&labels)?)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete a drone (its token hash with it) and its lease records. Returns
+    /// the number of unfinished leases dropped, or `None` if there is no such
+    /// drone. With the lease rows gone the queen no longer treats those
+    /// runners as owned, so it deregisters any that are still offline.
+    pub async fn remove_drone(&self, name: &str) -> Result<Option<u32>, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let exists = sqlx::query("SELECT 1 FROM drones WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let unfinished: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM leases WHERE drone = ? AND state IN ('pending', 'running')",
+        )
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await?
+        .get("n");
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query("DELETE FROM leases WHERE drone = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query("DELETE FROM drones WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(Some(u32::try_from(unfinished).unwrap_or(u32::MAX)))
+    }
+
     pub async fn drones(&self) -> Result<Vec<DroneRow>, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         let rows = sqlx::query(
-            "SELECT name, last_heartbeat, capacity, caps, accepting, cache_stats, quarantined, quarantine_reason, version FROM drones ORDER BY name",
+            "SELECT name, last_heartbeat, capacity, caps, accepting, cache_stats, quarantined, quarantine_reason, version, extra_labels, bids, quarantine_source, quarantined_at, probation_since, quarantine_strikes, health_cleared_at, version_since, reclaim, env_facts FROM drones ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -284,6 +512,7 @@ impl Store {
                 let capacity: Option<String> = r.get("capacity");
                 let caps: Option<String> = r.get("caps");
                 let stats: Option<String> = r.get("cache_stats");
+                let labels: Option<String> = r.get("extra_labels");
                 Ok(DroneRow {
                     name: r.get("name"),
                     last_heartbeat: r.get("last_heartbeat"),
@@ -302,38 +531,350 @@ impl Store {
                     quarantined: r.get::<i64, _>("quarantined") != 0,
                     quarantine_reason: r.get("quarantine_reason"),
                     version: r.get("version"),
+                    extra_labels: labels
+                        .as_deref()
+                        .map(from_text)
+                        .transpose()?
+                        .unwrap_or_default(),
+                    quarantine_source: r.get("quarantine_source"),
+                    quarantined_at: r.get("quarantined_at"),
+                    probation_since: r.get("probation_since"),
+                    quarantine_strikes: u32::try_from(r.get::<i64, _>("quarantine_strikes"))
+                        .unwrap_or(0),
+                    health_cleared_at: r.get("health_cleared_at"),
+                    version_since: r.get("version_since"),
+                    env_facts: r
+                        .get::<Option<String>, _>("env_facts")
+                        .as_deref()
+                        .map(from_text)
+                        .transpose()?,
+                    reclaim: r
+                        .get::<Option<String>, _>("reclaim")
+                        .as_deref()
+                        .map(from_text)
+                        .transpose()?,
+                    bids: r
+                        .get::<Option<String>, _>("bids")
+                        .as_deref()
+                        .map(from_text)
+                        .transpose()?
+                        .unwrap_or_default(),
                 })
             })
             .collect()
     }
 
-    /// Quarantine (`Some(reason)`) or release (`None`) a drone. False if no
-    /// such drone is enrolled.
+    /// Quarantine (`Some(reason)`) or release (`None`) a drone on an
+    /// operator's say-so. A release forgets earlier health evidence. False if
+    /// no such drone is enrolled.
     pub async fn set_quarantine(
         &self,
         name: &str,
         reason: Option<&str>,
     ) -> Result<bool, StoreError> {
-        const SQL: &str = "UPDATE drones SET quarantined = ?, quarantine_reason = ? WHERE name = ?";
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        const HOLD: &str = "UPDATE drones SET quarantined = 1, quarantine_reason = ?, quarantine_source = 'operator', quarantined_at = ?, probation_since = NULL, quarantine_strikes = 0 WHERE name = ?";
+        const FREE: &str = "UPDATE drones SET quarantined = 0, quarantine_reason = NULL, quarantine_source = NULL, quarantined_at = NULL, probation_since = NULL, quarantine_strikes = 0, health_cleared_at = ? WHERE name = ?";
+        let r = match reason {
+            // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+            Some(why) => sqlx::query(HOLD).bind(why).bind(now).bind(name),
+            // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+            None => sqlx::query(FREE).bind(now).bind(name),
+        }
+        .execute(&self.pool)
+        .await?;
+        if r.rows_affected() == 0 {
+            return Ok(false);
+        }
+        let event = if reason.is_some() {
+            "manual_quarantine"
+        } else {
+            "manual_release"
+        };
+        self.log_health(now, name, event, reason, None).await?;
+        Ok(true)
+    }
+
+    async fn log_health(
+        &self,
+        at: i64,
+        drone: &str,
+        event: &str,
+        reason: Option<&str>,
+        evidence: Option<&str>,
+    ) -> Result<(), StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
-        let r = sqlx::query(SQL)
-            .bind(i64::from(reason.is_some()))
-            .bind(reason)
+        sqlx::query(
+            "INSERT INTO health_log (at, drone, event, reason, evidence) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(at)
+        .bind(drone)
+        .bind(event)
+        .bind(reason)
+        .bind(evidence)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Apply one automatic health action and record it in the audit trail
+    /// (which is never pruned).
+    pub async fn apply_health_action(&self, action: &Action, now: i64) -> Result<(), StoreError> {
+        const HOLD: &str = "UPDATE drones SET quarantined = 1, quarantine_reason = ?, quarantine_source = 'auto', quarantined_at = ?, probation_since = NULL, quarantine_strikes = ? WHERE name = ?";
+        const PROBATION: &str =
+            "UPDATE drones SET probation_since = ? WHERE name = ? AND quarantine_source = 'auto'";
+        const FREE: &str = "UPDATE drones SET quarantined = 0, quarantine_reason = NULL, quarantine_source = NULL, quarantined_at = NULL, probation_since = NULL, quarantine_strikes = 0, health_cleared_at = ? WHERE name = ? AND quarantine_source = 'auto'";
+        let (reason, evidence) = match action {
+            Action::Quarantine {
+                drone,
+                reason,
+                evidence,
+                strikes,
+            }
+            | Action::Requarantine {
+                drone,
+                reason,
+                evidence,
+                strikes,
+            } => {
+                // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+                sqlx::query(HOLD)
+                    .bind(reason)
+                    .bind(now)
+                    .bind(i64::from(*strikes))
+                    .bind(drone)
+                    .execute(&self.pool)
+                    .await?;
+                (Some(reason.as_str()), Some(to_text(evidence)?))
+            }
+            Action::BeginProbation { drone } => {
+                // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+                sqlx::query(PROBATION)
+                    .bind(now)
+                    .bind(drone)
+                    .execute(&self.pool)
+                    .await?;
+                (None, None)
+            }
+            Action::Release { drone } => {
+                // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+                sqlx::query(FREE)
+                    .bind(now)
+                    .bind(drone)
+                    .execute(&self.pool)
+                    .await?;
+                (None, None)
+            }
+        };
+        self.log_health(
+            now,
+            action.drone(),
+            action.event(),
+            reason,
+            evidence.as_deref(),
+        )
+        .await
+    }
+
+    /// The newest `limit` health audit entries, newest first.
+    pub async fn health_log(&self, limit: i64) -> Result<Vec<HealthLogRow>, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let rows = sqlx::query(
+            "SELECT at, drone, event, reason, evidence FROM health_log ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let evidence: Option<String> = r.get("evidence");
+                Ok(HealthLogRow {
+                    at: r.get("at"),
+                    drone: r.get("drone"),
+                    event: r.get("event"),
+                    reason: r.get("reason"),
+                    evidence: evidence.as_deref().map(from_text).transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Store a drone's reclaim stats and append its new audit entries. Entries
+    /// already stored (same drone and `seq`) are ignored, so a repeated
+    /// heartbeat cannot duplicate them. Text is bounded.
+    pub async fn record_reclaim(&self, name: &str, stats: &ReclaimStats) -> Result<(), StoreError> {
+        const MAX_TEXT: usize = 500;
+        const MAX_ENTRIES: usize = 500;
+        let clip = |s: &str| {
+            s.chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_TEXT)
+                .collect::<String>()
+        };
+        for r in stats.recent.iter().take(MAX_ENTRIES) {
+            let size = i64::try_from(r.size_bytes).unwrap_or(i64::MAX);
+            let seq = i64::try_from(r.seq).unwrap_or(i64::MAX);
+            // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+            sqlx::query("INSERT OR IGNORE INTO reclaim_log (drone, seq, at, path, kind, size_bytes, reason, outcome, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(name)
+                .bind(seq)
+                .bind(r.at)
+                .bind(clip(&r.path))
+                .bind(to_text(&r.kind)?.trim_matches('"').to_owned())
+                .bind(size)
+                .bind(clip(&r.reason))
+                .bind(to_text(&r.outcome)?.trim_matches('"').to_owned())
+                .bind(r.error.as_deref().map(clip))
+                .execute(&self.pool)
+                .await?;
+        }
+        let mut kept = stats.clone();
+        kept.recent.clear();
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query("UPDATE drones SET reclaim = ? WHERE name = ?")
+            .bind(to_text(&kept)?)
             .bind(name)
             .execute(&self.pool)
             .await?;
-        Ok(r.rows_affected() > 0)
+        Ok(())
+    }
+
+    /// The newest reclaim audit entries across drones, newest first.
+    pub async fn reclaim_log(&self, limit: i64) -> Result<Vec<ReclaimLogRow>, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let rows = sqlx::query("SELECT drone, seq, at, path, kind, size_bytes, reason, outcome, error FROM reclaim_log ORDER BY at DESC, seq DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(ReclaimLogRow {
+                    drone: r.get("drone"),
+                    record: DeletionRecord {
+                        seq: u64::try_from(r.get::<i64, _>("seq")).unwrap_or(0),
+                        at: r.get("at"),
+                        path: r.get("path"),
+                        kind: enum_from(&r.get::<String, _>("kind"))?,
+                        size_bytes: u64::try_from(r.get::<i64, _>("size_bytes")).unwrap_or(0),
+                        reason: r.get("reason"),
+                        outcome: enum_from(&r.get::<String, _>("outcome"))?,
+                        error: r.get("error"),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Total bytes recorded as really deleted, across all drones and time.
+    pub async fn reclaim_bytes_logged(&self) -> Result<u64, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(size_bytes), 0) AS n FROM reclaim_log WHERE outcome = 'deleted'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(u64::try_from(row.get::<i64, _>("n")).unwrap_or(0))
+    }
+
+    pub async fn prune_reclaim_log(&self, before: i64) -> Result<u64, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let r = sqlx::query("DELETE FROM reclaim_log WHERE at < ?")
+            .bind(before)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Store the build environment a drone last reported.
+    pub async fn set_env_facts(&self, name: &str, facts: &EnvFacts) -> Result<(), StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query("UPDATE drones SET env_facts = ? WHERE name = ?")
+            .bind(to_text(facts)?)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Replace the bids a drone last reported.
+    pub async fn set_bids(&self, name: &str, bids: &[DroneBid]) -> Result<(), StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query("UPDATE drones SET bids = ? WHERE name = ?")
+            .bind(to_text(&bids)?)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Record the borg version a drone reported in its heartbeat.
-    pub async fn set_version(&self, name: &str, version: Option<&str>) -> Result<(), StoreError> {
+    pub async fn set_version(
+        &self,
+        name: &str,
+        version: Option<&str>,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        // `version_since` moves only when the reported version changes.
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
-        sqlx::query("UPDATE drones SET version = ? WHERE name = ?")
+        sqlx::query("UPDATE drones SET version_since = CASE WHEN version IS ? THEN version_since ELSE ? END, version = ? WHERE name = ?")
+            .bind(version)
+            .bind(now)
             .bind(version)
             .bind(name)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// The persisted state of the current rollout, if any.
+    pub async fn rollout_state(&self) -> Result<Option<RolloutState>, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let row = sqlx::query("SELECT state FROM rollout_state WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| from_text(&r.get::<String, _>("state")))
+            .transpose()
+    }
+
+    pub async fn save_rollout_state(&self, st: &RolloutState, now: i64) -> Result<(), StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query(
+            "INSERT OR REPLACE INTO rollout_state (id, state, updated_at) VALUES (1, ?, ?)",
+        )
+        .bind(to_text(st)?)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Forget the current rollout; the next pass starts it over.
+    pub async fn clear_rollout_state(&self) -> Result<(), StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query("DELETE FROM rollout_state WHERE id = 1")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn log_rollout(&self, at: i64, event: &str) -> Result<(), StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query("INSERT INTO rollout_log (at, event) VALUES (?, ?)")
+            .bind(at)
+            .bind(event)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The newest rollout audit lines, newest first.
+    pub async fn rollout_log(&self, limit: i64) -> Result<Vec<(i64, String)>, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let rows = sqlx::query("SELECT at, event FROM rollout_log ORDER BY id DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|r| (r.get("at"), r.get("event"))).collect())
     }
 
     pub async fn insert_lease(&self, l: &LeaseRow) -> Result<(), StoreError> {
@@ -590,7 +1131,12 @@ mod tests {
         let s = store_with("d1").await;
         assert!(!s.set_quarantine("nope", Some("x")).await.unwrap());
         assert!(s.set_quarantine("d1", Some("bad disk")).await.unwrap());
-        s.set_version("d1", Some("1.2.3")).await.unwrap();
+        s.set_version("d1", Some("1.2.3"), 50).await.unwrap();
+        s.set_version("d1", Some("1.2.3"), 99).await.unwrap();
+        assert_eq!(s.drones().await.unwrap()[0].version_since, Some(50));
+        s.set_version("d1", Some("1.2.4"), 120).await.unwrap();
+        assert_eq!(s.drones().await.unwrap()[0].version_since, Some(120));
+        s.set_version("d1", Some("1.2.3"), 130).await.unwrap();
         let d = &s.drones().await.unwrap()[0];
         assert!(d.accepting && d.quarantined && !d.schedulable());
         assert_eq!(d.quarantine_reason.as_deref(), Some("bad disk"));
@@ -599,6 +1145,71 @@ mod tests {
         let d = &s.drones().await.unwrap()[0];
         assert!(!d.quarantined && d.schedulable());
         assert_eq!(d.quarantine_reason, None);
+    }
+
+    #[tokio::test]
+    async fn probation_caps_a_drone_at_one_lease_and_a_hold_makes_it_unschedulable() {
+        use crate::health::{Action, Hold};
+        let s = store_with("d1").await;
+        let cap = crate::probe::Capacity {
+            hostname: "h".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            kind: crate::probe::HostKind::Vm,
+            vcpu: 8,
+            mem_mib: 16384,
+            free_disk_mib: None,
+            docker_usable: true,
+            mise_version: None,
+            git_version: None,
+        };
+        let row = || async { s.drones().await.unwrap().remove(0) };
+        assert!(row().await.schedulable());
+        assert_eq!(row().await.hold(), Hold::None);
+
+        let hold = Action::Quarantine {
+            drone: "d1".into(),
+            reason: "auto: test".into(),
+            evidence: vec![],
+            strikes: 2,
+        };
+        s.apply_health_action(&hold, 100).await.unwrap();
+        let r = row().await;
+        assert!(!r.schedulable() && r.held());
+        assert_eq!(
+            r.hold(),
+            Hold::Auto {
+                since: 100,
+                strikes: 2
+            }
+        );
+
+        s.apply_health_action(&Action::BeginProbation { drone: "d1".into() }, 200)
+            .await
+            .unwrap();
+        let r = row().await;
+        assert!(r.schedulable() && r.on_probation());
+        assert_eq!(
+            r.hold(),
+            Hold::Probation {
+                since: 200,
+                strikes: 2
+            }
+        );
+        assert_eq!(r.allocator_state(&cap, 0).max_leases, Some(1));
+
+        s.apply_health_action(&Action::Release { drone: "d1".into() }, 300)
+            .await
+            .unwrap();
+        let r = row().await;
+        assert_eq!(
+            (r.hold(), r.health_cleared_at, r.quarantine_strikes),
+            (Hold::None, Some(300), 0)
+        );
+        assert_eq!(r.allocator_state(&cap, 0).max_leases, None);
+        let log = s.health_log(10).await.unwrap();
+        let events: Vec<&str> = log.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(events, ["release", "probation_start", "auto_quarantine"]);
     }
 
     #[tokio::test]
@@ -635,9 +1246,13 @@ mod tests {
         )
         .await
         .unwrap();
+        s.set_extra_labels("d1", &["on-prem".to_owned()])
+            .await
+            .unwrap();
         let d = &s.drones().await.unwrap()[0];
         assert_eq!((d.last_heartbeat, d.accepting), (Some(123), false));
         assert_eq!(d.cache_stats, [stat]);
+        assert_eq!(d.extra_labels, ["on-prem"]);
         assert_eq!(d.capacity.as_ref(), Some(&cap));
     }
 }

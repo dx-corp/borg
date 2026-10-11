@@ -9,6 +9,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use crate::drone::fsops::FsOps;
+
 const BEGIN: &str = "# >>> borg managed cache flags (do not edit) >>>";
 const END: &str = "# <<< borg managed cache flags <<<";
 
@@ -39,7 +41,12 @@ pub fn with_block(existing: &str, block: &str) -> String {
 }
 
 /// Write the block into `rcfile`. Returns whether the file changed.
-pub fn write_rc(rcfile: &Path, disk_cache: &Path, repository_cache: &Path) -> io::Result<bool> {
+pub fn write_rc(
+    fs_ops: &dyn FsOps,
+    rcfile: &Path,
+    disk_cache: &Path,
+    repository_cache: &Path,
+) -> io::Result<bool> {
     let existing = match fs::read_to_string(rcfile) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -49,16 +56,14 @@ pub fn write_rc(rcfile: &Path, disk_cache: &Path, repository_cache: &Path) -> io
     if updated == existing {
         return Ok(false);
     }
-    if let Some(parent) = rcfile.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(rcfile, updated)?;
+    fs_ops.write_file(rcfile, &updated)?;
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drone::fsops::LocalFs;
 
     fn block() -> String {
         managed_block(Path::new("/c/bazel/disk"), Path::new("/c/bazel/repo"))
@@ -95,9 +100,33 @@ mod tests {
     fn writes_the_file_and_reports_changes() {
         let dir = tempfile::tempdir().unwrap();
         let rc = dir.path().join("home/.bazelrc");
-        assert!(write_rc(&rc, Path::new("/c/bazel/disk"), Path::new("/c/bazel/repo")).unwrap());
-        assert!(!write_rc(&rc, Path::new("/c/bazel/disk"), Path::new("/c/bazel/repo")).unwrap());
-        assert!(write_rc(&rc, Path::new("/c/other/disk"), Path::new("/c/bazel/repo")).unwrap());
+        assert!(
+            write_rc(
+                &LocalFs,
+                &rc,
+                Path::new("/c/bazel/disk"),
+                Path::new("/c/bazel/repo")
+            )
+            .unwrap()
+        );
+        assert!(
+            !write_rc(
+                &LocalFs,
+                &rc,
+                Path::new("/c/bazel/disk"),
+                Path::new("/c/bazel/repo")
+            )
+            .unwrap()
+        );
+        assert!(
+            write_rc(
+                &LocalFs,
+                &rc,
+                Path::new("/c/other/disk"),
+                Path::new("/c/bazel/repo")
+            )
+            .unwrap()
+        );
         assert!(fs::read_to_string(&rc).unwrap().contains("/c/other/disk"));
     }
 }

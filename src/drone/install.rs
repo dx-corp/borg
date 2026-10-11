@@ -1,12 +1,16 @@
 //! `borg drone install`: idempotently set a host up as a drone and report
 //! exactly what changed.
 //!
-//! Linux (and WSL, which needs systemd enabled) gets a dedicated service user
-//! in the docker group and a systemd unit; macOS gets a LaunchDaemon. Both get
-//! a copy of this binary, the pinned actions-runner (checksum verified), a
-//! config file and the enrollment token. Re-running changes only what differs
-//! and restarts the service only if something changed.
+//! Linux (and WSL, which needs systemd enabled) gets two service users and a
+//! systemd unit: the drone daemon user (owns `/etc/borg`, mode 0700, holding
+//! the enrollment token) and a separate unprivileged job user that every lease
+//! runs as, so job code cannot read the token. Both are in the docker group
+//! when it exists. macOS gets a LaunchDaemon and a single user. Both get a copy
+//! of this binary, the pinned actions-runner (checksum verified), a config file
+//! and the enrollment token. Re-running changes only what differs and restarts
+//! the service only if something changed.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -17,8 +21,12 @@ use sha2::{Digest, Sha256};
 
 use crate::drone::config::DroneConfig;
 use crate::drone::exec::Exec;
+use crate::drone::jobuser::JobUser;
 use crate::drone::pins::RunnerPin;
 use crate::secret::Secret;
+use crate::update::config::{
+    DEFAULT_DRONE_CONFIG, DEFAULT_MANIFEST_URL, DEFAULT_VERSIONED_MANIFEST_URL, UpdateConfig,
+};
 
 const SERVICE: &str = "borg-drone.service";
 const LAUNCHD_LABEL: &str = "org.borg.drone";
@@ -64,8 +72,21 @@ pub struct InstallOptions {
     pub max_vcpu: Option<u32>,
     pub max_mem_mib: Option<u64>,
     pub max_leases: Option<u32>,
-    /// Service account the drone and its jobs run as.
+    /// Service account the drone daemon runs as (and, without a job user, the
+    /// jobs too).
     pub run_as: String,
+    /// Linux: the separate unprivileged account leases run as; `None` runs jobs
+    /// as `run_as` (they can then read the drone's token). Ignored on macOS.
+    pub job_user: Option<String>,
+    /// Where host caches live; default `<job home>/cache`.
+    pub cache_root: Option<PathBuf>,
+    /// Take ownership of an existing `cache_root` (recursively) instead of
+    /// leaving its files as they are.
+    pub adopt_cache: bool,
+    pub extra_labels: Vec<String>,
+    pub runner_env: BTreeMap<String, String>,
+    pub job_started_hook: Option<PathBuf>,
+    pub job_completed_hook: Option<PathBuf>,
     /// Filesystem root the install is written under (`/` on a real host).
     pub root: PathBuf,
     pub platform: Platform,
@@ -73,6 +94,10 @@ pub struct InstallOptions {
     /// The borg binary to install.
     pub binary: PathBuf,
     pub dry_run: bool,
+    /// Release manifest the updater reads; the public release by default.
+    pub update_manifest_url: Option<String>,
+    /// Do not install the self-update path unit and updater configuration.
+    pub no_self_update: bool,
     /// Skip the "must be root" check (tests, `--root` staging).
     pub skip_root_check: bool,
     pub drain_timeout_secs: u64,
@@ -86,25 +111,43 @@ pub struct InstallOptions {
 struct Layout {
     bin: PathBuf,
     config_dir: PathBuf,
+    /// The drone's own state and working directory.
     data: PathBuf,
+    /// Home of whoever runs leases: holds the runner install, work directories
+    /// and (by default) the caches.
+    job_home: PathBuf,
+    cache_root: PathBuf,
     service_file: PathBuf,
 }
 
 impl Layout {
-    fn new(platform: Platform) -> Self {
-        match platform {
-            Platform::Linux => Self {
-                bin: "/usr/local/bin/borg".into(),
-                config_dir: "/etc/borg".into(),
-                data: "/var/lib/borg".into(),
-                service_file: format!("/etc/systemd/system/{SERVICE}").into(),
-            },
-            Platform::MacOs => Self {
-                bin: "/usr/local/bin/borg".into(),
-                config_dir: "/usr/local/etc/borg".into(),
-                data: "/usr/local/var/borg".into(),
-                service_file: format!("/Library/LaunchDaemons/{LAUNCHD_LABEL}.plist").into(),
-            },
+    fn new(platform: Platform, separate_job_user: bool, cache_root: Option<&Path>) -> Self {
+        let (bin, config_dir, data, service_file): (&str, &str, &str, String) = match platform {
+            Platform::Linux => (
+                "/usr/local/bin/borg",
+                "/etc/borg",
+                "/var/lib/borg",
+                format!("/etc/systemd/system/{SERVICE}"),
+            ),
+            Platform::MacOs => (
+                "/usr/local/bin/borg",
+                "/usr/local/etc/borg",
+                "/usr/local/var/borg",
+                format!("/Library/LaunchDaemons/{LAUNCHD_LABEL}.plist"),
+            ),
+        };
+        let job_home: PathBuf = if separate_job_user {
+            "/var/lib/borg-job".into()
+        } else {
+            data.into()
+        };
+        Self {
+            bin: bin.into(),
+            config_dir: config_dir.into(),
+            data: data.into(),
+            cache_root: cache_root.map_or_else(|| job_home.join("cache"), Path::to_path_buf),
+            job_home,
+            service_file: service_file.into(),
         }
     }
 
@@ -118,7 +161,10 @@ impl Layout {
         self.config_dir.join("queen-ca.pem")
     }
     fn runner(&self) -> PathBuf {
-        self.data.join("runner")
+        self.job_home.join("runner")
+    }
+    fn work(&self) -> PathBuf {
+        self.job_home.join("work")
     }
 }
 
@@ -128,7 +174,17 @@ pub fn render_systemd_unit(
     data: &Path,
     user: &str,
     drain_timeout_secs: u64,
+    separate_job_user: bool,
 ) -> String {
+    // The daemon starts job processes as the job user with `setpriv`, which
+    // needs these three capabilities; `setpriv` drops them again before the
+    // job runs. `NoNewPrivileges` must stay off for the same reason.
+    let caps = if separate_job_user {
+        "AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_SETPCAP\n\
+         CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SETPCAP\n"
+    } else {
+        ""
+    };
     format!(
         "[Unit]\n\
          Description=borg CI drone\n\
@@ -141,6 +197,7 @@ pub fn render_systemd_unit(
          Group={user}\n\
          WorkingDirectory={data}\n\
          ExecStart={bin} drone run --config {config}\n\
+         {caps}\
          Restart=always\n\
          RestartSec=5\n\
          KillSignal=SIGTERM\n\
@@ -195,6 +252,45 @@ pub fn render_launchd_plist(
     )
 }
 
+const UPDATE_PATH_UNIT: &str = "borg-update.path";
+const UPDATE_SERVICE_UNIT: &str = "borg-update.service";
+const UPDATE_LAUNCHD_LABEL: &str = "org.borg.update";
+
+/// systemd path unit: starts the updater when the drone writes a request.
+pub fn render_update_path_unit(request: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=borg drone update requests\n\n[Path]\nPathChanged={}\nUnit={UPDATE_SERVICE_UNIT}\n\n[Install]\nWantedBy=multi-user.target\n",
+        request.display()
+    )
+}
+
+/// The privileged one-shot updater, started by the path unit.
+pub fn render_update_service_unit(bin: &Path, config: &Path, timeout_secs: u64) -> String {
+    format!(
+        "[Unit]\nDescription=borg drone self-update\n\n[Service]\nType=oneshot\nUser=root\nExecStart={} update --config {} --from-request\nTimeoutStartSec={timeout_secs}\n",
+        bin.display(),
+        config.display()
+    )
+}
+
+/// launchd equivalent: a root daemon that runs when the request file changes.
+pub fn render_update_plist(bin: &Path, config: &Path, request: &Path) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n<dict>\n\
+         \t<key>Label</key><string>{UPDATE_LAUNCHD_LABEL}</string>\n\
+         \t<key>ProgramArguments</key>\n\t<array>\n\
+         \t\t<string>{}</string>\n\t\t<string>update</string>\n\t\t<string>--config</string>\n\t\t<string>{}</string>\n\t\t<string>--from-request</string>\n\
+         \t</array>\n\
+         \t<key>WatchPaths</key>\n\t<array>\n\t\t<string>{}</string>\n\t</array>\n\
+         </dict>\n</plist>\n",
+        bin.display(),
+        config.display(),
+        request.display()
+    )
+}
+
 struct Installer<'a> {
     opts: &'a InstallOptions,
     layout: Layout,
@@ -211,6 +307,118 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> InstallError + '_ {
 }
 
 impl Installer<'_> {
+    /// The updater: root-owned configuration (outside the drone's own
+    /// directory, so a compromised drone cannot redirect it) and the unit that
+    /// runs it when the drone asks for an update.
+    fn install_updater(&mut self) -> Result<bool, InstallError> {
+        let config_path = PathBuf::from(DEFAULT_DRONE_CONFIG);
+        let config_dir = config_path.parent().unwrap_or(Path::new("/")).to_owned();
+        self.ensure_dir(&config_dir, 0o755, Some("root"))?;
+        let update_cfg = UpdateConfig {
+            manifest_url: self
+                .opts
+                .update_manifest_url
+                .clone()
+                .unwrap_or_else(|| DEFAULT_MANIFEST_URL.to_owned()),
+            versioned_manifest_url: self
+                .opts
+                .update_manifest_url
+                .is_none()
+                .then(|| DEFAULT_VERSIONED_MANIFEST_URL.to_owned()),
+            allow_insecure: false,
+            service: match self.opts.platform {
+                Platform::Linux => SERVICE.to_owned(),
+                Platform::MacOs => LAUNCHD_LABEL.to_owned(),
+            },
+            launchd_plist: (self.opts.platform == Platform::MacOs)
+                .then(|| self.layout.service_file.to_string_lossy().into_owned()),
+            bin: self.layout.bin.clone(),
+            health_file: self.layout.data.join("health.json"),
+            state_dir: self.layout.data.clone(),
+            runner_dir: Some(self.layout.runner()),
+            runner_owner: Some(self.job_owner()),
+            health_timeout_secs: 120,
+        };
+        let mut json = serde_json::to_string_pretty(&update_cfg)
+            .map_err(|e| InstallError::Preflight(e.to_string()))?;
+        json.push('\n');
+        let mut changed = self.write_file(&config_path, json.as_bytes(), 0o644, Some("root"))?;
+        let request = crate::update::request_path(&self.layout.data);
+        let bin = self.layout.bin.clone();
+        let timeout = self.opts.drain_timeout_secs + 600;
+        match self.opts.platform {
+            Platform::Linux => {
+                let dir = self
+                    .layout
+                    .service_file
+                    .parent()
+                    .unwrap_or(Path::new("/"))
+                    .to_owned();
+                let path_unit = dir.join(UPDATE_PATH_UNIT);
+                let service_unit = dir.join(UPDATE_SERVICE_UNIT);
+                changed |= self.write_file(
+                    &path_unit,
+                    render_update_path_unit(&request).as_bytes(),
+                    0o644,
+                    None,
+                )?;
+                changed |= self.write_file(
+                    &service_unit,
+                    render_update_service_unit(&bin, &config_path, timeout).as_bytes(),
+                    0o644,
+                    None,
+                )?;
+                if !self.opts.dry_run {
+                    if changed {
+                        self.must("systemctl", &["daemon-reload"])?;
+                        self.note("ran", "systemctl daemon-reload");
+                    }
+                    if !self.cmd("systemctl", &["is-enabled", "--quiet", UPDATE_PATH_UNIT])? {
+                        self.must("systemctl", &["enable", "--now", UPDATE_PATH_UNIT])?;
+                        self.note(
+                            "ran",
+                            format_args!("systemctl enable --now {UPDATE_PATH_UNIT}"),
+                        );
+                    }
+                }
+            }
+            Platform::MacOs => {
+                let plist = PathBuf::from(format!(
+                    "/Library/LaunchDaemons/{UPDATE_LAUNCHD_LABEL}.plist"
+                ));
+                let content = render_update_plist(&bin, &config_path, &request);
+                let plist_changed = self.write_file(&plist, content.as_bytes(), 0o644, None)?;
+                changed |= plist_changed;
+                if !self.opts.dry_run {
+                    let target = format!("system/{UPDATE_LAUNCHD_LABEL}");
+                    let loaded = self.cmd("launchctl", &["print", &target])?;
+                    if loaded && plist_changed {
+                        self.must("launchctl", &["bootout", &target])?;
+                    }
+                    if !loaded || plist_changed {
+                        let path = self.on_disk(&plist).to_string_lossy().into_owned();
+                        self.must("launchctl", &["bootstrap", "system", &path])?;
+                        self.note("ran", format_args!("launchctl bootstrap system {path}"));
+                    }
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// The separate job user, on platforms that support one.
+    fn job_user(&self) -> Option<&str> {
+        match self.opts.platform {
+            Platform::Linux => self.opts.job_user.as_deref(),
+            Platform::MacOs => None,
+        }
+    }
+
+    /// Who owns job-facing files: the job user, else the drone's user.
+    fn job_owner(&self) -> String {
+        self.job_user().unwrap_or(&self.opts.run_as).to_owned()
+    }
+
     fn on_disk(&self, real: &Path) -> PathBuf {
         self.opts.root.join(real.strip_prefix("/").unwrap_or(real))
     }
@@ -353,12 +561,27 @@ impl Installer<'_> {
                 "systemd is not running on this host.{hint}"
             )));
         }
+        if self.job_user().is_some() && !self.cmd("setpriv", &["--version"])? {
+            return Err(InstallError::Preflight(
+                "setpriv (util-linux) is required to run jobs as a separate user; install it or pass --no-job-user".to_owned(),
+            ));
+        }
         Ok(())
     }
 
-    fn ensure_user(&mut self) -> Result<(), InstallError> {
-        let user = self.opts.run_as.clone();
-        let exists = self.cmd("id", &["-u", &user])?;
+    fn ensure_users(&mut self) -> Result<(), InstallError> {
+        let daemon = self.opts.run_as.clone();
+        self.ensure_user(&daemon, &self.layout.data.clone())?;
+        if let Some(job) = self.job_user().map(str::to_owned)
+            && job != daemon
+        {
+            self.ensure_user(&job, &self.layout.job_home.clone())?;
+        }
+        Ok(())
+    }
+
+    fn ensure_user(&mut self, user: &str, home: &Path) -> Result<(), InstallError> {
+        let exists = self.cmd("id", &["-u", user])?;
         match self.opts.platform {
             Platform::MacOs => {
                 if !exists {
@@ -376,7 +599,7 @@ impl Installer<'_> {
                     if self.opts.dry_run {
                         self.note("would create", format_args!("user {user}"));
                     } else {
-                        let home = self.layout.data.to_string_lossy().into_owned();
+                        let home = home.to_string_lossy().into_owned();
                         self.must(
                             "useradd",
                             &[
@@ -386,13 +609,15 @@ impl Installer<'_> {
                                 &home,
                                 "--shell",
                                 "/usr/sbin/nologin",
-                                &user,
+                                user,
                             ],
                         )?;
                         self.note("created", format_args!("user {user}"));
                     }
                 }
-                self.ensure_docker_group(&user, exists)?;
+                // The job user runs docker; the daemon also needs it to probe
+                // the engine and remove a lease's containers.
+                self.ensure_docker_group(user, exists)?;
             }
         }
         Ok(())
@@ -418,6 +643,39 @@ impl Installer<'_> {
             self.must("usermod", &["-aG", "docker", user])?;
             self.note("added", format_args!("user {user} to group docker"));
         }
+        Ok(())
+    }
+
+    /// Hand an existing cache directory (for example a host's warm compile
+    /// cache) to the job user, recursively, unless it already belongs to them.
+    fn adopt_cache(&mut self, real: &Path, owner: &str) -> Result<(), InstallError> {
+        let path = self.on_disk(real);
+        let current = self
+            .exec
+            .run("stat", &["-c", "%U", &path.to_string_lossy()])
+            .ok()
+            .filter(|o| o.success)
+            .map(|o| o.stdout);
+        if current.as_deref() == Some(owner) {
+            self.note(
+                "unchanged",
+                format_args!("cache {} already owned by {owner}", real.display()),
+            );
+            return Ok(());
+        }
+        self.changed = true;
+        if self.opts.dry_run {
+            self.note(
+                "would adopt",
+                format_args!("cache {} (chown -R {owner}:{owner})", real.display()),
+            );
+            return Ok(());
+        }
+        self.chown(real, owner, true)?;
+        self.note(
+            "adopted",
+            format_args!("cache {} (chown -R {owner}:{owner})", real.display()),
+        );
         Ok(())
     }
 
@@ -455,8 +713,8 @@ impl Installer<'_> {
             );
             return Ok(());
         }
-        let user = self.opts.run_as.clone();
-        let data = self.layout.data.clone();
+        let user = self.job_owner();
+        let data = self.layout.job_home.clone();
         let staging = data.join("runner.new");
         let tarball = data.join(self.opts.pin.filename());
         let (staging_fs, tarball_fs) = (self.on_disk(&staging), self.on_disk(&tarball));
@@ -515,14 +773,22 @@ impl Installer<'_> {
 
     fn drone_config(&self) -> Result<String, InstallError> {
         let o = self.opts;
+        // A host's reclaim policy is edited in place; reinstalling must not
+        // reset it.
+        let reclaim = std::fs::read_to_string(self.on_disk(&self.layout.config()))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("reclaim").cloned())
+            .and_then(|r| serde_json::from_value(r).ok())
+            .unwrap_or_default();
         let cfg = DroneConfig {
             queen_url: o.queen_url.clone(),
             token_file: Some(self.layout.token_file()),
             ca_cert_path: o.ca_cert.as_ref().map(|_| self.layout.ca_cert()),
             allow_insecure: o.allow_insecure,
             runner_dir: self.layout.runner(),
-            work_root: self.layout.data.join("work"),
-            cache_root: self.layout.data.join("cache"),
+            work_root: self.layout.work(),
+            cache_root: self.layout.cache_root.clone(),
             docker_bin: "docker".to_owned(),
             heartbeat_secs: 10,
             max_job_secs: 6 * 3600,
@@ -532,6 +798,17 @@ impl Installer<'_> {
             max_leases: o.max_leases,
             reserve_mem_mib: crate::allocator::HostCaps::default().reserve_mem_mib,
             slots: None,
+            state_dir: Some(self.layout.data.clone()),
+            job_user: self.job_user().map(|name| JobUser {
+                name: name.to_owned(),
+                home: self.layout.job_home.clone(),
+                priv_bin: "setpriv".to_owned(),
+            }),
+            extra_labels: o.extra_labels.clone(),
+            runner_env: o.runner_env.clone(),
+            job_started_hook: o.job_started_hook.clone(),
+            job_completed_hook: o.job_completed_hook.clone(),
+            reclaim,
             caches: crate::drone::config::CachesConfig {
                 git: crate::drone::config::GitCaches {
                     mirrors: o.git_mirrors.clone(),
@@ -565,7 +842,8 @@ impl Installer<'_> {
         let before = self.changed;
         match self.opts.platform {
             Platform::Linux => {
-                let unit = render_systemd_unit(&bin, &cfg, &data, &user, drain);
+                let unit =
+                    render_systemd_unit(&bin, &cfg, &data, &user, drain, self.job_user().is_some());
                 let unit_changed = self.write_file(&service_file, unit.as_bytes(), 0o644, None)?;
                 if self.opts.dry_run {
                     return Ok(());
@@ -615,21 +893,36 @@ impl Installer<'_> {
 pub fn install(opts: &InstallOptions, exec: &dyn Exec) -> Result<Vec<String>, InstallError> {
     let mut i = Installer {
         opts,
-        layout: Layout::new(opts.platform),
+        layout: Layout::new(
+            opts.platform,
+            opts.platform == Platform::Linux && opts.job_user.is_some(),
+            opts.cache_root.as_deref(),
+        ),
         exec,
         lines: Vec::new(),
         changed: false,
     };
     i.preflight()?;
     let run_as = opts.run_as.clone();
-    let owner = Some(run_as.as_str());
+    let job_owner = i.job_owner();
 
-    i.ensure_user()?;
-    let (config_dir, data) = (i.layout.config_dir.clone(), i.layout.data.clone());
-    i.ensure_dir(&config_dir, 0o755, None)?;
-    i.ensure_dir(&data, 0o755, owner)?;
-    for sub in ["work", "cache"] {
-        i.ensure_dir(&data.join(sub), 0o755, owner)?;
+    i.ensure_users()?;
+    let (config_dir, data, job_home) = (
+        i.layout.config_dir.clone(),
+        i.layout.data.clone(),
+        i.layout.job_home.clone(),
+    );
+    // The config directory holds the enrollment token: the drone's user only.
+    i.ensure_dir(&config_dir, 0o700, Some(&run_as))?;
+    i.ensure_dir(&data, 0o755, Some(&run_as))?;
+    if job_home != data {
+        i.ensure_dir(&job_home, 0o755, Some(&job_owner))?;
+    }
+    let (work, cache_root) = (i.layout.work(), i.layout.cache_root.clone());
+    i.ensure_dir(&work, 0o755, Some(&job_owner))?;
+    i.ensure_dir(&cache_root, 0o755, Some(&job_owner))?;
+    if opts.adopt_cache {
+        i.adopt_cache(&cache_root, &job_owner)?;
     }
     i.install_binary()?;
     i.install_runner()?;
@@ -638,15 +931,18 @@ pub fn install(opts: &InstallOptions, exec: &dyn Exec) -> Result<Vec<String>, In
     if let Some(ca) = &opts.ca_cert {
         let pem = fs::read(ca).map_err(io_err(ca))?;
         let target = i.layout.ca_cert();
-        config_changed |= i.write_file(&target, &pem, 0o644, None)?;
+        config_changed |= i.write_file(&target, &pem, 0o600, Some(&run_as))?;
     }
     let token_file = i.layout.token_file();
     let token = format!("{}\n", opts.token.expose());
-    config_changed |= i.write_file(&token_file, token.as_bytes(), 0o600, owner)?;
+    config_changed |= i.write_file(&token_file, token.as_bytes(), 0o600, Some(&run_as))?;
     let config = i.drone_config()?;
     let config_path = i.layout.config();
-    config_changed |= i.write_file(&config_path, config.as_bytes(), 0o644, None)?;
+    config_changed |= i.write_file(&config_path, config.as_bytes(), 0o600, Some(&run_as))?;
 
+    if !opts.no_self_update {
+        i.install_updater()?;
+    }
     i.install_service(config_changed)?;
 
     let mut lines = i.lines;
@@ -673,6 +969,7 @@ mod tests {
     use super::*;
     use crate::drone::cleanup::testing::FakeExec;
     use crate::drone::pins::pin_for;
+    use std::sync::Arc;
 
     fn tarball_bytes() -> Vec<u8> {
         b"fake runner tarball".to_vec()
@@ -711,11 +1008,20 @@ mod tests {
             max_mem_mib: Some(24576),
             max_leases: None,
             run_as: "borg".into(),
+            job_user: Some("borg-job".into()),
+            cache_root: None,
+            adopt_cache: false,
+            extra_labels: vec!["on-prem".into()],
+            runner_env: BTreeMap::new(),
+            job_started_hook: None,
+            job_completed_hook: None,
             root: e.root.clone(),
             platform: Platform::Linux,
             pin: e.pin.clone(),
             binary: e.binary.clone(),
             dry_run: false,
+            update_manifest_url: None,
+            no_self_update: false,
             skip_root_check: true,
             drain_timeout_secs: 3600,
             git_mirrors: vec!["example-org/app".into()],
@@ -728,12 +1034,13 @@ mod tests {
         let x = FakeExec::default();
         x.on("getent group docker", "docker:x:999:");
         x.on("id -nG borg", "borg docker");
+        x.on("id -nG borg-job", "borg-job docker");
         x
     }
 
     /// Fake tar/curl side effects on the staging tree.
-    fn with_downloads(x: FakeExec) -> impl Exec {
-        struct Hooked(FakeExec);
+    fn with_downloads(x: impl Into<Arc<FakeExec>>) -> impl Exec {
+        struct Hooked(Arc<FakeExec>);
         impl Exec for Hooked {
             fn run(&self, program: &str, args: &[&str]) -> io::Result<crate::drone::exec::Output> {
                 match program {
@@ -744,7 +1051,7 @@ mod tests {
                 self.0.run(program, args)
             }
         }
-        Hooked(x)
+        Hooked(x.into())
     }
 
     fn calls(x: &FakeExec) -> Vec<String> {
@@ -759,9 +1066,12 @@ mod tests {
             Path::new("/var/lib/borg"),
             "borg",
             3600,
+            true,
         );
         for line in [
             "User=borg",
+            "AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_SETPCAP",
+            "CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SETPCAP",
             "KillMode=mixed",
             "TimeoutStopSec=3720",
             "ExecStart=/usr/local/bin/borg drone run --config /etc/borg/drone.json",
@@ -769,6 +1079,18 @@ mod tests {
         ] {
             assert!(unit.contains(line), "{line}\n{unit}");
         }
+        let single = render_systemd_unit(
+            Path::new("/b"),
+            Path::new("/c"),
+            Path::new("/d"),
+            "borg",
+            60,
+            false,
+        );
+        assert!(
+            !single.contains("Capabilit"),
+            "no capabilities without a job user"
+        );
         let plist = render_launchd_plist(
             Path::new("/usr/local/bin/borg"),
             Path::new("/c.json"),
@@ -793,12 +1115,15 @@ mod tests {
         x.on("getent group docker", "docker:x:999:");
         x.fail("systemctl is-enabled --quiet borg-drone.service");
         x.fail("id -u borg");
+        x.fail("id -u borg-job");
         let ex = with_downloads(x);
         let first = install(&opts(&e), &ex).unwrap();
         let text = first.join("\n");
         for needle in [
-            "created user borg",
+            "created user borg\n",
+            "created user borg-job",
             "added user borg to group docker",
+            "added user borg-job to group docker",
             "created /usr/local/bin/borg",
             "installed actions-runner 2.337.0",
             "created /etc/borg/drone.token",
@@ -829,9 +1154,23 @@ mod tests {
         assert_eq!(cfg.caches.git.mirrors, ["example-org/app"]);
         assert!(
             e.root
-                .join("var/lib/borg/runner/.borg-runner-version")
+                .join("var/lib/borg-job/runner/.borg-runner-version")
                 .exists()
         );
+
+        // A reinstall keeps a reclaim policy the operator added to the config.
+        let path = e.root.join("etc/borg/drone.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        v["reclaim"] = serde_json::json!({
+            "enabled": true, "dry_run": false,
+            "roots": [{"path": "/srv/builds", "kind": "worktree"}]
+        });
+        fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+        let again = install(&opts(&e), &with_downloads(exec())).unwrap();
+        let kept = DroneConfig::from_json(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(kept.reclaim.enabled && !kept.reclaim.dry_run, "{again:?}");
+        assert_eq!(kept.reclaim.roots.len(), 1);
 
         // Second run on the now-configured host.
         let y = exec();
@@ -870,7 +1209,8 @@ mod tests {
         let out = install(&o, &with_downloads(exec())).unwrap().join("\n");
         assert!(out.contains("installed actions-runner 2.999.0"), "{out}");
         let marker =
-            fs::read_to_string(e.root.join("var/lib/borg/runner/.borg-runner-version")).unwrap();
+            fs::read_to_string(e.root.join("var/lib/borg-job/runner/.borg-runner-version"))
+                .unwrap();
         assert!(marker.starts_with("2.999.0 "));
     }
 
@@ -882,7 +1222,7 @@ mod tests {
         let x = exec();
         let err = install(&o, &with_downloads(x)).unwrap_err();
         assert!(matches!(err, InstallError::Checksum { .. }), "{err}");
-        assert!(!e.root.join("var/lib/borg/runner").exists());
+        assert!(!e.root.join("var/lib/borg-job/runner").exists());
         assert!(
             !e.root
                 .join("etc/systemd/system/borg-drone.service")
@@ -971,5 +1311,142 @@ mod tests {
         y.fail("id -u builder");
         let err = install(&o, &y).unwrap_err().to_string();
         assert!(err.contains("create it first"), "{err}");
+    }
+
+    fn mode(root: &Path, rel: &str) -> u32 {
+        fs::metadata(root.join(rel)).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_job_user_is_separate_and_cannot_reach_the_drones_files() {
+        let e = env();
+        let x = Arc::new(FakeExec::default());
+        x.fail("id -u borg");
+        x.fail("id -u borg-job");
+        install(&opts(&e), &with_downloads(Arc::clone(&x))).unwrap();
+
+        assert_eq!(
+            mode(&e.root, "etc/borg"),
+            0o700,
+            "config dir is the drone's alone"
+        );
+        assert_eq!(mode(&e.root, "etc/borg/drone.token"), 0o600);
+        assert_eq!(mode(&e.root, "etc/borg/drone.json"), 0o600);
+        let cfg = DroneConfig::from_json(
+            &fs::read_to_string(e.root.join("etc/borg/drone.json")).unwrap(),
+        )
+        .unwrap();
+        let job = cfg.job_user.expect("job user configured");
+        assert_eq!(
+            (job.name.as_str(), job.home.as_path()),
+            ("borg-job", Path::new("/var/lib/borg-job"))
+        );
+        assert_eq!(cfg.work_root, Path::new("/var/lib/borg-job/work"));
+        assert_eq!(cfg.cache_root, Path::new("/var/lib/borg-job/cache"));
+        assert_eq!(cfg.extra_labels, ["on-prem"]);
+
+        let calls = x.calls();
+        let root = e.root.display();
+        for owned in [
+            format!("chown borg:borg {root}/etc/borg"),
+            format!("chown borg:borg {root}/etc/borg/drone.token"),
+            format!("chown borg:borg {root}/etc/borg/drone.json"),
+            format!("chown borg-job:borg-job {root}/var/lib/borg-job/work"),
+            format!("chown borg-job:borg-job {root}/var/lib/borg-job/cache"),
+            format!("chown -R borg-job:borg-job {root}/var/lib/borg-job/runner"),
+        ] {
+            assert!(calls.contains(&owned), "missing `{owned}` in {calls:?}");
+        }
+        assert!(
+            !calls.iter().any(|c| c.starts_with("chown")
+                && c.contains("borg-job")
+                && c.contains("/etc/borg")),
+            "the job user is never given the drone's files: {calls:?}"
+        );
+        assert!(calls.contains(&"usermod -aG docker borg-job".to_owned()));
+        let unit =
+            fs::read_to_string(e.root.join("etc/systemd/system/borg-drone.service")).unwrap();
+        assert!(
+            unit.contains("User=borg\n") && unit.contains("AmbientCapabilities="),
+            "{unit}"
+        );
+    }
+
+    #[test]
+    fn without_a_job_user_everything_is_one_account_and_unit_has_no_capabilities() {
+        let e = env();
+        let mut o = opts(&e);
+        o.job_user = None;
+        let x = Arc::new(exec());
+        let out = install(&o, &with_downloads(Arc::clone(&x)))
+            .unwrap()
+            .join("\n");
+        assert!(!out.contains("borg-job"), "{out}");
+        let cfg = DroneConfig::from_json(
+            &fs::read_to_string(e.root.join("etc/borg/drone.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(cfg.job_user.is_none());
+        assert_eq!(cfg.work_root, Path::new("/var/lib/borg/work"));
+        let unit =
+            fs::read_to_string(e.root.join("etc/systemd/system/borg-drone.service")).unwrap();
+        assert!(!unit.contains("Capabilit"));
+        assert!(!x.calls().iter().any(|c| c.starts_with("setpriv")));
+    }
+
+    #[test]
+    fn a_missing_setpriv_is_a_clear_preflight_error() {
+        let e = env();
+        let x = exec();
+        x.fail("setpriv --version");
+        let err = install(&opts(&e), &x).unwrap_err().to_string();
+        assert!(
+            err.contains("setpriv") && err.contains("--no-job-user"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_existing_cache_can_be_adopted_once() {
+        let e = env();
+        let mut o = opts(&e);
+        o.cache_root = Some("/srv/example-cache".into());
+        o.adopt_cache = true;
+        let cache = e.root.join("srv/example-cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("warm-entry"), "21 GB of sccache").unwrap();
+
+        let x = Arc::new(exec());
+        let first = install(&o, &with_downloads(Arc::clone(&x)))
+            .unwrap()
+            .join("\n");
+        assert!(
+            first.contains("adopted cache /srv/example-cache (chown -R borg-job:borg-job)"),
+            "{first}"
+        );
+        assert!(
+            x.calls()
+                .contains(&format!("chown -R borg-job:borg-job {}", cache.display()))
+        );
+        assert_eq!(
+            fs::read_to_string(cache.join("warm-entry")).unwrap(),
+            "21 GB of sccache",
+            "contents are kept"
+        );
+        let cfg = DroneConfig::from_json(
+            &fs::read_to_string(e.root.join("etc/borg/drone.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.cache_root, Path::new("/srv/example-cache"));
+
+        // Already owned by the job user: nothing to do on the next run.
+        let y = exec();
+        y.on(&format!("stat -c %U {}", cache.display()), "borg-job");
+        let second = install(&o, &with_downloads(y)).unwrap().join("\n");
+        assert!(
+            second.contains("cache /srv/example-cache already owned by borg-job"),
+            "{second}"
+        );
+        assert!(second.contains("nothing to change"), "{second}");
     }
 }

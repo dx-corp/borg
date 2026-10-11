@@ -26,6 +26,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bid::{
+    ClassPressure, DroneBid, ProfileScore, ScoreWeights, demand_pressure, profile_term, score,
+};
 use crate::classes::{Class, ClassSpec, Classes, Scope};
 use crate::probe::Capacity;
 
@@ -62,6 +65,17 @@ pub struct DroneState {
     /// False while the drone drains (SIGTERM) or yields to its owner.
     pub accepting: bool,
     pub max_leases: Option<u32>,
+    /// Live (unexpired) bids. Empty means a legacy drone: always eligible,
+    /// neutral score. See [`crate::bid`].
+    #[serde(default)]
+    pub bids: Vec<DroneBid>,
+    /// Learned per-class profiles; add to the score, see [`crate::profile`].
+    #[serde(default)]
+    pub profiles: Vec<ProfileScore>,
+    /// Classes the build environment contract does not admit on this drone
+    /// right now; see [`crate::envcontract`]. The allocator never places them.
+    #[serde(default)]
+    pub blocked_classes: Vec<Class>,
 }
 
 impl DroneState {
@@ -77,6 +91,9 @@ impl DroneState {
             docker: capacity.docker_usable,
             accepting: true,
             max_leases: caps.max_leases,
+            bids: Vec::new(),
+            profiles: Vec::new(),
+            blocked_classes: Vec::new(),
         }
     }
 }
@@ -146,6 +163,7 @@ pub struct AllocatorInput {
     /// Demand that has waited at least this long is starving; `None` turns
     /// the guard off.
     pub starvation_after_secs: Option<u64>,
+    pub weights: ScoreWeights,
 }
 
 /// An instruction to mint one runner and hand it to one drone.
@@ -182,6 +200,17 @@ pub struct Allocation {
     pub grants: Vec<Grant>,
     pub unmet: Vec<Unmet>,
     pub reserved_for: Vec<Reservation>,
+    /// Demand pressure per class this pass, to publish to drones.
+    pub pressure: Vec<ClassPressure>,
+    /// Slots each class could still be granted before this pass's grants.
+    pub idle: Vec<ClassIdle>,
+}
+
+/// Idle room for one class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassIdle {
+    pub class: Class,
+    pub idle_slots: u32,
 }
 
 /// How many leases of `spec` this drone could hold if it were empty.
@@ -195,6 +224,42 @@ pub fn max_slots(drone: &DroneState, spec: &ClassSpec) -> u32 {
     u32::try_from(by_mem.min(by_cpu).min(by_cap)).unwrap_or(u32::MAX)
 }
 
+/// What is left of a drone's budget after the leases it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Room {
+    pub mem_mib: u64,
+    pub vcpu: u32,
+    pub leases_left: Option<u32>,
+}
+
+/// The room left on `drone` after `held` (leases on other drones are ignored).
+pub fn free_room(drone: &DroneState, held: &[ActiveLease], classes: &Classes) -> Room {
+    let mut room = Room {
+        mem_mib: drone.mem_mib,
+        vcpu: drone.vcpu,
+        leases_left: drone.max_leases,
+    };
+    for l in held.iter().filter(|l| l.drone_id == drone.id) {
+        let spec = classes.spec(l.class);
+        room.mem_mib = room.mem_mib.saturating_sub(spec.mem_mib);
+        room.vcpu = room.vcpu.saturating_sub(spec.vcpu);
+        room.leases_left = room.leases_left.map(|n| n.saturating_sub(1));
+    }
+    room
+}
+
+/// Whole leases of `spec` that fit in `room` right now; 0 if the drone takes
+/// no new leases or lacks Docker for the class.
+pub fn free_slots(drone: &DroneState, room: &Room, spec: &ClassSpec) -> u32 {
+    if !drone.accepting || (spec.docker && !drone.docker) {
+        return 0;
+    }
+    let by_mem = room.mem_mib / spec.mem_mib.max(1);
+    let by_cpu = u64::from(room.vcpu / spec.vcpu.max(1));
+    let by_cap = room.leases_left.map_or(u64::MAX, u64::from);
+    u32::try_from(by_mem.min(by_cpu).min(by_cap)).unwrap_or(u32::MAX)
+}
+
 /// Remaining room on a drone while allocating.
 struct Free<'a> {
     drone: &'a DroneState,
@@ -202,9 +267,39 @@ struct Free<'a> {
     vcpu: u32,
     leases_left: Option<u32>,
     in_flight: u32,
+    /// Grants made to this drone this pass, per key (bounds `available_slots`).
+    granted: BTreeMap<(Class, Scope), u32>,
 }
 
 impl Free<'_> {
+    /// The score this drone offers for `(class, scope)` at `pressure`, or
+    /// `None` if it declines.
+    fn offer(
+        &self,
+        class: Class,
+        scope: Scope,
+        pressure: u16,
+        weights: &ScoreWeights,
+    ) -> Option<i64> {
+        let learned = self
+            .drone
+            .profiles
+            .iter()
+            .find(|p| p.class == class)
+            .map_or(0, |p| profile_term(p, weights));
+        if self.drone.bids.is_empty() {
+            return Some(learned);
+        }
+        let bid = self
+            .drone
+            .bids
+            .iter()
+            .find(|b| b.class == class && b.scope == scope)?;
+        let used = self.granted.get(&(class, scope)).copied().unwrap_or(0);
+        (used < bid.available_slots && pressure >= bid.min_pressure.min(1000))
+            .then(|| score(bid, weights).saturating_add(learned))
+    }
+
     fn fits(&self, spec: &ClassSpec) -> bool {
         self.drone.accepting
             && (!spec.docker || self.drone.docker)
@@ -214,6 +309,14 @@ impl Free<'_> {
     }
 
     /// Could this drone ever hold `spec` if it were empty?
+    /// Whole leases of `spec` the remaining room holds.
+    fn slots(&self, spec: &ClassSpec) -> u32 {
+        let by_mem = self.mem_mib / spec.mem_mib.max(1);
+        let by_cpu = u64::from(self.vcpu / spec.vcpu.max(1));
+        let by_cap = self.leases_left.map_or(u64::MAX, u64::from);
+        u32::try_from(by_mem.min(by_cpu).min(by_cap)).unwrap_or(u32::MAX)
+    }
+
     fn could_ever_fit(&self, spec: &ClassSpec) -> bool {
         self.drone.accepting
             && (!spec.docker || self.drone.docker)
@@ -245,27 +348,36 @@ fn sum_counts<I: IntoIterator<Item = (Class, Scope, u32)>>(items: I) -> Counts {
 fn place(
     input: &AllocatorInput,
     free: &mut BTreeMap<&str, Free<'_>>,
+    pressure: &BTreeMap<Class, u16>,
     reserved: &BTreeMap<String, (Class, Scope)>,
     (scope, class): (Scope, Class),
     wanted: u32,
     out: &mut Vec<Grant>,
 ) -> u32 {
+    let level = pressure.get(&class).copied().unwrap_or(0);
     let spec = input.classes.spec(class);
     let mut placed = 0;
     for _ in 0..wanted {
-        // Tightest fit, then id: keeps hosts packed and output stable.
+        // Highest bid score; then tightest fit, which keeps hosts packed; then
+        // id, which keeps the output stable.
         let best = free
             .iter_mut()
             .filter(|(id, f)| {
                 f.fits(spec)
+                    && !f.drone.blocked_classes.contains(&class)
                     && reserved
                         .get(**id)
                         .is_none_or(|held| *held == (class, scope))
             })
-            .min_by_key(|(id, f)| (f.mem_mib - spec.mem_mib, **id))
-            .map(|(_, f)| f);
+            .filter_map(|(id, f)| {
+                let s = f.offer(class, scope, level, &input.weights)?;
+                Some((s, id, f))
+            })
+            .min_by_key(|(s, id, f)| (std::cmp::Reverse(*s), f.mem_mib - spec.mem_mib, **id))
+            .map(|(_, _, f)| f);
         let Some(f) = best else { break };
         f.take(spec);
+        *f.granted.entry((class, scope)).or_default() += 1;
         placed += 1;
         out.push(Grant {
             drone_id: f.drone.id.clone(),
@@ -291,6 +403,7 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
             vcpu: drone.vcpu,
             leases_left: drone.max_leases,
             in_flight: 0,
+            granted: BTreeMap::new(),
         });
     }
     for lease in &input.leases {
@@ -338,20 +451,51 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
     }
 
     let initial_need = need.clone();
-    let mut out = Allocation::default();
+    let aged = |class, scope| {
+        input.starvation_after_secs.is_some_and(|after| {
+            input
+                .queue_ages
+                .iter()
+                .any(|a| a.class == class && a.scope == scope && a.oldest_age_secs >= after)
+        })
+    };
+    let mut pressure: BTreeMap<Class, u16> = BTreeMap::new();
+    let mut idle_by_class: Vec<ClassIdle> = Vec::new();
+    for class in Class::ALL {
+        let spec = input.classes.spec(class);
+        let mut shortfall = 0u32;
+        let mut starving = false;
+        for scope in Scope::ALL {
+            let queued_here = get(&queued, class, scope);
+            shortfall += queued_here.min(initial_need.get(&(scope, class)).copied().unwrap_or(0));
+            starving |= queued_here > 0 && aged(class, scope);
+        }
+        let idle = free
+            .values()
+            .filter(|f| f.fits(spec))
+            .map(|f| f.slots(spec))
+            .fold(0u32, u32::saturating_add);
+        pressure.insert(class, demand_pressure(shortfall, idle, starving));
+        idle_by_class.push(ClassIdle {
+            class,
+            idle_slots: idle,
+        });
+    }
+    let mut out = Allocation {
+        pressure: pressure
+            .iter()
+            .map(|(&class, &pressure)| ClassPressure { class, pressure })
+            .collect(),
+        idle: idle_by_class,
+        ..Allocation::default()
+    };
     let mut placed: BTreeMap<(Scope, Class), u32> = BTreeMap::new();
     let mut reserved: BTreeMap<String, (Class, Scope)> = BTreeMap::new();
 
     // Starvation guard. Demand that has waited too long is placed first; if it
     // still cannot fit, hold back the drone that will free up soonest so the
     // stream of smaller jobs cannot keep it full.
-    if let Some(after) = input.starvation_after_secs {
-        let aged = |class, scope| {
-            input
-                .queue_ages
-                .iter()
-                .any(|a| a.class == class && a.scope == scope && a.oldest_age_secs >= after)
-        };
+    if input.starvation_after_secs.is_some() {
         for scope in Scope::ALL {
             for class in Class::ALL.into_iter().rev() {
                 let wanted = need.get(&(scope, class)).copied().unwrap_or(0);
@@ -361,6 +505,7 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
                 let n = place(
                     input,
                     &mut free,
+                    &pressure,
                     &reserved,
                     (scope, class),
                     wanted,
@@ -372,7 +517,11 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
                     let spec = input.classes.spec(class);
                     let target = free
                         .iter()
-                        .filter(|(id, f)| !reserved.contains_key(**id) && f.could_ever_fit(spec))
+                        .filter(|(id, f)| {
+                            !reserved.contains_key(**id)
+                                && f.could_ever_fit(spec)
+                                && !f.drone.blocked_classes.contains(&class)
+                        })
                         .min_by_key(|(id, f)| (f.in_flight, **id))
                         .map(|(id, _)| (*id).to_owned());
                     if let Some(id) = target {
@@ -394,6 +543,7 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
             let n = place(
                 input,
                 &mut free,
+                &pressure,
                 &reserved,
                 (scope, class),
                 wanted,
@@ -434,6 +584,9 @@ mod tests {
             docker: true,
             accepting: true,
             max_leases: None,
+            bids: vec![],
+            profiles: vec![],
+            blocked_classes: vec![],
         }
     }
 
@@ -453,6 +606,7 @@ mod tests {
             warm_floors: vec![],
             queue_ages: vec![],
             starvation_after_secs: None,
+            weights: ScoreWeights::default(),
         }
     }
 
@@ -514,9 +668,58 @@ mod tests {
     }
 
     #[test]
+    fn free_room_and_slots_subtract_what_the_drone_already_holds() {
+        let classes = Classes::default();
+        let d = host("a"); // 28 GiB, 16 vCPU, docker
+        let held = vec![
+            lease("a", Class::Heavy, Scope::Pr, LeaseState::Running),
+            lease("b", Class::Heavy, Scope::Pr, LeaseState::Running),
+        ];
+        let room = free_room(&d, &held, &classes);
+        let heavy = classes.spec(Class::Heavy);
+        assert_eq!(room.mem_mib, d.mem_mib - heavy.mem_mib);
+        assert_eq!(room.vcpu, d.vcpu - heavy.vcpu);
+        // Theoretical: one heavy fits an empty host; with one held, none do.
+        let empty = free_room(&d, &[], &classes);
+        assert_eq!(free_slots(&d, &empty, heavy), max_slots(&d, heavy));
+        assert_eq!(free_slots(&d, &room, heavy), 0);
+        assert!(free_slots(&d, &room, classes.spec(Class::Light)) > 0);
+        // A draining drone and a docker-less one have no free slots.
+        let draining = DroneState {
+            accepting: false,
+            ..host("c")
+        };
+        assert_eq!(free_slots(&draining, &empty, heavy), 0);
+        let nodocker = DroneState {
+            docker: false,
+            ..host("e")
+        };
+        assert_eq!(
+            free_slots(&nodocker, &empty, classes.spec(Class::Medium)),
+            0
+        );
+        assert!(free_slots(&nodocker, &empty, classes.spec(Class::Light)) > 0);
+        // The lease cap counts too.
+        let capped = DroneState {
+            max_leases: Some(1),
+            ..host("f")
+        };
+        let one = vec![lease("f", Class::Light, Scope::Pr, LeaseState::Running)];
+        assert_eq!(
+            free_slots(
+                &capped,
+                &free_room(&capped, &one, &classes),
+                classes.spec(Class::Light)
+            ),
+            0
+        );
+    }
+
+    #[test]
     fn no_demand_no_floor_no_grants() {
         let a = allocate(&input(&[], vec![host("a")]));
-        assert_eq!(a, Allocation::default());
+        assert!(a.grants.is_empty() && a.unmet.is_empty() && a.reserved_for.is_empty());
+        assert!(a.pressure.iter().all(|p| p.pressure == 0));
     }
 
     #[test]
@@ -1000,6 +1203,9 @@ mod tests {
                 docker: false,
                 accepting: true,
                 max_leases: Some(2),
+                bids: vec![],
+                profiles: vec![],
+                blocked_classes: vec![],
             },
             DroneState {
                 id: "c".into(),
@@ -1008,6 +1214,9 @@ mod tests {
                 docker: true,
                 accepting: true,
                 max_leases: None,
+                bids: vec![],
+                profiles: vec![],
+                blocked_classes: vec![],
             },
         ];
         for lm in 0..3 {
@@ -1034,5 +1243,250 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- bids -----------------------------------------------------------
+
+    use crate::bid::DroneBid;
+
+    fn bid(class: Class, scope: Scope) -> DroneBid {
+        DroneBid {
+            class,
+            scope,
+            available_slots: 8,
+            estimated_start_ms: 0,
+            cache_affinity: 0,
+            resource_pressure: 0,
+            estimated_cost: 1000,
+            confidence: 1000,
+            expires_at: i64::MAX,
+            min_pressure: 0,
+        }
+    }
+
+    fn bidder(id: &str, b: DroneBid) -> DroneState {
+        DroneState {
+            bids: vec![b],
+            ..host(id)
+        }
+    }
+
+    fn only_drone(a: &Allocation) -> &str {
+        assert_eq!(a.grants.len(), 1, "{a:?}");
+        &a.grants[0].drone_id
+    }
+
+    #[test]
+    fn the_warmest_bid_wins_over_the_tightest_fit() {
+        let mut cold = bid(Class::Light, Scope::Pr);
+        cold.cache_affinity = 100;
+        let mut warm = bid(Class::Light, Scope::Pr);
+        warm.cache_affinity = 900;
+        // "a" is the emptier host and would lose a pure tightest-fit contest
+        // only if it were fuller; give "b" a lease so tightest-fit prefers b.
+        let mut i = input(
+            &[(Class::Light, Scope::Pr, 1)],
+            vec![bidder("a", warm), bidder("b", cold)],
+        );
+        i.leases = vec![lease("b", Class::Medium, Scope::Pr, LeaseState::Running)];
+        let a = allocate(&i);
+        assert_eq!(only_drone(&a), "a");
+    }
+
+    #[test]
+    fn loaded_slow_expensive_hosts_lose_and_ties_fall_back_to_fit_then_id() {
+        let mut loaded = bid(Class::Light, Scope::Pr);
+        loaded.resource_pressure = 800;
+        let i = input(
+            &[(Class::Light, Scope::Pr, 1)],
+            vec![
+                bidder("a", loaded),
+                bidder("b", bid(Class::Light, Scope::Pr)),
+            ],
+        );
+        assert_eq!(only_drone(&allocate(&i)), "b");
+
+        // Equal bids: tightest fit (b has a lease), then id.
+        let mut i = input(
+            &[(Class::Light, Scope::Pr, 1)],
+            vec![
+                bidder("a", bid(Class::Light, Scope::Pr)),
+                bidder("b", bid(Class::Light, Scope::Pr)),
+            ],
+        );
+        i.leases = vec![lease("b", Class::Light, Scope::Pr, LeaseState::Running)];
+        assert_eq!(only_drone(&allocate(&i)), "b");
+        i.leases.clear();
+        assert_eq!(only_drone(&allocate(&i)), "a");
+    }
+
+    #[test]
+    fn a_bidding_drone_declines_keys_it_did_not_bid_on_and_exhausted_bids() {
+        let i = input(
+            &[(Class::Medium, Scope::Pr, 1)],
+            vec![bidder("a", bid(Class::Light, Scope::Pr))],
+        );
+        assert!(allocate(&i).grants.is_empty());
+
+        let mut one = bid(Class::Light, Scope::Pr);
+        one.available_slots = 2;
+        let i = input(&[(Class::Light, Scope::Pr, 5)], vec![bidder("a", one)]);
+        let a = allocate(&i);
+        assert_eq!(count(&a, Class::Light, Scope::Pr), 2);
+        assert_eq!(a.unmet[0].count, 3);
+    }
+
+    #[test]
+    fn legacy_drones_without_bids_stay_eligible_with_a_neutral_score() {
+        let mut bad = bid(Class::Light, Scope::Pr);
+        bad.resource_pressure = 900;
+        // The legacy drone ("a", no bids) beats a heavily loaded bidder.
+        let i = input(
+            &[(Class::Light, Scope::Pr, 1)],
+            vec![host("a"), bidder("b", bad)],
+        );
+        assert_eq!(only_drone(&allocate(&i)), "a");
+    }
+
+    #[test]
+    fn response_thresholds_gate_participation_on_demand_pressure() {
+        let mut shy = bid(Class::Light, Scope::Pr);
+        shy.min_pressure = 600;
+        // One queued job against eight idle slots: low pressure, shy host out.
+        let i = input(&[(Class::Light, Scope::Pr, 1)], vec![bidder("a", shy)]);
+        let a = allocate(&i);
+        assert!(a.grants.is_empty());
+        assert!(
+            a.pressure
+                .iter()
+                .any(|p| p.class == Class::Light && p.pressure < 600)
+        );
+
+        // Many queued jobs against the same room: pressure crosses the
+        // threshold and the shy host joins.
+        let i = input(&[(Class::Light, Scope::Pr, 30)], vec![bidder("a", shy)]);
+        let a = allocate(&i);
+        assert!(!a.grants.is_empty());
+        assert_eq!(
+            a.pressure
+                .iter()
+                .find(|p| p.class == Class::Light)
+                .map(|p| p.pressure),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn starving_demand_overrides_every_threshold() {
+        let mut shy = bid(Class::Light, Scope::Pr);
+        shy.min_pressure = 1000;
+        let mut i = input(&[(Class::Light, Scope::Pr, 1)], vec![bidder("a", shy)]);
+        assert!(allocate(&i).grants.is_empty());
+        aged(&mut i, Class::Light, Scope::Pr, 500);
+        assert_eq!(only_drone(&allocate(&i)), "a");
+    }
+
+    #[test]
+    fn a_warm_floor_is_placed_only_on_always_willing_hosts() {
+        let mut shy = bid(Class::Medium, Scope::Main);
+        shy.min_pressure = 200;
+        let mut i = input(&[], vec![bidder("a", shy)]);
+        i.warm_floors = default_warm_floors();
+        assert!(allocate(&i).grants.is_empty());
+        let eager = bid(Class::Medium, Scope::Main);
+        i.drones = vec![bidder("b", eager)];
+        assert_eq!(only_drone(&allocate(&i)), "b");
+    }
+
+    #[test]
+    fn bid_scoring_is_deterministic_and_never_over_grants() {
+        let mut drones = Vec::new();
+        for (n, id) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            let mut b = bid(Class::Light, Scope::Pr);
+            b.cache_affinity = u16::try_from(n * 250).unwrap();
+            b.available_slots = 3;
+            drones.push(bidder(id, b));
+        }
+        let i = input(&[(Class::Light, Scope::Pr, 9)], drones);
+        let first = allocate(&i);
+        assert_eq!(first, allocate(&i));
+        assert_within_budget(&i, &first);
+        assert_eq!(count(&first, Class::Light, Scope::Pr), 9);
+        // The warmest host fills its three slots first.
+        assert_eq!(first.grants.iter().filter(|g| g.drone_id == "d").count(), 3);
+    }
+
+    // ---- learned profiles -------------------------------------------------
+
+    fn profiled(id: &str, class: Class, speed: u32, conf: u32, rel: u32) -> DroneState {
+        DroneState {
+            profiles: vec![ProfileScore {
+                class,
+                speed_permille: speed,
+                speed_confidence_permille: conf,
+                reliability_permille: rel,
+            }],
+            ..host(id)
+        }
+    }
+
+    #[test]
+    fn a_proven_faster_host_wins_ties_that_would_go_to_the_lower_id() {
+        let i = input(
+            &[(Class::Light, Scope::Pr, 1)],
+            vec![
+                profiled("a", Class::Light, 1000, 0, 1000),
+                profiled("b", Class::Light, 1600, 1000, 1000),
+            ],
+        );
+        assert_eq!(only_drone(&allocate(&i)), "b");
+    }
+
+    #[test]
+    fn unreliable_hosts_lose_and_unproven_profiles_change_nothing() {
+        let i = input(
+            &[(Class::Light, Scope::Pr, 1)],
+            vec![
+                profiled("a", Class::Light, 1000, 1000, 700),
+                profiled("b", Class::Light, 1000, 1000, 1000),
+            ],
+        );
+        assert_eq!(only_drone(&allocate(&i)), "b");
+        // Speed with no confidence is ignored: the id tie-break decides.
+        let i = input(
+            &[(Class::Light, Scope::Pr, 1)],
+            vec![
+                profiled("a", Class::Light, 1000, 0, 1000),
+                profiled("b", Class::Light, 2000, 0, 1000),
+            ],
+        );
+        assert_eq!(only_drone(&allocate(&i)), "a");
+    }
+
+    #[test]
+    fn profiles_are_per_class_and_stack_with_bids() {
+        // The profile for medium does not help a light placement.
+        let i = input(
+            &[(Class::Light, Scope::Pr, 1)],
+            vec![
+                profiled("a", Class::Light, 1000, 0, 1000),
+                profiled("b", Class::Medium, 2000, 1000, 1000),
+            ],
+        );
+        assert_eq!(only_drone(&allocate(&i)), "a");
+        // A bidding drone's score includes its profile.
+        let mut warm = bid(Class::Light, Scope::Pr);
+        warm.cache_affinity = 100;
+        let fast = DroneState {
+            bids: vec![bid(Class::Light, Scope::Pr)],
+            ..profiled("b", Class::Light, 2000, 1000, 1000)
+        };
+        let i = input(
+            &[(Class::Light, Scope::Pr, 1)],
+            vec![bidder("a", warm), fast],
+        );
+        // a: 3*100 = 300; b: 1000 from the profile.
+        assert_eq!(only_drone(&allocate(&i)), "b");
+        assert_eq!(allocate(&i), allocate(&i));
     }
 }

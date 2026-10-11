@@ -54,6 +54,14 @@ pub struct Runner {
     pub name: String,
     pub status: String,
     pub busy: bool,
+    /// Labels GitHub reports for the runner (`self-hosted`, `Linux`, ...).
+    #[serde(default)]
+    pub labels: Vec<RunnerLabel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RunnerLabel {
+    pub name: String,
 }
 
 #[derive(Debug)]
