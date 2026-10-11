@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use borg::drone::exec::{Exec, SystemExec};
 
@@ -45,8 +46,19 @@ fn enroll_prints_only_the_token_and_list_and_remove_manage_drones() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = write_config(dir.path());
 
-    let (ok, token) = run(&["queen", "enroll", "--config", &cfg, "host-a"]);
-    assert!(ok);
+    // Emit SQL diagnostics even on a fast host: a slow-query warning in CI
+    // must never become part of the token returned on stdout.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test fixture: run the borg binary with isolated logging settings and capture both streams"
+    )]
+    let output = Command::new(borg_bin())
+        .args(["queen", "enroll", "--config", &cfg, "host-a"])
+        .env("RUST_LOG", "sqlx::query=debug")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let token = String::from_utf8(output.stdout).unwrap().trim().to_owned();
     assert!(
         token.starts_with("borg_")
             && token.len() == 5 + 64
@@ -55,6 +67,8 @@ fn enroll_prints_only_the_token_and_list_and_remove_manage_drones() {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
         "stdout is exactly the token: {token:?}"
     );
+    let diagnostics = String::from_utf8(output.stderr).unwrap();
+    assert!(diagnostics.contains("sqlx::query"), "{diagnostics}");
 
     let (ok, list) = run(&["queen", "drone", "list", "--config", &cfg]);
     assert!(ok);
