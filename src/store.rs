@@ -1,8 +1,8 @@
 //! SQLite bookkeeping: enrolled drones and lease history.
 //!
-//! The file is small and disposable in the sense that the queen re-derives
-//! truth from GitHub plus drone heartbeats after a restart. Enrollment hashes
-//! are the one thing worth backing up.
+//! Back up enrollment hashes and pending job bindings. The queen re-derives
+//! active capacity from GitHub and drone heartbeats, but losing a binding can
+//! lose the completion sample once its workflow leaves the active queue.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -141,6 +141,14 @@ CREATE TABLE IF NOT EXISTS leases (
     peak_rss_mib INTEGER
 );
 CREATE INDEX IF NOT EXISTS leases_state ON leases(state);
+CREATE INDEX IF NOT EXISTS leases_runner ON leases(runner_id, runner_name);
+-- Recover observed job identity after a queen restart, until GitHub reports completion.
+CREATE TABLE IF NOT EXISTS lease_jobs (
+    lease_id TEXT PRIMARY KEY REFERENCES leases(id) ON DELETE CASCADE,
+    repo TEXT NOT NULL,
+    job_id INTEGER NOT NULL,
+    observed_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS job_telemetry (
     lease_id        TEXT PRIMARY KEY,
     drone           TEXT NOT NULL,
@@ -899,7 +907,7 @@ impl Store {
         Ok(())
     }
 
-    fn lease_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<LeaseRow, StoreError> {
+    pub(crate) fn lease_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<LeaseRow, StoreError> {
         let jit: Option<String> = r.get("jit_config");
         Ok(LeaseRow {
             id: r.get("id"),

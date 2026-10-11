@@ -11,6 +11,7 @@
 //! Any GitHub failure before minting aborts the tick without minting: acting
 //! on a partial view of the queue would over- or under-grant.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -29,7 +30,7 @@ use crate::bid::{ClassPressure, ScoreWeights};
 use crate::classes::{Class, Scope};
 use crate::config::QueenConfig;
 use crate::envcontract::blocked_classes;
-use crate::github::{GithubClient, GithubError, QueuedJob, Runner};
+use crate::github::{GithubClient, GithubError, QueuedJob, Runner, WorkflowJob};
 use crate::health::{DroneHealth, DroneInfo, Outcome, OutcomeKind, evaluate};
 use crate::homeostasis::{Controller, KeyInput, KeyReport};
 use crate::janitor::Janitor;
@@ -349,8 +350,14 @@ impl Queen {
         self.reap(&ours, &active).await;
 
         let mut jobs = Vec::new();
+        let mut observed = Vec::new();
         for repo in &self.cfg.repos {
-            jobs.extend(self.github.queued_jobs(repo).await?);
+            for job in self.github.workflow_jobs(repo).await? {
+                if let Some(queued) = job.queued(repo)? {
+                    jobs.push(queued);
+                }
+                observed.push((repo.as_str(), job));
+            }
         }
         let (queue, demand, queue_ages) = self.summarize(&jobs, now);
 
@@ -520,6 +527,18 @@ impl Queen {
         let keep = i64::from(self.cfg.telemetry_retention_days) * 86_400;
         if let Err(e) = self.store.prune_telemetry(now_ts - keep).await {
             tracing::warn!("prune telemetry failed: {e}");
+        }
+        // Grants and the snapshot are published before optional feedback. Bound
+        // this pass so unavailable job history cannot stall subsequent ticks.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.collect_job_telemetry(&observed, now_ts),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("GitHub job telemetry collection failed: {e}"),
+            Err(_) => tracing::warn!("GitHub job telemetry collection exceeded its deadline"),
         }
         Ok(())
     }
@@ -817,6 +836,91 @@ impl Queen {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .view(now, settings.enabled)
+    }
+
+    /// Fill the existing telemetry owner from GitHub's job records. The durable
+    /// binding is needed because a workflow can finish between queue polls; a
+    /// transient cache would lose that final outcome on a queen restart.
+    async fn collect_job_telemetry(
+        &self,
+        observed: &[(&str, WorkflowJob)],
+        now: i64,
+    ) -> Result<(), QueenError> {
+        let prefix = self.runner_prefix();
+        let by_job: HashMap<_, _> = observed
+            .iter()
+            .map(|(repo, job)| ((*repo, job.id), job))
+            .collect();
+        for (repo, job) in observed {
+            if (job.status == "completed" && job.telemetry(repo).is_none())
+                || !job
+                    .runner_name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with(&prefix))
+            {
+                continue;
+            }
+            if let (Some(id), Some(name)) = (job.runner_id, job.runner_name.as_deref())
+                && let Some(lease) = self.store.lease_for_runner(id, name).await?
+            {
+                self.store.remember_job(&lease, repo, job.id, now).await?;
+            }
+        }
+        let mut pending = self.store.pending_jobs().await?;
+        if !pending.is_empty() {
+            // Rotate the starting point so a slow old job cannot starve later ones.
+            let tick =
+                now.div_euclid(i64::try_from(self.cfg.poll_interval_secs).unwrap_or(i64::MAX));
+            let offset = tick.rem_euclid(pending.len() as i64) as usize;
+            pending.rotate_left(offset);
+        }
+        let mut lookups = 0;
+        for (lease, repo, id) in pending {
+            let job = if let Some(job) = by_job.get(&(repo.as_str(), id)) {
+                Cow::Borrowed(*job)
+            } else {
+                if lookups >= 16 {
+                    continue;
+                }
+                lookups += 1;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    self.github.job(&repo, id),
+                )
+                .await
+                {
+                    Ok(Ok(job)) => Cow::Owned(job),
+                    Ok(Err(GithubError::Status { status: 404, .. })) => {
+                        self.store.forget_job(&lease.id).await?;
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("job {repo}/{id} telemetry unavailable: {e}");
+                        continue;
+                    }
+                    Err(_) => {
+                        tracing::warn!("job {repo}/{id} telemetry lookup timed out");
+                        continue;
+                    }
+                }
+            };
+            if job.id != id
+                || job.runner_id != Some(lease.runner_id)
+                || job.runner_name.as_deref() != Some(lease.runner_name.as_str())
+            {
+                continue;
+            }
+            if let Some((telemetry, duration, finished)) = job.telemetry(&repo) {
+                self.store
+                    .record_github_telemetry(&lease, &telemetry, duration, finished)
+                    .await?;
+            }
+            if job.status == "completed" {
+                // A terminal response with unusable timing cannot yield a sample.
+                self.store.forget_job(&lease.id).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Learned drone profiles, recomputed from telemetry at most every

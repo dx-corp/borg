@@ -131,6 +131,35 @@ recorded. The queen keeps it for `telemetry_retention_days` (default 30).
 `GET /report` summarize time by job and step, queue wait per class, the
 cancellation share and host-caused failures per drone.
 
+#### GitHub job feedback
+
+The queen also collects outcomes directly from the GitHub job records it reads
+while polling queued and in-progress workflows. It accepts a job only when both
+its runner ID and runner name match a lease the queen minted. Completed jobs
+supply their actual execution duration, conclusion, step timings and queue wait
+to the existing telemetry store, reports and learned placement profiles.
+Missing or reversed timestamps remain unavailable; they never become placeholder
+zeroes. GitHub failures retain `failure_class: unknown`, because an API result
+does not establish whether the host caused the failure. Drone reports can add
+that evidence and take precedence over this fallback.
+
+Once a running job is observed, its repository and job ID are retained in the
+queen's existing SQLite store until completion. This lets the next poll query
+the job directly after its workflow leaves the active list, including after a
+queen restart. These bindings expire with `telemetry_retention_days`; a deleted
+job (HTTP 404) or a completed job without usable timing drops its binding.
+Collection runs after grants and the status snapshot are published. A pass has
+five seconds, with at most sixteen direct lookups and one second per lookup;
+the starting job rotates each tick so a slow job cannot starve other bindings.
+Collection errors are logged and do not fail queue admission. No additional credentials or permissions are required beyond
+the existing Actions read access.
+
+This is polling coverage: a job whose entire workflow starts and finishes
+between polls can be missed. Reports count only collected outcomes. The existing
+profile minimum sample and confidence rules still apply, and profiles refresh
+on `profiles.refresh_secs`. This change does not alter owner resource caps,
+class sizes or warm-floor settings.
+
 #### What a drone-side parser should produce
 
 The queen validates but does not interpret these fields, so the drone owns

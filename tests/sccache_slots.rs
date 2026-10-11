@@ -63,6 +63,10 @@ fn workspace_crates_hit_the_compile_cache_when_a_slot_is_reused() {
         ("RUSTC_WRAPPER".to_owned(), "sccache".to_owned()),
         ("CARGO_INCREMENTAL".to_owned(), "0".to_owned()),
         (
+            "CARGO_TARGET_DIR".to_owned(),
+            tmp.path().join("target").to_string_lossy().into_owned(),
+        ),
+        (
             "CARGO_HOME".to_owned(),
             cargo_home.to_string_lossy().into_owned(),
         ),

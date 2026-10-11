@@ -41,6 +41,9 @@ pub struct MockState {
     pub jwt_rejections: u32,
     pub fail_mint: bool,
     pub fail_runner_list: bool,
+    pub job_requests: u32,
+    pub hide_completed_jobs: bool,
+    pub job_gate: Option<Arc<tokio::sync::Notify>>,
     /// Queued `pull_request` runs as the janitor lists them.
     pub pr_runs: Vec<Value>,
     /// Current head sha per pull request number.
@@ -172,7 +175,38 @@ async fn jobs(
     Path(_p): Path<(String, String, u64)>,
 ) -> Result<Json<Value>, StatusCode> {
     check_token(&h)?;
-    Ok(Json(json!({"jobs": lock(&s).jobs.clone()})))
+    let state = lock(&s);
+    let jobs: Vec<_> = state
+        .jobs
+        .iter()
+        .filter(|job| !state.hide_completed_jobs || job["status"] != "completed")
+        .cloned()
+        .collect();
+    Ok(Json(json!({"jobs": jobs})))
+}
+
+async fn one_job(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_o, _r, id)): Path<(String, String, u64)>,
+) -> Result<Json<Value>, StatusCode> {
+    check_token(&h)?;
+    let (job, gate) = {
+        let mut state = lock(&s);
+        state.job_requests += 1;
+        (
+            state
+                .jobs
+                .iter()
+                .find(|job| job["id"].as_u64() == Some(id))
+                .cloned(),
+            state.job_gate.clone(),
+        )
+    };
+    if let Some(gate) = gate {
+        gate.notified().await;
+    }
+    job.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn one_run(
@@ -321,6 +355,23 @@ impl Harness {
     /// Like `start`, with a fake tailnet identity table (callers all connect
     /// from 127.0.0.1) behind `tailnet_enroll` when the config enables it.
     pub async fn start_with(extra: Value, identities: borg::tailnet::StaticIdentities) -> Self {
+        Self::start_with_store(extra, identities, Store::open_in_memory().await.unwrap()).await
+    }
+
+    pub async fn start_file(extra: Value, path: &std::path::Path) -> Self {
+        Self::start_with_store(
+            extra,
+            borg::tailnet::StaticIdentities::default(),
+            Store::open(path).await.unwrap(),
+        )
+        .await
+    }
+
+    async fn start_with_store(
+        extra: Value,
+        identities: borg::tailnet::StaticIdentities,
+        store: Store,
+    ) -> Self {
         let mock: Shared = Arc::default();
         let (private_pem, public_pem) = generate_key();
         lock(&mock).public_pem = public_pem;
@@ -330,6 +381,7 @@ impl Harness {
             .route("/app/installations/{id}/access_tokens", post(access_token))
             .route("/repos/{owner}/{repo}/actions/runs", get(runs))
             .route("/repos/{owner}/{repo}/actions/runs/{run}/jobs", get(jobs))
+            .route("/repos/{owner}/{repo}/actions/jobs/{id}", get(one_job))
             .route("/repos/{owner}/{repo}/actions/runs/{run}", get(one_run))
             .route(
                 "/repos/{owner}/{repo}/actions/runs/{run}/cancel",
@@ -358,7 +410,6 @@ impl Harness {
         }
         let cfg = QueenConfig::from_json(&cfg.to_string()).unwrap();
         let github = GithubClient::new(&gh_url, ORG, "12345", private_pem.as_bytes()).unwrap();
-        let store = Store::open_in_memory().await.unwrap();
         let janitor = cfg.supersede_janitor.clone().map(|settings| {
             borg::janitor::Janitor::new(&gh_url, borg::secret::Secret::new(JANITOR_TOKEN), settings)
                 .unwrap()
