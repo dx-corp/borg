@@ -59,6 +59,24 @@ enum Command {
         #[command(subcommand)]
         command: QueenCommand,
     },
+    /// Work with configuration files.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Parse and validate a queen (default) or drone config, TOML or JSON, and
+    /// print the effective configuration with every default filled in.
+    Check {
+        /// The config file.
+        path: PathBuf,
+        /// Read it as a drone config instead of a queen config.
+        #[arg(long)]
+        drone: bool,
+    },
 }
 
 #[derive(Args)]
@@ -152,7 +170,7 @@ struct ReportArgs {
 
 #[derive(Args)]
 struct ConfigArg {
-    /// Path to the queen's JSON config file.
+    /// Path to the queen's config file (TOML or JSON).
     #[arg(long, env = "BORG_QUEEN_CONFIG")]
     config: PathBuf,
 }
@@ -234,7 +252,7 @@ enum RolloutCommand {
 
 #[derive(Args)]
 struct DroneConfigArg {
-    /// Path to the drone's JSON config file.
+    /// Path to the drone's config file (TOML or JSON).
     #[arg(long, env = "BORG_DRONE_CONFIG")]
     config: PathBuf,
     /// File holding the enrollment token (overrides `token_file` in the config).
@@ -727,6 +745,20 @@ async fn dispatch(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Report(a) => report(a).await,
+        Command::Config {
+            command: ConfigCommand::Check { path, drone },
+        } => {
+            // Debug output redacts secrets (see `borg::secret::Secret`).
+            if drone {
+                let cfg = DroneConfig::load(&path)?;
+                println!("{cfg:#?}");
+            } else {
+                let cfg = QueenConfig::load(&path)?;
+                println!("{cfg:#?}");
+            }
+            eprintln!("{}: ok", path.display());
+            Ok(())
+        }
         Command::Drone { command } => {
             tracing_subscriber::fmt()
                 .with_writer(std::io::stderr)
