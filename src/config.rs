@@ -1,6 +1,6 @@
-//! Queen configuration, read from a JSON file. Nothing org-specific is baked
-//! in: the organization, repositories, label prefix and class sizes all come
-//! from here.
+//! Queen configuration, read from a TOML or JSON file (see
+//! [`crate::configfile`]). Nothing org-specific is baked in: the organization,
+//! repositories, label prefix and class sizes all come from here.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -28,6 +28,8 @@ pub enum ConfigError {
     },
     #[error("parse config: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("parse config {0}")]
+    File(#[from] crate::configfile::ParseError),
     #[error("invalid classes: {0}")]
     Classes(#[from] ClassesError),
     #[error("{0}")]
@@ -112,8 +114,9 @@ pub struct QueenConfig {
     /// A drone silent for longer than this gets no new leases.
     #[serde(default = "default_drone_stale")]
     pub drone_stale_secs: i64,
-    /// Demand older than this triggers the starvation guard; null disables.
-    #[serde(default = "default_starvation")]
+    /// Demand older than this triggers the starvation guard. `false` (or JSON
+    /// `null`) disables it; TOML has no null.
+    #[serde(default = "default_starvation", deserialize_with = "secs_or_off")]
     pub starvation_after_secs: Option<u64>,
     #[serde(default)]
     pub classes: Classes,
@@ -195,13 +198,38 @@ fn default_starvation() -> Option<u64> {
     Some(120)
 }
 
+/// Seconds, or `false`/`null` for off.
+fn secs_or_off<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SecsOrOff {
+        Secs(u64),
+        Off(bool),
+    }
+    match Option::<SecsOrOff>::deserialize(d)? {
+        None | Some(SecsOrOff::Off(false)) => Ok(None),
+        Some(SecsOrOff::Secs(s)) => Ok(Some(s)),
+        Some(SecsOrOff::Off(true)) => Err(serde::de::Error::custom(
+            "expected seconds, or false to disable",
+        )),
+    }
+}
+
 impl QueenConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_owned(),
             source,
         })?;
-        Self::from_json(&text)
+        let cfg: Self = crate::configfile::parse(path, &text)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
+        let cfg: Self = crate::configfile::parse(Path::new("config.toml"), text)?;
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
@@ -371,5 +399,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.starvation_after_secs, None);
+        let c = QueenConfig::from_json(
+            &MIN.replace("\"repos\"", "\"starvation_after_secs\":false,\"repos\""),
+        )
+        .unwrap();
+        assert_eq!(c.starvation_after_secs, None);
+        assert!(
+            QueenConfig::from_json(
+                &MIN.replace("\"repos\"", "\"starvation_after_secs\":true,\"repos\"")
+            )
+            .is_err()
+        );
+    }
+
+    const FULL_JSON: &str = r#"{
+      "github": {"org": "example-org", "app_id": "7", "private_key_path": "/etc/borg/app.pem", "runner_group_id": 3},
+      "repos": ["example-org/app", "example-org/lib"],
+      "db_path": "/var/lib/borg/queen.db",
+      "listen": "192.0.2.5:8080",
+      "classes": {"label_prefix": "example-ci-", "heavy": {"mem_mib": 20480, "vcpu": 6, "docker": true}},
+      "warm_floors": [{"class": "medium", "scope": "main", "count": 2}],
+      "starvation_after_secs": null,
+      "health": {"auto_quarantine": false},
+      "units": {"enabled": true},
+      "supersede_janitor": {"dry_run": false}
+    }"#;
+
+    const FULL_TOML: &str = r#"
+repos = ["example-org/app", "example-org/lib"]
+db_path = "/var/lib/borg/queen.db"
+listen = "192.0.2.5:8080"
+starvation_after_secs = false
+
+[github]
+org = "example-org"
+app_id = "7"
+private_key_path = "/etc/borg/app.pem"
+runner_group_id = 3
+
+[classes]
+label_prefix = "example-ci-"
+heavy = { mem_mib = 20480, vcpu = 6, docker = true }
+
+[[warm_floors]]
+class = "medium"
+scope = "main"
+count = 2
+
+[health]
+auto_quarantine = false
+
+[units]
+enabled = true
+
+[supersede_janitor]
+dry_run = false
+"#;
+
+    #[test]
+    fn toml_and_json_give_the_same_config() {
+        let j = QueenConfig::from_json(FULL_JSON).unwrap();
+        let t = QueenConfig::from_toml(FULL_TOML).unwrap();
+        assert_eq!(format!("{j:?}"), format!("{t:?}"));
+        assert_eq!(t.repos.len(), 2);
+        assert_eq!(t.starvation_after_secs, None);
+        assert!(t.units.enabled);
+    }
+
+    #[test]
+    fn load_picks_the_format_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("queen.toml");
+        std::fs::write(&toml_path, FULL_TOML).unwrap();
+        let json_path = dir.path().join("queen.json");
+        std::fs::write(&json_path, FULL_JSON).unwrap();
+        let t = QueenConfig::load(&toml_path).unwrap();
+        let j = QueenConfig::load(&json_path).unwrap();
+        assert_eq!(format!("{j:?}"), format!("{t:?}"));
+
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, FULL_TOML.replace("repos = [", "nope = 1\nrepos = [")).unwrap();
+        let e = QueenConfig::load(&bad).unwrap_err().to_string();
+        assert!(e.contains("bad.toml") && e.contains("nope"), "{e}");
+
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(
+            &empty,
+            FULL_TOML.replace("\"example-org/app\", \"example-org/lib\"", ""),
+        )
+        .unwrap();
+        assert!(matches!(
+            QueenConfig::load(&empty),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 }

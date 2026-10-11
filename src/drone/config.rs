@@ -1,4 +1,5 @@
-//! Drone configuration, a JSON file written by `borg drone install`.
+//! Drone configuration: the JSON file `borg drone install` writes, or a
+//! hand-written TOML file with the same keys (see [`crate::configfile`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,8 @@ pub enum DroneConfigError {
     },
     #[error("parse config: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("parse config {0}")]
+    File(#[from] crate::configfile::ParseError),
     #[error("{0}")]
     Invalid(String),
 }
@@ -289,7 +292,9 @@ impl DroneConfig {
             path: path.to_owned(),
             source,
         })?;
-        Self::from_json(&text)
+        let cfg: Self = crate::configfile::parse(path, &text)?;
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     pub fn from_json(json: &str) -> Result<Self, DroneConfigError> {
@@ -505,6 +510,34 @@ mod tests {
         let with = BASE.replace('}', r#","max_vcpu":8,"max_mem_mib":24576}"#);
         let caps = DroneConfig::from_json(&with).unwrap().host_caps();
         assert_eq!((caps.max_vcpu, caps.max_mem_mib), (Some(8), Some(24576)));
+    }
+
+    #[test]
+    fn toml_drone_config_matches_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("drone.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+queen_url = "https://queen.example.test:8443"
+runner_dir = "/r"
+work_root = "/w"
+cache_root = "/c"
+max_vcpu = 8
+extra_labels = ["on-prem"]
+
+[runner_env]
+FOO = "bar"
+"#,
+        )
+        .unwrap();
+        let json = BASE.replace(
+            '}',
+            r#","max_vcpu":8,"extra_labels":["on-prem"],"runner_env":{"FOO":"bar"}}"#,
+        );
+        let t = DroneConfig::load(&toml_path).unwrap();
+        let j = DroneConfig::from_json(&json).unwrap();
+        assert_eq!(format!("{t:?}"), format!("{j:?}"));
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod api;
 pub mod bid;
 pub mod classes;
 pub mod config;
+pub mod configfile;
 pub mod drone;
 pub mod enroll;
 pub mod envcontract;
