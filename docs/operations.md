@@ -51,6 +51,18 @@ label_prefix = "example-ci-"
 heavy = { mem_mib = 20480, vcpu = 6, docker = true }
 ```
 
+Existing `runs-on` labels outside the prefix can be answered too with
+`aliases`, a map from label to class:
+
+```toml
+[classes.aliases]
+"example-deploy-lane" = "medium"
+```
+
+Queued jobs with an alias label count as main demand for that class, and every
+runner minted for the class also carries the alias labels. Alias labels must
+not start with the prefix.
+
 ## Config files
 
 Queen and drone configs are TOML or JSON with the same keys, defaults and

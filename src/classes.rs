@@ -4,6 +4,7 @@
 //! and merge-group jobs, `<prefix><class>-pr` for pull requests). The prefix
 //! and the per-class requirements are configuration with generic defaults.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -75,12 +76,18 @@ pub struct Classes {
     pub light: ClassSpec,
     pub medium: ClassSpec,
     pub heavy: ClassSpec,
+    /// Existing runner labels that borg also answers, each mapped to the class
+    /// that serves it (for example a deploy lane's `runs-on` label). Queued
+    /// jobs with an alias label count as main demand for the class, and every
+    /// runner of that class carries the alias labels so it can take them.
+    pub aliases: BTreeMap<String, Class>,
 }
 
 impl Default for Classes {
     fn default() -> Self {
         Self {
             label_prefix: DEFAULT_LABEL_PREFIX.to_owned(),
+            aliases: BTreeMap::new(),
             // 2.5 GiB p90, 2 vCPU.
             light: ClassSpec {
                 mem_mib: 2560,
@@ -110,6 +117,8 @@ pub enum ClassesError {
     Parse(#[from] serde_json::Error),
     #[error("label prefix must not be empty")]
     EmptyPrefix,
+    #[error("alias label {0:?} is malformed or starts with the class label prefix")]
+    BadAlias(String),
     #[error("class {class} must reserve at least 1 MiB and 1 vCPU")]
     Empty { class: Class },
     #[error("class {larger} must not reserve less than {smaller}")]
@@ -137,6 +146,11 @@ impl Classes {
     pub fn validate(&self) -> Result<(), ClassesError> {
         if self.label_prefix.is_empty() {
             return Err(ClassesError::EmptyPrefix);
+        }
+        for label in self.aliases.keys() {
+            if !valid_extra_label(label) || label.starts_with(self.label_prefix.as_str()) {
+                return Err(ClassesError::BadAlias(label.clone()));
+            }
         }
         for class in Class::ALL {
             let spec = self.spec(class);
@@ -193,6 +207,9 @@ impl Classes {
 
     /// Parse a job's `runs-on` label into its class and scope.
     pub fn parse_label(&self, label: &str) -> Option<(Class, Scope)> {
+        if let Some(&class) = self.aliases.get(label) {
+            return Some((class, Scope::Main));
+        }
         let rest = label.strip_prefix(self.label_prefix.as_str())?;
         let (name, scope) = match rest.strip_suffix(PR_SUFFIX) {
             Some(name) => (name, Scope::Pr),
@@ -207,13 +224,17 @@ impl Classes {
     /// Main grants carry only the bare label so GitHub can hand them nothing
     /// but main jobs. Pull-request grants carry both labels.
     pub fn runner_labels(&self, class: Class, scope: Scope) -> Vec<String> {
-        match scope {
-            Scope::Main => vec![self.job_label(class, Scope::Main)],
-            Scope::Pr => vec![
-                self.job_label(class, Scope::Main),
-                self.job_label(class, Scope::Pr),
-            ],
+        let mut labels = vec![self.job_label(class, Scope::Main)];
+        if scope == Scope::Pr {
+            labels.push(self.job_label(class, Scope::Pr));
         }
+        labels.extend(
+            self.aliases
+                .iter()
+                .filter(|&(_, &c)| c == class)
+                .map(|(l, _)| l.clone()),
+        );
+        labels
     }
 }
 
@@ -379,6 +400,45 @@ mod tests {
             c.sanitize_extra_labels(&["borg-ci-medium-pr".to_owned()]),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn aliases_are_main_demand_and_ride_on_class_runners() {
+        let c = Classes::from_json(
+            r#"{"label_prefix":"x-ci-","aliases":{"deploy-lane":"medium","publisher":"heavy"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.parse_label("deploy-lane"),
+            Some((Class::Medium, Scope::Main))
+        );
+        assert_eq!(
+            c.parse_label("publisher"),
+            Some((Class::Heavy, Scope::Main))
+        );
+        assert_eq!(
+            c.runner_labels(Class::Medium, Scope::Pr),
+            ["x-ci-medium", "x-ci-medium-pr", "deploy-lane"]
+        );
+        assert_eq!(c.runner_labels(Class::Light, Scope::Main), ["x-ci-light"]);
+        assert_eq!(
+            c.labels_scope(&c.runner_labels(Class::Medium, Scope::Pr)),
+            Some((Class::Medium, Scope::Pr))
+        );
+        assert!(
+            c.sanitize_extra_labels(&["deploy-lane".to_owned()])
+                .is_empty(),
+            "an alias cannot be smuggled in as an extra label"
+        );
+        for bad in [
+            r#"{"aliases":{"borg-ci-x":"light"}}"#,
+            r#"{"aliases":{"a b":"light"}}"#,
+        ] {
+            assert!(
+                matches!(Classes::from_json(bad), Err(ClassesError::BadAlias(_))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
