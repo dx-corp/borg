@@ -167,6 +167,74 @@ fn to_u64(v: i64) -> u64 {
 }
 
 impl Store {
+    /// Match both GitHub runner coordinates; never attribute a static or reused name.
+    pub async fn lease_for_runner(
+        &self,
+        id: u64,
+        name: &str,
+    ) -> Result<Option<LeaseRow>, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let row = sqlx::query("SELECT * FROM leases WHERE runner_id = ? AND runner_name = ?")
+            .bind(to_i64(id))
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(Self::lease_from_row).transpose()
+    }
+
+    /// Persist one GitHub job per ephemeral lease. Existing drone telemetry wins.
+    pub async fn remember_job(
+        &self,
+        lease: &LeaseRow,
+        repo: &str,
+        job_id: u64,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query(
+            "INSERT OR IGNORE INTO lease_jobs (lease_id, repo, job_id, observed_at)
+            SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM job_telemetry WHERE lease_id = ?)",
+        )
+        .bind(&lease.id)
+        .bind(repo)
+        .bind(to_i64(job_id))
+        .bind(now)
+        .bind(&lease.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn pending_jobs(&self) -> Result<Vec<(LeaseRow, String, u64)>, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let rows = sqlx::query(
+            "SELECT leases.*, lease_jobs.repo AS job_repo, lease_jobs.job_id AS observed_job_id
+            FROM lease_jobs JOIN leases ON leases.id = lease_jobs.lease_id
+            WHERE NOT EXISTS (SELECT 1 FROM job_telemetry WHERE job_telemetry.lease_id = leases.id)
+            ORDER BY lease_jobs.observed_at, lease_jobs.lease_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    Self::lease_from_row(row)?,
+                    row.get("job_repo"),
+                    to_u64(row.get("observed_job_id")),
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn forget_job(&self, lease_id: &str) -> Result<(), StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query("DELETE FROM lease_jobs WHERE lease_id = ?")
+            .bind(lease_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Store (or replace) the telemetry of a finished lease.
     pub async fn record_telemetry(
         &self,
@@ -175,14 +243,45 @@ impl Store {
         duration_secs: u64,
         now: i64,
     ) -> Result<(), StoreError> {
+        self.write_telemetry(lease, t, duration_secs, now, true)
+            .await
+    }
+
+    /// Fill a missing report atomically; a concurrent drone report takes precedence.
+    pub async fn record_github_telemetry(
+        &self,
+        lease: &LeaseRow,
+        t: &JobTelemetry,
+        duration_secs: u64,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        self.write_telemetry(lease, t, duration_secs, now, false)
+            .await
+    }
+
+    async fn write_telemetry(
+        &self,
+        lease: &LeaseRow,
+        t: &JobTelemetry,
+        duration_secs: u64,
+        now: i64,
+        replace: bool,
+    ) -> Result<(), StoreError> {
         let steps =
             serde_json::to_string(&t.steps).map_err(|e| StoreError::Corrupt(e.to_string()))?;
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         sqlx::query(
-            "INSERT OR REPLACE INTO job_telemetry
+            "INSERT INTO job_telemetry
              (lease_id, drone, class, scope, repo, run_id, job_name, conclusion, failure_class,
               duration_secs, queue_wait_secs, steps, finished_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(lease_id) DO UPDATE SET
+               drone=excluded.drone, class=excluded.class, scope=excluded.scope,
+               repo=excluded.repo, run_id=excluded.run_id, job_name=excluded.job_name,
+               conclusion=excluded.conclusion, failure_class=excluded.failure_class,
+               duration_secs=excluded.duration_secs, queue_wait_secs=excluded.queue_wait_secs,
+               steps=excluded.steps, finished_at=excluded.finished_at
+             WHERE ?",
         )
         .bind(&lease.id)
         .bind(&lease.drone)
@@ -197,6 +296,7 @@ impl Store {
         .bind(t.queue_wait_secs.map(to_i64))
         .bind(steps)
         .bind(now)
+        .bind(replace)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -243,6 +343,14 @@ impl Store {
 
     /// Delete reports finished before `before`; returns how many.
     pub async fn prune_telemetry(&self, before: i64) -> Result<u64, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query(
+            "DELETE FROM lease_jobs WHERE observed_at < ? OR EXISTS
+            (SELECT 1 FROM job_telemetry WHERE job_telemetry.lease_id = lease_jobs.lease_id)",
+        )
+        .bind(before)
+        .execute(&self.pool)
+        .await?;
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         let r = sqlx::query("DELETE FROM job_telemetry WHERE finished_at < ?")
             .bind(before)
@@ -755,7 +863,16 @@ mod tests {
             FailureClass::Host,
         )
         .telemetry;
+        let mut fallback = t.clone();
+        fallback.failure_class = FailureClass::Unknown;
+        s.record_github_telemetry(&lease, &fallback, 20, 450)
+            .await
+            .unwrap();
         s.record_telemetry(&lease, &t, 77, 500).await.unwrap();
+        s.record_github_telemetry(&lease, &fallback, 20, 550)
+            .await
+            .unwrap();
+        assert_eq!(s.telemetry_since(0, 10).await.unwrap()[0].telemetry, t);
         s.record_telemetry(&lease, &t, 88, 600).await.unwrap();
         let rows = s.telemetry_since(0, 10).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -765,5 +882,48 @@ mod tests {
         assert!(s.telemetry_since(601, 10).await.unwrap().is_empty());
         assert_eq!(s.prune_telemetry(601).await.unwrap(), 1);
         assert!(s.telemetry_since(0, 10).await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn pending_job_identity_survives_restart_and_expires_with_telemetry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queen.sqlite");
+        let s = Store::open(&path).await.unwrap();
+        s.enroll("d1", "h", 0).await.unwrap();
+        let lease = LeaseRow {
+            id: "l1".into(),
+            drone: "d1".into(),
+            class: Class::Light,
+            scope: Scope::Pr,
+            labels: vec![],
+            runner_name: "borg-d1-l1".into(),
+            runner_id: 123,
+            jit_config: None,
+            state: crate::store::LeaseStatus::Running,
+            created_at: 1,
+            expires_at: 500,
+        };
+        s.insert_lease(&lease).await.unwrap();
+        s.remember_job(&lease, "example-org/app", 77, 100)
+            .await
+            .unwrap();
+        s.remember_job(&lease, "other/repo", 88, 200).await.unwrap();
+        s.pool.close().await;
+        let reopened = Store::open(&path).await.unwrap();
+        let pending = reopened.pending_jobs().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            (&pending[0].0.id, pending[0].1.as_str(), pending[0].2),
+            (&lease.id, "example-org/app", 77)
+        );
+        reopened.prune_telemetry(101).await.unwrap();
+        assert!(reopened.pending_jobs().await.unwrap().is_empty());
+        reopened
+            .remember_job(&lease, "example-org/app", 77, 200)
+            .await
+            .unwrap();
+        assert_eq!(reopened.remove_drone("d1").await.unwrap(), Some(1));
+        assert!(reopened.pending_jobs().await.unwrap().is_empty());
+        assert!(reopened.lease(&lease.id).await.unwrap().is_none());
+        assert!(reopened.drones().await.unwrap().is_empty());
     }
 }

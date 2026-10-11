@@ -15,6 +15,99 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::secret::Secret;
+use crate::telemetry::{Conclusion, FailureClass, JobTelemetry, StepTiming};
+
+/// GitHub-owned job metadata; never contains logs, outputs or environment values.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkflowJob {
+    pub id: u64,
+    #[serde(default)]
+    pub run_id: u64,
+    #[serde(default)]
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<Conclusion>,
+    pub labels: Option<Vec<String>>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub runner_id: Option<u64>,
+    pub runner_name: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<JobStep>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobStep {
+    pub name: String,
+    pub number: u64,
+    pub conclusion: Option<Conclusion>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+fn timestamp(value: &str) -> Option<i64> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        .map(|t| t.unix_timestamp())
+}
+
+fn elapsed(start: Option<&str>, end: Option<&str>) -> Option<u64> {
+    u64::try_from(timestamp(end?)?.checked_sub(timestamp(start?)?)?).ok()
+}
+
+impl WorkflowJob {
+    pub fn queued(&self, repo: &str) -> Result<Option<QueuedJob>, GithubError> {
+        if self.status != "queued" {
+            return Ok(None);
+        }
+        let created_at = OffsetDateTime::parse(&self.created_at, &Rfc3339)
+            .map_err(|e| GithubError::Decode(format!("job {} created_at: {e}", self.id)))?;
+        Ok(Some(QueuedJob {
+            id: self.id,
+            repo: repo.to_owned(),
+            labels: self.labels.clone().ok_or_else(|| {
+                GithubError::Decode(format!("job {} missing queued labels", self.id))
+            })?,
+            created_at,
+        }))
+    }
+
+    /// A completed job's own execution time, excluding runner startup and idle time.
+    /// Missing or invalid timing is unavailable evidence, never a zero-duration sample.
+    pub fn telemetry(&self, repo: &str) -> Option<(JobTelemetry, u64, i64)> {
+        if self.status != "completed" {
+            return None;
+        }
+        let duration = elapsed(self.started_at.as_deref(), self.completed_at.as_deref())?;
+        let finished = timestamp(self.completed_at.as_deref()?)?;
+        let mut steps: Vec<_> = self.steps.iter().collect();
+        steps.sort_by_key(|step| step.number);
+        let telemetry = JobTelemetry {
+            job_name: self.name.clone(),
+            repo: repo.to_owned(),
+            run_id: self.run_id,
+            conclusion: self.conclusion.unwrap_or_default(),
+            failure_class: FailureClass::Unknown,
+            queue_wait_secs: elapsed(Some(&self.created_at), self.started_at.as_deref()),
+            steps: steps
+                .into_iter()
+                .filter_map(|step| {
+                    Some(StepTiming {
+                        name: step.name.clone(),
+                        conclusion: step.conclusion.unwrap_or_default(),
+                        duration_secs: elapsed(
+                            step.started_at.as_deref(),
+                            step.completed_at.as_deref(),
+                        )?,
+                    })
+                })
+                .collect(),
+        }
+        .sanitized()?;
+        Some((telemetry, duration, finished))
+    }
+}
 
 /// Upper bound on pages fetched per list call (100 items per page).
 const MAX_PAGES: u32 = 20;
@@ -223,8 +316,8 @@ impl GithubClient {
         self.send(Method::GET, path, rb).await
     }
 
-    /// Jobs that are `queued` in `repo`, across queued and in-progress runs.
-    pub async fn queued_jobs(&self, repo: &str) -> Result<Vec<QueuedJob>, GithubError> {
+    /// Jobs in queued and in-progress workflows, including their completed jobs.
+    pub async fn workflow_jobs(&self, repo: &str) -> Result<Vec<WorkflowJob>, GithubError> {
         #[derive(Deserialize)]
         struct Runs {
             workflow_runs: Vec<RunRef>,
@@ -235,14 +328,7 @@ impl GithubClient {
         }
         #[derive(Deserialize)]
         struct Jobs {
-            jobs: Vec<Job>,
-        }
-        #[derive(Deserialize)]
-        struct Job {
-            id: u64,
-            status: String,
-            labels: Vec<String>,
-            created_at: String,
+            jobs: Vec<WorkflowJob>,
         }
 
         let mut run_ids = BTreeSet::new();
@@ -267,24 +353,31 @@ impl GithubClient {
                     .get(&format!("/repos/{repo}/actions/runs/{run}/jobs?filter=latest&per_page=100&page={page}"))
                     .await?;
                 let n = jobs.jobs.len();
-                for j in jobs.jobs.into_iter().filter(|j| j.status == "queued") {
-                    let created_at =
-                        OffsetDateTime::parse(&j.created_at, &Rfc3339).map_err(|e| {
-                            GithubError::Decode(format!("job {} created_at: {e}", j.id))
-                        })?;
-                    out.push(QueuedJob {
-                        id: j.id,
-                        repo: repo.to_owned(),
-                        labels: j.labels,
-                        created_at,
-                    });
-                }
+                out.extend(jobs.jobs.into_iter().map(|mut job| {
+                    // The enclosing run is authoritative even if an older API omits run_id.
+                    job.run_id = run;
+                    job
+                }));
                 if n < 100 {
                     break;
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Compatibility surface for consumers that only need queued demand.
+    pub async fn queued_jobs(&self, repo: &str) -> Result<Vec<QueuedJob>, GithubError> {
+        self.workflow_jobs(repo)
+            .await?
+            .iter()
+            .filter_map(|j| j.queued(repo).transpose())
+            .collect()
+    }
+
+    pub async fn job(&self, repo: &str, job_id: u64) -> Result<WorkflowJob, GithubError> {
+        self.get(&format!("/repos/{repo}/actions/jobs/{job_id}"))
+            .await
     }
 
     /// Every self-hosted runner registered to the organization.
@@ -371,5 +464,48 @@ fn static_method(m: &Method) -> &'static str {
         Method::POST => "POST",
         Method::DELETE => "DELETE",
         _ => "REQUEST",
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn missing_and_reversed_timestamps_do_not_invent_timings() {
+        let mut value = json!({"id": 7, "run_id": 1, "name": "lint", "status": "completed", "conclusion": "success",
+        "created_at": "bad", "started_at": "2026-10-11T10:00:00Z", "completed_at": "2026-10-11T10:00:30Z",
+        "steps": [
+            {"name": "second", "number": 2, "conclusion": "success", "started_at": "2026-10-11T10:00:10Z", "completed_at": "2026-10-11T10:00:20Z"},
+            {"name": "first", "number": 1, "conclusion": "success", "started_at": "2026-10-11T10:00:00Z", "completed_at": "2026-10-11T10:00:10Z"},
+            {"name": "unavailable", "number": 3, "conclusion": null, "started_at": null, "completed_at": null}
+        ]});
+        let job: WorkflowJob = serde_json::from_value(value.clone()).unwrap();
+        let (telemetry, duration, _) = job.telemetry("example-org/app").unwrap();
+        assert_eq!(duration, 30);
+        assert_eq!(telemetry.queue_wait_secs, None);
+        assert_eq!(
+            telemetry
+                .steps
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        value["completed_at"] = json!("2026-10-11T09:00:00Z");
+        assert!(
+            serde_json::from_value::<WorkflowJob>(value.clone())
+                .unwrap()
+                .telemetry("example-org/app")
+                .is_none()
+        );
+        value["started_at"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<WorkflowJob>(value)
+                .unwrap()
+                .telemetry("example-org/app")
+                .is_none()
+        );
     }
 }

@@ -689,3 +689,342 @@ async fn reclaim_reports_are_audited_once_and_shown_in_status_and_metrics() {
         assert!(metrics.contains(line), "missing {line}\n{metrics}");
     }
 }
+
+#[tokio::test]
+async fn github_job_outcomes_feed_profiles_without_drone_telemetry() {
+    let h = Harness::start(json!({"profiles": {"refresh_secs": 1, "min_samples": 1}})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    let lease_id = lease_for(&h, &token, "borg-ci-light-pr", 71).await;
+    let lease = h.queen.store().lease(&lease_id).await.unwrap().unwrap();
+    let end = OffsetDateTime::now_utc();
+    let start = end - time::Duration::seconds(30);
+    let created = start - time::Duration::seconds(12);
+    h.state().jobs = vec![json!({
+        "id": 71, "run_id": 1, "name": "lint (shard 2)",
+        "status": "completed", "conclusion": "success", "labels": ["borg-ci-light-pr"],
+        "runner_id": lease.runner_id, "runner_name": lease.runner_name,
+        "created_at": created.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        "started_at": start.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        "completed_at": end.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        "steps": [{"name": "cargo check", "number": 1, "conclusion": "success",
+            "started_at": start.format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "completed_at": end.format(&time::format_description::well_known::Rfc3339).unwrap()}]
+    })];
+    h.tick().await;
+    let rows = h.queen.store().telemetry_since(0, 100).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "GitHub completion must close the learning loop"
+    );
+    assert_eq!(rows[0].lease_id, lease_id);
+    assert_eq!(rows[0].duration_secs, 30);
+    assert_eq!(rows[0].telemetry.queue_wait_secs, Some(12));
+    assert_eq!(rows[0].telemetry.steps[0].duration_secs, 30);
+    // The profile refresh has its own bounded cadence.
+    h.queen
+        .tick(end + time::Duration::seconds(2))
+        .await
+        .unwrap();
+    assert_eq!(h.queen.snapshot().profiles[0].jobs, 1);
+    h.tick().await;
+    assert_eq!(
+        h.queen.store().telemetry_since(0, 100).await.unwrap(),
+        rows,
+        "repeated observations must preserve the completion timestamp and one sample"
+    );
+}
+
+#[tokio::test]
+async fn observed_running_job_is_collected_after_workflow_leaves_the_queue() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    let lease_id = lease_for(&h, &token, "borg-ci-light-pr", 72).await;
+    let lease = h.queen.store().lease(&lease_id).await.unwrap().unwrap();
+    let start = OffsetDateTime::now_utc() - time::Duration::seconds(45);
+    h.state().jobs = vec![json!({
+        "id": 72, "run_id": 1, "name": "rust-test", "status": "in_progress",
+        "conclusion": null, "labels": ["borg-ci-light-pr"],
+        "runner_id": lease.runner_id, "runner_name": lease.runner_name,
+        "created_at": start.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        "started_at": start.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        "completed_at": null, "steps": []
+    })];
+    h.tick().await;
+    assert_eq!(h.queen.store().pending_jobs().await.unwrap().len(), 1);
+    assert!(
+        h.queen
+            .store()
+            .telemetry_since(0, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    h.state().queued_runs.clear();
+    h.state().jobs[0]["status"] = json!("completed");
+    h.state().jobs[0]["conclusion"] = json!("failure");
+    h.state().jobs[0]["completed_at"] = json!(
+        OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    );
+    h.tick().await;
+    let rows = h.queen.store().telemetry_since(0, 100).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].telemetry.conclusion,
+        borg::telemetry::Conclusion::Failure
+    );
+    assert_eq!(
+        rows[0].telemetry.failure_class,
+        borg::telemetry::FailureClass::Unknown,
+        "GitHub failure alone must never quarantine a host"
+    );
+    assert!(h.queen.store().pending_jobs().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn github_telemetry_requires_exact_runner_identity_and_preserves_drone_evidence() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    let lease_id = lease_for(&h, &token, "borg-ci-light-pr", 73).await;
+    let lease = h.queen.store().lease(&lease_id).await.unwrap().unwrap();
+    let start = OffsetDateTime::now_utc() - time::Duration::seconds(60);
+    let end = start + time::Duration::seconds(30);
+    let mut job = json!({
+        "id": 73, "run_id": 1, "name": "untrusted name", "status": "completed", "conclusion": "success",
+        "runner_id": lease.runner_id + 1, "runner_name": lease.runner_name,
+        "created_at": start.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        "started_at": start.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        "completed_at": end.format(&time::format_description::well_known::Rfc3339).unwrap()
+    });
+    h.state().jobs = vec![job.clone()];
+    h.tick().await;
+    assert!(
+        h.queen
+            .store()
+            .telemetry_since(0, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    job["runner_id"] = json!(lease.runner_id);
+    job["runner_name"] = json!("other-runner");
+    h.state().jobs = vec![job.clone()];
+    h.tick().await;
+    assert!(
+        h.queen
+            .store()
+            .telemetry_since(0, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        post_result(
+            &h,
+            &token,
+            &lease_id,
+            json!({
+                "exit_code": 1, "duration_secs": 60,
+                "telemetry": {"job_name": "drone evidence", "repo": "example-org/app", "run_id": 1,
+                    "conclusion": "failure", "failure_class": "host"}
+            })
+        )
+        .await,
+        reqwest::StatusCode::NO_CONTENT
+    );
+    job["runner_name"] = json!(lease.runner_name);
+    h.state().jobs = vec![job];
+    h.tick().await;
+    let rows = h.queen.store().telemetry_since(0, 100).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].telemetry.job_name, "drone evidence");
+    assert_eq!(
+        rows[0].telemetry.failure_class,
+        borg::telemetry::FailureClass::Host
+    );
+}
+
+fn running_feedback_job(lease: &borg::store::LeaseRow, id: u64) -> Value {
+    let start = OffsetDateTime::now_utc() - time::Duration::seconds(45);
+    json!({
+        "id": id, "run_id": 1, "name": "rust-test", "status": "in_progress",
+        "conclusion": null, "runner_id": lease.runner_id, "runner_name": lease.runner_name,
+        "created_at": start.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        "started_at": start.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        "completed_at": null
+    })
+}
+
+#[tokio::test]
+async fn slow_feedback_does_not_delay_admission_or_overwrite_concurrent_drone_evidence() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    let lease_id = lease_for(&h, &token, "borg-ci-light-pr", 80).await;
+    let lease = h.queen.store().lease(&lease_id).await.unwrap().unwrap();
+    h.state().jobs = vec![running_feedback_job(&lease, 80)];
+    h.tick().await;
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    {
+        let mut state = h.state();
+        state.jobs[0]["status"] = json!("completed");
+        state.jobs[0]["conclusion"] = json!("success");
+        state.jobs[0]["completed_at"] = json!(
+            OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        );
+        state.queued_runs.clear();
+        state.job_gate = Some(gate.clone());
+    }
+    // A second workflow is queued while the old one has left the active list.
+    h.queue_job(81, "borg-ci-medium-pr", 5);
+    // Completed history is absent from the active workflow's jobs response.
+    h.state().hide_completed_jobs = true;
+    let queen = h.queen.clone();
+    let tick = tokio::spawn(async move { queen.tick(OffsetDateTime::now_utc()).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while h.state().job_requests == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        h.state().mints.len(),
+        2,
+        "admission must precede a slow completion lookup"
+    );
+    assert_eq!(
+        post_result(
+            &h,
+            &token,
+            &lease_id,
+            json!({
+                "exit_code": 1, "duration_secs": 60,
+                "telemetry": {"job_name": "drone evidence", "repo": "example-org/app", "run_id": 1,
+                    "conclusion": "failure", "failure_class": "host"}
+            })
+        )
+        .await,
+        reqwest::StatusCode::NO_CONTENT
+    );
+    gate.notify_one();
+    tick.await.unwrap().unwrap();
+    let rows = h.queen.store().telemetry_since(0, 100).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].telemetry.failure_class,
+        borg::telemetry::FailureClass::Host
+    );
+    assert_eq!(rows[0].telemetry.job_name, "drone evidence");
+}
+
+#[tokio::test]
+async fn terminal_unusable_or_deleted_jobs_are_not_retried() {
+    for deleted in [false, true] {
+        let h = Harness::start(json!({})).await;
+        let token = h.enroll("d1").await;
+        h.heartbeat(&token, &[]).await;
+        let id = lease_for(&h, &token, "borg-ci-light-pr", 82).await;
+        let lease = h.queen.store().lease(&id).await.unwrap().unwrap();
+        h.state().jobs = vec![running_feedback_job(&lease, 82)];
+        h.tick().await;
+        h.state().queued_runs.clear();
+        if deleted {
+            h.state().jobs.clear();
+        } else {
+            h.state().jobs[0]["status"] = json!("completed");
+            h.state().jobs[0]["conclusion"] = json!("cancelled");
+            // No completion timestamp: no duration may be invented.
+        }
+        h.tick().await;
+        h.tick().await;
+        assert_eq!(h.state().job_requests, 1);
+        assert!(h.queen.store().pending_jobs().await.unwrap().is_empty());
+        assert!(
+            h.queen
+                .store()
+                .telemetry_since(0, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_new_queen_recovers_completion_from_file_backed_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queen.sqlite");
+    let h = Harness::start_file(json!({}), &path).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    let id = lease_for(&h, &token, "borg-ci-light-pr", 83).await;
+    let lease = h.queen.store().lease(&id).await.unwrap().unwrap();
+    h.state().jobs = vec![running_feedback_job(&lease, 83)];
+    h.tick().await;
+    let mut job = h.state().jobs[0].clone();
+    job["status"] = json!("completed");
+    job["conclusion"] = json!("success");
+    job["completed_at"] = json!(
+        OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    );
+    let restarted = Harness::start_file(json!({}), &path).await;
+    restarted.state().runners = h.state().runners.clone();
+    restarted.state().jobs = vec![job];
+    restarted.tick().await;
+    restarted.tick().await;
+    assert_eq!(restarted.state().job_requests, 1);
+    assert_eq!(
+        restarted
+            .queen
+            .store()
+            .telemetry_since(0, 100)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_timed_out_feedback_lookup_is_bounded_and_retried_later() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    let id = lease_for(&h, &token, "borg-ci-light-pr", 84).await;
+    let lease = h.queen.store().lease(&id).await.unwrap().unwrap();
+    h.state().jobs = vec![running_feedback_job(&lease, 84)];
+    h.tick().await;
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    h.state().queued_runs.clear();
+    h.state().job_gate = Some(gate.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(3), h.tick())
+        .await
+        .unwrap();
+    assert_eq!(h.state().job_requests, 1);
+    assert_eq!(h.queen.store().pending_jobs().await.unwrap().len(), 1);
+    h.state().job_gate = None;
+    h.state().jobs[0]["status"] = json!("completed");
+    h.state().jobs[0]["conclusion"] = json!("success");
+    h.state().jobs[0]["completed_at"] = json!(
+        OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    );
+    gate.notify_one();
+    h.tick().await;
+    assert_eq!(h.state().job_requests, 2);
+    assert_eq!(
+        h.queen.store().telemetry_since(0, 100).await.unwrap().len(),
+        1
+    );
+}
