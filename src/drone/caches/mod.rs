@@ -24,6 +24,7 @@ use tokio::sync::{OnceCell, OwnedRwLockReadGuard, RwLock};
 use crate::api::CacheStat;
 use crate::drone::config::DroneConfig;
 use crate::drone::exec::Exec;
+use crate::drone::fsops::FsOps;
 use crate::probe::{self, Host};
 use git::GitMirrors;
 use kinds::Kind;
@@ -62,6 +63,7 @@ struct Track {
 pub struct Caches {
     cfg: Arc<DroneConfig>,
     exec: Arc<dyn Exec>,
+    fs_ops: Arc<dyn FsOps>,
     host: Arc<dyn Host + Send + Sync>,
     sccache_size: OnceCell<String>,
     git: GitMirrors,
@@ -81,12 +83,19 @@ impl Caches {
     pub fn new(
         cfg: Arc<DroneConfig>,
         exec: Arc<dyn Exec>,
+        fs_ops: Arc<dyn FsOps>,
         host: Arc<dyn Host + Send + Sync>,
     ) -> Self {
-        let git = GitMirrors::new(&cfg.caches.git, &cfg.cache_root, Arc::clone(&exec));
+        let git = GitMirrors::new(
+            &cfg.caches.git,
+            &cfg.cache_root,
+            Arc::clone(&exec),
+            Arc::clone(&fs_ops),
+        );
         Self {
             cfg,
             exec,
+            fs_ops,
             host,
             sccache_size: OnceCell::new(),
             git,
@@ -126,10 +135,11 @@ impl Caches {
     async fn init(&self) -> &str {
         self.sccache_size
             .get_or_init(|| async {
-                let (cfg, host, exec) = (
+                let (cfg, host, exec, fs_ops) = (
                     Arc::clone(&self.cfg),
                     Arc::clone(&self.host),
                     Arc::clone(&self.exec),
+                    Arc::clone(&self.fs_ops),
                 );
                 let flags = self.remap_flags();
                 let enabled: Vec<Kind> =
@@ -138,22 +148,25 @@ impl Caches {
                     for kind in &enabled {
                         for sub in kind.subdirs() {
                             let path = kind.dir(&cfg.cache_root).join(sub);
-                            if let Err(e) = std::fs::create_dir_all(&path) {
+                            if let Err(e) = fs_ops.mkdir_p(&path) {
                                 tracing::warn!("create {}: {e}", path.display());
                             }
                         }
                     }
-                    if let Err(e) = std::fs::create_dir_all(cfg.cache_root.join("git")) {
+                    if let Err(e) = fs_ops.mkdir_p(&cfg.cache_root.join("git")) {
                         tracing::warn!("create git cache dir: {e}");
                     }
                     if cfg.caches.bazel.enabled {
-                        write_bazelrc(&cfg);
+                        write_bazelrc(fs_ops.as_ref(), &cfg);
                     }
                     if cfg.caches.cargo.enabled
                         && cfg.caches.cargo.export_rustflags
                         && rustflags::flags_are_passable(&flags)
-                        && let Err(e) =
-                            rustflags::write_config(&Kind::Cargo.dir(&cfg.cache_root), &flags)
+                        && let Err(e) = rustflags::write_config(
+                            fs_ops.as_ref(),
+                            &Kind::Cargo.dir(&cfg.cache_root),
+                            &flags,
+                        )
                     {
                         tracing::warn!("cargo config.toml: {e}");
                     }
@@ -280,6 +293,7 @@ impl Caches {
             })
             .collect();
         let root = self.cfg.cache_root.clone();
+        let fs_ops = Arc::clone(&self.fs_ops);
         let work = tokio::task::spawn_blocking(move || {
             let mut out: Vec<(&'static str, u64, u64)> = Vec::new();
             for (kind, cap) in plan {
@@ -290,7 +304,7 @@ impl Caches {
                 {
                     let units = gc::collect_units(&kind.gc_buckets(&root));
                     let pool: u64 = units.iter().map(|u| u.size).sum();
-                    freed = gc::evict_lru(units, pool, cap).freed_bytes;
+                    freed = gc::evict_lru(fs_ops.as_ref(), units, pool, cap).freed_bytes;
                     size = size.saturating_sub(freed);
                 }
                 out.push((kind.name(), size, freed));
@@ -371,13 +385,18 @@ impl Caches {
 }
 
 /// Point Bazel at the host-level disk and repository caches.
-fn write_bazelrc(cfg: &DroneConfig) {
+fn write_bazelrc(fs_ops: &dyn FsOps, cfg: &DroneConfig) {
+    // Bazel reads the rc of whoever runs it: the job user when there is one.
+    let home = match &cfg.job_user {
+        Some(user) => Some(user.home.clone()),
+        None => std::env::var_os("HOME").map(PathBuf::from),
+    };
     let rc: Option<PathBuf> = cfg
         .caches
         .bazel
         .bazelrc
         .clone()
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".bazelrc")));
+        .or_else(|| home.map(|h| h.join(".bazelrc")));
     let Some(rc) = rc else {
         tracing::warn!(
             "HOME is unset and caches.bazel.bazelrc is not configured; skipping Bazel cache flags"
@@ -385,7 +404,7 @@ fn write_bazelrc(cfg: &DroneConfig) {
         return;
     };
     let dir = Kind::Bazel.dir(&cfg.cache_root);
-    if let Err(e) = bazel::write_rc(&rc, &dir.join("disk"), &dir.join("repo")) {
+    if let Err(e) = bazel::write_rc(fs_ops, &rc, &dir.join("disk"), &dir.join("repo")) {
         tracing::warn!("write {}: {e}", rc.display());
     }
 }
@@ -431,6 +450,7 @@ mod tests {
         Arc::new(Caches::new(
             cfg,
             Arc::new(FakeExec::default()),
+            Arc::new(crate::drone::fsops::LocalFs),
             Arc::new(NoHost),
         ))
     }

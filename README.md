@@ -109,6 +109,294 @@ recorded. The queen keeps it for `telemetry_retention_days` (default 30).
 `GET /report` summarize time by job and step, queue wait per class, the
 cancellation share and host-caused failures per drone.
 
+#### What a drone-side parser should produce
+
+The queen validates but does not interpret these fields, so the drone owns
+their meaning. Keep it consistent across drones:
+
+- **Identity.** `repo`, `run_id` and `job_name` come from the job the runner
+  executed (its job context: repository, run id, job display name), not from
+  log text a workflow can print. `job_name` is the name as GitHub shows it,
+  including matrix suffixes.
+- **Steps.** One entry per step in execution order, `duration_secs` rounded
+  down to whole seconds, `conclusion` mapped from the step result (succeeded to
+  `success`, failed to `failure`, canceled to `cancelled`, skipped to
+  `skipped`, anything else to `unknown`). Report names only; never log lines,
+  environment values or step output.
+- **Conclusion.** The job's result, mapped the same way; a job the drone killed
+  at `max_job_secs` is `timed_out`.
+- **`queue_wait_secs`.** Seconds from the job being queued on GitHub to the
+  runner starting it. Omit it when it cannot be determined; do not send 0 as a
+  placeholder, because the report averages the values it receives.
+- **`failure_class`.** `host` when the machine or the runner failed rather than
+  the job: the runner process was killed by a signal or the kernel (OOM), the
+  disk filled, Docker was unreachable, the runner lost its connection, or the
+  lease was torn down by the drone. `code` when the job's own step exited
+  non-zero on a healthy host. `unknown` when the drone cannot tell. Leave it
+  `unknown` for jobs that did not fail.
+- **Failure behaviour.** Parsing is best effort and must never delay or fail
+  the result: if anything cannot be read, send the result without `telemetry`
+  (or with fewer fields), and send it in the same request as `exit_code` and
+  `duration_secs`. A retried result may be sent again; the queen keeps the
+  latest.
+
+### Drone bids and demand pressure
+
+A drone may add `bids` to its heartbeat: at most one per `(class, scope)` it is
+willing to serve. The queen answers every heartbeat with `pressure`, the
+demand pressure (0 to 1000) per class, so the drone can set its bids against it.
+
+```json
+{ "class": "medium", "scope": "pr", "available_slots": 2,
+  "estimated_start_ms": 1500, "cache_affinity": 800, "resource_pressure": 150,
+  "estimated_cost": 1000, "confidence": 900, "min_pressure": 0, "expires_at": 1760000000 }
+```
+
+`cache_affinity`, `resource_pressure`, `confidence` and `min_pressure` are
+permille (0 to 1000; larger values are clamped); `estimated_cost` is relative
+(1000 is fleet typical); `expires_at` is Unix seconds, after which the queen
+ignores the bid. `min_pressure` is the drone's response threshold: it does not
+want this work while the class's pressure is below it, so a warm idle host
+reports 0, a cold host something higher, and a workstation whose owner is
+active something high. Starving demand overrides every threshold.
+
+The allocator drops a bid with no `available_slots` or above the current
+pressure, and scores the rest with integers:
+`3*cache_affinity - 3*resource_pressure - 2*start - 1*(cost-1000)`, where
+`start` is `estimated_start_ms` as permille of 60 s, all scaled by
+`confidence/1000`. The highest score wins; ties go to the tightest memory fit,
+then the drone name. A drone that sends no bids, or only expired ones, is
+treated as before (always eligible, neutral score); a drone that bids but not
+for a key declines that key. GitHub still chooses which queued job a runner
+takes: bids steer only which host receives a freshly minted runner.
+
+### Wake-on-LAN
+
+Optional (`wake` block, off by default). When demand for a class stays unmet for
+`after_secs`, the queen sends a magic packet to a listed host that can serve the
+class and whose drone is not fresh, rate limited per pass, per hour and per host.
+Targets are IPv4 addresses or `addr/len` networks. See `/status` `wake`.
+
+### Build environment contract
+
+Optional (`env_contract.enabled`, off by default). Before a CI runner lease or a
+work unit is placed on a drone, the queen checks what the drone last reported
+about its build environment. Four checks, each `required`, `advisory` or `off`
+globally and per class (`env_contract.checks`, `env_contract.classes.<class>`):
+
+* `compiler_cache`: `RUSTC_WRAPPER` is an allowed wrapper (`allowed_wrappers`,
+  by file name: `sccache` by default, plus any single-flight wrapper in front of
+  it), `SCCACHE_DIR` is set, the sccache server is reachable.
+* `toolchain`: when the work declares a Rust toolchain, the drone has it. A unit
+  declares it (`rust_toolchain`, which `borg run` reads from `rust-toolchain.toml`
+  or `rust/rust-toolchain.toml` at the unit's tree); a class can declare it in
+  config (`classes.<class>.rust_toolchain`). A mismatch is not admitted.
+* `cache_store`: stats work, errors per thousand requests are under
+  `max_cache_error_pm`, the cache directory has at least
+  `min_cache_dir_free_bytes` free, and a write works. A hit rate at or under
+  `hit_rate_warn_pm` after `min_requests_for_hit_rate` requests is a *warning* in
+  `/status`, never a block.
+* `resources`: memory available covers the class's memory (`mem_available_pct`)
+  and CPU pressure is at most `max_cpu_psi_pm`. (Free capacity after active
+  leases is the allocator's own rule.)
+
+A required check that fails **or is unknown** makes the drone ineligible for the
+class; nothing else changes about placement. Facts older than
+`facts_max_age_secs` (180) count as unknown. A drone that has never reported is
+skipped unless `require_report`, so enabling the contract does not cut off
+drones that predate it. Defaults when enabled: `toolchain` and `resources`
+required, `compiler_cache` and `cache_store` advisory.
+
+`/status` shows each drone's `contract` (the checks with state, reason, observed
+values and warnings, and the admission per class with the reason) and
+`units.not_admitted` (why a queued unit is not admitted on each matching drone).
+Metrics: `borg_env_contract_check{drone,check,state}` and
+`borg_env_contract_admitted{drone,class}`.
+
+**Drone probe spec** (the heartbeat field `env_facts`). The drone only measures;
+verdicts and thresholds are the queen's. Every field is optional, and `null` /
+absent means "not measured" (never "fine"). Probe as the **job user**, with the
+environment a job will get, and cache results about 60 seconds (resend the cached
+object with its original `observed_at`; the queen treats facts over 180 seconds
+old as unknown, so probe at least that often):
+
+| Field | How |
+| --- | --- |
+| `observed_at` | Unix seconds the probes ran. |
+| `rustc_wrapper` | `RUSTC_WRAPPER` as a job sees it, resolved to a path through `PATH` if it is a bare name; absent if unset or empty. |
+| `sccache_dir` | `SCCACHE_DIR` as a job sees it; absent if unset. |
+| `sccache_server_reachable` | Whether the sccache server answers (connect to `SCCACHE_SERVER_PORT` or its socket, 5 s timeout). Never start a server to find out. |
+| `sccache_stats_ok` | `sccache --show-stats --stats-format json` exits 0 within 5 s. |
+| `cache_requests`, `cache_hits`, `cache_errors` | From that JSON: `compile_requests`, the sum of the `cache_hits.counts` values and the sum of the `cache_errors.counts` values (check against the installed sccache's schema). |
+| `cache_dir_free_bytes` | Available bytes (`f_bavail * f_frsize`) on the filesystem holding `SCCACHE_DIR`. |
+| `cache_write_ok` | Create, write and remove a small file named `.borg-probe-<pid>` in `SCCACHE_DIR`. |
+| `toolchains` | For each toolchain `rustup toolchain list` shows, `{channel, rustc_version}`: the channel as `rust-toolchain.toml` would name it (`1.95.0`, `stable`, `nightly-2026-01-01`; strip the host triple) and the `release:` line of `rustc +<channel> -vV`. `null` if rustup could not be queried. |
+| `mem_available_mib` | Linux `MemAvailable` from `/proc/meminfo`; macOS (free + inactive + speculative pages) times the page size, in MiB. |
+| `cpu_psi_some_avg10_pm` | Linux `/proc/pressure/cpu` line `some`, `avg10` times ten, rounded; absent where PSI does not exist. |
+
+A unit's toolchain (`rust_toolchain`) matches an installed `channel` or
+`rustc_version` exactly.
+
+### `borg run`
+
+```
+borg run [--index | --tree <sha>] [--publish] [--class medium] [--wait-secs 60] -- <command...>
+```
+
+Runs a command on the fleet when a drone has capacity, and otherwise right here;
+the exit code is the command's either way. With no `BORG_QUEEN` set it just runs
+the command locally, so wrappers can call it unconditionally.
+
+* Environment: `BORG_QUEEN` (queen URL), `BORG_CLIENT_TOKEN` or
+  `BORG_CLIENT_TOKEN_FILE` (default `~/.config/borg/client-token`; the token comes
+  from `borg queen enroll-client`), `BORG_RUN_WAIT_SECS`, `BORG_PUBLISH`,
+  `BORG_TOOLCHAIN`.
+* The tree is `HEAD^{tree}` by default, `git write-tree` of the index with
+  `--index` (pre-commit hooks), or `--tree <sha>`. The unit's identity is the repo,
+  tree, argv, platform and toolchain, so an identical command that already passed
+  for this tree is not run again (the receipt is reported, exit 0) and one that is
+  running is joined.
+* The drone has to be able to get the tree. A tree from a pushed commit is in
+  its git mirror. Otherwise `--publish` uploads a `git bundle` to the queen
+  (`PUT /v1/units/{id}/bundle`): a synthetic commit of the tree whose parent is the
+  merge base with `origin/main`, bundled without everything that merge base
+  already reaches, so it is small. Nothing is pushed to any remote. Without
+  `--publish`, an unpublished tree runs locally.
+* Falls back to running here when the queen is unset or unreachable, refuses the
+  unit, no drone takes it within `--wait-secs` (the unit is cancelled), the queen
+  is lost for 60 seconds mid-run, or the unit ends for infrastructure reasons
+  (cancelled, timed out, out of attempts). A command that ran on a drone and
+  exited nonzero is a real failure and its code is returned. Ctrl-C cancels a
+  unit this invocation created.
+### Work units (gate and hook runs)
+
+Optional (`units.enabled`, off by default). Clients such as `borg run`, the
+pre-commit hook and `mq` submit whole commands; drones run them. Enroll a client
+with `borg queen enroll-client <name>` (prints a token once).
+
+Client API (bearer: client token):
+
+* `POST /v1/units` with `{repo, tree_sha, argv, platform, toolchain, class, timeout_secs?, force?}`
+  returns `201` `{outcome: "new", unit_id, ...}`, or `200` with `outcome:
+  "joined"` (an identical unit is queued or running) or `"receipt"` (an
+  identical unit succeeded recently; `receipt` has the proof). The key is
+  (repo, tree SHA, argv, platform, toolchain); only successes are reused, never
+  for another tree, and `force` skips reuse. `platform` is `<os>-<arch>`
+  (`linux-x86_64`, `macos-aarch64`).
+* `GET /v1/units/{id}` returns the unit (state `queued|leased|running|done|failed`,
+  `exit_code`, `receipt`).
+* `GET /v1/units/{id}/log?from=N&wait=S` returns log bytes from offset `N`,
+  waiting up to `S` seconds (at most 30) for new bytes while the unit is active.
+  Headers: `x-borg-next` (the offset to ask for next), `x-borg-state`, and
+  `x-borg-exit` once finished and fully read.
+* `POST /v1/units/{id}/cancel`.
+* `PUT /v1/units/{id}/bundle` (the unit's own client; body is a git bundle, at most
+  `units.max_bundle_bytes`, 64 MiB by default). A unit submitted with
+  `"bundle": true` is not placed until the bundle arrives, and fails after
+  `units.bundle_wait_secs` (60) without it. Bundles are deleted with their unit
+  (7 days, the life of its receipt) or at once if the unit fails or is cancelled.
+
+Drone protocol (bearer: drone token):
+
+1. The heartbeat response carries `units: [{unit_id, repo, tree_sha, argv, class,
+   toolchain, timeout_secs, attempt}]` for units placed on this drone, and
+   `cancel_units: [id]`. Placed units are resent until acknowledged.
+2. Acknowledge by listing the unit id in `active_units` in the heartbeat request;
+   that starts the unit. Keep listing it while it runs. A running unit the drone
+   stops listing for 60 seconds is treated as lost and re-queued (up to
+   `units.max_attempts`).
+3. Run it: get `tree_sha` into the local git mirror (if `git cat-file -e
+   <tree>` fails and the grant has `bundle_bytes > 0`, fetch
+   `GET /v1/units/{id}/bundle` and `git bundle unbundle` it into the mirror; its
+   prerequisite is a commit the mirror already has, and if that fails the unit
+   fails and the client runs locally), check the tree out into a slot directory
+   (`git clean` it first), run `argv` as the unprivileged job user with the same
+   isolation rules as CI jobs, and enforce `timeout_secs`.
+4. Stream output with `POST /v1/units/{id}/log?offset=N` (raw bytes; `N` is the
+   byte offset of the first byte of the body). Repeating a chunk is harmless;
+   `409` means the queen holds fewer than `N` bytes, so resend from its length
+   (the `200` body of any append is the queen's length).
+5. Finish with `POST /v1/units/{id}/result` `{exit_code, duration_secs}`.
+   Idempotent. Stop and report on a `cancel_units` entry.
+
+Units are placed by the runner allocator (class capacity, owner caps, bids,
+profiles, quarantine and probation) on drones whose `<os>-<arch>` matches, using
+capacity left after CI runner demand.
+
+### Build-box reclaim
+
+A drone on a shared build host can reclaim abandoned git worktrees and cargo
+`target/` and `incremental/` directories by disk pressure (`reclaim` block of the
+drone config; off by default, dry-run by default). `reclaim::run_cycle` is the
+policy; the drone implements `ReclaimHost` and reports `ReclaimStats` in its
+heartbeat (`reclaim`), which the queen audits (`/status` `reclaim`).
+
+What a `ReclaimHost` implementation must guarantee, because the policy relies on
+it: `probe` reports **busy** if any process has its working directory or an open
+file inside the path (check `/proc/*/cwd` and `fd`, or `lsof +D` on macOS);
+**dirty** if `git status --porcelain` is non-empty, untracked files included;
+**unpushed** if `git rev-list HEAD --not --remotes` is non-empty (or HEAD is
+detached on such commits); **protected** for the main checkout (first entry of
+`git worktree list`), a locked worktree, or a repository with stashes; **not_git**
+when the path is not a work tree; and **unknown** whenever any step failed or
+timed out. `delete` removes the directory (for a worktree, `git worktree remove`
+or removal followed by `git worktree prune`) and returns the bytes freed. `scan`
+lists each child of a root, and for `cargo_target` roots also each
+`incremental/` directory inside (with `within` set to its target directory).
+
+### Quorum rollout
+
+`rollout_target_version` plus `rollout.previous_version` turns on a gated rollout
+of a new drone version: the queen tells one Linux and one macOS canary the
+target through `desired_version` in the heartbeat response, promotes through
+waves only while success rate, host-failure rate against the control group and
+heartbeat health agree, and halts and tells every drone the previous version
+otherwise. State is persisted; see `rollout` in `/status` and
+`borg queen rollout halt|reset`. Drones update between jobs when
+`desired_version` differs from what they run, and may downgrade.
+
+### Learned profiles
+
+The queen builds per-drone, per-class profiles from telemetry: speed against the
+fleet median for the same job family (the job name without matrix suffixes) and
+reliability from host-caused failures only. They add to the bid score in
+proportion to the evidence, so proven faster and more reliable hosts are
+preferred when placing a runner. See `profiles` in the queen config and
+`profiles[]` in `/status`.
+
+### Warm-floor controller
+
+Optional (`homeostasis.enabled`). A damped feedback loop raises the warm floor of
+a class and scope when queue latency stays above a target and idle room exists,
+and lowers it gradually when demand subsides, with hysteresis, per-key cooldowns,
+a step size, an hourly change limit and per-class ceilings. The clock schedule
+(`warm_schedule`) remains a minimum. State appears in `/status` and the
+`borg_warm_floor*` metrics.
+
+### Host health
+
+The queen scores each drone's host-caused failures (from telemetry with
+`failure_class: host`) with a half-life decay. Code failures never count. It
+recommends quarantine on moderate evidence, and quarantines automatically only
+when failures from several distinct runs corroborate, the failures do not look
+fleet-wide, and enough other hosts remain in service. A quarantined host returns
+after a cooldown, on probation (one lease at a time), once a few jobs succeed.
+Tune it with a `health` block in the queen config (`auto_quarantine`,
+`half_life_secs`, `window_secs`, `corroboration_runs`, `cooldown_secs`,
+`proof_jobs`, and the bounds); `/status` shows each drone's `health`.
+
+### Tailnet enrollment
+
+Optional and off by default. With a `tailnet_enroll` block
+(`allowed_tags`, `allowed_users`, optional `socket_path` for the local
+tailscaled), `POST /v1/enroll` identifies the caller through the local
+tailscaled (`whois` by remote address) and, if the node carries an allowed tag
+(or, for an untagged node, belongs to an allowed user), enrolls a drone named
+after the node and returns `{"name", "token"}` once. The queen must see the
+caller's tailnet address directly (bind it to the tailnet address, no proxy in
+front), and its service user needs access to the tailscaled socket
+(`tailscale set --operator=<user>`). A node that is already enrolled gets 409.
+
 The optional supersede janitor cancels queued pull-request workflow runs whose
 head commit is no longer the pull request's head. Add a `supersede_janitor`
 block (`token_path` or `BORG_JANITOR_TOKEN` for a token with `actions: write`,
@@ -127,6 +415,9 @@ put a TLS terminator in front.
 | `GET /metrics` | The same numbers in Prometheus text format. |
 | `POST /v1/heartbeat` | Drone API. Reports capacity; returns new leases until their JIT config is acknowledged. |
 | `POST /v1/leases/{id}/result` | Drone API. Reports a lease's exit code, duration and peak RSS. |
+
+Manage drones with `borg queen drone list` and `borg queen drone remove <name>`
+(which revokes the token). `borg queen enroll` prints only the token to stdout.
 
 Drone requests carry `Authorization: Bearer <token>`. The queen stores only
 the SHA-256 of each token.
@@ -164,6 +455,34 @@ It sets up:
 
 The queen URL must be `https://`; `ca_cert_path` makes that CA the only trust
 root. A plain `http://` URL is refused unless `allow_insecure` is set.
+
+### Separate job user (Linux)
+
+Leases run code from pull requests, so they must not run as the account that
+holds the enrollment token. `borg drone install` creates two accounts: the
+drone daemon (owns `/etc/borg`, mode 0700, with the config and token at 0600)
+and an unprivileged job user (`job_user` in the config; default `borg-job`)
+that runs every lease and owns the work and cache directories. The daemon
+becomes the job user with `setpriv --reuid ... --init-groups`, which drops every
+capability before the job starts; the systemd unit grants the daemon only
+`CAP_SETUID`, `CAP_SETGID` and `CAP_SETPCAP` for that. File operations on
+job-owned directories (cloning the runner, cleanup, cache collection) also run
+as the job user. `tests/job_user.rs` checks, as root, that a lease's uid differs
+from the drone's, that the token and config directory are unreadable to it, and
+that it holds no capability. Without `job_user` (macOS, or `--no-job-user`)
+jobs run as the drone's own account and the drone logs a warning.
+
+### Labels, environment, hooks
+
+* `extra_labels` are added to every runner the drone registers (for lanes that
+  still route by label). The queen drops any that equal a job class label, so
+  they can never change whether a runner serves main or pull-request jobs.
+* `runner_env` is a map injected into every lease's environment (keys starting
+  `BORG_` or `ACTIONS_RUNNER_`, and a few others, are reserved).
+* `job_started_hook` and `job_completed_hook` are absolute paths ending in `.sh`,
+  exported as `ACTIONS_RUNNER_HOOK_JOB_STARTED` and `ACTIONS_RUNNER_HOOK_JOB_COMPLETED`.
+* `borg drone run --token-file F` and `borg drone install --token-file F` read
+  the token from a file instead of the command line.
 
 ### Owner caps
 
@@ -314,6 +633,50 @@ ran without one). The queen shows them under each drone in `/status` and as
 On start the drone deletes leftover lease directories and borg-labelled docker
 resources from a previous run. On `SIGTERM` it stops accepting leases and waits
 up to `drain_timeout_secs` for running jobs before stopping them.
+
+## Updating a drone
+
+A drone follows the queen's `desired_version` (see Quorum rollout) between
+jobs, in either direction. When the version differs it stops accepting leases,
+finishes the jobs it holds, and then asks the updater: it writes `update-request`
+into its state directory (`state_dir` in `drone.json`). The drone itself cannot
+replace its binary, because it runs unprivileged and stopping it is what drains
+it. A root-owned path unit (`borg-update.path` on Linux, the `org.borg.update`
+launchd daemon on macOS) starts `borg update --from-request`, which:
+
+1. fetches the release manifest and downloads every artifact it needs, checking
+   each SHA-256 against the manifest **before** anything is stopped;
+2. stops the drone service (which drains running jobs), swaps the binary
+   atomically and keeps the previous one as `borg.prev`;
+3. starts the service and waits for a fresh `health.json`, which the new drone
+   writes after each heartbeat the queen answered;
+4. rolls back to `borg.prev` if the service does not start or does not report
+   healthy within `health_timeout_secs`.
+
+The outcome is left in `update-result.json` and sent to the queen in the next
+heartbeat as `update_report`. A target that failed or rolled back on a host is
+not retried there until the queen asks for a different version. A queen that is
+down is retried with growing delays, and job results are retried for several
+minutes, so a restart of the queen loses nothing.
+
+The updater reads `/etc/borg-update/update.json`, which only root can write, so
+a compromised drone cannot point it at another release. The manifest is a JSON
+document (`schema`, `version`, per-platform `url` and `sha256` for
+`linux-x64-musl`, `linux-arm64-musl` and `darwin-arm64`, and an optional pinned
+actions-runner). `https://` is required unless the config sets `allow_insecure`.
+There are no signatures: the trust anchor is HTTPS to the configured manifest
+URL plus the pinned digests.
+
+```text
+borg update --check          # what would change
+borg update --version 0.5.0  # install exactly this version
+borg update --runner-only    # replace just the pinned actions-runner, no restart
+```
+
+`borg drone install` writes the updater configuration and units;
+`--update-manifest-url` points them at another manifest and `--no-self-update`
+skips them. Drones installed before this feature have to be updated once by
+rerunning `borg drone install` with the new binary.
 
 ## Contributing
 

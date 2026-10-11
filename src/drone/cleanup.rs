@@ -11,6 +11,7 @@ use std::io;
 use std::path::Path;
 
 use crate::drone::exec::Exec;
+use crate::drone::fsops::FsOps;
 
 /// Label that marks a resource as belonging to a lease.
 pub const LEASE_LABEL: &str = "borg.lease";
@@ -202,19 +203,18 @@ pub fn cleanup_docker(exec: &dyn Exec, docker: &str, scope: Scope<'_>) -> Docker
     report
 }
 
-/// Delete `<work_root>/<lease_id>` (a symlink at that path is unlinked, never
-/// followed). Returns whether anything was removed.
-pub fn remove_lease_dir(work_root: &Path, lease_id: &str) -> io::Result<bool> {
-    if !valid_lease_id(lease_id) {
+/// Delete `<work_root>/<name>` (a symlink at that path is unlinked, never
+/// followed). Returns whether anything was there to remove.
+pub fn remove_lease_dir(fs: &dyn FsOps, work_root: &Path, name: &str) -> io::Result<bool> {
+    if !valid_lease_id(name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "unsafe lease id",
+            "unsafe directory name",
         ));
     }
-    let path = work_root.join(lease_id);
+    let path = work_root.join(name);
     match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path).map(|()| true),
-        Ok(_) => std::fs::remove_file(&path).map(|()| true),
+        Ok(_) => fs.remove_all(&path).map(|()| true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
     }
@@ -222,7 +222,7 @@ pub fn remove_lease_dir(work_root: &Path, lease_id: &str) -> io::Result<bool> {
 
 /// Delete every lease directory under `work_root` (startup: the drone holds
 /// no leases yet). Returns the removed names.
-pub fn sweep_work_root(work_root: &Path) -> io::Result<Vec<String>> {
+pub fn sweep_work_root(fs: &dyn FsOps, work_root: &Path) -> io::Result<Vec<String>> {
     let mut removed = Vec::new();
     let entries = match std::fs::read_dir(work_root) {
         Ok(e) => e,
@@ -231,7 +231,7 @@ pub fn sweep_work_root(work_root: &Path) -> io::Result<Vec<String>> {
     };
     for entry in entries {
         let name = entry?.file_name().to_string_lossy().into_owned();
-        if remove_lease_dir(work_root, &name)? {
+        if remove_lease_dir(fs, work_root, &name)? {
             removed.push(name);
         }
     }
@@ -300,6 +300,7 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::FakeExec;
     use super::*;
+    use crate::drone::fsops::LocalFs;
 
     const ID: &str = "0123456789ab";
 
@@ -445,16 +446,16 @@ mod tests {
         std::fs::write(cache.join("entry"), "x").unwrap();
         std::fs::create_dir_all(work.join("keep-me")).unwrap();
 
-        assert!(remove_lease_dir(&work, ID).unwrap());
+        assert!(remove_lease_dir(&LocalFs, &work, ID).unwrap());
         assert!(!work.join(ID).exists());
         assert!(
-            !remove_lease_dir(&work, ID).unwrap(),
+            !remove_lease_dir(&LocalFs, &work, ID).unwrap(),
             "second removal is a no-op"
         );
         assert!(cache.join("entry").exists());
         assert!(work.join("keep-me").exists());
-        assert!(remove_lease_dir(&work, "../cache").is_err());
-        assert!(remove_lease_dir(&work, "").is_err());
+        assert!(remove_lease_dir(&LocalFs, &work, "../cache").is_err());
+        assert!(remove_lease_dir(&LocalFs, &work, "").is_err());
     }
 
     #[cfg(unix)]
@@ -467,7 +468,7 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("f"), "x").unwrap();
         std::os::unix::fs::symlink(&target, work.join(ID)).unwrap();
-        assert!(remove_lease_dir(&work, ID).unwrap());
+        assert!(remove_lease_dir(&LocalFs, &work, ID).unwrap());
         assert!(target.join("f").exists());
     }
 
@@ -477,11 +478,11 @@ mod tests {
         for id in ["aaa", "bbb"] {
             std::fs::create_dir_all(root.path().join(id).join("x")).unwrap();
         }
-        let mut removed = sweep_work_root(root.path()).unwrap();
+        let mut removed = sweep_work_root(&LocalFs, root.path()).unwrap();
         removed.sort();
         assert_eq!(removed, ["aaa", "bbb"]);
         assert!(
-            sweep_work_root(&root.path().join("missing"))
+            sweep_work_root(&LocalFs, &root.path().join("missing"))
                 .unwrap()
                 .is_empty()
         );

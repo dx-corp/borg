@@ -17,6 +17,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use crate::drone::fsops::FsOps;
+
 /// Virtual prefix a slot directory is mapped to.
 pub const VIRTUAL_WORK: &str = "/borg/work";
 const VIRTUAL_CARGO: &str = "/borg/cargo";
@@ -66,7 +68,7 @@ pub fn config_toml(flags: &[String]) -> String {
 
 /// Write `config.toml` unless the file exists and is not ours. Returns whether
 /// the file was written.
-pub fn write_config(cargo_home: &Path, flags: &[String]) -> io::Result<bool> {
+pub fn write_config(fs_ops: &dyn FsOps, cargo_home: &Path, flags: &[String]) -> io::Result<bool> {
     let path = cargo_home.join("config.toml");
     let wanted = config_toml(flags);
     match fs::read_to_string(&path) {
@@ -81,14 +83,14 @@ pub fn write_config(cargo_home: &Path, flags: &[String]) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    fs::create_dir_all(cargo_home)?;
-    fs::write(&path, wanted)?;
+    fs_ops.write_file(&path, &wanted)?;
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drone::fsops::LocalFs;
 
     #[test]
     fn flags_cover_every_slot_and_the_cargo_dirs_identically_for_all_leases() {
@@ -130,16 +132,16 @@ mod tests {
     fn write_is_idempotent_and_never_clobbers_a_foreign_config() {
         let dir = tempfile::tempdir().unwrap();
         let flags = remap_flags(Path::new("/w"), 1, dir.path());
-        assert!(write_config(dir.path(), &flags).unwrap());
-        assert!(!write_config(dir.path(), &flags).unwrap());
+        assert!(write_config(&LocalFs, dir.path(), &flags).unwrap());
+        assert!(!write_config(&LocalFs, dir.path(), &flags).unwrap());
         let more = remap_flags(Path::new("/w"), 2, dir.path());
         assert!(
-            write_config(dir.path(), &more).unwrap(),
+            write_config(&LocalFs, dir.path(), &more).unwrap(),
             "our own file is updated"
         );
 
         fs::write(dir.path().join("config.toml"), "[net]\nretry = 5\n").unwrap();
-        assert!(write_config(dir.path(), &flags).is_err());
+        assert!(write_config(&LocalFs, dir.path(), &flags).is_err());
         assert_eq!(
             fs::read_to_string(dir.path().join("config.toml")).unwrap(),
             "[net]\nretry = 5\n"

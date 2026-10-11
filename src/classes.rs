@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 /// Default label prefix shared by every class label.
 pub const DEFAULT_LABEL_PREFIX: &str = "borg-ci-";
+/// Most extra labels one drone may add to its runners.
+pub const MAX_EXTRA_LABELS: usize = 16;
 /// Suffix marking pull-request demand.
 const PR_SUFFIX: &str = "-pr";
 
@@ -152,6 +154,35 @@ impl Classes {
         Ok(())
     }
 
+    /// Keep the extra runner labels a drone asked for that are safe to add:
+    /// well-formed, not `self-hosted`, not a label of any class (which could
+    /// change which jobs the runner is offered), no duplicates, at most 16.
+    pub fn sanitize_extra_labels(&self, labels: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for label in labels {
+            if valid_extra_label(label) && self.parse_label(label).is_none() && !out.contains(label)
+            {
+                out.push(label.clone());
+            }
+        }
+        out.truncate(MAX_EXTRA_LABELS);
+        out
+    }
+
+    /// The class and scope a runner minted with `labels` will serve: pull
+    /// request runners carry the `-pr` label, main-only runners only the bare
+    /// one. Labels that are not class labels never affect the answer.
+    pub fn labels_scope(&self, labels: &[String]) -> Option<(Class, Scope)> {
+        let mut found: Option<(Class, Scope)> = None;
+        for (class, scope) in labels.iter().filter_map(|l| self.parse_label(l)) {
+            found = match found {
+                Some((c, Scope::Pr)) if c == class => Some((c, Scope::Pr)),
+                _ => Some((class, scope)),
+            };
+        }
+        found
+    }
+
     /// The label a job requests for `class` and `scope`.
     pub fn job_label(&self, class: Class, scope: Scope) -> String {
         match scope {
@@ -184,6 +215,17 @@ impl Classes {
             ],
         }
     }
+}
+
+/// A label the drone may add to its runners: 1 to 64 characters of letters,
+/// digits, `.`, `_` and `-`, and not the reserved `self-hosted`.
+pub fn valid_extra_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 64
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && !label.eq_ignore_ascii_case("self-hosted")
 }
 
 #[cfg(test)]
@@ -293,5 +335,69 @@ mod tests {
                 larger: Class::Heavy
             })
         ));
+    }
+
+    #[test]
+    fn extra_labels_are_filtered_and_never_change_the_scope() {
+        let c = Classes::default();
+        let extras: Vec<String> = [
+            "legacy-lane",
+            "on-prem",
+            "borg-ci-heavy-pr",
+            "borg-ci-light",
+            "self-hosted",
+            "bad label",
+            "on-prem",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        assert_eq!(
+            c.sanitize_extra_labels(&extras),
+            ["legacy-lane", "on-prem"],
+            "class labels, duplicates and malformed labels are dropped"
+        );
+
+        for (class, scope) in [
+            (Class::Medium, Scope::Pr),
+            (Class::Medium, Scope::Main),
+            (Class::Light, Scope::Pr),
+        ] {
+            let mut labels = c.runner_labels(class, scope);
+            labels.extend(c.sanitize_extra_labels(&extras));
+            assert_eq!(
+                c.labels_scope(&labels),
+                Some((class, scope)),
+                "{class} {scope:?}"
+            );
+        }
+        // Without the sanitizer a smuggled class label would flip a PR runner to the main lane.
+        let mut smuggled = c.runner_labels(Class::Medium, Scope::Main);
+        smuggled.push("borg-ci-medium-pr".to_owned());
+        assert_eq!(c.labels_scope(&smuggled), Some((Class::Medium, Scope::Pr)));
+        assert_eq!(
+            c.sanitize_extra_labels(&["borg-ci-medium-pr".to_owned()]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn extra_label_syntax() {
+        assert!(valid_extra_label("on-prem") && valid_extra_label("a.b_c-1"));
+        for bad in [
+            "",
+            "self-hosted",
+            "Self-Hosted",
+            "a b",
+            "a/b",
+            &"x".repeat(65),
+        ] {
+            assert!(!valid_extra_label(bad), "{bad}");
+        }
+        let many: Vec<String> = (0..40).map(|i| format!("l{i}")).collect();
+        assert_eq!(
+            Classes::default().sanitize_extra_labels(&many).len(),
+            MAX_EXTRA_LABELS
+        );
     }
 }

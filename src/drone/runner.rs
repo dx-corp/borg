@@ -13,12 +13,15 @@ use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::process::Command;
 
 use crate::drone::cleanup::{docker_prefix, valid_lease_id};
 use crate::drone::exec::Exec;
+use crate::drone::fsops::FsOps;
+use crate::drone::jobuser::JobUser;
 use crate::secret::Secret;
 
 const RSS_SAMPLE_EVERY: Duration = Duration::from_secs(2);
@@ -34,6 +37,9 @@ pub struct RunSpec<'a> {
     /// Extra job environment (cache directories, git mirrors).
     pub extra_env: &'a [(String, String)],
     pub max_job: Duration,
+    /// Run the job as this user (see [`crate::drone::jobuser`]); `None` runs it
+    /// as the drone's own user.
+    pub job_user: Option<&'a JobUser>,
     /// `/proc` (a different root is used by tests).
     pub proc_root: &'a Path,
 }
@@ -136,6 +142,7 @@ fn kill_group(exec: &dyn Exec, pgid: u32) {
 pub async fn run_lease(
     spec: &RunSpec<'_>,
     exec: &dyn Exec,
+    fs_ops: Arc<dyn FsOps>,
     mut abort: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<RunOutcome> {
     if !valid_lease_id(spec.lease_id) {
@@ -149,19 +156,37 @@ pub async fn run_lease(
     tokio::task::spawn_blocking(move || {
         // A slot is reused, so make sure nothing of an earlier lease remains.
         if dst.symlink_metadata().is_ok() {
-            fs::remove_dir_all(&dst)?;
+            fs_ops.remove_all(&dst)?;
         }
-        clone_tree(&src, &dst)
+        fs_ops.clone_tree(&src, &dst)
     })
     .await
     .map_err(io::Error::other)??;
 
     let prefix = docker_prefix(spec.lease_id);
+    let run_sh = lease_dir.join("run.sh");
+    // With a job user the drone starts `setpriv ... run.sh`, which becomes the
+    // runner under the job user's uid with no capabilities.
+    let (program, leading): (PathBuf, Vec<String>) = match spec.job_user {
+        Some(user) => {
+            let mut args = user.setpriv_args();
+            args.push(run_sh.to_string_lossy().into_owned());
+            (PathBuf::from(&user.priv_bin), args)
+        }
+        None => (run_sh, Vec::new()),
+    };
     #[allow(
         clippy::disallowed_methods,
-        reason = "starts the pinned actions-runner run.sh from the drone-owned per-lease directory; its only argument is the queen-issued JIT config"
+        reason = "starts the pinned actions-runner run.sh (directly, or through setpriv as the job user) from the drone-owned per-lease directory; its only secret input is the queen-issued JIT config, passed in the environment"
     )]
-    let mut command = Command::new(lease_dir.join("run.sh"));
+    let mut command = Command::new(&program);
+    command.args(&leading);
+    if let Some(user) = spec.job_user {
+        command
+            .env("HOME", &user.home)
+            .env("USER", &user.name)
+            .env("LOGNAME", &user.name);
+    }
     command
         // The runner reads `ACTIONS_RUNNER_INPUT_<ARG>` as a fallback for each
         // command-line argument (Runner.Listener `CommandSettings`, v2.337.0),
@@ -180,7 +205,9 @@ pub async fn run_lease(
         .env("DISABLE_RUNNER_UPDATE", "1")
         .stdin(Stdio::null())
         .process_group(0)
-        .kill_on_drop(true);
+        // With a job user the drone cannot signal the job directly; its group
+        // is killed through `exec` instead.
+        .kill_on_drop(spec.job_user.is_none());
     let mut child = spawn_retrying(&mut command).await?;
     let pgid = child.id();
 
@@ -260,10 +287,18 @@ mod tests {
             lease_dir: &work.join("slot-0"),
             cache_root: &dir.join("cache"),
             extra_env: &[],
+            job_user: None,
             max_job,
             proc_root: Path::new("/proc"),
         };
-        let out = run_lease(&spec, &SystemExec, rx).await.unwrap();
+        let out = run_lease(
+            &spec,
+            &SystemExec,
+            Arc::new(crate::drone::fsops::LocalFs),
+            rx,
+        )
+        .await
+        .unwrap();
         (out, work.join("slot-0"))
     }
 
@@ -368,6 +403,7 @@ mod tests {
             lease_dir: &work.join("slot-0"),
             cache_root: &cache,
             extra_env: &[],
+            job_user: None,
             max_job: Duration::from_secs(60),
             proc_root: Path::new("/proc"),
         };
@@ -376,7 +412,14 @@ mod tests {
             let _ = tx.send(true);
             tx
         });
-        let out = run_lease(&spec, &SystemExec, rx).await.unwrap();
+        let out = run_lease(
+            &spec,
+            &SystemExec,
+            Arc::new(crate::drone::fsops::LocalFs),
+            rx,
+        )
+        .await
+        .unwrap();
         let _tx = abort.await.unwrap();
         assert!(out.aborted && !out.timed_out);
     }
@@ -394,10 +437,20 @@ mod tests {
             lease_dir: &dir.path().join("work/slot-0"),
             cache_root: dir.path(),
             extra_env: &[],
+            job_user: None,
             max_job: Duration::from_secs(1),
             proc_root: Path::new("/proc"),
         };
-        assert!(run_lease(&spec, &SystemExec, rx).await.is_err());
+        assert!(
+            run_lease(
+                &spec,
+                &SystemExec,
+                Arc::new(crate::drone::fsops::LocalFs),
+                rx
+            )
+            .await
+            .is_err()
+        );
         assert!(!dir.path().join("work").exists());
     }
 
