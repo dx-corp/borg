@@ -190,6 +190,7 @@ fn opts(r: &Repo, queen: Option<String>, marker: &str) -> RunOptions {
         toolchain: "tc".into(),
         timeout_secs: None,
         force: false,
+        scope: "pr".into(),
         wait_secs: 1,
         publish: false,
         argv: vec!["sh".into(), "-c".into(), format!("touch {marker}; exit 7")],

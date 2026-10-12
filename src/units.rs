@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
-use crate::classes::Class;
+use crate::classes::{Class, Scope};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -169,6 +169,25 @@ pub struct SubmitUnit {
     /// (`PUT /v1/units/{id}/bundle`); the unit is not placed until it arrives.
     #[serde(default)]
     pub bundle: bool,
+    /// Priority scope: `deploy`, `main` or `pr` (default). Decides the
+    /// capacity the unit competes for and the drones it may run on.
+    #[serde(default = "default_scope")]
+    pub scope: Scope,
+    /// Newest wins: a new submission with this key from the same client
+    /// cancels that client's older queued or running units with the same key,
+    /// unless they were submitted with `record`.
+    #[serde(default)]
+    pub supersede_key: Option<String>,
+    /// The result is wanted as a record: this unit is never superseded.
+    #[serde(default)]
+    pub record: bool,
+}
+
+/// Longest `supersede_key`.
+pub const MAX_SUPERSEDE_KEY: usize = 128;
+
+fn default_scope() -> Scope {
+    Scope::Pr
 }
 
 fn default_class() -> Class {
@@ -215,6 +234,13 @@ impl SubmitUnit {
         if self.toolchain.len() > 200 || self.toolchain.chars().any(char::is_control) {
             return Err("toolchain must be at most 200 printable characters".into());
         }
+        if let Some(k) = &self.supersede_key
+            && (k.is_empty() || k.len() > MAX_SUPERSEDE_KEY || k.chars().any(char::is_control))
+        {
+            return Err(format!(
+                "supersede_key must be 1 to {MAX_SUPERSEDE_KEY} printable characters"
+            ));
+        }
         Ok(())
     }
 
@@ -233,6 +259,11 @@ impl SubmitUnit {
         field(self.rust_toolchain.as_deref().unwrap_or(""));
         for a in &self.argv {
             field(a);
+        }
+        // Work of a higher scope never shares a unit or a receipt with a lower
+        // one. Pull-request units add nothing, so existing keys stay valid.
+        if self.scope != Scope::Pr {
+            field(self.scope.as_str());
         }
         hex::encode(h.finalize())
     }
@@ -268,6 +299,9 @@ pub struct Unit {
     pub awaiting_bundle: bool,
     /// Size of the uploaded bundle, 0 if none.
     pub bundle_bytes: u64,
+    pub scope: Scope,
+    pub supersede_key: Option<String>,
+    pub record: bool,
 }
 
 /// The proof a unit succeeded for exactly this tree.
@@ -416,6 +450,10 @@ fn unit_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<Unit, StoreError> {
         log_bytes: u64::try_from(r.get::<i64, _>("log_bytes")).unwrap_or(0),
         awaiting_bundle: r.get::<i64, _>("awaiting_bundle") != 0,
         bundle_bytes: u64::try_from(r.get::<i64, _>("bundle_bytes")).unwrap_or(0),
+        scope: serde_json::from_str(&format!("\"{}\"", r.get::<String, _>("scope")))
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?,
+        supersede_key: r.get("supersede_key"),
+        record: r.get::<i64, _>("record") != 0,
     })
 }
 
@@ -428,13 +466,28 @@ impl Store {
         token_hash: &str,
         now: i64,
     ) -> Result<(), StoreError> {
+        self.enroll_client_scoped(name, token_hash, Scope::Pr, now)
+            .await
+    }
+
+    /// Enroll a client that may submit units up to `max_scope`.
+    pub async fn enroll_client_scoped(
+        &self,
+        name: &str,
+        token_hash: &str,
+        max_scope: Scope,
+        now: i64,
+    ) -> Result<(), StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
-        let r = sqlx::query("INSERT INTO clients (name, token_hash, created_at) VALUES (?, ?, ?)")
-            .bind(name)
-            .bind(token_hash)
-            .bind(now)
-            .execute(&self.pool)
-            .await;
+        let r = sqlx::query(
+            "INSERT INTO clients (name, token_hash, created_at, max_scope) VALUES (?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(token_hash)
+        .bind(now)
+        .bind(max_scope.as_str())
+        .execute(&self.pool)
+        .await;
         match r {
             Ok(_) => Ok(()),
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
@@ -454,6 +507,69 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|r| r.get("name")))
+    }
+
+    /// The highest scope a client may submit; `pr` for an unknown client.
+    pub async fn client_max_scope(&self, name: &str) -> Result<Scope, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let row = sqlx::query("SELECT max_scope FROM clients WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(Scope::Pr);
+        };
+        serde_json::from_str(&format!("\"{}\"", row.get::<String, _>("max_scope")))
+            .map_err(|e| StoreError::Corrupt(e.to_string()))
+    }
+
+    /// Cancel `client`'s queued and running non-record units that carry
+    /// `key`, except `except`. Queued ones end at once; running ones are
+    /// flagged for their drone's next heartbeat. Returns the ids.
+    pub async fn supersede_units(
+        &self,
+        client: &str,
+        key: &str,
+        except: &str,
+        now: i64,
+    ) -> Result<Vec<String>, StoreError> {
+        let sql = format!(
+            "SELECT id FROM units WHERE client = ? AND supersede_key = ? AND record = 0 AND id != ? AND state IN {ACTIVE} AND cancel_requested = 0 ORDER BY created_at, id"
+        );
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let rows = sqlx::query(&sql)
+            .bind(client)
+            .bind(key)
+            .bind(except)
+            .fetch_all(&self.pool)
+            .await?;
+        let why = format!("superseded by {except}");
+        let mut out = Vec::new();
+        for r in rows {
+            let id: String = r.get("id");
+            // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+            let ended = sqlx::query("UPDATE units SET state = 'failed', failure = ?, finished_at = ?, cancel_requested = 1 WHERE id = ? AND state IN ('queued', 'leased')")
+                .bind(&why)
+                .bind(now)
+                .bind(&id)
+                .execute(&self.pool)
+                .await?;
+            if ended.rows_affected() > 0 {
+                self.delete_unit_bundle(&id).await?;
+                out.push(id);
+                continue;
+            }
+            // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+            let flagged = sqlx::query("UPDATE units SET cancel_requested = 1, failure = ? WHERE id = ? AND state = 'running'")
+                .bind(&why)
+                .bind(&id)
+                .execute(&self.pool)
+                .await?;
+            if flagged.rows_affected() > 0 {
+                out.push(id);
+            }
+        }
+        Ok(out)
     }
 
     pub async fn unit(&self, id: &str) -> Result<Option<Unit>, StoreError> {
@@ -502,7 +618,7 @@ impl Store {
             return Ok(existing);
         }
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
-        let inserted = sqlx::query("INSERT INTO units (id, key, repo, tree_sha, argv, platform, toolchain, rust_toolchain, class, timeout_secs, client, state, attempt, created_at, awaiting_bundle) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)")
+        let inserted = sqlx::query("INSERT INTO units (id, key, repo, tree_sha, argv, platform, toolchain, rust_toolchain, class, timeout_secs, client, state, attempt, created_at, awaiting_bundle, scope, supersede_key, record) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)")
             .bind(id)
             .bind(&key)
             .bind(&s.repo)
@@ -516,6 +632,9 @@ impl Store {
             .bind(client)
             .bind(now)
             .bind(i64::from(s.bundle))
+            .bind(s.scope.as_str())
+            .bind(s.supersede_key.as_deref())
+            .bind(i64::from(s.record))
             .execute(&self.pool)
             .await;
         match inserted {
@@ -942,6 +1061,9 @@ mod tests {
             force: false,
             rust_toolchain: None,
             bundle: false,
+            scope: Scope::Pr,
+            supersede_key: None,
+            record: false,
         }
     }
 
@@ -982,6 +1104,32 @@ mod tests {
         ] {
             assert_ne!(changed.key(), k, "{changed:?}");
         }
+        // Work of a higher scope is its own unit; pull-request keys are unchanged.
+        for scope in [Scope::Main, Scope::Deploy] {
+            assert_ne!(SubmitUnit { scope, ..submit() }.key(), k);
+        }
+        assert_ne!(
+            SubmitUnit {
+                scope: Scope::Main,
+                ..submit()
+            }
+            .key(),
+            SubmitUnit {
+                scope: Scope::Deploy,
+                ..submit()
+            }
+            .key()
+        );
+        // Superseding and record do not change identity either.
+        assert_eq!(
+            SubmitUnit {
+                supersede_key: Some("pr-1".into()),
+                record: true,
+                ..submit()
+            }
+            .key(),
+            k
+        );
         // Case of the object id is not part of the identity; class and force are not either.
         let upper = SubmitUnit {
             tree_sha: "A".repeat(40),
@@ -1234,5 +1382,69 @@ mod tests {
             Some("agent")
         );
         assert!(s.client_for_token_hash("nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn scope_supersede_key_record_and_client_maximum_are_stored() {
+        let s = store().await;
+        s.enroll_client("plain", "h1", 1).await.unwrap();
+        s.enroll_client_scoped("gate", "h2", Scope::Deploy, 1)
+            .await
+            .unwrap();
+        assert_eq!(s.client_max_scope("plain").await.unwrap(), Scope::Pr);
+        assert_eq!(s.client_max_scope("gate").await.unwrap(), Scope::Deploy);
+        assert_eq!(s.client_max_scope("unknown").await.unwrap(), Scope::Pr);
+
+        let mut a = submit();
+        a.scope = Scope::Main;
+        a.supersede_key = Some("pr-1".into());
+        s.submit_unit(&a, "gate", "u1", 60, 100, 10).await.unwrap();
+        let u = s.unit("u1").await.unwrap().unwrap();
+        assert_eq!(
+            (u.scope, u.supersede_key.as_deref(), u.record),
+            (Scope::Main, Some("pr-1"), false)
+        );
+        let plain = SubmitUnit {
+            tree_sha: "b".repeat(40),
+            ..submit()
+        };
+        s.submit_unit(&plain, "gate", "u2", 60, 100, 11)
+            .await
+            .unwrap();
+        let u = s.unit("u2").await.unwrap().unwrap();
+        assert_eq!(
+            (u.scope, u.supersede_key, u.record),
+            (Scope::Pr, None, false)
+        );
+
+        // Records and other clients' units with the same key survive.
+        let keep = SubmitUnit {
+            tree_sha: "c".repeat(40),
+            supersede_key: Some("pr-1".into()),
+            record: true,
+            ..submit()
+        };
+        s.submit_unit(&keep, "gate", "u3", 60, 100, 12)
+            .await
+            .unwrap();
+        let theirs = SubmitUnit {
+            tree_sha: "d".repeat(40),
+            supersede_key: Some("pr-1".into()),
+            ..submit()
+        };
+        s.submit_unit(&theirs, "plain", "u4", 60, 100, 13)
+            .await
+            .unwrap();
+        let hit = s.supersede_units("gate", "pr-1", "u9", 20).await.unwrap();
+        assert_eq!(hit, ["u1"]);
+        let u = s.unit("u1").await.unwrap().unwrap();
+        assert_eq!(u.state, UnitState::Failed);
+        assert_eq!(u.failure.as_deref(), Some("superseded by u9"));
+        assert!(
+            s.supersede_units("gate", "pr-1", "u9", 21)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -285,3 +285,87 @@ async fn the_contract_is_off_by_default_and_require_report_is_opt_in() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn a_drone_missing_a_required_tool_gets_no_lease_and_status_names_it() {
+    let h = Harness::start(cfg(json!({
+        "env_contract": {
+            "enabled": true,
+            "checks": {"tools": "required"},
+            "required_tools": ["git", "gh", "node"],
+            "classes": {"heavy": {"required_tools": ["git"]}}
+        }
+    })))
+    .await;
+    // "a-bare" would win every name tie; it came up without gh and node.
+    let bare = h.enroll("a-bare").await;
+    let full = h.enroll("b-full").await;
+    let mut f = good("1.95.0");
+    f["tools"] =
+        json!({"git": "git version 2.45.0", "gh": "missing", "node": "missing", "jq": "jq-1.7"});
+    beat(&h, &bare, Some(f)).await;
+    let mut f = good("1.95.0");
+    f["tools"] = json!({"git": "git version 2.45.0", "gh": "gh version 2.50.0", "node": "v22.1.0"});
+    beat(&h, &full, Some(f)).await;
+
+    h.queue_job(1, "borg-ci-light-pr", 5);
+    h.tick().await;
+    assert!(
+        beat(&h, &bare, None).await["leases"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        beat(&h, &full, None).await["leases"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let s = h.status().await;
+    let c = &drone(&s, "a-bare")["contract"];
+    assert_eq!(c["admission"]["light"]["admit"], false);
+    assert!(
+        c["admission"]["light"]["why"]
+            .as_str()
+            .unwrap()
+            .contains("required tools missing on PATH: gh, node")
+    );
+    // The heavy class only asks for git.
+    assert_eq!(c["admission"]["heavy"]["admit"], true);
+    let find_tools = |c: &Value| {
+        c["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["kind"] == "tools")
+            .unwrap()
+            .clone()
+    };
+    let t = find_tools(c);
+    assert_eq!(
+        (t["state"].as_str(), t["mode"].as_str()),
+        (Some("fail"), Some("required"))
+    );
+    assert_eq!(t["observed"]["missing"], "gh,node");
+    assert!(
+        t["observed"]["versions"]
+            .as_str()
+            .unwrap()
+            .contains("git=git version 2.45.0")
+    );
+    assert_eq!(
+        find_tools(&drone(&s, "b-full")["contract"])["state"],
+        "pass"
+    );
+
+    let m = h.metrics().await;
+    for line in [
+        "borg_env_contract_check{drone=\"a-bare\",check=\"tools\",state=\"fail\"} 1",
+        "borg_env_contract_check{drone=\"b-full\",check=\"tools\",state=\"pass\"} 1",
+    ] {
+        assert!(m.contains(line), "missing {line}\n{m}");
+    }
+}

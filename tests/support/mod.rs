@@ -54,6 +54,12 @@ pub struct MockState {
     pub cancelled: Vec<u64>,
     /// Runs whose cancel answers 409.
     pub uncancellable: Vec<u64>,
+    /// Jobs the requeuer re-ran.
+    pub reruns: Vec<u64>,
+    /// Status code a job's rerun answers instead of 201.
+    pub rerun_status: HashMap<u64, u16>,
+    /// Reads of a single run (janitor or requeuer).
+    pub run_reads: u32,
     next_runner_id: u64,
 }
 
@@ -152,9 +158,18 @@ async fn runs(
     h: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, StatusCode> {
-    if q.get("event").map(String::as_str) == Some("pull_request") {
-        check_janitor(&h)?;
-        return Ok(Json(json!({"workflow_runs": lock(&s).pr_runs.clone()})));
+    if bearer(&h) == Some(JANITOR_TOKEN) {
+        let runs: Vec<Value> = lock(&s)
+            .pr_runs
+            .iter()
+            .filter(|r| {
+                ["status", "event"]
+                    .iter()
+                    .all(|k| q.get(*k).is_none_or(|v| r[*k].as_str() == Some(v)))
+            })
+            .cloned()
+            .collect();
+        return Ok(Json(json!({"workflow_runs": runs})));
     }
     check_token(&h)?;
     let ids: Vec<Value> = if q.get("status").map(String::as_str) == Some("queued") {
@@ -215,7 +230,8 @@ async fn one_run(
     Path((_o, _r, id)): Path<(String, String, u64)>,
 ) -> Result<Json<Value>, StatusCode> {
     check_janitor(&h)?;
-    let st = lock(&s);
+    let mut st = lock(&s);
+    st.run_reads += 1;
     let mut run = st
         .pr_runs
         .iter()
@@ -243,6 +259,22 @@ async fn cancel_run(
     st.cancelled.push(id);
     st.pr_runs.retain(|r| r["id"].as_u64() != Some(id));
     StatusCode::ACCEPTED
+}
+
+async fn rerun_job(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_o, _r, id)): Path<(String, String, u64)>,
+) -> StatusCode {
+    if check_janitor(&h).is_err() {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let mut st = lock(&s);
+    if let Some(code) = st.rerun_status.get(&id) {
+        return StatusCode::from_u16(*code).unwrap();
+    }
+    st.reruns.push(id);
+    StatusCode::CREATED
 }
 
 async fn pull(
@@ -387,6 +419,10 @@ impl Harness {
                 "/repos/{owner}/{repo}/actions/runs/{run}/cancel",
                 post(cancel_run),
             )
+            .route(
+                "/repos/{owner}/{repo}/actions/jobs/{id}/rerun",
+                post(rerun_job),
+            )
             .route("/repos/{owner}/{repo}/pulls/{n}", get(pull))
             .route("/orgs/{org}/actions/runners", get(list_runners))
             .route(
@@ -414,10 +450,25 @@ impl Harness {
             borg::janitor::Janitor::new(&gh_url, borg::secret::Secret::new(JANITOR_TOKEN), settings)
                 .unwrap()
         });
+        let requeuer = cfg
+            .supersede_janitor
+            .as_ref()
+            .filter(|_| cfg.preemption.is_some())
+            .map(|settings| {
+                borg::requeue::Requeuer::new(
+                    &gh_url,
+                    borg::secret::Secret::new(JANITOR_TOKEN),
+                    settings,
+                )
+                .unwrap()
+            });
         let wakes = Arc::new(RecordingWake::default());
         let mut queen = Queen::new(cfg, store, github).with_wake_sender(wakes.clone());
         if let Some(j) = janitor {
             queen = queen.with_janitor(j);
+        }
+        if let Some(r) = requeuer {
+            queen = queen.with_requeuer(r);
         }
         if let Some(settings) = queen.config().tailnet_enroll.clone() {
             queen = queen.with_tailnet_enroll(borg::tailnet::TailnetEnroll {
@@ -538,9 +589,64 @@ impl Harness {
         }));
     }
 
+    /// Add a run of any status or event as the janitor lists it.
+    pub fn add_run(&self, id: u64, status: &str, event: &str, sha: &str, pr: Option<u64>) {
+        let prs: Vec<Value> = pr.iter().map(|n| json!({"number": n})).collect();
+        self.state().pr_runs.push(json!({
+            "id": id, "workflow_id": 1, "status": status, "event": event,
+            "head_sha": sha, "pull_requests": prs
+        }));
+    }
+
     pub async fn janitor_pass(&self) -> borg::janitor::PassReport {
         let repos = self.queen.config().repos.clone();
         self.queen.janitor().unwrap().pass(&repos).await
+    }
+
+    /// Record a preemption of `job` in `run` at unix time `at`.
+    pub async fn preempted(&self, lease: &str, run: u64, job: u64, at: i64) {
+        use borg::classes::{Class, Scope};
+        use borg::store::{LeaseRow, LeaseStatus, PreemptionRow};
+        let store = self.queen.store();
+        store
+            .insert_lease(&LeaseRow {
+                id: lease.into(),
+                drone: "d1".into(),
+                class: Class::Medium,
+                scope: Scope::Pr,
+                labels: vec![],
+                runner_name: format!("borg-d1-{lease}"),
+                runner_id: 1,
+                jit_config: None,
+                state: LeaseStatus::Running,
+                created_at: at,
+                expires_at: at + 600,
+            })
+            .await
+            .unwrap();
+        let row = PreemptionRow {
+            lease_id: lease.into(),
+            drone: "d1".into(),
+            class: Class::Medium,
+            scope: Scope::Pr,
+            for_scope: Scope::Main,
+            repo: format!("{ORG}/app"),
+            run_id: run,
+            job_id: job,
+            at,
+            requeued_at: None,
+        };
+        assert!(store.record_preemption(&row, at).await.unwrap());
+    }
+
+    pub async fn requeue_pass(&self) -> borg::requeue::PassReport {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        self.queen
+            .requeuer()
+            .unwrap()
+            .pass(self.queen.store(), now)
+            .await
+            .unwrap()
     }
 
     pub async fn tick(&self) {

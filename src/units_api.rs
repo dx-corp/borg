@@ -72,6 +72,10 @@ pub struct SubmitResponse {
     pub unit_id: String,
     pub state: String,
     pub receipt: Option<Receipt>,
+    /// Older units of the same client and `supersede_key` this submission
+    /// cancelled.
+    #[serde(default)]
+    pub superseded: Vec<String>,
 }
 
 async fn submit(
@@ -82,6 +86,14 @@ async fn submit(
     enabled(&queen)?;
     let client = authenticate_client(&queen, &headers).await?;
     req.validate().map_err(ApiError::BadRequest)?;
+    let max_scope = queen.store().client_max_scope(&client).await?;
+    if req.scope < max_scope {
+        return Err(ApiError::ForbiddenWith(format!(
+            "this client may submit units up to scope {} but asked for {}",
+            max_scope.as_str(),
+            req.scope.as_str()
+        )));
+    }
     let cfg = &queen.config().units;
     let timeout = req
         .timeout_secs
@@ -103,8 +115,15 @@ async fn submit(
     let submitted = store
         .submit_unit(&req, &client, &id, timeout, cfg.receipt_ttl_secs, t)
         .await?;
+    let mut superseded = Vec::new();
     let (outcome, unit, status) = match submitted {
-        Submitted::New(u) => ("new", u, StatusCode::CREATED),
+        Submitted::New(u) => {
+            if let Some(key) = &req.supersede_key {
+                superseded = store.supersede_units(&client, key, &u.id, t).await?;
+                queen.count_units_superseded(superseded.len());
+            }
+            ("new", u, StatusCode::CREATED)
+        }
         Submitted::Joined(u) => {
             queen.count_unit_join();
             ("joined", u, StatusCode::OK)
@@ -127,6 +146,7 @@ async fn submit(
             unit_id: unit.id.clone(),
             state: unit.state.as_str().to_owned(),
             receipt: unit.receipt(),
+            superseded,
         }),
     ))
 }

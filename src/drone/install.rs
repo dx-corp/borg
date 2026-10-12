@@ -84,6 +84,10 @@ pub struct InstallOptions {
     /// leaving its files as they are.
     pub adopt_cache: bool,
     pub extra_labels: Vec<String>,
+    pub trust: crate::classes::Trust,
+    /// Seconds without a queen answer before standby deploy runners start;
+    /// 0 turns fail-open off.
+    pub fail_open_after_secs: u64,
     pub runner_env: BTreeMap<String, String>,
     pub job_started_hook: Option<PathBuf>,
     pub job_completed_hook: Option<PathBuf>,
@@ -791,7 +795,9 @@ impl Installer<'_> {
             cache_root: self.layout.cache_root.clone(),
             docker_bin: "docker".to_owned(),
             heartbeat_secs: 10,
+            fail_open_after_secs: o.fail_open_after_secs,
             max_job_secs: 6 * 3600,
+            preempt_grace_secs: 30,
             drain_timeout_secs: o.drain_timeout_secs,
             max_vcpu: o.max_vcpu,
             max_mem_mib: o.max_mem_mib,
@@ -805,6 +811,7 @@ impl Installer<'_> {
                 priv_bin: "setpriv".to_owned(),
             }),
             extra_labels: o.extra_labels.clone(),
+            trust: o.trust,
             runner_env: o.runner_env.clone(),
             job_started_hook: o.job_started_hook.clone(),
             job_completed_hook: o.job_completed_hook.clone(),
@@ -1012,6 +1019,8 @@ mod tests {
             cache_root: None,
             adopt_cache: false,
             extra_labels: vec!["on-prem".into()],
+            trust: crate::classes::Trust::Shared,
+            fail_open_after_secs: 120,
             runner_env: BTreeMap::new(),
             job_started_hook: None,
             job_completed_hook: None,

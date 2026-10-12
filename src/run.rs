@@ -55,6 +55,8 @@ pub struct RunOptions {
     pub toolchain: String,
     pub timeout_secs: Option<u64>,
     pub force: bool,
+    /// Unit priority scope: `deploy`, `main` or `pr`.
+    pub scope: String,
     /// How long to wait for a drone to pick the unit up before running locally.
     pub wait_secs: u64,
     pub publish: bool,
@@ -347,7 +349,7 @@ async fn remote(opts: &RunOptions, out: &mut dyn Write) -> Result<i32, Fallback>
     let body = serde_json::json!({
         "repo": repo, "tree_sha": tree, "argv": opts.argv, "platform": opts.platform,
         "toolchain": opts.toolchain, "class": opts.class,
-        "timeout_secs": opts.timeout_secs, "force": opts.force, "bundle": needs_bundle,
+        "timeout_secs": opts.timeout_secs, "force": opts.force, "bundle": needs_bundle, "scope": opts.scope,
         "rust_toolchain": tree_rust_toolchain(&opts.dir, &tree),
     });
     let resp = q

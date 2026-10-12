@@ -15,6 +15,7 @@ use borg::github::GithubClient;
 use borg::janitor::Janitor;
 use borg::probe::{self, system::SystemHost};
 use borg::queen::Queen;
+use borg::requeue::Requeuer;
 use borg::store::Store;
 use borg::tailnet::{TailnetEnroll, TailscaledWhois};
 use borg::update;
@@ -102,6 +103,24 @@ struct UpdateArgs {
     json: bool,
 }
 
+/// A unit scope on the command line.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ScopeArg {
+    Deploy,
+    Main,
+    Pr,
+}
+
+impl From<ScopeArg> for borg::classes::Scope {
+    fn from(s: ScopeArg) -> Self {
+        match s {
+            ScopeArg::Deploy => Self::Deploy,
+            ScopeArg::Main => Self::Main,
+            ScopeArg::Pr => Self::Pr,
+        }
+    }
+}
+
 #[derive(Args)]
 struct RunArgs {
     /// Queen base URL. Without it the command simply runs here.
@@ -136,6 +155,9 @@ struct RunArgs {
     /// Run even if an identical command already passed for this tree.
     #[arg(long)]
     force: bool,
+    /// Priority scope of the unit; the client token's maximum applies.
+    #[arg(long, env = "BORG_RUN_SCOPE", value_enum, default_value = "pr")]
+    scope: ScopeArg,
     /// Seconds to wait for a drone before running here.
     #[arg(long, env = "BORG_RUN_WAIT_SECS", default_value_t = 60)]
     wait_secs: u64,
@@ -194,6 +216,9 @@ enum QueenCommand {
         config: ConfigArg,
         /// Client name: lowercase letters, digits and dashes.
         name: String,
+        /// Highest unit scope this client may submit.
+        #[arg(long, value_enum, default_value = "pr")]
+        max_scope: ScopeArg,
     },
     /// Stop granting a drone new leases (running jobs finish).
     Quarantine {
@@ -320,6 +345,15 @@ struct InstallArgs {
     /// Add this label to every runner the drone registers; repeatable.
     #[arg(long = "extra-label")]
     extra_labels: Vec<String>,
+    /// `shared` (default), `deploy` or `deploy-only`: a deploy drone runs only
+    /// deploy and main jobs, a deploy-only drone only deploy jobs, a shared
+    /// drone never runs deploy jobs.
+    #[arg(long, value_parser = parse_trust, default_value = "shared")]
+    trust: borg::classes::Trust,
+    /// Start standby deploy runners after this many seconds without a queen
+    /// answer; 0 turns fail-open off.
+    #[arg(long, default_value_t = 120)]
+    fail_open_after_secs: u64,
     /// KEY=VALUE injected into every lease's environment; repeatable.
     #[arg(long = "runner-env", value_parser = parse_env_pair)]
     runner_env: Vec<(String, String)>,
@@ -349,6 +383,11 @@ struct InstallArgs {
     /// Print what would change without changing anything.
     #[arg(long)]
     dry_run: bool,
+}
+
+fn parse_trust(s: &str) -> Result<borg::classes::Trust, String> {
+    serde_json::from_value(serde_json::Value::from(s))
+        .map_err(|_| "expected shared, deploy or deploy-only".to_owned())
 }
 
 fn parse_env_pair(s: &str) -> Result<(String, String), String> {
@@ -417,6 +456,7 @@ async fn run_queen(path: &Path) -> Result<()> {
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
     tracing::info!("queen listening on {}", cfg.listen);
+    let mut requeuer = None;
     let janitor = match &cfg.supersede_janitor {
         Some(settings) => {
             let token = janitor_token(settings)?;
@@ -428,6 +468,13 @@ async fn run_queen(path: &Path) -> Result<()> {
                     "cancelling"
                 }
             );
+            if cfg.preemption.is_some() {
+                requeuer = Some(Requeuer::new(
+                    &cfg.github.api_base,
+                    token.clone(),
+                    settings,
+                )?);
+            }
             Some(Janitor::new(&cfg.github.api_base, token, settings.clone())?)
         }
         None => None,
@@ -448,6 +495,9 @@ async fn run_queen(path: &Path) -> Result<()> {
     }
     if let Some(j) = janitor {
         queen = queen.with_janitor(j);
+    }
+    if let Some(r) = requeuer {
+        queen = queen.with_requeuer(r);
     }
     let queen = Arc::new(queen);
     api::serve(queen, listener, wait_for_shutdown()).await?;
@@ -501,7 +551,7 @@ async fn report(a: ReportArgs) -> Result<()> {
     Ok(())
 }
 
-async fn enroll_client(path: &Path, name: &str) -> Result<()> {
+async fn enroll_client(path: &Path, name: &str, max_scope: borg::classes::Scope) -> Result<()> {
     if !enroll::valid_drone_name(name) {
         bail!(
             "client name must be 1-40 lowercase letters, digits or dashes, not starting with a dash"
@@ -512,7 +562,7 @@ async fn enroll_client(path: &Path, name: &str) -> Result<()> {
     let token = enroll::new_token();
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     store
-        .enroll_client(name, &enroll::hash_token(&token), now)
+        .enroll_client_scoped(name, &enroll::hash_token(&token), max_scope, now)
         .await?;
     eprintln!("Enrolled client {name}. The token is shown once; the queen stores only its hash.");
     println!("{token}");
@@ -620,6 +670,8 @@ fn install_drone(a: InstallArgs) -> Result<()> {
         cache_root: a.cache_root,
         adopt_cache: a.adopt_cache,
         extra_labels: a.extra_labels,
+        trust: a.trust,
+        fail_open_after_secs: a.fail_open_after_secs,
         runner_env: a.runner_env.into_iter().collect(),
         job_started_hook: a.job_started_hook,
         job_completed_hook: a.job_completed_hook,
@@ -701,6 +753,7 @@ async fn run_command(a: RunArgs) -> u8 {
         toolchain: a.toolchain,
         timeout_secs: a.timeout,
         force: a.force,
+        scope: borg::classes::Scope::from(a.scope).as_str().to_owned(),
         wait_secs: a.wait_secs,
         publish: a.publish,
         argv: a.argv,
@@ -788,9 +841,11 @@ async fn dispatch(command: Command) -> Result<()> {
                     reason,
                     name,
                 } => set_quarantine(&config.config, &name, Some(&reason)).await,
-                QueenCommand::EnrollClient { config, name } => {
-                    enroll_client(&config.config, &name).await
-                }
+                QueenCommand::EnrollClient {
+                    config,
+                    name,
+                    max_scope,
+                } => enroll_client(&config.config, &name, max_scope.into()).await,
                 QueenCommand::Rollout { command } => match command {
                     RolloutCommand::Halt { config, reason } => {
                         rollout_admin(&config.config, Some(&reason)).await

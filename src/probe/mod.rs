@@ -5,9 +5,14 @@
 
 pub mod system;
 
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+
+use crate::drone::exec::Exec;
+use crate::envcontract::{EnvFacts, PROBE_TOOLS, TOOL_MISSING};
 
 /// What kind of machine the drone runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +74,120 @@ pub fn probe(host: &dyn Host) -> Capacity {
         mise_version: host.run("mise", &["--version"]),
         git_version: host.run("git", &["--version"]),
     }
+}
+
+/// Build-environment facts that need no tooling: memory available and CPU
+/// pressure. Sent on every heartbeat; the admission rule reads the pressure.
+pub fn env_facts(host: &dyn Host, now: i64) -> EnvFacts {
+    EnvFacts {
+        observed_at: now,
+        mem_available_mib: mem_available_mib(host),
+        cpu_psi_some_avg10_pm: cpu_psi_pm(host),
+        ..EnvFacts::default()
+    }
+}
+
+/// How long a tools probe is reused before the tools are looked up again.
+const TOOLS_TTL_SECS: i64 = 60;
+/// Longest version string reported for a tool.
+const TOOL_VERSION_MAX: usize = 80;
+
+/// The first line of a tool's `--version` output, trimmed and clipped to
+/// [`TOOL_VERSION_MAX`] characters; `"unknown"` when there is no output.
+pub fn tool_version_line(output: &str) -> String {
+    let line = output.lines().map(str::trim).find(|l| !l.is_empty());
+    match line {
+        Some(l) => l.chars().take(TOOL_VERSION_MAX).collect(),
+        None => "unknown".to_owned(),
+    }
+}
+
+/// For each tool in [`PROBE_TOOLS`], its version line, or `"missing"` when the
+/// shell cannot find it on `PATH`. `exec` runs as the job user, so this is the
+/// `PATH` a job gets. A tool that exists but prints no version is `"unknown"`.
+pub fn tool_versions(exec: &dyn Exec) -> BTreeMap<String, String> {
+    PROBE_TOOLS
+        .iter()
+        .map(|&tool| {
+            let found = exec
+                .run(
+                    "sh",
+                    &["-c", "command -v \"$1\" >/dev/null 2>&1", "sh", tool],
+                )
+                .is_ok_and(|o| o.success);
+            let value = if found {
+                // `go` has no `--version` flag.
+                let args: &[&str] = if tool == "go" {
+                    &["version"]
+                } else {
+                    &["--version"]
+                };
+                match exec.run(tool, args) {
+                    Ok(o) if o.success => tool_version_line(&o.stdout),
+                    _ => "unknown".to_owned(),
+                }
+            } else {
+                TOOL_MISSING.to_owned()
+            };
+            (tool.to_owned(), value)
+        })
+        .collect()
+}
+
+/// The last tools probe, reused for [`TOOLS_TTL_SECS`].
+#[derive(Clone, Default)]
+pub struct ToolsCache(Arc<Mutex<Option<ToolsProbe>>>);
+
+/// When the tools were probed, and what was found.
+type ToolsProbe = (i64, BTreeMap<String, String>);
+
+impl ToolsCache {
+    /// The cached tools if they are under a minute old, else a fresh probe.
+    pub fn get(&self, exec: &dyn Exec, now: i64) -> Option<BTreeMap<String, String>> {
+        let mut slot = self.0.lock().ok()?;
+        if let Some((at, tools)) = slot.as_ref()
+            && (0..TOOLS_TTL_SECS).contains(&(now - at))
+        {
+            return Some(tools.clone());
+        }
+        let tools = tool_versions(exec);
+        *slot = Some((now, tools.clone()));
+        Some(tools)
+    }
+}
+
+fn mem_available_mib(host: &dyn Host) -> Option<u64> {
+    let meminfo = host.read_to_string(Path::new("/proc/meminfo"))?;
+    let kib = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    Some(kib / 1024)
+}
+
+/// The higher of the host-wide and the cgroup `cpu some avg10`, in permille.
+/// Inside an LXC container `/proc/pressure/cpu` is the host's or the
+/// container's depending on lxcfs, so both files are read.
+fn cpu_psi_pm(host: &dyn Host) -> Option<u16> {
+    ["/proc/pressure/cpu", "/sys/fs/cgroup/cpu.pressure"]
+        .iter()
+        .filter_map(|path| parse_psi_some_avg10_pm(&host.read_to_string(Path::new(path))?))
+        .max()
+}
+
+/// `some avg10=1.23 ...` (percent) as permille, clamped to 1000.
+fn parse_psi_some_avg10_pm(text: &str) -> Option<u16> {
+    let line = text.lines().find(|l| l.starts_with("some "))?;
+    let pct = line
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("avg10="))?
+        .parse::<f64>()
+        .ok()?;
+    pct.is_finite()
+        .then(|| (pct * 10.0).round().clamp(0.0, 1000.0) as u16)
 }
 
 fn hostname(host: &dyn Host) -> String {
@@ -244,6 +363,117 @@ mod tests {
             cpus: Some(16),
             ..FakeHost::default()
         }
+    }
+
+    struct FakeExec {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Exec for FakeExec {
+        fn run(&self, program: &str, args: &[&str]) -> std::io::Result<crate::drone::exec::Output> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{program} {}", args.join(" ")));
+            let ok = |stdout: &str| {
+                Ok(crate::drone::exec::Output {
+                    success: true,
+                    stdout: stdout.to_owned(),
+                })
+            };
+            let no = || {
+                Ok(crate::drone::exec::Output {
+                    success: false,
+                    stdout: String::new(),
+                })
+            };
+            match (program, args) {
+                ("sh", [_, _, _, tool]) => {
+                    if ["git", "gh", "go", "jq"].contains(tool) {
+                        ok("")
+                    } else {
+                        no()
+                    }
+                }
+                ("git", ["--version"]) => ok("git version 2.45.0\nbuilt from source"),
+                ("gh", ["--version"]) => {
+                    ok("\n  gh version 2.50.0 (2026-01-01)  \nhttps://example.test")
+                }
+                ("go", ["version"]) => ok("go version go1.25.0 linux/amd64"),
+                _ => no(),
+            }
+        }
+    }
+
+    #[test]
+    fn version_lines_are_the_first_non_empty_line_trimmed_and_clipped() {
+        assert_eq!(
+            tool_version_line("git version 2.45.0\nmore"),
+            "git version 2.45.0"
+        );
+        assert_eq!(tool_version_line("\n  v22.1.0  \n"), "v22.1.0");
+        assert_eq!(tool_version_line("   \n"), "unknown");
+        assert_eq!(tool_version_line(&"x".repeat(200)).len(), 80);
+    }
+
+    #[test]
+    fn tools_are_found_on_path_then_asked_for_their_version() {
+        let exec = FakeExec {
+            calls: Mutex::default(),
+        };
+        let t = tool_versions(&exec);
+        assert_eq!(t.len(), PROBE_TOOLS.len());
+        assert_eq!(t["git"], "git version 2.45.0");
+        assert_eq!(t["gh"], "gh version 2.50.0 (2026-01-01)");
+        assert_eq!(t["go"], "go version go1.25.0 linux/amd64");
+        // On PATH but silent: present, version unknown.
+        assert_eq!(t["jq"], "unknown");
+        assert_eq!(t["node"], "missing");
+        assert_eq!(t["cosign"], "missing");
+        // A missing tool is never executed.
+        assert!(
+            !exec
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("node "))
+        );
+    }
+
+    #[test]
+    fn the_tools_probe_is_cached_for_a_minute() {
+        let exec = FakeExec {
+            calls: Mutex::default(),
+        };
+        let cache = ToolsCache::default();
+        let first = cache.get(&exec, 1000).unwrap();
+        let n = exec.calls.lock().unwrap().len();
+        assert_eq!(cache.get(&exec, 1059).unwrap(), first);
+        assert_eq!(exec.calls.lock().unwrap().len(), n);
+        cache.get(&exec, 1060).unwrap();
+        assert!(exec.calls.lock().unwrap().len() > n);
+    }
+
+    #[test]
+    fn psi_is_the_higher_of_host_and_cgroup_pressure() {
+        let mut h = linux();
+        h.files.insert(
+            "/proc/pressure/cpu",
+            "some avg10=12.34 avg60=1.00 avg300=1.00 total=1\nfull avg10=0.00\n",
+        );
+        assert_eq!(cpu_psi_pm(&h), Some(123));
+        h.files.insert(
+            "/sys/fs/cgroup/cpu.pressure",
+            "some avg10=45.60 avg60=1.00 avg300=1.00 total=1\n",
+        );
+        assert_eq!(cpu_psi_pm(&h), Some(456));
+        assert_eq!(cpu_psi_pm(&linux()), None);
+        assert_eq!(parse_psi_some_avg10_pm("full avg10=5.00\n"), None);
+        assert_eq!(
+            parse_psi_some_avg10_pm("some avg10=100.00 avg60=0\n"),
+            Some(1000)
+        );
     }
 
     const MEMINFO_28G: &str = "MemTotal:       29360128 kB\nMemFree: 1 kB\n";

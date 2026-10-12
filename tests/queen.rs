@@ -1028,3 +1028,216 @@ async fn a_timed_out_feedback_lookup_is_bounded_and_retried_later() {
         1
     );
 }
+
+#[tokio::test]
+async fn starving_main_demand_preempts_one_running_pr_lease_and_tells_its_drone() {
+    let h = Harness::start(json!({
+        "preemption": {"after_secs": 600, "max_per_pass": 1, "min_victim_age_secs": 60}
+    }))
+    .await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    h.queue_job(1, "borg-ci-medium-pr", 1);
+    h.queue_job(2, "borg-ci-medium-pr", 1);
+    h.tick().await;
+    h.set_runner("borg-d1-", "online", true);
+    let started = (OffsetDateTime::now_utc() - time::Duration::minutes(10))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let running: Vec<Value> = h
+        .state()
+        .mints
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            json!({"id": 100 + i, "run_id": 9, "status": "in_progress", "labels": [],
+                   "created_at": started, "started_at": started, "runner_name": m["name"]})
+        })
+        .collect();
+    h.state().jobs = running;
+    h.queue_job(3, "borg-ci-medium", 700);
+
+    h.tick().await;
+    h.tick().await;
+
+    let rows = h.queen.store().preemptions(20).await.unwrap();
+    assert_eq!(rows.len(), 1, "one cancellation covers the demand");
+    assert_eq!((rows[0].run_id, rows[0].job_id / 100), (1, 1));
+    let body = h.heartbeat_with(&token, json!({})).await;
+    assert_eq!(body["cancel_leases"], json!([rows[0].lease_id]));
+    let status = h.status().await;
+    assert_eq!(
+        status["preemptions"][0]["lease_id"],
+        json!(rows[0].lease_id)
+    );
+    assert!(
+        h.metrics()
+            .await
+            .contains("borg_preemptions_total{from_scope=\"pr\",to_scope=\"main\"} 1")
+    );
+}
+
+#[tokio::test]
+async fn nothing_is_preempted_unless_configured() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    h.queue_job(1, "borg-ci-medium", 5000);
+    h.tick().await;
+    assert!(h.queen.store().preemptions(20).await.unwrap().is_empty());
+    let body = h.heartbeat_with(&token, json!({})).await;
+    assert_eq!(body["cancel_leases"], json!([]));
+}
+
+fn standby_cfg() -> Value {
+    json!({"standby": {"classes": ["medium"], "per_drone": 1}})
+}
+
+async fn standby_beat(h: &Harness, token: &str, held: &[&str], active: &[&str]) -> Value {
+    h.heartbeat_with(
+        token,
+        json!({"trust": "deploy-only", "held_standby": held, "active_leases": active}),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn standby_runners_are_minted_for_deploy_drones_only_and_never_expire_by_ttl() {
+    let mut cfg = standby_cfg();
+    cfg["lease_ttl_secs"] = json!(300);
+    let h = Harness::start(cfg).await;
+    let dep = h.enroll("dep").await;
+    let shared = h.enroll("shr").await;
+    standby_beat(&h, &dep, &[], &[]).await;
+    h.heartbeat(&shared, &[]).await;
+
+    h.tick().await;
+
+    let mints = h.state().mints.clone();
+    assert_eq!(mints.len(), 1, "one standby for the deploy-only drone");
+    assert!(mints[0]["name"].as_str().unwrap().starts_with("borg-dep-"));
+    assert_eq!(
+        labels(&mints[0]),
+        ["self-hosted", "Linux", "X64", "borg-ci-medium-deploy"],
+        "deploy labels only"
+    );
+    let body = standby_beat(&h, &dep, &[], &[]).await;
+    assert_eq!(body["leases"], json!([]), "not an ordinary lease");
+    assert_eq!(body["start_standby"], json!([]));
+    let grants = body["standby"].as_array().unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0]["scope"], "deploy");
+    let name = mints[0]["name"].as_str().unwrap();
+    assert_eq!(grants[0]["jit_config"], format!("jit-{name}"));
+    let id = grants[0]["lease_id"].as_str().unwrap().to_owned();
+    let shared_body = h.heartbeat_with(&shared, json!({})).await;
+    assert_eq!(shared_body["standby"], json!([]));
+
+    // Acknowledged by listing it as held: not resent.
+    let body = standby_beat(&h, &dep, &[&id], &[]).await;
+    assert_eq!(body["standby"], json!([]));
+
+    // Far beyond the pending-lease TTL the standby is still there, its
+    // registration is not deleted and no replacement is minted.
+    let runner_id = h.state().runners[0]["id"].as_u64().unwrap();
+    let later = OffsetDateTime::now_utc() + time::Duration::seconds(301);
+    h.queen.tick(later).await.unwrap();
+    assert!(!h.state().deleted.contains(&runner_id));
+    assert_eq!(h.state().mints.len(), 1);
+    let lease = h.queen.store().lease(&id).await.unwrap().unwrap();
+    assert_eq!(lease.state, borg::store::LeaseStatus::Standby);
+    // The reaper treats the offline standby registration as owned.
+    assert_eq!(h.state().runners.len(), 1);
+}
+
+#[tokio::test]
+async fn a_lost_standby_config_is_resent_and_a_forgotten_one_is_dropped() {
+    let h = Harness::start(standby_cfg()).await;
+    let dep = h.enroll("dep").await;
+    standby_beat(&h, &dep, &[], &[]).await;
+    h.tick().await;
+    let id = standby_beat(&h, &dep, &[], &[]).await["standby"][0]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The drone lost its copy: the queen sends it again.
+    let body = standby_beat(&h, &dep, &[], &[]).await;
+    assert_eq!(body["standby"][0]["lease_id"], json!(id));
+    // A held id the queen has no standby for is dropped.
+    let body = standby_beat(&h, &dep, &[&id, "gone1"], &[]).await;
+    assert_eq!(body["drop_standby"], json!(["gone1"]));
+}
+
+#[tokio::test]
+async fn queued_deploy_demand_starts_the_standby_instead_of_minting_and_a_replacement_follows() {
+    let h = Harness::start(standby_cfg()).await;
+    let dep = h.enroll("dep").await;
+    standby_beat(&h, &dep, &[], &[]).await;
+    h.tick().await;
+    let id = standby_beat(&h, &dep, &[], &[]).await["standby"][0]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    h.queue_job(1, "borg-ci-medium-deploy", 5);
+    h.tick().await;
+    assert_eq!(h.state().mints.len(), 1, "the standby absorbs the demand");
+    let body = standby_beat(&h, &dep, &[&id], &[]).await;
+    assert_eq!(body["start_standby"], json!([id]));
+    assert_eq!(body["leases"], json!([]));
+
+    // The drone started it: it reports the id as active and no longer held.
+    standby_beat(&h, &dep, &[], &[&id]).await;
+    let lease = h.queen.store().lease(&id).await.unwrap().unwrap();
+    assert_eq!(lease.state, borg::store::LeaseStatus::Pending);
+    assert!(lease.jit_config.is_none());
+
+    // The runner takes the job; the queen marks the lease running and mints
+    // a new standby.
+    h.set_runner("borg-dep-", "online", true);
+    h.state().jobs.clear();
+    h.tick().await;
+    let lease = h.queen.store().lease(&id).await.unwrap().unwrap();
+    assert_eq!(lease.state, borg::store::LeaseStatus::Running);
+    assert_eq!(h.state().mints.len(), 2, "replacement standby minted");
+    let body = standby_beat(&h, &dep, &[], &[&id]).await;
+    assert_eq!(body["start_standby"], json!([]));
+    assert_eq!(body["standby"].as_array().unwrap().len(), 1);
+
+    // The job finishes and the ephemeral runner deregisters.
+    h.state().runners.retain(|r| r["busy"] != json!(true));
+    h.tick().await;
+    let lease = h.queen.store().lease(&id).await.unwrap().unwrap();
+    assert_eq!(lease.state, borg::store::LeaseStatus::Done);
+    assert_eq!(h.state().mints.len(), 2);
+}
+
+#[tokio::test]
+async fn a_standby_started_during_an_outage_is_reconciled_when_the_queen_returns() {
+    let h = Harness::start(standby_cfg()).await;
+    let dep = h.enroll("dep").await;
+    standby_beat(&h, &dep, &[], &[]).await;
+    h.tick().await;
+    let id = standby_beat(&h, &dep, &[], &[]).await["standby"][0]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The drone fail-opened on its own and the job ran while the queen could
+    // not hear it; the runner is gone from GitHub before the next heartbeat.
+    h.set_runner("borg-dep-", "online", true);
+    h.tick().await;
+    assert_eq!(
+        h.queen.store().lease(&id).await.unwrap().unwrap().state,
+        borg::store::LeaseStatus::Running
+    );
+    h.state().runners.retain(|r| r["busy"] != json!(true));
+    h.tick().await;
+    assert_eq!(
+        h.queen.store().lease(&id).await.unwrap().unwrap().state,
+        borg::store::LeaseStatus::Done
+    );
+    // The drone, back online, still lists it as held; the queen does not
+    // revive it and tells the drone to forget it.
+    let body = standby_beat(&h, &dep, &[&id], &[]).await;
+    assert_eq!(body["drop_standby"], json!([id]));
+}

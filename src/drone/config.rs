@@ -213,9 +213,16 @@ pub struct DroneConfig {
     pub docker_bin: String,
     #[serde(default = "default_heartbeat")]
     pub heartbeat_secs: u64,
+    /// A drone holding standby deploy runners starts them all once the queen
+    /// has not answered a heartbeat for this long. 0 disables fail-open.
+    #[serde(default = "default_fail_open")]
+    pub fail_open_after_secs: u64,
     /// A lease running longer than this is killed.
     #[serde(default = "default_max_job")]
     pub max_job_secs: u64,
+    /// A preempted lease's runner gets SIGINT, then is killed after this long.
+    #[serde(default = "default_preempt_grace")]
+    pub preempt_grace_secs: u64,
     /// On SIGTERM, wait this long for in-flight jobs before killing them.
     #[serde(default = "default_drain")]
     pub drain_timeout_secs: u64,
@@ -247,6 +254,12 @@ pub struct DroneConfig {
     /// ignored by the queen so they cannot change a runner's scope.
     #[serde(default)]
     pub extra_labels: Vec<String>,
+    /// `shared` (default), `deploy` or `deploy-only`. A deploy drone runs only
+    /// deploy and main jobs, never pull-request jobs or work units; a
+    /// deploy-only drone runs only deploy jobs; a shared drone never runs
+    /// deploy jobs.
+    #[serde(default)]
+    pub trust: crate::classes::Trust,
     /// Environment injected into every lease's runner.
     #[serde(default)]
     pub runner_env: BTreeMap<String, String>,
@@ -276,8 +289,14 @@ fn default_docker() -> String {
 fn default_heartbeat() -> u64 {
     10
 }
+fn default_fail_open() -> u64 {
+    120
+}
 fn default_max_job() -> u64 {
     6 * 3600
+}
+fn default_preempt_grace() -> u64 {
+    30
 }
 fn default_drain() -> u64 {
     3600
@@ -315,6 +334,9 @@ impl DroneConfig {
         }
         if self.heartbeat_secs == 0 || self.max_job_secs == 0 {
             return bad("heartbeat_secs and max_job_secs must be positive");
+        }
+        if self.preempt_grace_secs == 0 {
+            return bad("preempt_grace_secs must be positive");
         }
         if self.max_vcpu == Some(0) || self.max_mem_mib == Some(0) || self.max_leases == Some(0) {
             return bad("owner caps must be positive when set");
@@ -507,6 +529,12 @@ mod tests {
     fn defaults_and_caps() {
         let c = DroneConfig::from_json(BASE).unwrap();
         assert_eq!((c.heartbeat_secs, c.docker_bin.as_str()), (10, "docker"));
+        assert_eq!(c.fail_open_after_secs, 120);
+        let off = BASE.replace('}', r#","fail_open_after_secs":0}"#);
+        assert_eq!(
+            DroneConfig::from_json(&off).unwrap().fail_open_after_secs,
+            0
+        );
         let with = BASE.replace('}', r#","max_vcpu":8,"max_mem_mib":24576}"#);
         let caps = DroneConfig::from_json(&with).unwrap().host_caps();
         assert_eq!((caps.max_vcpu, caps.max_mem_mib), (Some(8), Some(24576)));
