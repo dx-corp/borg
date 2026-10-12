@@ -2,10 +2,12 @@
 //!
 //! The client resolves the tree it is asked to run against, submits a work unit
 //! to the queen (`POST /v1/units`, see [`crate::units`]), streams the unit's log
-//! to this process's stdout and exits with the unit's exit code. It never makes
-//! things worse than running the command directly: when the queen is not
-//! configured, unreachable, refuses the unit, or no drone picks it up within
-//! `wait_secs`, the command runs locally with this process's own stdio.
+//! to this process's stdout and exits with the unit's exit code. By default,
+//! when the queen is not configured, unreachable, refuses the unit, or no drone
+//! picks it up within `wait_secs`, the command runs locally with this process's
+//! own stdio. `--remote-only` disables every local fallback and returns
+//! infrastructure exit code 125 instead. `--result-file` writes JSON execution
+//! provenance separately from command output.
 //!
 //! * The tree is `git write-tree` of the index (`--index`, for pre-commit
 //!   hooks) or `HEAD^{tree}` (default), or an explicit SHA.
@@ -13,21 +15,24 @@
 //!   streamed); one that already succeeded is not run at all: the receipt is
 //!   reported and the exit code is 0.
 //! * A unit that fails for infrastructure reasons (cancelled, timed out, out of
-//!   attempts, or the queen lost track of it) is run locally rather than
-//!   reported as the command's failure. A command that ran and exited nonzero
+//!   attempts, or the queen lost track of it) uses local fallback by default
+//!   or returns 125 in remote-only mode. A command that ran and exited nonzero
 //!   on a drone is a real failure: its code is returned as is.
 //! * The drone must be able to get the tree. A tree from a pushed commit is in
 //!   its git mirror. Otherwise `--publish` uploads a `git bundle` of just the
 //!   missing objects (everything since the merge base with `origin/main`) to the
 //!   queen, which hands it to the drone; nothing is pushed to any remote. Without
-//!   `--publish`, an unpublished tree runs locally.
+//!   `--publish`, an unpublished tree uses local fallback by default or returns
+//!   125 in remote-only mode.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+use crate::units::{Receipt, UnitState};
 
 use crate::secret::Secret;
 
@@ -60,6 +65,10 @@ pub struct RunOptions {
     /// How long to wait for a drone to pick the unit up before running locally.
     pub wait_secs: u64,
     pub publish: bool,
+    /// Refuse local fallback and return 125 when infrastructure cannot finish the unit.
+    pub remote_only: bool,
+    /// Write a JSON execution result separately from command output.
+    pub result_file: Option<PathBuf>,
     pub argv: Vec<String>,
 }
 
@@ -264,7 +273,7 @@ fn signal_of(_: &std::process::ExitStatus) -> i32 {
 struct Submitted {
     outcome: String,
     unit_id: String,
-    receipt: Option<serde_json::Value>,
+    receipt: Option<Receipt>,
 }
 
 struct Remote<'a> {
@@ -276,6 +285,25 @@ struct Remote<'a> {
 impl Remote<'_> {
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base.trim_end_matches('/'))
+    }
+
+    async fn cancel_created(&self, id: &str, created: bool) {
+        if created {
+            let _ = self
+                .http
+                .post(self.url(&format!("/v1/units/{id}/cancel")))
+                .bearer_auth(self.token.expose())
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await;
+        }
+    }
+}
+
+async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -307,28 +335,170 @@ enum Fallback {
     Local(String),
 }
 
-/// Run `opts.argv`: remotely when possible, otherwise here. Returns the exit
-/// code to exit with. Remote log bytes go to `out`.
+/// Machine-readable execution result, separate from streamed command output.
+/// `requested_tree_sha` identifies the requested snapshot, not the mutable
+/// working directory used by local fallback. A null host means unavailable.
+#[derive(Debug, Serialize)]
+pub struct RunResult {
+    pub schema_version: u32,
+    pub requested_tree_sha: Option<String>,
+    pub argv: Vec<String>,
+    /// `remote`, `local`, or `none` (no execution was observed).
+    pub execution: String,
+    /// `new`, `joined`, `reused`, or `fallback`.
+    pub provenance: Option<String>,
+    pub unit_id: Option<String>,
+    pub host: Option<String>,
+    pub exit_code: i32,
+    pub infrastructure_error: Option<String>,
+    pub receipt: Option<Receipt>,
+}
+
+#[derive(Deserialize)]
+struct UnitStatus {
+    id: String,
+    repo: String,
+    tree_sha: String,
+    argv: Vec<String>,
+    platform: String,
+    toolchain: String,
+    state: String,
+    exit_code: Option<i32>,
+    drone: Option<String>,
+    timeout_secs: u64,
+    receipt: Option<Receipt>,
+}
+
+async fn unit_status(q: &Remote<'_>, id: &str) -> Result<UnitStatus, String> {
+    q.http
+        .get(q.url(&format!("/v1/units/{id}")))
+        .bearer_auth(q.token.expose())
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("cannot read unit metadata ({e})"))?
+        .error_for_status()
+        .map_err(|e| format!("cannot read unit metadata ({e})"))?
+        .json()
+        .await
+        .map_err(|e| format!("unreadable unit metadata ({e})"))
+}
+
+fn record_status(
+    result: &mut RunResult,
+    unit: UnitStatus,
+    exit: Option<i32>,
+    opts: &RunOptions,
+    repo: &str,
+) -> Result<u64, String> {
+    if result.unit_id.as_deref() != Some(unit.id.as_str())
+        || result.requested_tree_sha.as_deref() != Some(unit.tree_sha.as_str())
+        || result.argv != unit.argv
+        || unit.repo != repo
+        || unit.platform != opts.platform
+        || unit.toolchain != opts.toolchain
+        || exit.is_some_and(|code| {
+            unit.state != UnitState::Done.as_str() || unit.exit_code != Some(code)
+        })
+    {
+        return Err("unit metadata does not match the submitted command".into());
+    }
+    if let Some(receipt) = &unit.receipt
+        && (receipt.unit_id != unit.id
+            || receipt.tree_sha != unit.tree_sha
+            || receipt.argv != unit.argv
+            || receipt.repo != unit.repo
+            || receipt.platform != unit.platform
+            || receipt.toolchain != unit.toolchain
+            || unit.drone.as_deref() != Some(receipt.drone.as_str())
+            || unit.state != UnitState::Done.as_str()
+            || unit.exit_code != Some(0)
+            || receipt.exit_code != 0
+            || !receipt.verifies())
+    {
+        return Err("unit receipt does not match the completed command".into());
+    }
+    if unit.state == UnitState::Running.as_str() || unit.state == UnitState::Done.as_str() {
+        result.execution = "remote".into();
+    }
+    result.host = unit.drone;
+    result.receipt = unit.receipt;
+    Ok(unit.timeout_secs)
+}
+
+/// Run remotely when possible. `remote_only` prevents every local fallback.
+/// Returns 125 for infrastructure errors and result-file failures.
 pub async fn run(opts: &RunOptions, out: &mut dyn Write) -> i32 {
-    match remote(opts, out).await {
+    // Open before execution so an invalid result destination cannot quietly
+    // execute work without the requested result.
+    let file = match opts
+        .result_file
+        .as_ref()
+        .map(std::fs::File::create)
+        .transpose()
+    {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("borg run: cannot create result file: {e}");
+            return 125;
+        }
+    };
+    let mut result = RunResult {
+        schema_version: 1,
+        requested_tree_sha: None,
+        argv: opts.argv.clone(),
+        execution: "none".into(),
+        provenance: None,
+        unit_id: None,
+        host: None,
+        exit_code: 125,
+        infrastructure_error: None,
+        receipt: None,
+    };
+    result.exit_code = match remote(opts, out, &mut result).await {
         Ok(code) => code,
         Err(Fallback::Local(why)) => {
-            eprintln!("borg run: {why}; running locally");
-            run_local(&opts.argv, &opts.dir)
+            result.infrastructure_error = Some(why.clone());
+            if opts.remote_only {
+                eprintln!("borg run: {why}; remote-only execution failed");
+                125
+            } else {
+                eprintln!("borg run: {why}; running locally");
+                result.execution = "local".into();
+                result.provenance = Some("fallback".into());
+                result.host = None;
+                result.receipt = None;
+                run_local(&opts.argv, &opts.dir)
+            }
         }
+    };
+    if let Some(mut file) = file
+        && let Err(e) = serde_json::to_writer_pretty(&mut file, &result)
+            .map_err(std::io::Error::other)
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.flush())
+    {
+        eprintln!("borg run: cannot write result file: {e}");
+        return 125;
     }
+    result.exit_code
 }
 
 #[allow(
     clippy::too_many_lines,
     reason = "one linear submit, wait, stream, finish flow"
 )]
-async fn remote(opts: &RunOptions, out: &mut dyn Write) -> Result<i32, Fallback> {
+async fn remote(
+    opts: &RunOptions,
+    out: &mut dyn Write,
+    result: &mut RunResult,
+) -> Result<i32, Fallback> {
     let local = |why: &str| Fallback::Local(why.to_owned());
     let (Some(base), Some(token)) = (&opts.queen, &opts.token) else {
         return Err(local("no queen configured"));
     };
     let tree = resolve_tree(&opts.dir, &opts.tree).map_err(Fallback::Local)?;
+    result.requested_tree_sha = Some(tree.clone());
     let repo = match &opts.repo {
         Some(r) => r.clone(),
         None => git(&opts.dir, &["remote", "get-url", "origin"])
@@ -371,29 +541,46 @@ async fn remote(opts: &RunOptions, out: &mut dyn Write) -> Result<i32, Fallback>
         .json()
         .await
         .map_err(|e| Fallback::Local(format!("unreadable queen answer ({e})")))?;
+    result.unit_id = Some(sub.unit_id.clone());
     if sub.outcome == "receipt" {
-        let drone = sub
+        let receipt = sub
             .receipt
-            .as_ref()
-            .and_then(|r| r["drone"].as_str())
-            .unwrap_or("a drone");
+            .ok_or_else(|| local("queen returned no reusable receipt"))?;
+        if receipt.unit_id != sub.unit_id
+            || receipt.tree_sha != tree
+            || receipt.argv != opts.argv
+            || receipt.repo != repo
+            || receipt.platform != opts.platform
+            || receipt.toolchain != opts.toolchain
+            || receipt.exit_code != 0
+            || !receipt.verifies()
+        {
+            return Err(local(
+                "queen returned a receipt that does not match the command",
+            ));
+        }
         eprintln!(
-            "borg run: tree {} already passed on {drone} (unit {}); not running again",
+            "borg run: tree {} already passed on {} (unit {}); not running again",
             &tree[..tree.len().min(12)],
+            receipt.drone,
             sub.unit_id
         );
+        result.execution = "remote".into();
+        result.provenance = Some("reused".into());
+        result.host = Some(receipt.drone.clone());
+        result.receipt = Some(receipt);
         return Ok(0);
     }
-    let created = sub.outcome == "new";
+    let created = match sub.outcome.as_str() {
+        "new" => true,
+        "joined" => false,
+        _ => return Err(local("queen returned an unknown submission outcome")),
+    };
+    result.provenance = Some(if created { "new" } else { "joined" }.into());
     if created && needs_bundle {
         let sent = upload_bundle(&q, &opts.dir, &tree, &sub.unit_id).await;
         if let Err(why) = sent {
-            let _ = q
-                .http
-                .post(q.url(&format!("/v1/units/{}/cancel", sub.unit_id)))
-                .bearer_auth(q.token.expose())
-                .send()
-                .await;
+            q.cancel_created(&sub.unit_id, created).await;
             return Err(Fallback::Local(why));
         }
     }
@@ -403,9 +590,27 @@ async fn remote(opts: &RunOptions, out: &mut dyn Write) -> Result<i32, Fallback>
         if created { "queued" } else { "joined" }
     );
 
+    let timeout_secs = if opts.remote_only {
+        // Use the admitted timeout, including the queen's configured default
+        // and cap. The client also enforces it if the queen stops making progress.
+        let metadata = unit_status(&q, &sub.unit_id)
+            .await
+            .and_then(|unit| record_status(result, unit, None, opts, &repo));
+        match metadata {
+            Ok(timeout) => Some(timeout),
+            Err(why) => {
+                q.cancel_created(&sub.unit_id, created).await;
+                return Err(Fallback::Local(why));
+            }
+        }
+    } else {
+        None
+    };
     let started = Instant::now();
+    let queued_deadline = tokio::time::Instant::now() + Duration::from_secs(opts.wait_secs);
+    let deadline = timeout_secs.map(|t| queued_deadline + Duration::from_secs(t));
     let mut offset: u64 = 0;
-    let mut running = false;
+    let mut running = result.execution == "remote";
     let mut unreachable_since: Option<Instant> = None;
     loop {
         let poll = q
@@ -418,11 +623,16 @@ async fn remote(opts: &RunOptions, out: &mut dyn Write) -> Result<i32, Fallback>
             .timeout(Duration::from_secs(25));
         let resp = tokio::select! {
             r = poll.send() => r,
+            _ = wait_deadline(deadline.map(|d| if running { d } else { d.min(queued_deadline) })) => {
+                q.cancel_created(&sub.unit_id, created).await;
+                return Err(local(if running {
+                    "remote execution exceeded the command deadline"
+                } else {
+                    "no drone took the unit within the admission deadline"
+                }));
+            },
             _ = tokio::signal::ctrl_c() => {
-                if created {
-                    let _ = q.http.post(q.url(&format!("/v1/units/{}/cancel", sub.unit_id)))
-                        .bearer_auth(q.token.expose()).send().await;
-                }
+                q.cancel_created(&sub.unit_id, created).await;
                 eprintln!("borg run: interrupted");
                 return Ok(130);
             }
@@ -434,9 +644,16 @@ async fn remote(opts: &RunOptions, out: &mut dyn Write) -> Result<i32, Fallback>
             }
             other => {
                 let since = *unreachable_since.get_or_insert_with(Instant::now);
-                if since.elapsed() > Duration::from_secs(60) {
+                let loss_limit = if opts.remote_only {
+                    opts.wait_secs.min(60)
+                } else {
+                    60
+                };
+                if since.elapsed() >= Duration::from_secs(loss_limit) {
+                    q.cancel_created(&sub.unit_id, created && opts.remote_only)
+                        .await;
                     return Err(Fallback::Local(match other {
-                        Ok(r) => format!("queen answered {} for 60s", r.status()),
+                        Ok(r) => format!("queen answered {} while reading logs", r.status()),
                         Err(e) => format!("lost the queen ({e})"),
                     }));
                 }
@@ -454,25 +671,62 @@ async fn remote(opts: &RunOptions, out: &mut dyn Write) -> Result<i32, Fallback>
         let next = hdr("x-borg-next").and_then(|v| v.parse::<u64>().ok());
         let exit = hdr("x-borg-exit").and_then(|v| v.parse::<i32>().ok());
         let failure = hdr("x-borg-failure");
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| Fallback::Local(format!("log read failed ({e})")))?;
-        if !bytes.is_empty() {
-            let _ = out.write_all(&bytes);
-            let _ = out.flush();
+        if state == "running" || state == "done" {
+            running = true;
+            result.execution = "remote".into();
+        }
+        let bytes = tokio::select! {
+            bytes = resp.bytes() => match bytes {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    q.cancel_created(&sub.unit_id, created && opts.remote_only).await;
+                    return Err(Fallback::Local(format!("log read failed ({e})")));
+                }
+            },
+            _ = wait_deadline(deadline.map(|d| if running { d } else { d.min(queued_deadline) })) => {
+                q.cancel_created(&sub.unit_id, created).await;
+                return Err(local("remote log exceeded the execution deadline"));
+            },
+        };
+        if !bytes.is_empty()
+            && let Err(e) = out.write_all(&bytes).and_then(|()| out.flush())
+        {
+            let why = format!("cannot write remote log ({e})");
+            if opts.remote_only {
+                q.cancel_created(&sub.unit_id, created).await;
+                return Err(Fallback::Local(why));
+            }
+            // A broken output consumer must never rerun a command that already
+            // executed remotely. Preserve the default behavior: drain the log
+            // and return the remote exit code even if displaying output fails.
+            result.infrastructure_error = Some(why);
         }
         if let Some(n) = next {
             offset = n;
         }
-        if state == "running" || state == "done" {
-            running = true;
-        }
         match state.as_str() {
             "done" => {
                 if let Some(code) = exit {
+                    if opts.result_file.is_some() {
+                        match unit_status(&q, &sub.unit_id)
+                            .await
+                            .and_then(|unit| record_status(result, unit, Some(code), opts, &repo))
+                        {
+                            Ok(_) => {}
+                            Err(why) => {
+                                // The command finished. Metadata loss must never
+                                // trigger a second execution through local fallback.
+                                result.host = None;
+                                result.receipt = None;
+                                result.infrastructure_error = Some(why);
+                            }
+                        }
+                    }
                     return Ok(code);
                 }
+                // The queen labels every chunk of a completed unit "done",
+                // but sends the exit code only after its log is fully drained.
+                // Keep polling from `next` until that final chunk arrives.
             }
             "failed" => {
                 let why = failure.unwrap_or_else(|| "failed".into());
@@ -483,14 +737,7 @@ async fn remote(opts: &RunOptions, out: &mut dyn Write) -> Result<i32, Fallback>
             "queued" | "leased"
                 if !running && started.elapsed() >= Duration::from_secs(opts.wait_secs) =>
             {
-                if created {
-                    let _ = q
-                        .http
-                        .post(q.url(&format!("/v1/units/{}/cancel", sub.unit_id)))
-                        .bearer_auth(q.token.expose())
-                        .send()
-                        .await;
-                }
+                q.cancel_created(&sub.unit_id, created).await;
                 return Err(Fallback::Local(format!(
                     "no drone took it within {}s",
                     opts.wait_secs

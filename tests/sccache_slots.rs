@@ -6,7 +6,26 @@ use std::fs;
 use std::path::Path;
 
 use borg::drone::caches::{rustflags, sccache};
-use borg::drone::exec::{Exec, SystemExec};
+use borg::drone::exec::{Exec, Output, SystemExec};
+
+/// Keep each fixture's local cache independent of runner backend settings.
+struct FixtureExec;
+
+impl Exec for FixtureExec {
+    fn run(&self, program: &str, args: &[&str]) -> std::io::Result<Output> {
+        let mut argv = Vec::new();
+        for name in std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| name.starts_with("SCCACHE_"))
+        {
+            argv.extend(["-u".to_owned(), name]);
+        }
+        argv.push(program.to_owned());
+        argv.extend(args.iter().map(|arg| (*arg).to_owned()));
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        SystemExec.run("env", &argv)
+    }
+}
 
 fn available(program: &str) -> bool {
     SystemExec
@@ -28,7 +47,7 @@ fn run_with(env: &[(String, String)], program: &str, args: &[&str]) -> bool {
     argv.push(program.to_owned());
     argv.extend(args.iter().map(|a| (*a).to_owned()));
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-    SystemExec.run("env", &argv).is_ok_and(|o| o.success)
+    FixtureExec.run("env", &argv).is_ok_and(|o| o.success)
 }
 
 struct TestServer {
@@ -37,7 +56,19 @@ struct TestServer {
 
 impl TestServer {
     fn start(root: &Path) -> Self {
-        let env = sccache::server_env(&root.join("cache").to_string_lossy(), "1G", free_port());
+        let mut env = sccache::server_env(&root.join("cache").to_string_lossy(), "1G", free_port());
+        let config = root.join("config");
+        fs::write(&config, "").unwrap();
+        env.extend([
+            (
+                "SCCACHE_CONF".to_owned(),
+                config.to_string_lossy().into_owned(),
+            ),
+            (
+                "SCCACHE_CACHED_CONF".to_owned(),
+                root.join("cached-config").to_string_lossy().into_owned(),
+            ),
+        ]);
         // sccache gives an inherited Unix socket precedence over the TCP port.
         // Keep start, compiler, stats and cleanup commands on our own endpoint.
         #[cfg(unix)]
@@ -51,7 +82,7 @@ impl TestServer {
         };
         let server = Self { env };
         assert!(
-            sccache::start_server(&SystemExec, "sccache", &server.env),
+            sccache::start_server(&FixtureExec, "sccache", &server.env),
             "sccache server starts"
         );
         server
@@ -119,7 +150,7 @@ fn workspace_crates_hit_the_compile_cache_when_a_slot_is_reused() {
                 manifest.to_str().unwrap()
             ]
         ));
-        sccache::show_stats(&SystemExec, "sccache", env).expect("sccache answers")
+        sccache::show_stats(&FixtureExec, "sccache", env).expect("sccache answers")
     };
 
     let first = build(0);
@@ -177,13 +208,21 @@ fn slot_fixture_preserves_an_inherited_sccache_server() {
             tmp.path().to_str().unwrap(),
         ],
     ));
-    let before = sccache::show_stats(&SystemExec, "sccache", &outer.env).unwrap();
+    let before = sccache::show_stats(&FixtureExec, "sccache", &outer.env).unwrap();
     assert!(before.1 > 0, "the outer server has a sentinel cache miss");
 
     // Use a child process so ambient environment is exercised without changing
     // this test process's environment while other tests may be running.
+    // CI can retain backend selectors after removing Actions credentials.
+    // The child must still use its own cold local cache and private socket.
+    let mut child_env = outer.env.clone();
+    child_env.extend([
+        ("SCCACHE_GCS_BUCKET".to_owned(), String::new()),
+        ("SCCACHE_GHA_ENABLED".to_owned(), "true".to_owned()),
+        ("SCCACHE_GHA_VERSION".to_owned(), "inherited".to_owned()),
+    ]);
     assert!(run_with(
-        &outer.env,
+        &child_env,
         std::env::current_exe().unwrap().to_str().unwrap(),
         &[
             "--exact",
@@ -192,7 +231,7 @@ fn slot_fixture_preserves_an_inherited_sccache_server() {
         ],
     ));
     assert_eq!(
-        sccache::show_stats(&SystemExec, "sccache", &outer.env),
+        sccache::show_stats(&FixtureExec, "sccache", &outer.env),
         Some(before),
         "the outer server survives fixture cleanup with unchanged counters"
     );

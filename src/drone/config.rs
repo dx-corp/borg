@@ -213,6 +213,9 @@ pub struct DroneConfig {
     pub cache_root: PathBuf,
     #[serde(default = "default_docker")]
     pub docker_bin: String,
+    /// Bounded execution smoke tests run through the job-user boundary.
+    #[serde(default)]
+    pub capability_probe: crate::drone::capabilities::ProbeSettings,
     #[serde(default = "default_heartbeat")]
     pub heartbeat_secs: u64,
     /// A drone holding standby deploy runners starts them all once the queen
@@ -349,6 +352,9 @@ impl DroneConfig {
         if let Some(user) = &self.job_user {
             user.validate().map_err(DroneConfigError::Invalid)?;
         }
+        self.capability_probe
+            .validate()
+            .map_err(DroneConfigError::Invalid)?;
         self.validate_job_settings()?;
         self.reclaim.validate().map_err(DroneConfigError::Invalid)?;
         self.validate_caches()

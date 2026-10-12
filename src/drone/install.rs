@@ -794,6 +794,7 @@ impl Installer<'_> {
             work_root: self.layout.work(),
             cache_root: self.layout.cache_root.clone(),
             docker_bin: "docker".to_owned(),
+            capability_probe: Default::default(),
             heartbeat_secs: 10,
             fail_open_after_secs: o.fail_open_after_secs,
             max_job_secs: 6 * 3600,

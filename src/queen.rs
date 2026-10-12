@@ -12,7 +12,7 @@
 //! on a partial view of the queue would over- or under-grant.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,13 +24,16 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::allocator::{
-    ActiveLease, AllocatorInput, ClassIdle, Demand, DroneAdmission, DroneState, Grant, LeaseState,
-    Promotion, QueueAge, Reservation, Unmet, WarmFloor, allocate, free_room, free_slots, max_slots,
+    ActiveLease, AdmissionState, AllocatorInput, ClassIdle, Demand, DroneAdmission, DroneState,
+    LeaseState, PlacementDecision, Promotion, QueueAge, Reservation, Unmet, WarmFloor,
+    allocate_reserved, allocate_reserved_with_backlog, allocate_scope, free_room, free_slots,
+    max_slots,
 };
 use crate::bid::{ClassPressure, ScoreWeights};
 use crate::classes::{Class, Scope};
 use crate::config::{QueenConfig, StandbySettings};
-use crate::envcontract::blocked_classes;
+use crate::envcontract::{CheckKind, CheckState, Mode, Need, blocked_classes, capability_states};
+use crate::explain::{MAX_HISTORY, PlacementKind, PlacementOutcome, PlacementRecord};
 use crate::github::{GithubClient, GithubError, QueuedJob, Runner, WorkflowJob};
 use crate::health::{DroneHealth, DroneInfo, Outcome, OutcomeKind, evaluate};
 use crate::homeostasis::{Controller, KeyInput, KeyReport};
@@ -44,7 +47,7 @@ use crate::rollout::{
     Check as RolloutCheck, DroneView, Observed as RolloutObserved, RolloutState, advance,
     desired_for,
 };
-use crate::store::{LeaseRow, LeaseStatus, PreemptionRow, Store, StoreError};
+use crate::store::{DroneRow, LeaseRow, LeaseStatus, PreemptionRow, Store, StoreError};
 use crate::tailnet::TailnetEnroll;
 use crate::telemetry::{Conclusion, FailureClass, MAX_REPORT_ROWS, TelemetryRow};
 use crate::units::{Unit, UnitState};
@@ -160,6 +163,36 @@ pub struct QueueEntry {
     pub oldest_age_secs: u64,
 }
 
+#[derive(Default)]
+struct UnitPlacement {
+    leases: Vec<ActiveLease>,
+    reserved: Vec<Reservation>,
+}
+
+type UnitGroupKey<'a> = (&'a str, Option<&'a str>);
+
+struct UnitPlacementPolicy<'a> {
+    share: Option<u8>,
+    reserved: &'a [Reservation],
+    spent_bids: &'a [ActiveLease],
+}
+
+/// Heartbeat bids describe additional slots, so grants made earlier in the
+/// same reconciliation pass spend them even when a different queue allocates.
+fn spend_bids(drones: &mut [DroneState], granted: &[ActiveLease]) {
+    for d in drones {
+        for bid in &mut d.bids {
+            let used = granted
+                .iter()
+                .filter(|g| g.drone_id == d.id && g.class == bid.class && g.scope == bid.scope)
+                .count();
+            bid.available_slots = bid
+                .available_slots
+                .saturating_sub(u32::try_from(used).unwrap_or(u32::MAX));
+        }
+    }
+}
+
 pub struct Queen {
     pub(crate) cfg: QueenConfig,
     pub(crate) store: Store,
@@ -175,6 +208,8 @@ pub struct Queen {
     unit_joins: AtomicU64,
     unit_receipts: AtomicU64,
     units_superseded: AtomicU64,
+    /// Transient round-robin cursor; authoritative work stays in the store.
+    unit_cursor: std::sync::Mutex<BTreeMap<Scope, String>>,
     wake_sender: Arc<dyn WakeSender>,
     tick_lock: tokio::sync::Mutex<()>,
 }
@@ -355,6 +390,7 @@ impl Queen {
             unit_joins: AtomicU64::new(0),
             unit_receipts: AtomicU64::new(0),
             units_superseded: AtomicU64::new(0),
+            unit_cursor: std::sync::Mutex::new(BTreeMap::new()),
             wake_sender: Arc::new(UdpWakeSender),
             tick_lock: tokio::sync::Mutex::new(()),
         }
@@ -564,9 +600,9 @@ impl Queen {
             .effective_floors(&self.cfg.warm_floors, now);
         let (warm_floors, homeostasis) = self.regulate(now_ts, &schedule_floors, &queue);
         let placement_drones = drones.clone();
-        let placement_leases = leases.clone();
+        let mut placement_leases = leases.clone();
         let preempt_ages = queue_ages.clone();
-        let allocation = allocate(&AllocatorInput {
+        let mut runner_input = AllocatorInput {
             classes: self.cfg.classes.clone(),
             demand,
             drones,
@@ -576,26 +612,136 @@ impl Queen {
             starvation_after_secs: self.cfg.starvation_after_secs,
             weights: ScoreWeights::default(),
             admission: self.cfg.admission.as_ref().map(|a| a.thresholds()),
-        });
-
+        };
+        let mut unit_reserved = Vec::new();
+        let mut deploy_grants = Vec::new();
+        let mut deploy_decisions = Vec::new();
+        let mut spent_bids = Vec::new();
+        if self.cfg.units.enabled && self.cfg.units.capacity_share_percent > 0 {
+            // Deploy CI retains first claim. Hold these grants while admitting
+            // the unit share, then let the ordinary allocator fill the rest.
+            // Pressure still comes from the full runner queue after the usual
+            // pending/standby coverage, including shared PR runners for Main.
+            let deploy = allocate_scope(&runner_input, Scope::Deploy);
+            deploy_grants = deploy.grants;
+            deploy_decisions = deploy.decisions;
+            let mut held = placement_leases.clone();
+            spent_bids.extend(deploy_grants.iter().map(|g| ActiveLease {
+                drone_id: g.drone_id.clone(),
+                class: g.class,
+                scope: g.scope,
+                state: LeaseState::Pending,
+            }));
+            held.extend(spent_bids.iter().cloned());
+            let units = self
+                .place_units(
+                    now_ts,
+                    &placement_drones,
+                    &capacities,
+                    held,
+                    UnitPlacementPolicy {
+                        share: Some(self.cfg.units.capacity_share_percent),
+                        reserved: &deploy.reserved_for,
+                        spent_bids: &spent_bids,
+                    },
+                )
+                .await?;
+            unit_reserved = units.reserved;
+            spent_bids.extend(units.leases);
+            // Re-read persisted placements; units hold capacity without
+            // offsetting runner demand.
+            placement_leases = active
+                .iter()
+                .map(as_active)
+                .chain(self.unit_leases().await)
+                .collect();
+            runner_input.leases = placement_leases.clone();
+            runner_input
+                .leases
+                .extend(deploy_grants.iter().map(|g| ActiveLease {
+                    drone_id: g.drone_id.clone(),
+                    class: g.class,
+                    scope: g.scope,
+                    state: LeaseState::Pending,
+                }));
+            // A starving unit needs contiguous room as existing work drains.
+            // Do not refill its eligible reserved host with new CI this tick.
+            spend_bids(&mut runner_input.drones, &spent_bids);
+        }
+        let mut allocation = allocate_reserved(&runner_input, &unit_reserved);
+        deploy_grants.append(&mut allocation.grants);
+        allocation.grants = deploy_grants;
+        deploy_decisions.append(&mut allocation.decisions);
+        allocation.decisions = deploy_decisions;
+        allocation.reserved_for.extend(unit_reserved);
+        let mut held = placement_leases.clone();
+        let runner_spent: Vec<ActiveLease> = allocation
+            .grants
+            .iter()
+            .map(|g| ActiveLease {
+                drone_id: g.drone_id.clone(),
+                class: g.class,
+                scope: g.scope,
+                state: LeaseState::Pending,
+            })
+            .collect();
+        held.extend(runner_spent.iter().cloned());
+        // Deploy grants already occur in spent_bids; add only later CI grants.
+        spent_bids.extend(
+            runner_spent
+                .into_iter()
+                .filter(|g| self.cfg.units.capacity_share_percent == 0 || g.scope != Scope::Deploy),
+        );
         if let Err(e) = self
             .place_units(
                 now_ts,
                 &placement_drones,
                 &capacities,
-                placement_leases.clone(),
-                &allocation.grants,
+                held,
+                UnitPlacementPolicy {
+                    share: None,
+                    reserved: &allocation.reserved_for,
+                    spent_bids: &spent_bids,
+                },
             )
             .await
         {
             tracing::warn!("unit placement failed: {e}");
         }
+        let unit_leases = self.unit_leases().await;
+        placement_leases = active
+            .iter()
+            .map(as_active)
+            .chain(unit_leases.iter().cloned())
+            .collect();
         // Demand that idle non-borg runners will take is not borg's to wake
         // hosts for.
         let unmet_placeable = placeable_unmet(&allocation.unmet, &statics, &self.cfg.classes);
         let wake = self.wake_pass(now_ts, &unmet_placeable, &fresh_names).await;
         let mut mint_error = None;
-        for grant in &allocation.grants {
+        let mut lease_error = None;
+        let mut persisted = BTreeSet::new();
+        // Deploy decisions came from the preliminary pass; align their order
+        // with the combined grants actually minted below.
+        let mut assigned = BTreeSet::new();
+        for decision in allocation
+            .decisions
+            .iter_mut()
+            .filter(|d| d.winner.is_some())
+        {
+            if let Some((order, _)) = allocation.grants.iter().enumerate().find(|(i, g)| {
+                !assigned.contains(i)
+                    && Some(g.drone_id.as_str()) == decision.winner.as_deref()
+                    && g.class == decision.class
+                    && g.scope == decision.scope
+            }) {
+                decision.grant_order = order;
+                assigned.insert(order);
+            }
+        }
+        let rows_by_id = drone_rows.iter().map(|d| (d.name.as_str(), d)).collect();
+        self.enrich_decisions(&mut allocation.decisions, &rows_by_id, None, now_ts);
+        for (order, grant) in allocation.grants.iter().enumerate() {
             let Some(cap) = capacities.get(&grant.drone_id) else {
                 continue;
             };
@@ -638,8 +784,32 @@ impl Queen {
             if let Err(e) = self.store.insert_lease(&row).await {
                 // Do not leave an unowned registration behind.
                 let _ = self.github.delete_runner(minted.runner_id).await;
-                return Err(e.into());
+                lease_error = Some(e);
+                break;
             }
+            persisted.insert(order);
+        }
+        for decision in &allocation.decisions {
+            let key = self.cfg.classes.job_label(decision.class, decision.scope);
+            let outcome = if decision.winner.is_none() {
+                PlacementOutcome::Unplaced
+            } else if persisted.contains(&decision.grant_order) {
+                PlacementOutcome::Granted
+            } else {
+                PlacementOutcome::Failed
+            };
+            self.record_placement(PlacementRecord {
+                at: now_ts,
+                kind: PlacementKind::Runner,
+                key: &key,
+                client: None,
+                outcome,
+                decision,
+            })
+            .await;
+        }
+        if let Some(e) = lease_error {
+            return Err(e.into());
         }
 
         let start_standby = promotions(&allocation.promote, &active, &capacities);
@@ -1003,18 +1173,88 @@ impl Queen {
         Ok(())
     }
 
-    /// Place queued units with the runner allocator, on drones of each unit's
-    /// platform, in the capacity left after CI runner grants.
+    /// Diagnostic writes never change admission or lease persistence.
+    async fn record_placement(&self, record: PlacementRecord<'_>) {
+        if let Err(e) = self.store.record_placement(record).await {
+            tracing::warn!("placement history write failed: {e}");
+        }
+    }
+
+    async fn record_unit_placements(
+        &self,
+        now: i64,
+        history: &VecDeque<(String, String, PlacementOutcome, PlacementDecision)>,
+    ) {
+        let records: Vec<_> = history
+            .iter()
+            .map(|(key, client, outcome, decision)| PlacementRecord {
+                at: now,
+                kind: PlacementKind::Unit,
+                key,
+                client: Some(client),
+                outcome: *outcome,
+                decision,
+            })
+            .collect();
+        if let Err(e) = self.store.record_placements(&records).await {
+            tracing::warn!("placement history write failed: {e}");
+        }
+    }
+
+    /// Copy only typed effective blockers, never raw environment values or
+    /// free-form reasons, from the same snapshot used for admission.
+    fn enrich_decisions(
+        &self,
+        decisions: &mut [PlacementDecision],
+        rows: &HashMap<&str, &DroneRow>,
+        toolchain: Option<&str>,
+        now: i64,
+    ) {
+        for decision in decisions {
+            let need = Need::for_class(
+                &self.cfg.env_contract,
+                decision.class,
+                self.cfg.classes.spec(decision.class),
+                toolchain,
+            );
+            for candidate in &mut decision.candidates {
+                let facts = rows
+                    .get(candidate.drone_id.as_str())
+                    .and_then(|d| d.env_facts.as_ref());
+                let verdict =
+                    crate::envcontract::evaluate(&self.cfg.env_contract, facts, &need, now);
+                if verdict.admit {
+                    continue;
+                }
+                candidate.environment_checks = verdict
+                    .checks
+                    .iter()
+                    .filter(|c| c.mode == Mode::Required && c.state != CheckState::Pass)
+                    .map(|c| (c.kind, c.state))
+                    .collect();
+                if candidate
+                    .environment_checks
+                    .contains_key(&CheckKind::Capabilities)
+                {
+                    candidate.capability_checks =
+                        capability_states(&self.cfg.env_contract, facts, decision.class, now);
+                }
+            }
+        }
+    }
+
+    /// Place units fairly across clients, platforms and toolchains. A share
+    /// pass precedes non-deploy CI; a borrowing pass consumes only leftover room.
     async fn place_units(
         &self,
         now: i64,
         drones: &[DroneState],
         capacities: &HashMap<String, Capacity>,
-        leases: Vec<ActiveLease>,
-        runner_grants: &[Grant],
-    ) -> Result<(), QueenError> {
+        mut base: Vec<ActiveLease>,
+        policy: UnitPlacementPolicy<'_>,
+    ) -> Result<UnitPlacement, QueenError> {
         if !self.cfg.units.enabled {
-            return Ok(());
+            return Ok(UnitPlacement::default());
         }
         let queued: Vec<Unit> = self
             .store
@@ -1024,98 +1264,274 @@ impl Queen {
             .filter(|u| !u.awaiting_bundle)
             .collect();
         if queued.is_empty() {
-            return Ok(());
+            return Ok(UnitPlacement::default());
         }
-        let mut base = leases;
-        base.extend(runner_grants.iter().map(|g| ActiveLease {
-            drone_id: g.drone_id.clone(),
-            class: g.class,
-            scope: g.scope,
-            state: LeaseState::Pending,
-        }));
-        // Units of one platform and Rust toolchain share a candidate set: the
-        // drones of that platform whose build environment contract admits the
-        // class for that toolchain.
-        let mut by_platform: BTreeMap<(&str, Option<&str>), Vec<&Unit>> = BTreeMap::new();
-        for u in &queued {
-            by_platform
-                .entry((u.platform.as_str(), u.rust_toolchain.as_deref()))
-                .or_default()
-                .push(u);
-        }
+        let inflight = self
+            .store
+            .units_in(&[UnitState::Leased, UnitState::Running])
+            .await?;
         let rows = self.store.drones().await?;
-        for ((platform, toolchain), units) in by_platform {
-            let group: Vec<DroneState> = drones
+        let rows_by_id: HashMap<&str, &DroneRow> =
+            rows.iter().map(|d| (d.name.as_str(), d)).collect();
+        let admission = self.cfg.admission.as_ref().map(|a| a.thresholds());
+        // Platform and toolchain determine the contract snapshot, independently
+        // of unit class/scope. Share it across queued units while keeping blocked
+        // hosts visible to diagnostics and scope eligibility per request.
+        let mut groups: BTreeMap<UnitGroupKey<'_>, Vec<DroneState>> = BTreeMap::new();
+        let mut backlogs: BTreeMap<UnitGroupKey<'_>, BTreeMap<(Class, Scope), u32>> =
+            BTreeMap::new();
+        for u in &queued {
+            let key = (u.platform.as_str(), u.rust_toolchain.as_deref());
+            groups.entry(key).or_insert_with(|| {
+                let mut group: Vec<DroneState> = drones
+                    .iter()
+                    .filter(|d| {
+                        capacities
+                            .get(&d.id)
+                            .is_some_and(|c| platform_of(c) == u.platform)
+                    })
+                    .map(|d| {
+                        let mut d = d.clone();
+                        d.blocked_classes = blocked_classes(
+                            &self.cfg.env_contract,
+                            rows_by_id
+                                .get(d.id.as_str())
+                                .and_then(|r| r.env_facts.as_ref()),
+                            &self.cfg.classes,
+                            u.rust_toolchain.as_deref(),
+                            now,
+                        );
+                        d
+                    })
+                    .collect();
+                spend_bids(&mut group, policy.spent_bids);
+                group
+            });
+            let count = backlogs
+                .entry(key)
+                .or_default()
+                .entry((u.class, u.scope))
+                .or_default();
+            *count = count.saturating_add(1);
+        }
+        let eligible: BTreeSet<&str> = queued
+            .iter()
+            .flat_map(|u| {
+                groups[&(u.platform.as_str(), u.rust_toolchain.as_deref())]
+                    .iter()
+                    .filter(|d| {
+                        let state = AdmissionState::of(d.cpu_psi_pm, admission);
+                        d.accepting
+                            && d.trust.admits(u.scope)
+                            && state != AdmissionState::Closed
+                            && (state != AdmissionState::PrBlocked || u.scope != Scope::Pr)
+                            && !d.blocked_classes.contains(&u.class)
+                            && max_slots(d, self.cfg.classes.spec(u.class)) > 0
+                            && (d.bids.is_empty()
+                                || d.bids.iter().any(|b| {
+                                    b.class == u.class
+                                        && b.scope == u.scope
+                                        && b.available_slots > 0
+                                }))
+                    })
+                    .map(|d| d.id.as_str())
+            })
+            .collect();
+        let (vcpu, mem, slots) = drones
+            .iter()
+            .filter(|d| eligible.contains(d.id.as_str()))
+            .fold((0u64, 0u64, 0u64), |(c, m, slots), d| {
+                let capacity = Class::ALL
+                    .into_iter()
+                    .map(|class| max_slots(d, self.cfg.classes.spec(class)))
+                    .max()
+                    .unwrap_or(0);
+                (
+                    c.saturating_add(u64::from(d.vcpu)),
+                    m.saturating_add(d.mem_mib),
+                    slots.saturating_add(u64::from(capacity)),
+                )
+            });
+        let (mut used_cpu, mut used_mem, mut used_slots) = inflight
+            .iter()
+            .filter(|u| u.drone.as_deref().is_some_and(|d| eligible.contains(d)))
+            .fold((0u64, 0u64, 0u64), |(c, m, slots), u| {
+                let spec = self.cfg.classes.spec(u.class);
+                (
+                    c.saturating_add(u64::from(spec.vcpu)),
+                    m.saturating_add(spec.mem_mib),
+                    slots.saturating_add(1),
+                )
+            });
+        let budget = policy.share.map(|percent| {
+            let portion = |n: u64| n.saturating_mul(u64::from(percent)).div_ceil(100);
+            (portion(vcpu), portion(mem), portion(slots))
+        });
+        let mut loads: BTreeMap<&str, usize> = BTreeMap::new();
+        for u in &inflight {
+            *loads.entry(&u.client).or_default() += 1;
+        }
+        let mut cursors = self
+            .unit_cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut remaining: Vec<usize> = (0..queued.len()).collect();
+        let mut reservations = policy.reserved.to_vec();
+        let mut placed = UnitPlacement::default();
+        let mut history = VecDeque::new();
+        while !remaining.is_empty() {
+            // The share is a soft boundary: allow one whole unit to cross it,
+            // so even a one-slot fleet and heavy units can make progress.
+            if budget
+                .is_some_and(|(c, m, slots)| used_cpu >= c || used_mem >= m || used_slots >= slots)
+            {
+                break;
+            }
+            let next = remaining
                 .iter()
-                .filter(|d| {
-                    capacities
-                        .get(&d.id)
-                        .is_some_and(|c| platform_of(c) == platform)
+                .enumerate()
+                .min_by_key(|(_, i)| {
+                    let u = &queued[**i];
+                    let age = u64::try_from(now.saturating_sub(u.created_at)).unwrap_or(0);
+                    let starving = self
+                        .cfg
+                        .starvation_after_secs
+                        .is_some_and(|after| age >= after);
+                    let after_cursor = cursors.get(&u.scope).is_none_or(|last| &u.client > last);
+                    (
+                        u.scope,
+                        std::cmp::Reverse(starving),
+                        starving.then_some(std::cmp::Reverse(u.class)),
+                        loads.get(u.client.as_str()).copied().unwrap_or(0),
+                        std::cmp::Reverse(after_cursor),
+                        &u.client,
+                        u.created_at,
+                        &u.id,
+                    )
                 })
-                .map(|d| {
-                    let mut d = d.clone();
-                    d.blocked_classes = blocked_classes(
-                        &self.cfg.env_contract,
-                        rows.iter()
-                            .find(|r| r.name == d.id)
-                            .and_then(|r| r.env_facts.as_ref()),
-                        &self.cfg.classes,
-                        toolchain,
-                        now,
-                    );
-                    d
+                .map(|(i, _)| i)
+                .expect("remaining is nonempty");
+            let i = remaining.remove(next);
+            let u = &queued[i];
+            let key = (u.platform.as_str(), u.rust_toolchain.as_deref());
+            let mut group = groups[&key].clone();
+            spend_bids(&mut group, &placed.leases);
+            let backlog: Vec<Demand> = backlogs[&key]
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .map(|(&(class, scope), &count)| Demand {
+                    class,
+                    scope,
+                    count,
                 })
                 .collect();
-            if group.is_empty() {
-                continue;
-            }
-            let mut demand: BTreeMap<(Class, Scope), u32> = BTreeMap::new();
-            for u in &units {
-                *demand.entry((u.class, u.scope)).or_default() += 1;
-            }
-            let allocation = allocate(&AllocatorInput {
-                classes: self.cfg.classes.clone(),
-                demand: demand
-                    .into_iter()
-                    .map(|((class, scope), count)| Demand {
-                        class,
-                        scope,
-                        count,
-                    })
-                    .collect(),
-                drones: group,
-                leases: base.clone(),
-                warm_floors: Vec::new(),
-                queue_ages: Vec::new(),
-                starvation_after_secs: None,
-                weights: ScoreWeights::default(),
-                admission: self.cfg.admission.as_ref().map(|a| a.thresholds()),
-            });
-            // Grants of a (class, scope) are interchangeable: hand them out
-            // deploy first, then main, then pull request, each in submission
-            // order.
-            let mut grants: Vec<&Grant> = allocation.grants.iter().collect();
-            let mut ordered = units;
-            ordered.sort_by_key(|u| u.scope);
-            for u in ordered {
-                if let Some(i) = grants
-                    .iter()
-                    .position(|g| g.class == u.class && g.scope == u.scope)
-                {
-                    let g = grants.remove(i);
-                    if self.store.lease_unit(&u.id, &g.drone_id, now).await? {
-                        base.push(ActiveLease {
-                            drone_id: g.drone_id.clone(),
-                            class: g.class,
-                            scope: g.scope,
-                            state: LeaseState::Running,
-                        });
-                        tracing::info!("unit {} placed on {}", u.id, g.drone_id);
-                    }
+            let mut allocation = allocate_reserved_with_backlog(
+                &AllocatorInput {
+                    classes: self.cfg.classes.clone(),
+                    demand: vec![Demand {
+                        class: u.class,
+                        scope: u.scope,
+                        count: 1,
+                    }],
+                    drones: group,
+                    // Pending runner leases must consume room without offsetting
+                    // unit demand: they execute a different queue's work.
+                    leases: base
+                        .iter()
+                        .cloned()
+                        .map(|mut l| {
+                            l.state = LeaseState::Running;
+                            l
+                        })
+                        .collect(),
+                    warm_floors: Vec::new(),
+                    queue_ages: vec![QueueAge {
+                        class: u.class,
+                        scope: u.scope,
+                        oldest_age_secs: u64::try_from(now.saturating_sub(u.created_at))
+                            .unwrap_or(0),
+                    }],
+                    starvation_after_secs: self.cfg.starvation_after_secs,
+                    weights: ScoreWeights::default(),
+                    admission,
+                },
+                &reservations,
+                &backlog,
+            );
+            for r in allocation.reserved_for {
+                if !reservations.iter().any(|old| old.drone_id == r.drone_id) {
+                    reservations.push(r.clone());
+                    placed.reserved.push(r);
                 }
             }
+            self.enrich_decisions(
+                &mut allocation.decisions,
+                &rows_by_id,
+                u.rust_toolchain.as_deref(),
+                now,
+            );
+            let leased = match allocation.grants.first() {
+                Some(g) => self.store.lease_unit(&u.id, &g.drone_id, now).await,
+                None => Ok(false),
+            };
+            let outcome = if allocation.grants.is_empty() {
+                PlacementOutcome::Unplaced
+            } else if matches!(leased, Ok(true)) {
+                PlacementOutcome::Granted
+            } else {
+                PlacementOutcome::Failed
+            };
+            for decision in allocation.decisions {
+                // Only the newest retained records can survive store pruning.
+                if history.len() == MAX_HISTORY as usize {
+                    history.pop_front();
+                }
+                let outcome = if decision.winner.is_none() {
+                    PlacementOutcome::Unplaced
+                } else {
+                    outcome
+                };
+                history.push_back((u.id.clone(), u.client.clone(), outcome, decision));
+            }
+            let leased = match leased {
+                Ok(leased) => leased,
+                Err(e) => {
+                    self.record_unit_placements(now, &history).await;
+                    return Err(e.into());
+                }
+            };
+            if leased && let Some(g) = allocation.grants.first() {
+                // Only persisted leases cover backlog; failed and attempted
+                // unplaced work continues to contribute to demand pressure.
+                let count = backlogs
+                    .get_mut(&key)
+                    .and_then(|counts| counts.get_mut(&(u.class, u.scope)))
+                    .expect("queued unit has a backlog count");
+                *count = count.saturating_sub(1);
+                let lease = ActiveLease {
+                    drone_id: g.drone_id.clone(),
+                    class: g.class,
+                    scope: g.scope,
+                    state: LeaseState::Running,
+                };
+                base.push(lease.clone());
+                placed.leases.push(lease);
+                let spec = self.cfg.classes.spec(u.class);
+                used_cpu = used_cpu.saturating_add(u64::from(spec.vcpu));
+                used_mem = used_mem.saturating_add(spec.mem_mib);
+                used_slots = used_slots.saturating_add(1);
+                *loads.entry(&u.client).or_default() += 1;
+                cursors.insert(u.scope, u.client.clone());
+                self.unit_cursor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(u.scope, u.client.clone());
+                tracing::info!("unit {} placed on {}", u.id, g.drone_id);
+            }
         }
-        Ok(())
+        self.record_unit_placements(now, &history).await;
+        Ok(placed)
     }
 
     /// Send wake-on-LAN packets for demand that has stayed unmet.

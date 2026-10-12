@@ -281,6 +281,76 @@ pub struct Allocation {
     /// Standby deploy runners to start now, per class: queued deploy demand
     /// that pending runners do not cover, up to the standbys that exist.
     pub promote: Vec<Promotion>,
+    /// Decisions captured by the same evaluation that selected each grant.
+    #[serde(default)]
+    pub decisions: Vec<PlacementDecision>,
+    /// Extra decisions omitted to bound diagnostic memory; placement continues.
+    #[serde(default)]
+    pub omitted_decisions: u32,
+}
+
+/// Diagnostic bounds do not limit fleet size or the number of grants.
+pub const MAX_DECISIONS: usize = 128;
+pub const MAX_CANDIDATES: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rejection {
+    NotAccepting,
+    AdmissionClosed,
+    PrPressure,
+    Trust,
+    Environment,
+    Docker,
+    Memory,
+    Vcpu,
+    LeaseCap,
+    Reserved,
+    NoBid,
+    BidExhausted,
+    BidThreshold,
+}
+
+/// Facts at one placement attempt, before its winner consumes capacity. The
+/// budget is already net of the owner's caps and OS reserve; room additionally
+/// subtracts active leases and earlier grants. No command or credentials enter
+/// this diagnostic type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Candidate {
+    pub drone_id: String,
+    pub budget: Room,
+    pub room: Room,
+    pub accepting: bool,
+    pub trust: Trust,
+    pub admission: AdmissionState,
+    pub reserved_for: Option<(Class, Scope)>,
+    pub rejection_reasons: Vec<Rejection>,
+    /// The queen may attach required failing checks from the same environment
+    /// evaluation that blocked this class. Raw observed values are excluded.
+    #[serde(default)]
+    pub environment_checks: BTreeMap<crate::envcontract::CheckKind, crate::envcontract::CheckState>,
+    #[serde(default)]
+    pub capability_checks: BTreeMap<crate::envcontract::Capability, crate::envcontract::CheckState>,
+    pub bid: Option<DroneBid>,
+    pub bid_score: i64,
+    pub profile_score: i64,
+    pub score: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementDecision {
+    pub class: Class,
+    pub scope: Scope,
+    /// Index in this allocation's grant order. Failed attempts do not advance it.
+    pub grant_order: usize,
+    pub requested: ClassSpec,
+    pub pressure: u16,
+    pub candidates: Vec<Candidate>,
+    pub total_candidates: usize,
+    /// A host held for this demand after an unsuccessful starving attempt.
+    pub reservation: Option<String>,
+    /// Retained even when the winning host is beyond the candidate limit.
+    pub winner: Option<String>,
 }
 
 /// Start `count` standby deploy runners of `class`.
@@ -356,7 +426,62 @@ struct Free<'a> {
     granted: BTreeMap<(Class, Scope), u32>,
 }
 
+/// One evaluation shared by placement diagnostics and reservation admission.
+struct BidEvaluation {
+    bid: Option<DroneBid>,
+    bid_score: i64,
+    profile_score: i64,
+    rejection_reasons: Vec<Rejection>,
+    score: Option<i64>,
+}
+
 impl Free<'_> {
+    fn evaluate_bid(
+        &self,
+        class: Class,
+        scope: Scope,
+        pressure: u16,
+        weights: &ScoreWeights,
+    ) -> BidEvaluation {
+        let profile_score = self
+            .drone
+            .profiles
+            .iter()
+            .find(|p| p.class == class)
+            .map_or(0, |p| profile_term(p, weights));
+        let bid = self
+            .drone
+            .bids
+            .iter()
+            .find(|b| b.class == class && b.scope == scope)
+            .copied();
+        let mut rejection_reasons = Vec::new();
+        if !self.drone.bids.is_empty() {
+            match bid {
+                None => rejection_reasons.push(Rejection::NoBid),
+                Some(b) => {
+                    let used = self.granted.get(&(class, scope)).copied().unwrap_or(0);
+                    if used >= b.available_slots {
+                        rejection_reasons.push(Rejection::BidExhausted);
+                    }
+                    if pressure < b.min_pressure.min(1000) {
+                        rejection_reasons.push(Rejection::BidThreshold);
+                    }
+                }
+            }
+        }
+        let bid_score = bid.as_ref().map_or(0, |b| score(b, weights));
+        BidEvaluation {
+            bid,
+            bid_score,
+            profile_score,
+            score: rejection_reasons
+                .is_empty()
+                .then_some(bid_score.saturating_add(profile_score)),
+            rejection_reasons,
+        }
+    }
+
     /// The score this drone offers for `(class, scope)` at `pressure`, or
     /// `None` if it declines.
     fn offer(
@@ -366,23 +491,80 @@ impl Free<'_> {
         pressure: u16,
         weights: &ScoreWeights,
     ) -> Option<i64> {
-        let learned = self
-            .drone
-            .profiles
-            .iter()
-            .find(|p| p.class == class)
-            .map_or(0, |p| profile_term(p, weights));
-        if self.drone.bids.is_empty() {
-            return Some(learned);
+        self.evaluate_bid(class, scope, pressure, weights).score
+    }
+
+    /// Eligibility and scores are evaluated once, for both selection and its
+    /// explanation. Keeping this next to `offer` prevents a second scheduler.
+    fn candidate(
+        &self,
+        input: &AllocatorInput,
+        class: Class,
+        scope: Scope,
+        pressure: u16,
+        reserved_for: Option<(Class, Scope)>,
+    ) -> Candidate {
+        let spec = input.classes.spec(class);
+        let mut reasons = Vec::new();
+        if !self.drone.accepting {
+            reasons.push(Rejection::NotAccepting);
         }
-        let bid = self
-            .drone
-            .bids
-            .iter()
-            .find(|b| b.class == class && b.scope == scope)?;
-        let used = self.granted.get(&(class, scope)).copied().unwrap_or(0);
-        (used < bid.available_slots && pressure >= bid.min_pressure.min(1000))
-            .then(|| score(bid, weights).saturating_add(learned))
+        match self.admission {
+            AdmissionState::Closed => reasons.push(Rejection::AdmissionClosed),
+            AdmissionState::PrBlocked if scope == Scope::Pr => reasons.push(Rejection::PrPressure),
+            _ => {}
+        }
+        if !self.drone.trust.admits(scope) {
+            reasons.push(Rejection::Trust);
+        }
+        if self.drone.blocked_classes.contains(&class) {
+            reasons.push(Rejection::Environment);
+        }
+        if spec.docker && !self.drone.docker {
+            reasons.push(Rejection::Docker);
+        }
+        if self.mem_mib < spec.mem_mib {
+            reasons.push(Rejection::Memory);
+        }
+        if self.vcpu < spec.vcpu {
+            reasons.push(Rejection::Vcpu);
+        }
+        if self.leases_left == Some(0) {
+            reasons.push(Rejection::LeaseCap);
+        }
+        if reserved_for.is_some_and(|key| key != (class, scope)) {
+            reasons.push(Rejection::Reserved);
+        }
+        let evaluated = self.evaluate_bid(class, scope, pressure, &input.weights);
+        reasons.extend(evaluated.rejection_reasons);
+        Candidate {
+            drone_id: self.drone.id.clone(),
+            budget: Room {
+                mem_mib: self.drone.mem_mib,
+                vcpu: self.drone.vcpu,
+                leases_left: self.drone.max_leases,
+            },
+            room: Room {
+                mem_mib: self.mem_mib,
+                vcpu: self.vcpu,
+                leases_left: self.leases_left,
+            },
+            accepting: self.drone.accepting,
+            trust: self.drone.trust,
+            admission: self.admission,
+            reserved_for,
+            score: if reasons.is_empty() {
+                evaluated.score
+            } else {
+                None
+            },
+            rejection_reasons: reasons,
+            environment_checks: BTreeMap::new(),
+            capability_checks: BTreeMap::new(),
+            bid: evaluated.bid,
+            bid_score: evaluated.bid_score,
+            profile_score: evaluated.profile_score,
+        }
     }
 
     fn fits(&self, spec: &ClassSpec) -> bool {
@@ -439,7 +621,7 @@ fn place(
     reserved: &BTreeMap<String, (Class, Scope)>,
     (scope, class): (Scope, Class),
     wanted: u32,
-    out: &mut Vec<Grant>,
+    out: &mut Allocation,
 ) -> u32 {
     let level = pressure.get(&class).copied().unwrap_or(0);
     let spec = input.classes.spec(class);
@@ -447,28 +629,51 @@ fn place(
     for _ in 0..wanted {
         // Highest bid score; then tightest fit, which keeps hosts packed; then
         // id, which keeps the output stable.
-        let best = free
-            .iter_mut()
-            .filter(|(id, f)| {
-                f.fits(spec)
-                    && f.admission.admits(scope)
-                    && f.drone.trust.admits(scope)
-                    && !f.drone.blocked_classes.contains(&class)
-                    && reserved
-                        .get(**id)
-                        .is_none_or(|held| *held == (class, scope))
-            })
-            .filter_map(|(id, f)| {
-                let s = f.offer(class, scope, level, &input.weights)?;
-                Some((s, id, f))
-            })
-            .min_by_key(|(s, id, f)| (std::cmp::Reverse(*s), f.mem_mib - spec.mem_mib, **id))
-            .map(|(_, _, f)| f);
-        let Some(f) = best else { break };
+        let mut candidates = Vec::new();
+        let mut winning_candidate = None;
+        let mut best: Option<(i64, u64, &str)> = None;
+        for (id, f) in free.iter() {
+            let candidate = f.candidate(input, class, scope, level, reserved.get(*id).copied());
+            if let Some(score) = candidate.score {
+                let rank = (std::cmp::Reverse(score), f.mem_mib - spec.mem_mib, *id);
+                if best.is_none_or(|(s, mem, name)| rank < (std::cmp::Reverse(s), mem, name)) {
+                    best = Some((score, f.mem_mib - spec.mem_mib, *id));
+                    winning_candidate = Some(candidate.clone());
+                }
+            }
+            if candidates.len() < MAX_CANDIDATES {
+                candidates.push(candidate);
+            }
+        }
+        let winner = best.map(|(_, _, id)| id);
+        if let Some(candidate) = winning_candidate
+            && !candidates.iter().any(|c| c.drone_id == candidate.drone_id)
+        {
+            candidates.pop();
+            candidates.push(candidate);
+        }
+        if out.decisions.len() < MAX_DECISIONS {
+            out.decisions.push(PlacementDecision {
+                class,
+                scope,
+                grant_order: out.grants.len(),
+                requested: *spec,
+                pressure: level,
+                candidates,
+                total_candidates: free.len(),
+                reservation: None,
+                winner: winner.map(str::to_owned),
+            });
+        } else {
+            out.omitted_decisions = out.omitted_decisions.saturating_add(1);
+        }
+        let Some(f) = winner.and_then(|id| free.get_mut(id)) else {
+            break;
+        };
         f.take(spec);
         *f.granted.entry((class, scope)).or_default() += 1;
         placed += 1;
-        out.push(Grant {
+        out.grants.push(Grant {
             drone_id: f.drone.id.clone(),
             class,
             scope,
@@ -482,6 +687,41 @@ fn place(
 
 /// Decide which runners to mint and where. Pure and deterministic.
 pub fn allocate(input: &AllocatorInput) -> Allocation {
+    allocate_reserved(input, &[])
+}
+
+/// Allocate only one scope while retaining the full queue's bid pressure.
+/// Coverage by pending/shared runners and standby deploy runners is calculated
+/// before restricting placement, just as in a complete allocation pass.
+pub fn allocate_scope(input: &AllocatorInput, scope: Scope) -> Allocation {
+    allocate_inner(input, &[], None, Some(scope))
+}
+
+/// Apply reservations inherited from an earlier allocation pass. These are
+/// enforced at the same eligibility boundary as new starvation reservations,
+/// so their diagnostic reason is preserved instead of masquerading as drain.
+pub fn allocate_reserved(input: &AllocatorInput, inherited: &[Reservation]) -> Allocation {
+    allocate_inner(input, inherited, None, None)
+}
+
+/// Select only `input.demand`, but evaluate bid thresholds against the actual
+/// uncovered queue. Per-client fairness selects one unit at a time; that must
+/// not make a saturated queue look like one isolated request. Callers pass only
+/// demand not already covered by a pending runner or leased work unit.
+pub fn allocate_reserved_with_backlog(
+    input: &AllocatorInput,
+    inherited: &[Reservation],
+    uncovered_backlog: &[Demand],
+) -> Allocation {
+    allocate_inner(input, inherited, Some(uncovered_backlog), None)
+}
+
+fn allocate_inner(
+    input: &AllocatorInput,
+    inherited: &[Reservation],
+    backlog: Option<&[Demand]>,
+    scope: Option<Scope>,
+) -> Allocation {
     // Remaining room per drone after leases already in flight. Duplicate
     // drone ids collapse to the first entry.
     let mut free: BTreeMap<&str, Free<'_>> = BTreeMap::new();
@@ -568,7 +808,9 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
         need.insert((Scope::Pr, class), pr_need);
     }
 
-    let initial_need = need.clone();
+    let mut initial_need = need.clone();
+    let pressure_backlog =
+        backlog.map(|demand| sum_counts(demand.iter().map(|d| (d.class, d.scope, d.count))));
     let aged = |class, scope| {
         input.starvation_after_secs.is_some_and(|after| {
             input
@@ -584,8 +826,13 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
         let mut shortfall = 0u32;
         let mut starving = false;
         for scope in Scope::ALL {
-            let queued_here = get(&queued, class, scope);
-            shortfall += queued_here.min(initial_need.get(&(scope, class)).copied().unwrap_or(0));
+            let queued_here = get(pressure_backlog.as_ref().unwrap_or(&queued), class, scope);
+            let uncovered = if pressure_backlog.is_some() {
+                queued_here
+            } else {
+                queued_here.min(initial_need.get(&(scope, class)).copied().unwrap_or(0))
+            };
+            shortfall = shortfall.saturating_add(uncovered);
             starving |= queued_here > 0 && aged(class, scope);
         }
         let idle = free
@@ -598,6 +845,13 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
             class,
             idle_slots: idle,
         });
+    }
+    if let Some(scope) = scope {
+        need.retain(|&(s, _), _| s == scope);
+        initial_need.retain(|&(s, _), _| s == scope);
+        if scope != Scope::Deploy {
+            promote.clear();
+        }
     }
     let mut out = Allocation {
         pressure: pressure
@@ -617,7 +871,10 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
         ..Allocation::default()
     };
     let mut placed: BTreeMap<(Scope, Class), u32> = BTreeMap::new();
-    let mut reserved: BTreeMap<String, (Class, Scope)> = BTreeMap::new();
+    let mut reserved: BTreeMap<String, (Class, Scope)> = inherited
+        .iter()
+        .map(|r| (r.drone_id.clone(), (r.class, r.scope)))
+        .collect();
 
     // Starvation guard. Demand that has waited too long is placed first; if it
     // still cannot fit, hold back the drone that will free up soonest so the
@@ -636,7 +893,7 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
                     &reserved,
                     (scope, class),
                     wanted,
-                    &mut out.grants,
+                    &mut out,
                 );
                 placed.insert((scope, class), n);
                 need.insert((scope, class), 0);
@@ -650,10 +907,24 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
                                 && f.could_ever_fit(spec)
                                 && f.admission.admits(scope)
                                 && !f.drone.blocked_classes.contains(&class)
+                                && f.offer(
+                                    class,
+                                    scope,
+                                    pressure.get(&class).copied().unwrap_or(0),
+                                    &input.weights,
+                                )
+                                .is_some()
                         })
                         .min_by_key(|(id, f)| (f.in_flight, **id))
                         .map(|(id, _)| (*id).to_owned());
                     if let Some(id) = target {
+                        if let Some(decision) = out.decisions.last_mut()
+                            && decision.class == class
+                            && decision.scope == scope
+                            && decision.winner.is_none()
+                        {
+                            decision.reservation = Some(id.clone());
+                        }
                         reserved.insert(id.clone(), (class, scope));
                         out.reserved_for.push(Reservation {
                             drone_id: id,
@@ -676,7 +947,7 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
                 &reserved,
                 (scope, class),
                 wanted,
-                &mut out.grants,
+                &mut out,
             );
             *placed.entry((scope, class)).or_default() += n;
         }

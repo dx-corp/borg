@@ -6,6 +6,7 @@
 //! stops accepting leases and lets in-flight jobs finish, up to a timeout.
 
 pub mod caches;
+pub mod capabilities;
 pub mod cleanup;
 pub mod client;
 pub mod config;
@@ -92,6 +93,7 @@ pub struct Drone {
     update_wanted: AtomicBool,
     /// The last tools probe, reused for a minute.
     tools_cache: probe::ToolsCache,
+    capability_cache: capabilities::CapabilityCache,
 }
 
 impl Drone {
@@ -131,6 +133,7 @@ impl Drone {
             selfupdate,
             update_wanted: AtomicBool::new(false),
             tools_cache: probe::ToolsCache::default(),
+            capability_cache: capabilities::CapabilityCache::default(),
             client: Arc::new(client),
             host,
             exec,
@@ -220,6 +223,18 @@ impl Drone {
             .await
             .ok()
             .flatten();
+        // Slow execution proofs must not make an otherwise healthy drone
+        // miss its heartbeat and cause the queen to requeue active work.
+        // Refreshes share the existing task set, and drain starts none.
+        if accepting {
+            self.capability_cache.refresh_if_due(
+                Arc::clone(&self.job_exec),
+                Arc::clone(&self.cfg),
+                now,
+                tasks,
+            );
+        }
+        env_facts.capabilities = self.capability_cache.snapshot();
         let req = HeartbeatRequest {
             capacity,
             caps: self.cfg.host_caps(),
@@ -470,7 +485,7 @@ impl Drone {
         }
 
         tracing::info!(
-            "draining: no new leases; waiting up to {}s for {} job(s)",
+            "draining: no new leases; waiting up to {}s for {} task(s)",
             self.cfg.drain_timeout_secs,
             tasks.len()
         );

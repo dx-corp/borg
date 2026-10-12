@@ -49,6 +49,8 @@ enum Command {
     /// Summarize stored job telemetry: time by job and step, queue wait per
     /// class, cancellation share and host-caused failures per drone.
     Report(ReportArgs),
+    /// Explain a retained placement decision for a runner label or work unit.
+    Explain(ExplainArgs),
     /// Run a command on the fleet when capacity is free, otherwise here.
     /// Everything after `--` is the command.
     Run(RunArgs),
@@ -159,7 +161,13 @@ struct RunArgs {
     /// Priority scope of the unit; the client token's maximum applies.
     #[arg(long, env = "BORG_RUN_SCOPE", value_enum, default_value = "pr")]
     scope: ScopeArg,
-    /// Seconds to wait for a drone before running here.
+    /// Require fleet execution; infrastructure failures exit 125 without running here.
+    #[arg(long, env = "BORG_RUN_REMOTE_ONLY")]
+    remote_only: bool,
+    /// Write a JSON execution result to this file, separately from command stdout.
+    #[arg(long)]
+    result_file: Option<PathBuf>,
+    /// Seconds to wait for a drone before fallback (or failure with --remote-only).
     #[arg(long, env = "BORG_RUN_WAIT_SECS", default_value_t = 60)]
     wait_secs: u64,
     /// Upload a git bundle of the tree (since the merge base with origin/main)
@@ -187,6 +195,24 @@ struct ReportArgs {
     #[arg(long, default_value_t = 20)]
     limit: usize,
     /// Print the JSON report instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ExplainArgs {
+    /// Work-unit id or configured runner label.
+    key: String,
+    /// Fetch from a running queen.
+    #[arg(long, conflicts_with = "config", required_unless_present = "config")]
+    queen: Option<String>,
+    /// Read the queen's SQLite file directly as a local operator.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Client token file for a remote unit query (same defaults as `borg run`).
+    #[arg(long, env = "BORG_CLIENT_TOKEN_FILE")]
+    token_file: Option<PathBuf>,
+    /// Print the typed JSON history instead of text.
     #[arg(long)]
     json: bool,
 }
@@ -588,6 +614,36 @@ async fn report(a: ReportArgs) -> Result<()> {
     Ok(())
 }
 
+async fn explain(a: ExplainArgs) -> Result<()> {
+    use borg::explain::{Explanation, PlacementKind};
+    let report = match (&a.queen, &a.config) {
+        (Some(url), _) => {
+            let token = client_token(a.token_file.as_deref()).map(borg::secret::Secret::new);
+            borg::explain::fetch(url, &a.key, token.as_ref())
+                .await
+                .context("fetch placement history")?
+        }
+        (None, Some(path)) => {
+            let cfg = QueenConfig::load(path)?;
+            let store = open_store(&cfg).await?;
+            let (kind, key) = match cfg.classes.parse_label(&a.key) {
+                Some((class, scope)) => {
+                    (PlacementKind::Runner, cfg.classes.job_label(class, scope))
+                }
+                None => (PlacementKind::Unit, a.key.clone()),
+            };
+            Explanation::new(a.key, store.placement_history(kind, &key, None).await?)
+        }
+        (None, None) => bail!("give --queen or --config"),
+    };
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", borg::explain::render_text(&report));
+    }
+    Ok(())
+}
+
 async fn enroll_client(path: &Path, name: &str, max_scope: borg::classes::Scope) -> Result<()> {
     if !enroll::valid_drone_name(name) {
         bail!(
@@ -793,6 +849,8 @@ async fn run_command(a: RunArgs) -> u8 {
         scope: borg::classes::Scope::from(a.scope).as_str().to_owned(),
         wait_secs: a.wait_secs,
         publish: a.publish,
+        remote_only: a.remote_only,
+        result_file: a.result_file,
         argv: a.argv,
     };
     let code = borg::run::run(&opts, &mut std::io::stdout()).await;
@@ -811,6 +869,7 @@ async fn main() -> Result<std::process::ExitCode> {
 
 async fn dispatch(command: Command) -> Result<()> {
     match command {
+        Command::Explain(a) => explain(a).await,
         Command::Run(_) => Ok(()),
         Command::Update(a) => {
             run_update(update::cli::Args {

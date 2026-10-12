@@ -1,7 +1,7 @@
 //! The build environment contract: facts a drone reports about its build
 //! environment, and the queen's pure admission check over them.
 //!
-//! Before work (a CI runner lease or a work unit) is placed on a drone, five
+//! Before work (a CI runner lease or a work unit) is placed on a drone, six
 //! checks are evaluated against what the drone last reported:
 //!
 //! 1. **compiler_cache**: `RUSTC_WRAPPER` resolves to an allowed wrapper
@@ -18,6 +18,9 @@
 //! 5. **tools**: every tool the operator lists as required (globally or for the
 //!    class) resolved on the job user's `PATH` when the drone probed it. The
 //!    list is empty unless the operator writes one.
+//! 6. **capabilities**: actual sandbox, Docker and filesystem smoke tests run
+//!    as the job user. Named requirements fail closed even on older drones;
+//!    the list is empty unless the operator writes one.
 //!
 //! The drone is a dumb prober: it reports *facts* ([`EnvFacts`]), every one of
 //! which may be unknown (`None`), cached about a minute on its side. Thresholds
@@ -29,7 +32,8 @@
 //!
 //! Nothing is enforced unless `env_contract.enabled`; a drone that has never
 //! reported is skipped unless `require_report` is set, so enabling the contract
-//! does not cut off drones that predate it.
+//! does not cut off drones that predate it. Explicit required capability
+//! names are the exception: a missing job-user execution proof blocks them.
 
 use std::collections::BTreeMap;
 
@@ -45,6 +49,7 @@ pub enum CheckKind {
     CacheStore,
     Resources,
     Tools,
+    Capabilities,
 }
 
 /// The tools a drone looks for on the job user's `PATH`, in report order.
@@ -57,12 +62,13 @@ pub const PROBE_TOOLS: [&str; 15] = [
 pub const TOOL_MISSING: &str = "missing";
 
 impl CheckKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::CompilerCache,
         Self::Toolchain,
         Self::CacheStore,
         Self::Resources,
         Self::Tools,
+        Self::Capabilities,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -72,6 +78,7 @@ impl CheckKind {
             Self::CacheStore => "cache_store",
             Self::Resources => "resources",
             Self::Tools => "tools",
+            Self::Capabilities => "capabilities",
         }
     }
 }
@@ -104,6 +111,42 @@ impl CheckState {
     }
 
     pub const ALL: [Self; 3] = [Self::Pass, Self::Fail, Self::Unknown];
+}
+
+/// Execution capabilities proven by a smoke test as the configured job user.
+/// Inventory (for example `docker info` as the service user) is not proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    Sandbox,
+    Docker,
+    WorkWrite,
+    CacheWrite,
+}
+
+impl Capability {
+    pub const ALL: [Self; 4] = [
+        Self::Sandbox,
+        Self::Docker,
+        Self::WorkWrite,
+        Self::CacheWrite,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sandbox => "sandbox",
+            Self::Docker => "docker",
+            Self::WorkWrite => "work_write",
+            Self::CacheWrite => "cache_write",
+        }
+    }
+}
+
+/// A capability's own observation time survives cached heartbeat reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityFact {
+    pub observed_at: i64,
+    pub state: CheckState,
 }
 
 /// An installed Rust toolchain, as `rustc -vV` reports it for the channel.
@@ -161,6 +204,9 @@ pub struct EnvFacts {
     /// output, or `"missing"`; `None` when the drone did not measure it.
     #[serde(default)]
     pub tools: Option<BTreeMap<String, String>>,
+    /// Actual execution proofs as the job user, each with its probe timestamp.
+    #[serde(default)]
+    pub capabilities: BTreeMap<Capability, CapabilityFact>,
 }
 
 /// Settings of one class (or the defaults for all).
@@ -173,6 +219,8 @@ pub struct ClassContract {
     pub rust_toolchain: Option<String>,
     /// Tools this class needs on `PATH`; replaces the global list.
     pub required_tools: Option<Vec<String>>,
+    /// Execution proofs this class needs; replaces the global list.
+    pub required_capabilities: Option<Vec<Capability>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -201,6 +249,8 @@ pub struct ContractSettings {
     /// Tools (from [`PROBE_TOOLS`]) every class needs on `PATH`. Empty means
     /// the `tools` check has nothing to require.
     pub required_tools: Vec<String>,
+    /// Execution proofs every class needs. Empty preserves older drones.
+    pub required_capabilities: Vec<Capability>,
     pub checks: BTreeMap<CheckKind, Mode>,
     pub classes: BTreeMap<Class, ClassContract>,
 }
@@ -219,6 +269,7 @@ impl Default for ContractSettings {
             max_cpu_psi_pm: 700,
             mem_available_pct: 100,
             required_tools: Vec::new(),
+            required_capabilities: Vec::new(),
             // Conservative: only the checks that protect a build from failing
             // outright block by default; the cache checks report.
             checks: BTreeMap::from([
@@ -227,6 +278,7 @@ impl Default for ContractSettings {
                 (CheckKind::CacheStore, Mode::Advisory),
                 (CheckKind::Resources, Mode::Required),
                 (CheckKind::Tools, Mode::Advisory),
+                (CheckKind::Capabilities, Mode::Required),
             ]),
             classes: BTreeMap::new(),
         }
@@ -291,13 +343,25 @@ impl ContractSettings {
             .unwrap_or(&self.required_tools)
     }
 
+    /// Execution proofs a class needs: its own list, else the global one.
+    pub fn class_required_capabilities(&self, class: Class) -> &[Capability] {
+        self.classes
+            .get(&class)
+            .and_then(|c| c.required_capabilities.as_deref())
+            .unwrap_or(&self.required_capabilities)
+    }
+
     fn mode(&self, class: Class, kind: CheckKind) -> Mode {
         self.classes
             .get(&class)
             .and_then(|c| c.checks.get(&kind))
             .or_else(|| self.checks.get(&kind))
             .copied()
-            .unwrap_or(Mode::Off)
+            .unwrap_or(if kind == CheckKind::Capabilities {
+                Mode::Required
+            } else {
+                Mode::Off
+            })
     }
 
     /// The toolchain a class needs by configuration.
@@ -602,6 +666,87 @@ fn tools(s: &ContractSettings, f: &EnvFacts, need: &Need<'_>) -> Acc {
     a
 }
 
+fn capability_fresh(s: &ContractSettings, fact: &CapabilityFact, now: i64) -> bool {
+    fact.observed_at <= now && now.saturating_sub(fact.observed_at) <= s.facts_max_age_secs
+}
+
+fn capability_state(s: &ContractSettings, fact: Option<&CapabilityFact>, now: i64) -> CheckState {
+    match fact {
+        Some(fact) if capability_fresh(s, fact, now) => fact.state,
+        _ => CheckState::Unknown,
+    }
+}
+
+/// Effective states of the named proofs this class needs, using the same
+/// per-proof freshness rules as admission. Check mode is deliberately left
+/// to the caller: diagnostics may also show advisory requirements.
+pub fn capability_states(
+    s: &ContractSettings,
+    facts: Option<&EnvFacts>,
+    class: Class,
+    now: i64,
+) -> BTreeMap<Capability, CheckState> {
+    s.class_required_capabilities(class)
+        .iter()
+        .map(|&kind| {
+            let fact = facts.and_then(|f| f.capabilities.get(&kind));
+            (kind, capability_state(s, fact, now))
+        })
+        .collect()
+}
+
+fn capabilities(s: &ContractSettings, f: &EnvFacts, need: &Need<'_>, now: i64) -> Acc {
+    let mut a = Acc::new();
+    let required = s.class_required_capabilities(need.class);
+    a.see(
+        "required",
+        required
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    for &capability in required {
+        let name = capability.as_str();
+        match f.capabilities.get(&capability) {
+            None => a.note(
+                CheckState::Unknown,
+                format!("{name}: job-user proof was not reported"),
+            ),
+            Some(fact) => {
+                let age = now.saturating_sub(fact.observed_at);
+                a.see(&format!("{name}_age_secs"), age);
+                a.see(name, fact.state.as_str());
+                if !capability_fresh(s, fact, now) {
+                    a.note(
+                        CheckState::Unknown,
+                        format!("{name}: proof is stale or future-dated ({age}s old)"),
+                    );
+                } else {
+                    a.note(
+                        capability_state(s, Some(fact), now),
+                        format!("{name}: job-user smoke test {}", fact.state.as_str()),
+                    );
+                }
+            }
+        }
+    }
+    if s.mode(need.class, CheckKind::Capabilities) == Mode::Advisory {
+        a.warnings.extend(a.reasons.iter().cloned());
+    }
+    // Unrequired failures remain diagnostic and never exclude a class.
+    for (capability, fact) in &f.capabilities {
+        if !required.contains(capability) && fact.state != CheckState::Pass {
+            a.warnings.push(format!(
+                "{}: unrequired job-user smoke test {}",
+                capability.as_str(),
+                fact.state.as_str()
+            ));
+        }
+    }
+    a
+}
+
 /// Evaluate the contract for `need` against `facts` at `now`. Pure.
 pub fn evaluate(
     s: &ContractSettings,
@@ -624,19 +769,32 @@ pub fn evaluate(
         .filter(|(_, m)| *m != Mode::Off)
         .collect();
     let Some(f) = facts else {
-        let blocked = s.require_report && modes.iter().any(|(_, m)| *m == Mode::Required);
+        let blocked = modes.iter().any(|&(kind, mode)| {
+            mode == Mode::Required
+                && if kind == CheckKind::Capabilities {
+                    !s.class_required_capabilities(need.class).is_empty()
+                } else {
+                    s.require_report
+                }
+        });
         return Verdict {
             reported: false,
             age_secs: None,
             checks: modes
                 .iter()
-                .map(|&(kind, mode)| CheckOutcome {
-                    kind,
-                    mode,
-                    state: CheckState::Unknown,
-                    reason: "the drone has not reported its environment".into(),
-                    observed: BTreeMap::new(),
-                    warnings: Vec::new(),
+                .map(|&(kind, mode)| {
+                    if kind == CheckKind::Capabilities {
+                        capabilities(s, &EnvFacts::default(), need, now).finish(kind, mode)
+                    } else {
+                        CheckOutcome {
+                            kind,
+                            mode,
+                            state: CheckState::Unknown,
+                            reason: "the drone has not reported its environment".into(),
+                            observed: BTreeMap::new(),
+                            warnings: Vec::new(),
+                        }
+                    }
                 })
                 .collect(),
             admit: !blocked,
@@ -647,7 +805,11 @@ pub fn evaluate(
     let stale = age > s.facts_max_age_secs;
     let mut checks = Vec::new();
     for (kind, mode) in modes {
-        let acc = if stale {
+        let acc = if kind == CheckKind::Capabilities {
+            // Each execution proof has its own clock. An empty requirement
+            // must not become blocking just because unrelated facts aged.
+            capabilities(s, f, need, now)
+        } else if stale {
             let mut a = Acc::new();
             a.note(
                 CheckState::Unknown,
@@ -661,6 +823,7 @@ pub fn evaluate(
                 CheckKind::CacheStore => cache_store(s, f),
                 CheckKind::Resources => resources(s, f, need),
                 CheckKind::Tools => tools(s, f, need),
+                CheckKind::Capabilities => capabilities(s, f, need, now),
             }
         };
         checks.push(acc.finish(kind, mode));
@@ -734,6 +897,7 @@ mod tests {
                 ("git", "git version 2.45.0"),
                 ("gh", "gh version 2.50.0"),
             ])),
+            capabilities: BTreeMap::new(),
         }
     }
 
@@ -1062,7 +1226,13 @@ mod tests {
         };
         let v = evaluate(&s, Some(&old), &need(Class::Light, None), NOW);
         assert!(!v.admit);
-        assert!(v.checks.iter().all(|c| c.state == CheckState::Unknown));
+        assert!(
+            v.checks
+                .iter()
+                .filter(|c| c.kind != CheckKind::Capabilities)
+                .all(|c| c.state == CheckState::Unknown)
+        );
+        assert_eq!(check(&v, CheckKind::Capabilities).state, CheckState::Pass);
         assert!(v.checks[0].reason.contains("1000s old"));
         // A drone that never reported: admitted by default, blocked on request.
         let v = evaluate(&s, None, &need(Class::Light, None), NOW);
@@ -1279,5 +1449,174 @@ mod tests {
             },
         );
         assert!(s.validate().is_err());
+    }
+
+    fn capability_settings(mode: Mode) -> ContractSettings {
+        ContractSettings {
+            checks: BTreeMap::from([(CheckKind::Capabilities, mode)]),
+            required_capabilities: vec![Capability::Sandbox],
+            ..on()
+        }
+    }
+
+    fn capability_facts(state: CheckState, observed_at: i64) -> EnvFacts {
+        EnvFacts {
+            capabilities: BTreeMap::from([(
+                Capability::Sandbox,
+                CapabilityFact { observed_at, state },
+            )]),
+            ..good()
+        }
+    }
+
+    #[test]
+    fn required_job_user_capabilities_fail_closed_including_old_drones() {
+        let settings = capability_settings(Mode::Required);
+        let need = need(Class::Light, None);
+        assert!(
+            evaluate(
+                &settings,
+                Some(&capability_facts(CheckState::Pass, NOW)),
+                &need,
+                NOW
+            )
+            .admit
+        );
+        for state in [CheckState::Fail, CheckState::Unknown] {
+            let v = evaluate(&settings, Some(&capability_facts(state, NOW)), &need, NOW);
+            assert!(!v.admit);
+            assert_eq!(check(&v, CheckKind::Capabilities).state, state);
+            assert!(v.why.unwrap().contains("sandbox"));
+        }
+        assert!(!evaluate(&settings, Some(&good()), &need, NOW).admit);
+        // require_report=false cannot skip an explicitly required named proof.
+        assert!(!evaluate(&settings, None, &need, NOW).admit);
+        let old: EnvFacts = serde_json::from_str(r#"{"observed_at":10000}"#).unwrap();
+        assert!(old.capabilities.is_empty());
+        assert!(!evaluate(&settings, Some(&old), &need, NOW).admit);
+    }
+
+    #[test]
+    fn a_fresh_heartbeat_cannot_refresh_an_old_or_future_capability_proof() {
+        let settings = capability_settings(Mode::Required);
+        for at in [NOW - settings.facts_max_age_secs - 1, NOW + 1] {
+            let v = evaluate(
+                &settings,
+                Some(&capability_facts(CheckState::Pass, at)),
+                &need(Class::Light, None),
+                NOW,
+            );
+            assert_eq!(v.age_secs, Some(10));
+            assert!(!v.admit);
+            assert_eq!(
+                check(&v, CheckKind::Capabilities).state,
+                CheckState::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn capability_requirements_and_advisory_modes_are_class_specific() {
+        let mut settings = capability_settings(Mode::Required);
+        settings.required_capabilities.clear();
+        settings.classes.insert(
+            Class::Heavy,
+            ClassContract {
+                required_capabilities: Some(vec![Capability::Sandbox]),
+                ..ClassContract::default()
+            },
+        );
+        let facts = capability_facts(CheckState::Fail, NOW);
+        assert!(evaluate(&settings, Some(&facts), &need(Class::Light, None), NOW).admit);
+        assert!(!evaluate(&settings, Some(&facts), &need(Class::Heavy, None), NOW).admit);
+        let v = evaluate(&settings, Some(&facts), &need(Class::Light, None), NOW);
+        assert!(check(&v, CheckKind::Capabilities).warnings[0].contains("sandbox"));
+        settings
+            .classes
+            .get_mut(&Class::Heavy)
+            .unwrap()
+            .checks
+            .insert(CheckKind::Capabilities, Mode::Advisory);
+        let v = evaluate(&settings, Some(&facts), &need(Class::Heavy, None), NOW);
+        assert!(v.admit);
+        assert_eq!(check(&v, CheckKind::Capabilities).state, CheckState::Fail);
+        assert!(check(&v, CheckKind::Capabilities).warnings[0].contains("sandbox"));
+        assert!(evaluate(&settings, None, &need(Class::Light, None), NOW).admit);
+    }
+
+    #[test]
+    fn capability_names_are_closed_and_the_class_list_replaces_global_requirements() {
+        let json = r#"{"enabled":true,"required_capabilities":["sandbox"],"classes":{"heavy":{"required_capabilities":["docker"]},"medium":{"required_capabilities":[]}}}"#;
+        let settings: ContractSettings = serde_json::from_str(json).unwrap();
+        assert!(settings.validate().is_ok());
+        assert_eq!(
+            settings.class_required_capabilities(Class::Light),
+            [Capability::Sandbox]
+        );
+        assert_eq!(
+            settings.class_required_capabilities(Class::Heavy),
+            [Capability::Docker]
+        );
+        assert!(
+            settings
+                .class_required_capabilities(Class::Medium)
+                .is_empty()
+        );
+        assert!(
+            serde_json::from_str::<ContractSettings>(&json.replace("sandbox", "arbitrary_command"))
+                .is_err()
+        );
+        // No requirements is backward compatible, even with the new check required.
+        assert!(evaluate(&on(), Some(&good()), &need(Class::Light, None), NOW).admit);
+        let empty = ContractSettings {
+            checks: BTreeMap::from([(CheckKind::Capabilities, Mode::Required)]),
+            required_capabilities: Vec::new(),
+            require_report: true,
+            ..on()
+        };
+        assert!(evaluate(&empty, None, &need(Class::Light, None), NOW).admit);
+        let stale = EnvFacts {
+            observed_at: NOW - 3600,
+            ..good()
+        };
+        assert!(evaluate(&empty, Some(&stale), &need(Class::Light, None), NOW).admit);
+    }
+
+    #[test]
+    fn capability_diagnostics_use_admissions_effective_proof_states() {
+        let settings = capability_settings(Mode::Required);
+        for (state, at, expected) in [
+            (CheckState::Pass, NOW, CheckState::Pass),
+            (CheckState::Fail, NOW, CheckState::Fail),
+            (CheckState::Unknown, NOW, CheckState::Unknown),
+            (CheckState::Pass, NOW - 3600, CheckState::Unknown),
+            (CheckState::Fail, NOW + 1, CheckState::Unknown),
+        ] {
+            let facts = capability_facts(state, at);
+            let states = capability_states(&settings, Some(&facts), Class::Light, NOW);
+            let verdict = evaluate(&settings, Some(&facts), &need(Class::Light, None), NOW);
+            assert_eq!(states[&Capability::Sandbox], expected);
+            assert_eq!(
+                states[&Capability::Sandbox],
+                check(&verdict, CheckKind::Capabilities).state
+            );
+        }
+        assert_eq!(
+            capability_states(&settings, None, Class::Light, NOW)[&Capability::Sandbox],
+            CheckState::Unknown
+        );
+        assert_eq!(
+            capability_states(&settings, Some(&good()), Class::Light, NOW)[&Capability::Sandbox],
+            CheckState::Unknown
+        );
+        let mut settings = settings;
+        settings.classes.insert(
+            Class::Heavy,
+            ClassContract {
+                required_capabilities: Some(Vec::new()),
+                ..ClassContract::default()
+            },
+        );
+        assert!(capability_states(&settings, None, Class::Heavy, NOW).is_empty());
     }
 }

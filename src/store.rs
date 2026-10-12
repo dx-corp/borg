@@ -61,6 +61,18 @@ CREATE TABLE IF NOT EXISTS reclaim_log (
     PRIMARY KEY (drone, seq)
 );
 CREATE INDEX IF NOT EXISTS reclaim_log_at ON reclaim_log(at);
+-- Diagnostic metadata only, owned and pruned with the queen's existing store.
+CREATE TABLE IF NOT EXISTS placement_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('runner', 'unit')),
+    key TEXT NOT NULL,
+    client TEXT,
+    outcome TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    CHECK ((kind = 'runner' AND client IS NULL) OR (kind = 'unit' AND client IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS placement_history_key ON placement_history(kind, key, id);
 CREATE TABLE IF NOT EXISTS clients (
     name       TEXT PRIMARY KEY,
     token_hash TEXT NOT NULL UNIQUE,
@@ -403,6 +415,107 @@ fn enum_from<T: DeserializeOwned>(s: &str) -> Result<T, StoreError> {
 }
 
 impl Store {
+    /// Historical placement cannot be derived from current heartbeats. Keep it
+    /// in this existing store, bounded by rows and serialized bytes, pruning in
+    /// the same transaction as insertion. Unit ownership is checked against its
+    /// authoritative row before persisting the diagnostic owner.
+    pub async fn record_placement(
+        &self,
+        record: crate::explain::PlacementRecord<'_>,
+    ) -> Result<(), StoreError> {
+        self.record_placements(&[record]).await
+    }
+
+    /// Persist one bounded placement pass atomically, pruning once after its
+    /// inserts. Invalid bounds or a mismatched unit owner reject the whole batch.
+    pub async fn record_placements(
+        &self,
+        records: &[crate::explain::PlacementRecord<'_>],
+    ) -> Result<(), StoreError> {
+        use crate::explain::{MAX_DECISION_BYTES, MAX_HISTORY, PlacementKind};
+        if records.len() > MAX_HISTORY as usize {
+            return Err(StoreError::Corrupt(
+                "placement batch exceeds diagnostic bounds".into(),
+            ));
+        }
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut encoded = Vec::with_capacity(records.len());
+        for record in records {
+            if record.key.is_empty() || record.key.len() > 256 {
+                return Err(StoreError::Corrupt(
+                    "placement key exceeds diagnostic bounds".into(),
+                ));
+            }
+            let decision = to_text(record.decision)?;
+            if decision.len() > MAX_DECISION_BYTES
+                || record.decision.candidates.len() > crate::allocator::MAX_CANDIDATES
+            {
+                return Err(StoreError::Corrupt(
+                    "placement exceeds diagnostic bounds".into(),
+                ));
+            }
+            encoded.push(decision);
+        }
+        let mut tx = self.pool.begin().await?;
+        for (record, decision) in records.iter().zip(encoded) {
+            match record.kind {
+                PlacementKind::Runner if record.client.is_some() => {
+                    return Err(StoreError::Corrupt("runner placement has a client".into()));
+                }
+                PlacementKind::Unit => {
+                    let owner: Option<String> =
+                        // sqlx-runtime-query: standalone SQLite diagnostic owner check
+                        sqlx::query_scalar("SELECT client FROM units WHERE id = ?")
+                            .bind(record.key)
+                            .fetch_optional(&mut *tx)
+                            .await?;
+                    if record.client.is_none() || owner.as_deref() != record.client {
+                        return Err(StoreError::Corrupt("unit placement owner mismatch".into()));
+                    }
+                }
+                PlacementKind::Runner => {}
+            }
+            // sqlx-runtime-query: standalone-buildable bounded SQLite diagnostics
+            sqlx::query("INSERT INTO placement_history (at, kind, key, client, outcome, decision) VALUES (?, ?, ?, ?, ?, ?)")
+                .bind(record.at).bind(record.kind.as_str()).bind(record.key).bind(record.client)
+                .bind(enum_text(&record.outcome)?).bind(decision).execute(&mut *tx).await?;
+        }
+        // sqlx-runtime-query: all batch inserts and retention form one transaction
+        sqlx::query("DELETE FROM placement_history WHERE id NOT IN (SELECT id FROM placement_history ORDER BY id DESC LIMIT ?)")
+            .bind(MAX_HISTORY).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// `client` restricts unit history to its persisted owner. `None` for a unit
+    /// is deliberately queen-local administration; HTTP callers must supply
+    /// their authenticated client. Runner reads always exclude unit records.
+    pub async fn placement_history(
+        &self,
+        kind: crate::explain::PlacementKind,
+        key: &str,
+        client: Option<&str>,
+    ) -> Result<Vec<crate::explain::HistoryEntry>, StoreError> {
+        // sqlx-runtime-query: typed bounded query; no command payloads selected
+        let rows = sqlx::query("SELECT id, at, kind, key, outcome, decision FROM placement_history WHERE kind = ? AND key = ? AND (? IS NULL OR client = ?) ORDER BY id DESC LIMIT ?")
+            .bind(kind.as_str()).bind(key).bind(client).bind(client)
+            .bind(crate::explain::MAX_QUERY_ROWS).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::explain::HistoryEntry {
+                    id: row.try_get("id")?,
+                    at: row.try_get("at")?,
+                    kind: enum_from(&row.try_get::<String, _>("kind")?)?,
+                    key: row.try_get("key")?,
+                    outcome: enum_from(&row.try_get::<String, _>("outcome")?)?,
+                    decision: from_text(&row.try_get::<String, _>("decision")?)?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
         let opts = SqliteConnectOptions::new()
             .filename(path)

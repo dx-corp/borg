@@ -12,8 +12,9 @@
 //!   never stand in for a different tree. `force` skips reuse.
 //! * **Placement.** Queued units are placed by the same allocator that places
 //!   runner leases (class capacity, owner caps, bids, learned profiles,
-//!   quarantine and probation), on drones of the unit's platform, after CI
-//!   runner demand has been served.
+//!   quarantine and probation), on drones of the unit's platform. A configurable
+//!   capacity share serves queued units before non-deploy CI demand; either
+//!   queue may borrow unused capacity.
 //! * **Execution** is the drone's: it is told about a unit in its heartbeat
 //!   response (`units`), acknowledges it with `active_units`, appends log bytes
 //!   with `POST /v1/units/{id}/log?offset=N`, and ends it with
@@ -40,6 +41,12 @@ use crate::store::{Store, StoreError};
 pub struct UnitSettings {
     /// Off unless the queen opts in; the endpoints answer 404 otherwise.
     pub enabled: bool,
+    /// Guaranteed share of eligible fleet CPU, memory and lease slots for work units,
+    /// before non-deploy CI demand, in percent. In-flight units count toward
+    /// the share; an indivisible unit may cross the budget once. Unused share
+    /// is available to CI, and units may borrow room left by CI. Zero keeps
+    /// strict CI-first scheduling. Does not preempt work already running.
+    pub capacity_share_percent: u8,
     /// A successful result is reused for this long.
     pub receipt_ttl_secs: i64,
     /// A placed unit the drone has not acknowledged within this is re-queued.
@@ -64,6 +71,7 @@ impl Default for UnitSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            capacity_share_percent: 25,
             receipt_ttl_secs: 7 * 86_400,
             lease_ttl_secs: 120,
             default_timeout_secs: 3600,
@@ -80,6 +88,9 @@ impl Default for UnitSettings {
 
 impl UnitSettings {
     pub fn validate(&self) -> Result<(), String> {
+        if self.capacity_share_percent > 100 {
+            return Err("units.capacity_share_percent must be between 0 and 100".into());
+        }
         if self.receipt_ttl_secs <= 0
             || self.lease_ttl_secs <= 0
             || self.keep_secs <= 0
@@ -1065,6 +1076,26 @@ mod tests {
             supersede_key: None,
             record: false,
         }
+    }
+
+    #[test]
+    fn capacity_share_defaults_and_bounds() {
+        let defaults: UnitSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.capacity_share_percent, 25);
+        for value in [0, 100] {
+            let settings: UnitSettings =
+                serde_json::from_value(serde_json::json!({"capacity_share_percent": value}))
+                    .unwrap();
+            assert!(settings.validate().is_ok());
+        }
+        let invalid: UnitSettings =
+            serde_json::from_str(r#"{"capacity_share_percent":101}"#).unwrap();
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .contains("capacity_share_percent")
+        );
     }
 
     #[test]
