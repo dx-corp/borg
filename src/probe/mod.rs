@@ -50,7 +50,8 @@ pub struct Capacity {
     pub mem_mib: u64,
     /// Free space on the filesystem holding the work directory.
     pub free_disk_mib: Option<u64>,
-    /// `docker info` reached a daemon.
+    /// `docker info` reached a daemon as the service user. This is inventory;
+    /// job-user execution proof lives in `EnvFacts::capabilities`.
     pub docker_usable: bool,
     pub mise_version: Option<String>,
     pub git_version: Option<String>,

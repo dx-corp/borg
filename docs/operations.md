@@ -274,6 +274,9 @@ Targets are IPv4 addresses or `addr/len` networks. See `/status` `wake`.
 
 ### Build environment contract
 
+[Capability admission](capability-admission.md) adds bounded job-user execution
+proofs for sandbox, Docker, work-root and cache-root access.
+
 Optional (`env_contract.enabled`, off by default). Before a CI runner lease or a
 work unit is placed on a drone, the queen checks what the drone last reported
 about its build environment. Five checks, each `required`, `advisory` or `off`
@@ -383,6 +386,10 @@ the command locally, so wrappers can call it unconditionally.
   unit this invocation created.
 
 ### Work units (gate and hook runs)
+
+See [remote execution](remote-execution.md) for remote-only runs and JSON
+results, [work-unit fairness](work-unit-fairness.md) for capacity shares, and
+[placement diagnostics](placement-diagnostics.md) for `borg explain`.
 
 Optional (`units.enabled`, off by default). Clients such as `borg run`, the
 pre-commit hook and `mq` submit whole commands; drones run them. Enroll a client

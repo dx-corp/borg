@@ -46,6 +46,10 @@ impl Host for FixedHost {
 struct RecordingExec(Mutex<Vec<String>>);
 
 impl Exec for RecordingExec {
+    fn run_grouped(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        self.run(program, args)
+    }
+
     fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
         self.0
             .lock()
@@ -790,5 +794,195 @@ async fn an_idle_drone_asks_for_the_version_the_queen_wants_and_takes_no_lease()
         drone.heartbeat_once(true, &mut tasks).await.unwrap(),
         0,
         "no new lease while an update is pending"
+    );
+}
+
+#[tokio::test]
+async fn capability_heartbeat_proves_job_user_execution_and_reuses_probe_timestamps() {
+    let rig = Rig::new().await;
+    let drone = rig.drone(json!({
+        "job_user": {"name": "borg-job", "home": "/var/lib/borg-job"},
+        "capability_probe": {"docker_image": "busybox:local"}
+    }));
+    let mut tasks = JoinSet::new();
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    drain(&mut tasks).await;
+    // The next heartbeat publishes the asynchronously completed proof.
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    let first = rig.h.queen.store().drones().await.unwrap();
+    let facts = &first[0].env_facts.as_ref().unwrap().capabilities;
+    for name in borg::envcontract::Capability::ALL {
+        assert_eq!(facts[&name].state, borg::envcontract::CheckState::Pass);
+        assert!(facts[&name].observed_at > 0);
+    }
+    let calls = rig.exec.0.lock().unwrap().clone();
+    let probes: Vec<_> = calls
+        .iter()
+        .filter(|c| c.contains("--kill-after=2s"))
+        .collect();
+    assert_eq!(probes.len(), 7);
+    assert!(probes.iter().all(
+        |c| c.starts_with("setpriv --reuid borg-job --regid borg-job")
+            && c.contains("--bounding-set=-all -- timeout")
+    ));
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    let second = rig.h.queen.store().drones().await.unwrap();
+    assert_eq!(facts, &second[0].env_facts.as_ref().unwrap().capabilities);
+    assert_eq!(
+        rig.exec
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains("--kill-after=2s"))
+            .count(),
+        7
+    );
+}
+
+/// Deliberately blocks only capability commands; inventory/tool probes stay
+/// fast. Releasing the gate lets the full smoke and cleanup sequence finish.
+#[derive(Default)]
+struct GatedCapabilityExec {
+    released: (Mutex<bool>, std::sync::Condvar),
+    started: tokio::sync::Notify,
+    commands: std::sync::atomic::AtomicUsize,
+}
+
+impl GatedCapabilityExec {
+    fn release(&self) {
+        *self.released.0.lock().unwrap() = true;
+        self.released.1.notify_all();
+    }
+}
+
+impl Exec for GatedCapabilityExec {
+    fn run_grouped(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        self.run(program, args)
+    }
+
+    fn run(&self, _program: &str, args: &[&str]) -> io::Result<Output> {
+        if args.contains(&"--kill-after=2s") {
+            self.commands
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.notify_one();
+            let mut released = self.released.0.lock().unwrap();
+            while !*released {
+                released = self.released.1.wait(released).unwrap();
+            }
+        }
+        Ok(Output {
+            success: true,
+            stdout: String::new(),
+        })
+    }
+}
+
+/// A failing assertion must also release the blocking thread, so a regression
+/// fails promptly instead of hanging the Tokio runtime's shutdown.
+struct ReleaseCapabilityGate(Arc<GatedCapabilityExec>);
+impl Drop for ReleaseCapabilityGate {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[tokio::test]
+async fn blocked_capability_refresh_does_not_block_heartbeats_or_duplicate_probes() {
+    let rig = Rig::with_queen(json!({
+        "env_contract": {
+            "enabled": true,
+            "checks": {"capabilities": "required"},
+            "required_capabilities": ["sandbox"]
+        }
+    }))
+    .await;
+    let exec = Arc::new(GatedCapabilityExec::default());
+    let release = ReleaseCapabilityGate(Arc::clone(&exec));
+    let drone = rig.drone_with(
+        json!({
+            "capability_probe": {"timeout_secs": 10, "docker_image": "busybox:local"}
+        }),
+        exec.clone(),
+    );
+    let mut tasks = JoinSet::new();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        drone.heartbeat_once(true, &mut tasks),
+    )
+    .await
+    .expect("heartbeat must not wait for smoke completion")
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), exec.started.notified())
+        .await
+        .expect("smoke should start in background");
+    assert_eq!(exec.commands.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        tasks.len(),
+        1,
+        "unfinished refresh belongs to the drain task set"
+    );
+    let stored = rig.h.queen.store().drones().await.unwrap();
+    assert!(
+        stored[0].last_heartbeat.is_some(),
+        "heartbeat reached the queen while the smoke was blocked"
+    );
+    assert!(
+        stored[0]
+            .env_facts
+            .as_ref()
+            .unwrap()
+            .capabilities
+            .is_empty()
+    );
+    assert_eq!(
+        rig.h.status().await["drones"][0]["contract"]["admission"]["light"]["admit"],
+        false
+    );
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        drone.heartbeat_once(true, &mut tasks),
+    )
+    .await
+    .expect("later heartbeat must also remain independent of the refresh")
+    .unwrap();
+    assert_eq!(exec.commands.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(tasks.len(), 1, "refresh is single-flight");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        drone.heartbeat_once(false, &mut tasks),
+    )
+    .await
+    .expect("draining heartbeat must not wait for the refresh")
+    .unwrap();
+    assert_eq!(tasks.len(), 1);
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(30), drain(&mut tasks))
+        .await
+        .expect("drain joins refresh and its cleanup");
+    assert_eq!(exec.commands.load(std::sync::atomic::Ordering::SeqCst), 7);
+    drone.heartbeat_once(false, &mut tasks).await.unwrap();
+    let stored = rig.h.queen.store().drones().await.unwrap();
+    assert_eq!(
+        stored[0].env_facts.as_ref().unwrap().capabilities[&borg::envcontract::Capability::Sandbox]
+            .state,
+        borg::envcontract::CheckState::Pass
+    );
+}
+
+#[tokio::test]
+async fn draining_drones_do_not_start_capability_refreshes() {
+    let rig = Rig::new().await;
+    let drone = rig.drone(json!({}));
+    let mut tasks = JoinSet::new();
+    drone.heartbeat_once(false, &mut tasks).await.unwrap();
+    assert!(tasks.is_empty());
+    assert!(
+        !rig.exec
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("--kill-after=2s"))
     );
 }

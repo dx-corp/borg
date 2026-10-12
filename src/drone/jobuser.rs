@@ -95,6 +95,14 @@ impl Exec for JobExec {
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         self.inner.run(&self.user.priv_bin, &argv)
     }
+
+    fn run_grouped(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        let mut argv = self.user.setpriv_args();
+        argv.push(program.to_owned());
+        argv.extend(args.iter().map(|a| (*a).to_owned()));
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        self.inner.run_grouped(&self.user.priv_bin, &argv)
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +129,42 @@ mod tests {
                 "setpriv --reuid borg-job --regid borg-job --init-groups --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- rm -rf -- /w/slot-0"
             ]
         );
+    }
+
+    #[test]
+    fn grouped_commands_preserve_both_isolation_and_the_job_user_boundary() {
+        struct GroupOnly;
+        impl Exec for GroupOnly {
+            fn run(&self, _program: &str, _args: &[&str]) -> io::Result<Output> {
+                panic!("JobExec must forward the grouped boundary");
+            }
+            fn run_grouped(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+                assert_eq!(program, "setpriv");
+                assert_eq!(
+                    args,
+                    [
+                        "--reuid",
+                        "borg-job",
+                        "--regid",
+                        "borg-job",
+                        "--init-groups",
+                        "--inh-caps=-all",
+                        "--ambient-caps=-all",
+                        "--bounding-set=-all",
+                        "--",
+                        "timeout",
+                        "1s",
+                        "sh"
+                    ]
+                );
+                Ok(Output {
+                    success: true,
+                    stdout: String::new(),
+                })
+            }
+        }
+        let exec = JobExec::new(Arc::new(GroupOnly), user());
+        assert!(exec.run_grouped("timeout", &["1s", "sh"]).unwrap().success);
     }
 
     #[test]

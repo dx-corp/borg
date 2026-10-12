@@ -97,6 +97,9 @@ fn sanitize_facts(f: &EnvFacts, now: i64) -> EnvFacts {
     };
     let mut out = f.clone();
     out.observed_at = out.observed_at.min(now);
+    for fact in out.capabilities.values_mut() {
+        fact.observed_at = fact.observed_at.min(now);
+    }
     out.rustc_wrapper = out.rustc_wrapper.as_ref().map(clip);
     out.sccache_dir = out.sccache_dir.as_ref().map(clip);
     if let Some(list) = &mut out.toolchains {
@@ -284,11 +287,52 @@ pub fn router(queen: Arc<Queen>) -> Router {
         .route("/status", get(status))
         .route("/metrics", get(metrics))
         .route("/report", get(report))
+        .route("/explain", get(explain))
         .route("/v1/enroll", post(tailnet_enroll))
         .route("/v1/heartbeat", post(heartbeat))
         .route("/v1/leases/{id}/result", post(lease_result))
         .merge(crate::units_api::routes())
         .with_state(queen)
+}
+
+#[derive(Debug, Deserialize)]
+struct ExplainQuery {
+    key: String,
+}
+
+/// Public label queries contain runner decisions only. Unit diagnostics require
+/// the existing client token and a row owned by that client; another client's
+/// unit is indistinguishable from an unknown key.
+async fn explain(
+    State(queen): State<Arc<Queen>>,
+    headers: HeaderMap,
+    Query(query): Query<ExplainQuery>,
+) -> Result<Json<crate::explain::Explanation>, ApiError> {
+    use crate::explain::{Explanation, PlacementKind};
+    if query.key.is_empty() || query.key.len() > 256 {
+        return Err(ApiError::BadRequest(
+            "explain key must be 1-256 bytes".into(),
+        ));
+    }
+    let (kind, key, client) =
+        if let Some((class, scope)) = queen.config().classes.parse_label(&query.key) {
+            (
+                PlacementKind::Runner,
+                queen.config().classes.job_label(class, scope),
+                None,
+            )
+        } else {
+            if !queen.config().units.enabled {
+                return Err(ApiError::NotFound);
+            }
+            let owner = crate::units_api::authenticate_client(&queen, &headers).await?;
+            (PlacementKind::Unit, query.key.clone(), Some(owner))
+        };
+    let history = queen
+        .store()
+        .placement_history(kind, &key, client.as_deref())
+        .await?;
+    Ok(Json(Explanation::new(query.key, history)))
 }
 
 /// The drone name behind the request's bearer token.

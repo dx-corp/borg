@@ -121,7 +121,10 @@ and job telemetry at `/report`.
 | --- | --- |
 | [Configuration](docs/operations.md#config-files) | TOML and JSON, validation, defaults, and redacted secrets. |
 | [Scheduling](docs/operations.md#drone-bids-and-demand-pressure) | Bids, capacity, starvation protection, host health, and warm floors. |
-| [Work units](docs/operations.md#borg-run) | Run commands on the fleet with `borg run`, including local fallback. |
+| [Work units](docs/remote-execution.md) | Remote-only execution, local fallback, and JSON execution results. |
+| [Capability admission](docs/capability-admission.md) | Job-user smoke tests and per-class requirements. |
+| [Work-unit fairness](docs/work-unit-fairness.md) | Capacity shares, client rotation, and starvation protection. |
+| [Placement diagnostics](docs/placement-diagnostics.md) | Explain recorded placement choices with `borg explain`. |
 | [Host caches](docs/operations.md#host-caches) | Cache limits, collection, git mirrors, slots, and compile-cache behavior. |
 | [Drone updates](docs/operations.md#updating-a-drone) | Canary rollout, update manifests, health checks, and rollback. |
 | [Operations reference](docs/operations.md) | APIs, telemetry fields, enrollment, and optional controllers. |

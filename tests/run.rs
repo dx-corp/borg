@@ -18,9 +18,19 @@ use serde_json::{Value, json};
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Receipt,
+    BadReusedDigest,
     Run,
     Failed,
     Queued,
+    Joined,
+    LostLog,
+    JoinedLostLog,
+    JoinedRun,
+    MultiChunk,
+    RunningForever,
+    Unauthorized,
+    BadTerminalReceipt,
+    BadTerminalDigest,
     Refuse,
     /// Runs like `Run` but rejects the bundle upload.
     RefuseBundle,
@@ -31,19 +41,44 @@ struct Fake {
     submitted: Mutex<Vec<Value>>,
     cancelled: Mutex<u32>,
     bundles: Mutex<Vec<Vec<u8>>>,
+    log_reads: Mutex<u32>,
 }
 
 type Shared = Arc<Fake>;
 
+fn receipt_for(command: &Value) -> borg::units::Receipt {
+    let mut receipt = borg::units::Receipt {
+        unit_id: "u-1".into(),
+        repo: command["repo"].as_str().unwrap().into(),
+        tree_sha: command["tree_sha"].as_str().unwrap().into(),
+        argv: serde_json::from_value(command["argv"].clone()).unwrap(),
+        platform: command["platform"].as_str().unwrap().into(),
+        toolchain: command["toolchain"].as_str().unwrap().into(),
+        drone: "d9".into(),
+        exit_code: 0,
+        finished_at: 123,
+        duration_secs: 2,
+        digest: String::new(),
+    };
+    receipt.digest = receipt.compute_digest();
+    receipt
+}
+
 async fn submit(State(f): State<Shared>, Json(b): Json<Value>) -> Response {
-    f.submitted.lock().unwrap().push(b);
+    f.submitted.lock().unwrap().push(b.clone());
     match f.mode {
+        Mode::Joined | Mode::JoinedLostLog | Mode::JoinedRun => {
+            Json(json!({"outcome": "joined", "unit_id": "u-1", "state": "queued"})).into_response()
+        }
         Mode::Refuse => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        Mode::Receipt => Json(
-            json!({"outcome": "receipt", "unit_id": "u-1", "state": "done",
-            "receipt": {"drone": "d9", "exit_code": 0}}),
-        )
-        .into_response(),
+        Mode::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
+        Mode::Receipt | Mode::BadReusedDigest => {
+            let mut receipt = receipt_for(&b);
+            if f.mode == Mode::BadReusedDigest {
+                receipt.digest = "tampered".into();
+            }
+            Json(json!({"outcome": "receipt", "unit_id": "u-1", "state": "done", "receipt": receipt})).into_response()
+        }
         _ => (
             StatusCode::CREATED,
             Json(json!({"outcome": "new", "unit_id": "u-1", "state": "queued"})),
@@ -52,9 +87,80 @@ async fn submit(State(f): State<Shared>, Json(b): Json<Value>) -> Response {
     }
 }
 
+async fn show(State(f): State<Shared>, AxPath(_id): AxPath<String>) -> Json<Value> {
+    let mut unit = f.submitted.lock().unwrap().last().unwrap().clone();
+    unit["id"] = json!("u-1");
+    unit["drone"] = json!("d9");
+    unit["timeout_secs"] = json!(if f.mode == Mode::RunningForever {
+        1
+    } else {
+        30
+    });
+    unit["state"] = json!(match f.mode {
+        Mode::Run
+        | Mode::RefuseBundle
+        | Mode::BadTerminalReceipt
+        | Mode::BadTerminalDigest
+        | Mode::JoinedRun
+        | Mode::MultiChunk => "done",
+        Mode::RunningForever | Mode::LostLog | Mode::JoinedLostLog => "running",
+        Mode::Failed => "failed",
+        _ => "queued",
+    });
+    unit["exit_code"] = json!(if matches!(
+        f.mode,
+        Mode::BadTerminalReceipt | Mode::BadTerminalDigest
+    ) {
+        0
+    } else {
+        3
+    });
+    if f.mode == Mode::BadTerminalReceipt {
+        unit["receipt"] = json!({"unit_id": "u-1", "repo": "other/repo",
+            "tree_sha": unit["tree_sha"], "argv": unit["argv"],
+            "platform": unit["platform"], "toolchain": unit["toolchain"],
+            "drone": "d9", "exit_code": 0, "finished_at": 123,
+            "duration_secs": 1, "digest": "tampered"});
+    }
+    if f.mode == Mode::BadTerminalDigest {
+        let mut receipt = receipt_for(&unit);
+        receipt.digest = "tampered".into();
+        unit["receipt"] = serde_json::to_value(receipt).unwrap();
+    }
+    Json(unit)
+}
+
 async fn log(State(f): State<Shared>, AxPath(_id): AxPath<String>) -> Response {
+    if matches!(f.mode, Mode::LostLog | Mode::JoinedLostLog) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if f.mode == Mode::MultiChunk {
+        let mut reads = f.log_reads.lock().unwrap();
+        *reads += 1;
+        let last = *reads > 1;
+        let mut response = if last {
+            "second chunk\n"
+        } else {
+            "first chunk\n"
+        }
+        .into_response();
+        let headers = response.headers_mut();
+        headers.insert("x-borg-state", "done".parse().unwrap());
+        headers.insert(
+            "x-borg-next",
+            if last { "25" } else { "12" }.parse().unwrap(),
+        );
+        if last {
+            headers.insert("x-borg-exit", "3".parse().unwrap());
+        }
+        return response;
+    }
     let mut r = match f.mode {
-        Mode::Run | Mode::RefuseBundle => "hello from the fleet\n".into_response(),
+        Mode::Run
+        | Mode::RefuseBundle
+        | Mode::BadTerminalReceipt
+        | Mode::BadTerminalDigest
+        | Mode::JoinedRun => "hello from the fleet\n".into_response(),
         _ => {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             "".into_response()
@@ -62,14 +168,35 @@ async fn log(State(f): State<Shared>, AxPath(_id): AxPath<String>) -> Response {
     };
     let h = r.headers_mut();
     let (state, next) = match f.mode {
-        Mode::Run | Mode::RefuseBundle => ("done", "21"),
+        Mode::Run
+        | Mode::RefuseBundle
+        | Mode::BadTerminalReceipt
+        | Mode::BadTerminalDigest
+        | Mode::JoinedRun => ("done", "21"),
         Mode::Failed => ("failed", "0"),
+        Mode::RunningForever => ("running", "0"),
         _ => ("queued", "0"),
     };
     h.insert("x-borg-state", state.parse().unwrap());
     h.insert("x-borg-next", next.parse().unwrap());
-    if matches!(f.mode, Mode::Run | Mode::RefuseBundle) {
-        h.insert("x-borg-exit", "3".parse().unwrap());
+    if matches!(
+        f.mode,
+        Mode::Run
+            | Mode::RefuseBundle
+            | Mode::BadTerminalReceipt
+            | Mode::BadTerminalDigest
+            | Mode::JoinedRun
+    ) {
+        h.insert(
+            "x-borg-exit",
+            if matches!(f.mode, Mode::BadTerminalReceipt | Mode::BadTerminalDigest) {
+                "0"
+            } else {
+                "3"
+            }
+            .parse()
+            .unwrap(),
+        );
     }
     if f.mode == Mode::Failed {
         h.insert("x-borg-failure", "timed out".parse().unwrap());
@@ -100,9 +227,11 @@ async fn fake_queen(mode: Mode) -> (String, Shared) {
         submitted: Mutex::new(Vec::new()),
         cancelled: Mutex::new(0),
         bundles: Mutex::new(Vec::new()),
+        log_reads: Mutex::new(0),
     });
     let app = Router::new()
         .route("/v1/units", post(submit))
+        .route("/v1/units/{id}", get(show))
         .route("/v1/units/{id}/log", get(log))
         .route("/v1/units/{id}/bundle", axum::routing::put(bundle))
         .route("/v1/units/{id}/cancel", post(cancel))
@@ -193,6 +322,8 @@ fn opts(r: &Repo, queen: Option<String>, marker: &str) -> RunOptions {
         scope: "pr".into(),
         wait_secs: 1,
         publish: false,
+        remote_only: false,
+        result_file: None,
         argv: vec!["sh".into(), "-c".into(), format!("touch {marker}; exit 7")],
     }
 }
@@ -447,4 +578,329 @@ async fn the_submission_carries_the_trees_toolchain() {
         fake.submitted.lock().unwrap()[0]["rust_toolchain"],
         "1.95.0"
     );
+}
+
+#[tokio::test]
+async fn remote_only_never_runs_the_local_command_on_infrastructure_failures() {
+    for mode in [
+        Mode::Refuse,
+        Mode::Unauthorized,
+        Mode::Failed,
+        Mode::Queued,
+        Mode::LostLog,
+    ] {
+        let r = repo();
+        let (url, _) = fake_queen(mode).await;
+        let mut o = opts(&r, Some(url), &marker(&r));
+        o.remote_only = true;
+        o.wait_secs = 0;
+        o.result_file = Some(r.dir.join("result.json"));
+        assert_eq!(run(&o, &mut Vec::new()).await, 125);
+        assert!(!Path::new(&marker(&r)).exists());
+        let result: Value =
+            serde_json::from_slice(&std::fs::read(o.result_file.unwrap()).unwrap()).unwrap();
+        assert_eq!(result["exit_code"], 125);
+        assert!(result["infrastructure_error"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn remote_only_requires_configuration_a_resolvable_published_tree_and_a_reachable_queen() {
+    let r = repo();
+    let mut o = opts(&r, None, &marker(&r));
+    o.remote_only = true;
+    assert_eq!(run(&o, &mut Vec::new()).await, 125);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    o.queen = Some(dead);
+    o.token = Some(borg::secret::Secret::new("token"));
+    assert_eq!(run(&o, &mut Vec::new()).await, 125);
+    o.tree = TreeSource::Explicit("missing-tree".into());
+    assert_eq!(run(&o, &mut Vec::new()).await, 125);
+    std::fs::write(r.dir.join("a.txt"), "staged\n").unwrap();
+    git(&r.dir, &["add", "a.txt"]);
+    o.tree = TreeSource::Index;
+    assert_eq!(run(&o, &mut Vec::new()).await, 125);
+    let (url, fake) = fake_queen(Mode::RefuseBundle).await;
+    o.queen = Some(url);
+    o.publish = true;
+    assert_eq!(run(&o, &mut Vec::new()).await, 125);
+    assert_eq!(*fake.cancelled.lock().unwrap(), 1);
+    assert!(!Path::new(&marker(&r)).exists());
+}
+
+#[tokio::test]
+async fn leaving_a_joined_unit_does_not_cancel_another_subscribers_work() {
+    for remote_only in [false, true] {
+        let r = repo();
+        let (url, fake) = fake_queen(Mode::Joined).await;
+        let mut o = opts(&r, Some(url), &marker(&r));
+        o.remote_only = remote_only;
+        o.wait_secs = 0;
+        assert_eq!(
+            run(&o, &mut Vec::new()).await,
+            if remote_only { 125 } else { 7 }
+        );
+        assert_eq!(*fake.cancelled.lock().unwrap(), 0);
+        assert_eq!(Path::new(&marker(&r)).exists(), !remote_only);
+    }
+}
+
+#[tokio::test]
+async fn result_files_identify_remote_execution_and_reused_receipts_without_mixing_stdout() {
+    for mode in [Mode::Run, Mode::Receipt] {
+        let r = repo();
+        let (url, _) = fake_queen(mode).await;
+        let mut o = opts(&r, Some(url), &marker(&r));
+        o.remote_only = true;
+        o.result_file = Some(r.dir.join("result.json"));
+        let mut out = Vec::new();
+        assert_eq!(
+            run(&o, &mut out).await,
+            if mode == Mode::Receipt { 0 } else { 3 }
+        );
+        let result: Value =
+            serde_json::from_slice(&std::fs::read(o.result_file.unwrap()).unwrap()).unwrap();
+        assert_eq!(result["schema_version"], 1);
+        assert_eq!(result["execution"], "remote");
+        assert_eq!(result["host"], "d9");
+        assert_eq!(result["unit_id"], "u-1");
+        assert_eq!(
+            result["requested_tree_sha"],
+            resolve_tree(&r.dir, &TreeSource::Head).unwrap()
+        );
+        assert_eq!(result["argv"], json!(o.argv));
+        assert_eq!(
+            result["provenance"],
+            if mode == Mode::Receipt {
+                "reused"
+            } else {
+                "new"
+            }
+        );
+        if mode == Mode::Receipt {
+            assert_eq!(out, b"");
+            assert_eq!(result["receipt"]["drone"], "d9");
+        } else {
+            assert_eq!(out, b"hello from the fleet\n");
+        }
+        assert!(!Path::new(&marker(&r)).exists());
+    }
+}
+
+#[tokio::test]
+async fn a_local_result_does_not_claim_execution_against_a_git_tree() {
+    let r = repo();
+    let mut o = opts(&r, None, &marker(&r));
+    o.result_file = Some(r.dir.join("result.json"));
+    assert_eq!(run(&o, &mut Vec::new()).await, 7);
+    let result: Value =
+        serde_json::from_slice(&std::fs::read(o.result_file.unwrap()).unwrap()).unwrap();
+    assert_eq!(result["execution"], "local");
+    assert_eq!(result["provenance"], "fallback");
+    assert!(result["host"].is_null());
+    assert!(result["receipt"].is_null());
+}
+
+#[test]
+fn the_cli_remote_only_flag_prevents_local_execution_and_emits_a_result() {
+    let r = repo();
+    let result_path = r.dir.join("result.json");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test invokes the Borg CLI with a local sentinel"
+    )]
+    let output = Command::new(env!("CARGO_BIN_EXE_borg"))
+        .current_dir(&r.dir)
+        .env_remove("BORG_QUEEN")
+        .env_remove("BORG_RUN_REMOTE_ONLY")
+        .args(["run", "--remote-only", "--result-file"])
+        .arg(&result_path)
+        .args(["--", "sh", "-c", "touch ran-locally"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    assert!(output.stdout.is_empty());
+    assert!(!Path::new(&marker(&r)).exists());
+    let result: Value = serde_json::from_slice(&std::fs::read(result_path).unwrap()).unwrap();
+    assert_eq!(result["execution"], "none");
+    assert_eq!(result["exit_code"], 125);
+}
+
+#[tokio::test]
+async fn remote_only_enforces_the_admitted_command_deadline() {
+    let r = repo();
+    let (url, fake) = fake_queen(Mode::RunningForever).await;
+    let mut o = opts(&r, Some(url), &marker(&r));
+    o.remote_only = true;
+    let started = std::time::Instant::now();
+    assert_eq!(run(&o, &mut Vec::new()).await, 125);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(*fake.cancelled.lock().unwrap(), 1);
+    assert!(!Path::new(&marker(&r)).exists());
+}
+
+#[tokio::test]
+async fn broken_output_consumers_never_rerun_remote_commands_locally() {
+    struct BrokenOutput {
+        fail_flush: bool,
+    }
+    impl std::io::Write for BrokenOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_flush {
+                Ok(bytes.len())
+            } else {
+                Err(std::io::Error::other("closed log consumer"))
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                Err(std::io::Error::other("cannot flush log consumer"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    for remote_only in [false, true] {
+        for fail_flush in [false, true] {
+            for mode in [Mode::Run, Mode::JoinedRun, Mode::MultiChunk] {
+                let r = repo();
+                let (url, fake) = fake_queen(mode).await;
+                let mut o = opts(&r, Some(url), &marker(&r));
+                o.remote_only = remote_only;
+                o.result_file = Some(r.dir.join("result.json"));
+                assert_eq!(
+                    run(&o, &mut BrokenOutput { fail_flush }).await,
+                    if remote_only { 125 } else { 3 }
+                );
+                assert_eq!(
+                    *fake.cancelled.lock().unwrap(),
+                    u32::from(remote_only && mode != Mode::JoinedRun)
+                );
+                assert!(!Path::new(&marker(&r)).exists());
+                if mode == Mode::MultiChunk && !remote_only {
+                    assert_eq!(*fake.log_reads.lock().unwrap(), 2);
+                }
+                let result: Value =
+                    serde_json::from_slice(&std::fs::read(o.result_file.unwrap()).unwrap())
+                        .unwrap();
+                assert_eq!(result["execution"], "remote");
+                assert!(
+                    result["infrastructure_error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("remote log")
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_unwritable_result_destination_prevents_execution() {
+    let r = repo();
+    let mut o = opts(&r, None, &marker(&r));
+    o.result_file = Some(r.dir.join("missing-parent/result.json"));
+    assert_eq!(run(&o, &mut Vec::new()).await, 125);
+    assert!(!Path::new(&marker(&r)).exists());
+}
+
+#[tokio::test]
+async fn terminal_metadata_never_publishes_a_tampered_receipt_or_reexecutes_the_command() {
+    let r = repo();
+    let (url, _) = fake_queen(Mode::BadTerminalReceipt).await;
+    let mut o = opts(&r, Some(url), &marker(&r));
+    // Default execution can finish; optional metadata validation must not cause
+    // a second local execution after the remote command has completed.
+    o.result_file = Some(r.dir.join("result.json"));
+    assert_eq!(run(&o, &mut Vec::new()).await, 0);
+    let result: Value =
+        serde_json::from_slice(&std::fs::read(o.result_file.unwrap()).unwrap()).unwrap();
+    assert!(result["receipt"].is_null());
+    assert!(result["host"].is_null());
+    assert!(
+        result["infrastructure_error"]
+            .as_str()
+            .unwrap()
+            .contains("receipt")
+    );
+    assert!(!Path::new(&marker(&r)).exists());
+}
+
+#[tokio::test]
+async fn completed_units_drain_all_log_chunks_before_returning_the_exit_code() {
+    for remote_only in [false, true] {
+        let r = repo();
+        let (url, fake) = fake_queen(Mode::MultiChunk).await;
+        let mut o = opts(&r, Some(url), &marker(&r));
+        o.remote_only = remote_only;
+        let mut out = Vec::new();
+        assert_eq!(run(&o, &mut out).await, 3);
+        assert_eq!(out, b"first chunk\nsecond chunk\n");
+        assert_eq!(*fake.log_reads.lock().unwrap(), 2);
+        assert_eq!(*fake.cancelled.lock().unwrap(), 0);
+        assert!(!Path::new(&marker(&r)).exists());
+    }
+}
+
+#[tokio::test]
+async fn losing_remote_logs_cancels_only_a_newly_created_unit() {
+    for mode in [Mode::LostLog, Mode::JoinedLostLog] {
+        let r = repo();
+        let (url, fake) = fake_queen(mode).await;
+        let mut o = opts(&r, Some(url), &marker(&r));
+        o.remote_only = true;
+        o.wait_secs = 0;
+        assert_eq!(run(&o, &mut Vec::new()).await, 125);
+        assert_eq!(
+            *fake.cancelled.lock().unwrap(),
+            u32::from(mode == Mode::LostLog)
+        );
+        assert!(!Path::new(&marker(&r)).exists());
+    }
+}
+
+#[tokio::test]
+async fn a_matching_terminal_receipt_with_only_its_digest_corrupted_is_rejected() {
+    let r = repo();
+    let (url, _) = fake_queen(Mode::BadTerminalDigest).await;
+    let mut o = opts(&r, Some(url), &marker(&r));
+    o.result_file = Some(r.dir.join("result.json"));
+    assert_eq!(run(&o, &mut Vec::new()).await, 0);
+    let result: Value =
+        serde_json::from_slice(&std::fs::read(o.result_file.unwrap()).unwrap()).unwrap();
+    assert_eq!(result["execution"], "remote");
+    assert_eq!(result["exit_code"], 0);
+    assert!(result["receipt"].is_null());
+    assert!(result["host"].is_null());
+    assert!(
+        result["infrastructure_error"]
+            .as_str()
+            .unwrap()
+            .contains("receipt")
+    );
+    assert!(!Path::new(&marker(&r)).exists());
+}
+
+#[tokio::test]
+async fn a_matching_reused_receipt_with_only_its_digest_corrupted_is_rejected() {
+    let r = repo();
+    let (url, _) = fake_queen(Mode::BadReusedDigest).await;
+    let mut o = opts(&r, Some(url), &marker(&r));
+    o.remote_only = true;
+    o.result_file = Some(r.dir.join("result.json"));
+    assert_eq!(run(&o, &mut Vec::new()).await, 125);
+    let result: Value =
+        serde_json::from_slice(&std::fs::read(o.result_file.unwrap()).unwrap()).unwrap();
+    assert_eq!(result["exit_code"], 125);
+    assert!(result["receipt"].is_null());
+    assert!(result["host"].is_null());
+    assert!(
+        result["infrastructure_error"]
+            .as_str()
+            .unwrap()
+            .contains("receipt")
+    );
+    assert!(!Path::new(&marker(&r)).exists());
 }

@@ -817,3 +817,769 @@ async fn the_newest_unit_with_a_supersede_key_wins() {
         .await;
     assert_eq!(code, 400);
 }
+
+async fn retire_ci(r: &Rig, count: usize, now: i64) {
+    let leases = r.h.queen.store().active_leases().await.unwrap();
+    for lease in leases.into_iter().take(count) {
+        r.h.queen
+            .store()
+            .set_state(&lease.id, borg::store::LeaseStatus::Done, now)
+            .await
+            .unwrap();
+    }
+}
+
+fn sustained_ci(r: &Rig) {
+    for id in 1..=20 {
+        r.h.queue_job(id, "borg-ci-light-pr", 0);
+    }
+}
+
+#[tokio::test]
+async fn unit_share_survives_sustained_ci_and_rotates_clients_across_ticks() {
+    let r = Rig::new(json!({})).await;
+    let d = r.drone("d1").await;
+    let other = scoped_client(&r, "other", borg::classes::Scope::Pr).await;
+    sustained_ci(&r);
+    for n in 0..4 {
+        for (token, name) in [(&r.client, "agent"), (&other, "other")] {
+            let (_, sub) = r
+                .submit_as(
+                    token,
+                    &r.unit(json!({"argv": ["job", n.to_string(), name]})),
+                )
+                .await;
+            assert_eq!(sub["outcome"], "new");
+        }
+    }
+    let mut served = Vec::new();
+    for round in 0..4 {
+        r.tick(10 + round * 2).await;
+        let units =
+            r.h.queen
+                .store()
+                .units_in(&[
+                    borg::units::UnitState::Leased,
+                    borg::units::UnitState::Running,
+                ])
+                .await
+                .unwrap();
+        // 25% of 16 vCPU = two light units; CI consumes the remaining six.
+        assert_eq!(units.len(), 2);
+        assert_eq!(r.h.queen.store().active_leases().await.unwrap().len(), 6);
+        assert_ne!(
+            units[0].client, units[1].client,
+            "both clients receive their share"
+        );
+        if round == 0 {
+            // Held units count toward the next tick's budget.
+            r.tick(11).await;
+            assert_eq!(
+                r.h.queen
+                    .store()
+                    .units_in(&[
+                        borg::units::UnitState::Leased,
+                        borg::units::UnitState::Running
+                    ])
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        for unit in units {
+            served.push(unit.client.clone());
+            r.beat(&d, &[&unit.id]).await;
+            assert_eq!(r.post_result(&d, &unit.id, 0).await, 204);
+        }
+        retire_ci(&r, usize::MAX, r.base.unix_timestamp() + 11 + round * 2).await;
+    }
+    assert_eq!(served.iter().filter(|c| c.as_str() == "agent").count(), 4);
+    assert_eq!(served.iter().filter(|c| c.as_str() == "other").count(), 4);
+}
+
+#[tokio::test]
+async fn zero_share_keeps_ci_first_and_idle_ci_borrows_the_unit_share() {
+    for percent in [0, 25] {
+        let r =
+            Rig::new(json!({"units": {"enabled": true, "capacity_share_percent": percent}})).await;
+        r.drone("d1").await;
+        sustained_ci(&r);
+        // No unit demand reserves no capacity, even with the feature enabled.
+        r.tick(5).await;
+        assert_eq!(r.h.queen.store().active_leases().await.unwrap().len(), 8);
+        let (_, sub) = r.submit(&r.unit(json!({}))).await;
+        retire_ci(&r, usize::MAX, r.base.unix_timestamp() + 6).await;
+        r.tick(10).await;
+        assert_eq!(
+            state_of(&r, sub["unit_id"].as_str().unwrap()).await,
+            if percent == 0 { "queued" } else { "leased" }
+        );
+        assert_eq!(
+            r.h.queen.store().active_leases().await.unwrap().len(),
+            if percent == 0 { 8 } else { 7 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn pending_ci_runners_do_not_absorb_work_unit_demand() {
+    let r = Rig::new(json!({"units": {"enabled": true, "capacity_share_percent": 0}})).await;
+    r.drone("d1").await;
+    r.h.queue_job(1, "borg-ci-light-pr", 0);
+    r.tick(5).await;
+    let (_, sub) = r.submit(&r.unit(json!({}))).await;
+    r.tick(10).await;
+    assert_eq!(
+        state_of(&r, sub["unit_id"].as_str().unwrap()).await,
+        "leased"
+    );
+    assert_eq!(r.h.queen.store().active_leases().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn aging_reserves_contiguous_room_and_a_heavy_unit_can_cross_the_share() {
+    let r = Rig::new(json!({"starvation_after_secs": 30})).await;
+    r.drone("d1").await;
+    sustained_ci(&r);
+    r.tick(1).await;
+    let (_, sub) = r.submit(&r.unit(json!({"class": "heavy"}))).await;
+    let id = sub["unit_id"].as_str().unwrap();
+    r.tick(5).await;
+    assert_eq!(state_of(&r, id).await, "queued");
+    retire_ci(&r, 1, r.base.unix_timestamp() + 35).await;
+    r.tick(40).await;
+    assert_eq!(state_of(&r, id).await, "queued");
+    assert_eq!(
+        r.h.queen.store().active_leases().await.unwrap().len(),
+        7,
+        "an aged heavy unit prevents CI refilling its reserved host"
+    );
+    assert!(
+        r.h.status().await["reserved_for"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["class"] == "heavy")
+    );
+    retire_ci(&r, usize::MAX, r.base.unix_timestamp() + 41).await;
+    r.tick(45).await;
+    assert_eq!(
+        state_of(&r, id).await,
+        "leased",
+        "24 GiB unit exceeds the 7 GiB share but remains indivisible"
+    );
+    assert_eq!(r.h.queen.store().active_leases().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn active_units_reduce_client_priority_even_across_toolchains() {
+    let r = Rig::new(json!({"units": {"enabled": true, "capacity_share_percent": 50}})).await;
+    let d = r.drone("d1").await;
+    let other = scoped_client(&r, "other", borg::classes::Scope::Pr).await;
+    sustained_ci(&r);
+    let mut occupied = Vec::new();
+    for n in 0..4 {
+        let (_, sub) = r
+            .submit(&r.unit(json!({"argv": ["job", n.to_string()], "rust_toolchain": "1.95.0"})))
+            .await;
+        if n < 2 {
+            let id = sub["unit_id"].as_str().unwrap();
+            assert!(
+                r.h.queen
+                    .store()
+                    .lease_unit(id, "d1", r.base.unix_timestamp())
+                    .await
+                    .unwrap()
+            );
+            occupied.push(id.to_owned());
+        }
+        r.submit_as(
+            &other,
+            &r.unit(json!({"argv": ["other", n.to_string()], "rust_toolchain": "1.96.0"})),
+        )
+        .await;
+    }
+    r.beat(&d, &occupied.iter().map(String::as_str).collect::<Vec<_>>())
+        .await;
+    r.tick(5).await;
+    let units =
+        r.h.queen
+            .store()
+            .units_in(&[
+                borg::units::UnitState::Leased,
+                borg::units::UnitState::Running,
+            ])
+            .await
+            .unwrap();
+    assert_eq!(units.len(), 4);
+    assert_eq!(units.iter().filter(|u| u.client == "agent").count(), 2);
+    assert_eq!(
+        units.iter().filter(|u| u.client == "other").count(),
+        2,
+        "the less-loaded client wins despite its lexically later toolchain"
+    );
+    assert_eq!(r.h.queen.store().active_leases().await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn unit_share_never_overrides_owner_caps_or_unavailable_bids() {
+    let r = Rig::new(json!({"starvation_after_secs": 1})).await;
+    let d = r.h.enroll("d1").await;
+    r.h.heartbeat_with(&d, json!({"caps": {"max_vcpu": 4, "max_leases": 2},
+        "bids": [{"class":"light", "scope":"pr", "available_slots": 1, "expires_at": r.base.unix_timestamp() + 1000}]})).await;
+    sustained_ci(&r);
+    let (_, heavy) = r.submit(&r.unit(json!({"class": "heavy"}))).await;
+    for n in 0..3 {
+        r.submit(&r.unit(json!({"argv": ["light", n.to_string()]})))
+            .await;
+    }
+    r.tick(5).await;
+    assert_eq!(
+        state_of(&r, heavy["unit_id"].as_str().unwrap()).await,
+        "queued"
+    );
+    let units =
+        r.h.queen
+            .store()
+            .units_in(&[borg::units::UnitState::Leased])
+            .await
+            .unwrap();
+    assert_eq!(
+        units.len(),
+        1,
+        "a heartbeat bid slot is shared by both allocation passes"
+    );
+    assert!(r.h.queen.store().active_leases().await.unwrap().is_empty());
+    assert!(
+        r.h.status().await["reserved_for"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "an impossible heavy unit cannot reserve this capped host"
+    );
+}
+
+#[tokio::test]
+async fn deploy_ci_retains_priority_over_the_unit_share() {
+    let r = Rig::new(json!({})).await;
+    deploy_drone(&r, "deploy").await;
+    let client = scoped_client(&r, "gate", borg::classes::Scope::Main).await;
+    let (_, sub) = r
+        .submit_as(&client, &r.unit(json!({"scope":"main", "class":"heavy"})))
+        .await;
+    r.h.queue_job(1, "borg-ci-heavy-deploy", 0);
+    r.tick(5).await;
+    assert_eq!(
+        state_of(&r, sub["unit_id"].as_str().unwrap()).await,
+        "queued"
+    );
+    let leases = r.h.queen.store().active_leases().await.unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].scope, borg::classes::Scope::Deploy);
+}
+
+#[tokio::test]
+async fn one_slot_share_rotates_clients_without_toolchain_lexical_priority() {
+    let r = Rig::new(json!({})).await;
+    let d = r.drone("d1").await;
+    let other = scoped_client(&r, "other", borg::classes::Scope::Pr).await;
+    sustained_ci(&r);
+    for n in 0..2 {
+        for (token, toolchain) in [(&r.client, "1.96.0"), (&other, "1.95.0")] {
+            r.submit_as(token, &r.unit(json!({"class":"heavy", "argv":["job",n.to_string(),toolchain], "rust_toolchain":toolchain}))).await;
+        }
+    }
+    let mut clients = Vec::new();
+    for round in 0..4 {
+        r.tick(5 + round).await;
+        let units =
+            r.h.queen
+                .store()
+                .units_in(&[borg::units::UnitState::Leased])
+                .await
+                .unwrap();
+        assert_eq!(units.len(), 1);
+        clients.push(units[0].client.clone());
+        r.beat(&d, &[&units[0].id]).await;
+        assert_eq!(r.post_result(&d, &units[0].id, 0).await, 204);
+        retire_ci(&r, usize::MAX, r.base.unix_timestamp() + 5 + round).await;
+    }
+    assert_ne!(clients[0], clients[1]);
+    assert_eq!(clients[0], clients[2]);
+    assert_eq!(clients[1], clients[3]);
+}
+
+#[tokio::test]
+async fn aging_does_not_reserve_a_host_missing_the_units_toolchain() {
+    let r = Rig::new(json!({"starvation_after_secs":1,
+        "env_contract":{"enabled":true,"require_report":true,
+            "checks":{"compiler_cache":"off","toolchain":"required","cache_store":"off","resources":"off","tools":"off"}}})).await;
+    let d = r.h.enroll("d1").await;
+    r.h.heartbeat_with(
+        &d,
+        json!({"env_facts":{"observed_at":r.base.unix_timestamp(),
+        "toolchains":[{"channel":"1.95.0","rustc_version":"1.95.0"}]}}),
+    )
+    .await;
+    sustained_ci(&r);
+    // Age only the unit, so an empty reservation set specifically proves
+    // that its missing toolchain cannot hold capacity from young CI demand.
+    let id = submit_at(
+        &r,
+        "agent",
+        json!({"class":"heavy","rust_toolchain":"1.96.0"}),
+        r.base.unix_timestamp() - 10,
+    )
+    .await;
+    r.tick(0).await;
+    assert_eq!(state_of(&r, &id).await, "queued");
+    assert!(
+        r.h.status().await["reserved_for"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        r.h.queen.store().active_leases().await.unwrap().len(),
+        8,
+        "ineligible work holds no CI capacity"
+    );
+    // Once CI itself ages, its residual demand may legitimately reserve the
+    // host. That reservation must be light CI, never the blocked heavy unit.
+    r.tick(5).await;
+    assert_eq!(state_of(&r, &id).await, "queued");
+    assert_eq!(
+        r.h.status().await["reserved_for"],
+        json!([{"drone_id":"d1","class":"light","scope":"pr"}])
+    );
+    assert_eq!(r.h.queen.store().active_leases().await.unwrap().len(), 8);
+    let report = explanation(&r, &id).await;
+    assert!(
+        report
+            .history
+            .iter()
+            .all(|row| row.decision.reservation.is_none())
+    );
+}
+
+#[tokio::test]
+async fn per_unit_fairness_preserves_backlog_bid_pressure() {
+    let r = Rig::new(json!({})).await;
+    let d = r.h.enroll("d1").await;
+    r.h.heartbeat_with(
+        &d,
+        json!({"bids":[{"class":"light","scope":"pr",
+        "available_slots":8,"min_pressure":500,"expires_at":r.base.unix_timestamp()+1000}]}),
+    )
+    .await;
+    for n in 0..8 {
+        r.submit(&r.unit(json!({"argv":["job",n.to_string()]})))
+            .await;
+    }
+    sustained_ci(&r);
+    r.tick(5).await;
+    assert_eq!(
+        r.h.queen
+            .store()
+            .units_in(&[borg::units::UnitState::Leased])
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "eight queued units create pressure500; selecting one fairly must retain the backlog pressure"
+    );
+    assert_eq!(r.h.queen.store().active_leases().await.unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn unit_share_accounts_for_owner_lease_slots_across_platforms() {
+    let r = Rig::new(json!({})).await;
+    let linux = r.h.enroll("linux").await;
+    r.h.heartbeat_with(&linux, json!({"caps":{"max_leases":1}}))
+        .await;
+    let mac = r.h.enroll("mac").await;
+    let mut cap = serde_json::to_value(support::capacity()).unwrap();
+    cap["os"] = json!("macos");
+    cap["arch"] = json!("aarch64");
+    r.h.heartbeat_with(&mac, json!({"capacity":cap,"caps":{"max_leases":1}}))
+        .await;
+    r.submit(&r.unit(json!({"platform":"linux-x86_64"}))).await;
+    r.submit(&r.unit(json!({"platform":"macos-aarch64"}))).await;
+    sustained_ci(&r);
+    r.tick(5).await;
+    assert_eq!(
+        r.h.queen
+            .store()
+            .units_in(&[borg::units::UnitState::Leased])
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "25 percent of two owner-capped slots rounds to one, even with spare CPU and memory"
+    );
+    assert_eq!(r.h.queen.store().active_leases().await.unwrap().len(), 1);
+}
+
+async fn explanation(r: &Rig, key: &str) -> borg::explain::Explanation {
+    r.h.http
+        .get(format!("{}/explain", r.h.url))
+        .query(&[("key", key)])
+        .bearer_auth(&r.client)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn queen_automatically_retains_unit_and_runner_decisions_after_persistence() {
+    use borg::explain::{PlacementKind, PlacementOutcome};
+    let r = Rig::new(json!({})).await;
+    r.drone("d1").await;
+    let (_, sub) = r.submit(&r.unit(json!({}))).await;
+    let (_, wrong_platform) = r.submit(&r.unit(json!({"platform":"macos-aarch64"}))).await;
+    r.h.queue_job(1, "borg-ci-light-pr", 0);
+    r.tick(5).await;
+    let success = explanation(&r, sub["unit_id"].as_str().unwrap()).await;
+    assert!(!success.history.is_empty());
+    assert_eq!(success.history[0].kind, PlacementKind::Unit);
+    assert_eq!(success.history[0].outcome, PlacementOutcome::Granted);
+    assert_eq!(success.history[0].decision.winner.as_deref(), Some("d1"));
+    let unplaced = explanation(&r, wrong_platform["unit_id"].as_str().unwrap()).await;
+    assert!(!unplaced.history.is_empty());
+    assert_eq!(unplaced.history[0].outcome, PlacementOutcome::Unplaced);
+    assert!(unplaced.history[0].decision.winner.is_none());
+    assert!(unplaced.history[0].decision.candidates.is_empty());
+    let runner = explanation(&r, "borg-ci-light-pr").await;
+    assert!(!runner.history.is_empty());
+    assert_eq!(runner.history[0].kind, PlacementKind::Runner);
+    assert_eq!(runner.history[0].outcome, PlacementOutcome::Granted);
+}
+
+#[tokio::test]
+async fn a_selected_runner_is_failed_in_history_when_minting_fails() {
+    let r = Rig::new(json!({})).await;
+    r.drone("d1").await;
+    r.h.queue_job(1, "borg-ci-light-pr", 0);
+    r.h.state().fail_mint = true;
+    r.tick(5).await;
+    assert!(r.h.queen.store().active_leases().await.unwrap().is_empty());
+    let report = explanation(&r, "borg-ci-light-pr").await;
+    assert_eq!(report.history.len(), 1);
+    assert_eq!(
+        report.history[0].outcome,
+        borg::explain::PlacementOutcome::Failed
+    );
+    assert_eq!(report.history[0].decision.winner.as_deref(), Some("d1"));
+}
+
+#[tokio::test]
+async fn blocked_unit_history_contains_effective_typed_checks_without_raw_environment() {
+    use borg::envcontract::{CheckKind, CheckState};
+    let r = Rig::new(json!({"env_contract":{"enabled":true,"require_report":true,
+        "checks":{"compiler_cache":"off","toolchain":"required","cache_store":"off","resources":"off","tools":"off"}}})).await;
+    let d = r.h.enroll("d1").await;
+    r.h.heartbeat_with(&d,json!({"env_facts":{"observed_at":r.base.unix_timestamp(),
+        "rustc_wrapper":"private-path-should-not-appear", "toolchains":[{"channel":"1.95.0","rustc_version":"private-version-should-not-appear"}]}})).await;
+    let (_, sub) = r.submit(&r.unit(json!({"rust_toolchain":"1.96.0"}))).await;
+    r.tick(5).await;
+    let report = explanation(&r, sub["unit_id"].as_str().unwrap()).await;
+    assert_eq!(
+        report.history[0].outcome,
+        borg::explain::PlacementOutcome::Unplaced
+    );
+    let candidate = &report.history[0].decision.candidates[0];
+    assert_eq!(
+        candidate.environment_checks.get(&CheckKind::Toolchain),
+        Some(&CheckState::Fail)
+    );
+    assert!(
+        candidate
+            .rejection_reasons
+            .contains(&borg::allocator::Rejection::Environment)
+    );
+    let encoded = serde_json::to_string(&report).unwrap();
+    assert!(!encoded.contains("private-path-should-not-appear"));
+    assert!(!encoded.contains("private-version-should-not-appear"));
+}
+
+#[tokio::test]
+async fn unit_history_uses_effective_capability_requirements_and_freshness() {
+    use borg::envcontract::{Capability, CheckState};
+    let r = Rig::new(json!({"env_contract":{"enabled":true,"facts_max_age_secs":2,
+        "checks":{"compiler_cache":"off","toolchain":"off","cache_store":"off","resources":"off","tools":"off"},
+        "required_capabilities":["sandbox"],"classes":{"light":{"required_capabilities":["docker"]}}}})).await;
+    let d = r.h.enroll("d1").await;
+    r.h.heartbeat_with(
+        &d,
+        json!({"env_facts":{"observed_at":r.base.unix_timestamp(),"capabilities":{
+        "sandbox":{"observed_at":r.base.unix_timestamp(),"state":"fail"},
+        "docker":{"observed_at":r.base.unix_timestamp(),"state":"pass"}}}}),
+    )
+    .await;
+    let (_, sub) = r.submit(&r.unit(json!({}))).await;
+    r.tick(5).await;
+    let report = explanation(&r, sub["unit_id"].as_str().unwrap()).await;
+    assert_eq!(
+        report.history[0].outcome,
+        borg::explain::PlacementOutcome::Unplaced
+    );
+    let candidate = &report.history[0].decision.candidates[0];
+    assert_eq!(candidate.capability_checks.len(), 1);
+    assert_eq!(
+        candidate.capability_checks.get(&Capability::Docker),
+        Some(&CheckState::Unknown)
+    );
+    assert!(
+        !candidate
+            .capability_checks
+            .contains_key(&Capability::Sandbox),
+        "a class replacement excludes the global requirement from diagnostics too"
+    );
+}
+
+#[tokio::test]
+async fn leased_units_leave_the_backlog_before_the_next_bid_threshold_check() {
+    let r = Rig::new(json!({})).await;
+    let d = r.h.enroll("d1").await;
+    r.h.heartbeat_with(
+        &d,
+        json!({"bids":[{"class":"light","scope":"pr",
+        "available_slots":8,"min_pressure":250,"expires_at":r.base.unix_timestamp()+1000}]}),
+    )
+    .await;
+    for n in 0..4 {
+        r.submit(&r.unit(json!({"argv":["job",n.to_string()]})))
+            .await;
+    }
+    sustained_ci(&r);
+    r.tick(5).await;
+    assert_eq!(
+        r.h.queen
+            .store()
+            .units_in(&[borg::units::UnitState::Leased])
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "initial pressure4*500/8=250 admits one; remaining3*500/7=214 is below the bid threshold"
+    );
+    assert_eq!(r.h.queen.store().active_leases().await.unwrap().len(), 7);
+    let queued =
+        r.h.queen
+            .store()
+            .units_in(&[borg::units::UnitState::Queued])
+            .await
+            .unwrap();
+    assert_eq!(queued.len(), 3);
+    let report = explanation(&r, &queued[0].id).await;
+    assert!(report.history.iter().any(|row| row.decision.pressure == 214
+        && row.outcome == borg::explain::PlacementOutcome::Unplaced));
+}
+
+#[tokio::test]
+async fn young_deploy_ci_keeps_priority_when_main_ci_has_starved() {
+    let r = Rig::new(json!({"starvation_after_secs":30})).await;
+    deploy_drone(&r, "deploy").await;
+    let client = scoped_client(&r, "gate", borg::classes::Scope::Main).await;
+    let (_, unit) = r
+        .submit_as(&client, &r.unit(json!({"scope":"main","class":"heavy"})))
+        .await;
+    r.h.queue_job(1, "borg-ci-heavy", 300);
+    r.h.queue_job(2, "borg-ci-heavy-deploy", 0);
+    r.tick(5).await;
+    assert_eq!(
+        state_of(&r, unit["unit_id"].as_str().unwrap()).await,
+        "queued"
+    );
+    let leases = r.h.queen.store().active_leases().await.unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(
+        leases[0].scope,
+        borg::classes::Scope::Deploy,
+        "an aged main preallocation must not hide deploy demand before the unit share"
+    );
+}
+
+async fn submit_at(r: &Rig, client: &str, extra: Value, at: i64) -> String {
+    let unit: borg::units::SubmitUnit = serde_json::from_value(r.unit(extra)).unwrap();
+    unit.validate().unwrap();
+    let id = borg::queen::new_unit_id();
+    r.h.queen
+        .store()
+        .submit_unit(
+            &unit,
+            client,
+            &id,
+            3600,
+            r.h.queen.config().units.receipt_ttl_secs,
+            at,
+        )
+        .await
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn aged_heavy_unit_reserves_before_fresh_work_from_a_less_loaded_client() {
+    // Cover both a fresh light unit and an already-aged smaller class.
+    for light_created_offset in [119, 0] {
+        let r = Rig::new(json!({"starvation_after_secs":30})).await;
+        let d = r.drone("d1").await;
+        scoped_client(&r, "other", borg::classes::Scope::Pr).await;
+        let active = submit_at(
+            &r,
+            "agent",
+            json!({"argv":["active"]}),
+            r.base.unix_timestamp(),
+        )
+        .await;
+        r.h.queen
+            .store()
+            .lease_unit(&active, "d1", r.base.unix_timestamp())
+            .await
+            .unwrap();
+        r.beat(&d, &[&active]).await;
+        sustained_ci(&r);
+        r.tick(1).await;
+        assert_eq!(r.h.queen.store().active_leases().await.unwrap().len(), 7);
+        let heavy = submit_at(
+            &r,
+            "agent",
+            json!({"class":"heavy","argv":["aged-heavy"]}),
+            r.base.unix_timestamp(),
+        )
+        .await;
+        let fresh = submit_at(
+            &r,
+            "other",
+            json!({"argv":["fresh-light"]}),
+            r.base.unix_timestamp() + light_created_offset,
+        )
+        .await;
+        retire_ci(&r, 1, r.base.unix_timestamp() + 119).await;
+        r.tick(120).await;
+        assert_eq!(state_of(&r, &heavy).await, "queued");
+        assert_eq!(
+            state_of(&r, &fresh).await,
+            "queued",
+            "fresh light work cannot consume the last share slot before the aged heavy reservation"
+        );
+        assert_eq!(
+            r.h.queen.store().active_leases().await.unwrap().len(),
+            6,
+            "continuous CI cannot refill the host reserved for heavy work"
+        );
+        assert!(
+            r.h.status().await["reserved_for"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["class"] == "heavy")
+        );
+        retire_ci(&r, usize::MAX, r.base.unix_timestamp() + 121).await;
+        r.tick(122).await;
+        assert_eq!(state_of(&r, &heavy).await, "leased");
+        assert_eq!(state_of(&r, &active).await, "running");
+        assert_eq!(state_of(&r, &fresh).await, "queued");
+    }
+}
+
+#[tokio::test]
+async fn deploy_prepass_uses_full_uncovered_runner_pressure_before_unit_share() {
+    use borg::classes::Scope;
+    use borg::explain::{PlacementKind, PlacementOutcome};
+    let r = Rig::new(json!({})).await;
+    let drone = r.h.enroll("deploy").await;
+    r.h.heartbeat_with(&drone, json!({"trust":"deploy","bids":[
+        {"class":"heavy","scope":"deploy","available_slots":1,"min_pressure":750,"expires_at":r.base.unix_timestamp()+1000},
+        {"class":"heavy","scope":"main","available_slots":1,"expires_at":r.base.unix_timestamp()+1000}
+    ]})).await;
+    let client = scoped_client(&r, "gate", Scope::Main).await;
+    let (_, unit) = r
+        .submit_as(&client, &r.unit(json!({"scope":"main","class":"heavy"})))
+        .await;
+    r.h.queue_job(1, "borg-ci-heavy", 0);
+    r.h.queue_job(2, "borg-ci-heavy-deploy", 0);
+    r.tick(5).await;
+    let leases = r.h.queen.store().active_leases().await.unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].scope, Scope::Deploy);
+    assert_eq!(
+        state_of(&r, unit["unit_id"].as_str().unwrap()).await,
+        "queued",
+        "full runner pressure admits Deploy before a Main unit can consume its only heavy slot"
+    );
+    let history =
+        r.h.queen
+            .store()
+            .placement_history(PlacementKind::Runner, "borg-ci-heavy-deploy", None)
+            .await
+            .unwrap();
+    assert_eq!(history[0].outcome, PlacementOutcome::Granted);
+    assert_eq!(history[0].decision.pressure, 1000);
+    assert_eq!(history[0].decision.winner.as_deref(), Some("deploy"));
+}
+
+#[tokio::test]
+async fn pending_pr_runner_covering_main_does_not_inflate_deploy_pressure() {
+    use borg::allocator::Rejection;
+    use borg::classes::Scope;
+    use borg::explain::{PlacementKind, PlacementOutcome};
+    let r = Rig::new(json!({})).await;
+    r.drone("shared").await;
+    r.h.queue_job(1, "borg-ci-heavy-pr", 0);
+    r.tick(0).await;
+    let pending = r.h.queen.store().active_leases().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].scope, Scope::Pr);
+    assert_eq!(pending[0].state, borg::store::LeaseStatus::Pending);
+
+    let drone = r.h.enroll("deploy").await;
+    r.h.heartbeat_with(&drone, json!({"trust":"deploy","bids":[
+        {"class":"heavy","scope":"deploy","available_slots":1,"min_pressure":750,"expires_at":r.base.unix_timestamp()+1000},
+        {"class":"heavy","scope":"main","available_slots":1,"expires_at":r.base.unix_timestamp()+1000}
+    ]})).await;
+    let client = scoped_client(&r, "gate", Scope::Main).await;
+    let (_, unit) = r
+        .submit_as(&client, &r.unit(json!({"scope":"main","class":"heavy"})))
+        .await;
+    r.h.state().jobs.clear();
+    r.h.queue_job(2, "borg-ci-heavy", 0);
+    r.h.queue_job(3, "borg-ci-heavy-deploy", 0);
+    r.tick(5).await;
+    let leases = r.h.queen.store().active_leases().await.unwrap();
+    assert_eq!(
+        leases.len(),
+        1,
+        "the existing pending PR runner covers Main CI"
+    );
+    assert_eq!(leases[0].id, pending[0].id);
+    assert_eq!(
+        state_of(&r, unit["unit_id"].as_str().unwrap()).await,
+        "leased"
+    );
+    let history =
+        r.h.queen
+            .store()
+            .placement_history(PlacementKind::Runner, "borg-ci-heavy-deploy", None)
+            .await
+            .unwrap();
+    assert!(
+        history
+            .iter()
+            .all(|row| row.outcome == PlacementOutcome::Unplaced)
+    );
+    assert!(history.iter().any(|row| row.decision.pressure == 500
+        && row.decision.candidates.iter().any(|candidate| {
+            candidate.drone_id == "deploy"
+                && candidate
+                    .rejection_reasons
+                    .contains(&Rejection::BidThreshold)
+        })));
+}

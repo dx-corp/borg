@@ -18,6 +18,7 @@ pub mod configfile;
 pub mod drone;
 pub mod enroll;
 pub mod envcontract;
+pub mod explain;
 pub mod github;
 pub mod health;
 pub mod homeostasis;

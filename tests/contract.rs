@@ -369,3 +369,63 @@ async fn a_drone_missing_a_required_tool_gets_no_lease_and_status_names_it() {
         assert!(m.contains(line), "missing {line}\n{m}");
     }
 }
+
+#[tokio::test]
+async fn class_specific_job_user_proofs_gate_ci_and_survive_heartbeat_storage() {
+    let h = Harness::start(cfg(json!({
+        "env_contract": {
+            "enabled": true,
+            "checks": {"capabilities": "required"},
+            "classes": {"heavy": {"required_capabilities": ["sandbox", "docker"]}}
+        }
+    })))
+    .await;
+    let old = h.enroll("a-inventory-only").await;
+    let ok = h.enroll("b-proven").await;
+    let stale = h.enroll("c-stale-proof").await;
+    let mut fresh = good("1.95.0");
+    fresh["capabilities"] = json!({
+        "sandbox": {"observed_at": now(), "state": "pass"},
+        "docker": {"observed_at": now(), "state": "pass"}
+    });
+    beat(&h, &old, Some(good("1.95.0"))).await;
+    beat(&h, &ok, Some(fresh.clone())).await;
+    fresh["capabilities"]["sandbox"]["observed_at"] = json!(now() - 3600);
+    beat(&h, &stale, Some(fresh)).await;
+    h.queue_job(1, "borg-ci-heavy-pr", 5);
+    h.tick().await;
+    for token in [&old, &stale] {
+        assert!(
+            beat(&h, token, None).await["leases"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        beat(&h, &ok, None).await["leases"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let status = h.status().await;
+    for name in ["a-inventory-only", "c-stale-proof"] {
+        let admission = &drone(&status, name)["contract"]["admission"];
+        assert_eq!(admission["heavy"]["admit"], false);
+        assert_eq!(admission["light"]["admit"], true);
+        assert!(
+            admission["heavy"]["why"]
+                .as_str()
+                .unwrap()
+                .contains("sandbox")
+        );
+    }
+    let stored = h.queen.store().drones().await.unwrap();
+    let stale = stored.iter().find(|d| d.name == "c-stale-proof").unwrap();
+    assert!(
+        stale.env_facts.as_ref().unwrap().capabilities[&borg::envcontract::Capability::Sandbox]
+            .observed_at
+            < now() - 3500
+    );
+}

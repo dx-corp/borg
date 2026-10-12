@@ -52,7 +52,10 @@ fn enabled(queen: &Queen) -> Result<(), ApiError> {
     }
 }
 
-async fn authenticate_client(queen: &Queen, headers: &HeaderMap) -> Result<String, ApiError> {
+pub(crate) async fn authenticate_client(
+    queen: &Queen,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
     let presented = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
