@@ -23,6 +23,7 @@ pub mod health;
 pub mod homeostasis;
 pub mod janitor;
 pub mod lead;
+pub mod mirror_auth;
 pub mod preempt;
 pub mod probe;
 pub mod profile;

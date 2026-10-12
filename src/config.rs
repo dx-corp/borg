@@ -236,6 +236,62 @@ pub struct QueenConfig {
     /// Absent (the default) disables preemption; see [`crate::preempt`].
     #[serde(default)]
     pub preemption: Option<PreemptSettings>,
+    /// Absent (the default) disables git mirror credentials; see
+    /// [`crate::mirror_auth`].
+    #[serde(default)]
+    pub mirror_auth: Option<MirrorAuthSettings>,
+}
+
+/// A second GitHub App, held by the queen only, whose short-lived read-only
+/// installation tokens let drones refresh private git mirrors.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorAuthSettings {
+    /// The mirror App's id (or client id).
+    pub app_id: String,
+    /// PEM private key file. If absent, `BORG_MIRROR_APP_PRIVATE_KEY` must
+    /// hold the PEM text.
+    #[serde(default)]
+    pub private_key_path: Option<PathBuf>,
+    /// Bare repository names in `github.org` the token may read.
+    pub repositories: Vec<String>,
+}
+
+impl MirrorAuthSettings {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |msg: &str| Err(ConfigError::Invalid(msg.to_owned()));
+        if self.app_id.is_empty() {
+            return bad("mirror_auth.app_id is required");
+        }
+        if self.repositories.is_empty() {
+            return bad("mirror_auth.repositories must name at least one repository");
+        }
+        if self.repositories.iter().any(|r| {
+            r.is_empty()
+                || r.contains('/')
+                || r.chars().any(|c| c.is_whitespace() || c.is_control())
+        }) {
+            return bad("every mirror_auth.repositories entry must be a bare repository name");
+        }
+        Ok(())
+    }
+
+    /// The App private key: `private_key_path`, else `env_pem` (the value of
+    /// `BORG_MIRROR_APP_PRIVATE_KEY`).
+    pub fn private_key(&self, env_pem: Option<String>) -> Result<Vec<u8>, ConfigError> {
+        match (&self.private_key_path, env_pem) {
+            (Some(path), _) => std::fs::read(path).map_err(|e| {
+                ConfigError::Invalid(format!(
+                    "read mirror_auth.private_key_path {}: {e}",
+                    path.display()
+                ))
+            }),
+            (None, Some(pem)) if !pem.trim().is_empty() => Ok(pem.into_bytes()),
+            (None, _) => Err(ConfigError::Invalid(
+                "set mirror_auth.private_key_path or BORG_MIRROR_APP_PRIVATE_KEY".to_owned(),
+            )),
+        }
+    }
 }
 
 fn default_listen() -> SocketAddr {
@@ -313,6 +369,9 @@ impl QueenConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         self.classes.validate()?;
         let bad = |msg: &str| Err(ConfigError::Invalid(msg.to_owned()));
+        if let Some(m) = &self.mirror_auth {
+            m.validate()?;
+        }
         if self.github.org.is_empty() || self.github.app_id.is_empty() {
             return bad("github.org and github.app_id are required");
         }
@@ -387,6 +446,54 @@ mod tests {
         assert_eq!(c.github.api_base, "https://api.github.com");
         assert_eq!(c.warm_floors, default_warm_floors());
         assert_eq!(c.listen.ip().to_string(), "127.0.0.1");
+    }
+
+    fn with_mirror(block: &str) -> String {
+        MIN.replace("\"repos\"", &format!("\"mirror_auth\":{block},\"repos\""))
+    }
+
+    #[test]
+    fn mirror_auth_is_off_unless_present_and_validated() {
+        assert!(QueenConfig::from_json(MIN).unwrap().mirror_auth.is_none());
+        let ok = with_mirror(
+            r#"{"app_id":"12345","private_key_path":"/etc/borg/mirror-app.pem","repositories":["app"]}"#,
+        );
+        let c = QueenConfig::from_json(&ok).unwrap();
+        assert_eq!(c.mirror_auth.unwrap().repositories, ["app"]);
+        for bad in [
+            r#"{"app_id":"12345","repositories":[]}"#,
+            r#"{"app_id":"12345","repositories":["example-org/app"]}"#,
+            r#"{"app_id":"12345","repositories":[""]}"#,
+            r#"{"app_id":"12345","repositories":["a b"]}"#,
+            r#"{"app_id":"","repositories":["app"]}"#,
+            r#"{"app_id":"12345","repositories":["app"],"nope":1}"#,
+            r#"{"repositories":["app"]}"#,
+        ] {
+            assert!(QueenConfig::from_json(&with_mirror(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn mirror_key_comes_from_the_file_or_the_environment_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mirror-app.pem");
+        std::fs::write(&file, "PEM-FROM-FILE").unwrap();
+        let settings = |path: Option<PathBuf>| MirrorAuthSettings {
+            app_id: "12345".to_owned(),
+            private_key_path: path,
+            repositories: vec!["app".to_owned()],
+        };
+        let from_file = settings(Some(file)).private_key(Some("ignored".to_owned()));
+        assert_eq!(from_file.unwrap(), b"PEM-FROM-FILE");
+        let from_env = settings(None).private_key(Some("PEM-FROM-ENV".to_owned()));
+        assert_eq!(from_env.unwrap(), b"PEM-FROM-ENV");
+        assert!(settings(None).private_key(None).is_err());
+        assert!(settings(None).private_key(Some("  \n".to_owned())).is_err());
+        assert!(
+            settings(Some(dir.path().join("missing.pem")))
+                .private_key(None)
+                .is_err()
+        );
     }
 
     #[test]

@@ -136,6 +136,13 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
+The integration tests share fixtures across two suites. Run service-state tests
+with `cargo test --locked --test suite units::`, or host tests with
+`cargo test --locked --test host_suite drone::`. The largest module, `queen`,
+keeps its own target for focused edits: `cargo test --locked --test queen`.
+The compiler-cache test has its own target because it invokes itself by exact test name:
+`cargo test --locked --test sccache_slots`.
+
 | Source | Responsibility |
 | --- | --- |
 | `src/probe/` | Host capacity and tool detection. |

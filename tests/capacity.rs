@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 use serde_json::{Value, json};
 use support::Harness;

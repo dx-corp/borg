@@ -211,6 +211,11 @@ pub struct HeartbeatResponse {
     /// Held standby leases that ended on the queen's side; forget them.
     #[serde(default)]
     pub drop_standby: Vec<String>,
+    /// A short-lived read-only token for the git mirrors, present on every
+    /// heartbeat while the queen has `mirror_auth` configured. Keep it in
+    /// memory only and never log it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_credential: Option<crate::mirror_auth::MirrorCredential>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -477,6 +482,16 @@ async fn heartbeat(
             })
         })
         .collect();
+    let mirror_credential = match queen.mirror_auth() {
+        Some(mirror) => match mirror.credential().await {
+            Ok(credential) => Some(credential),
+            Err(e) => {
+                tracing::warn!("mint mirror token: {e}");
+                None
+            }
+        },
+        None => None,
+    };
     Ok(Json(HeartbeatResponse {
         leases,
         units,
@@ -492,6 +507,7 @@ async fn heartbeat(
         standby,
         start_standby,
         drop_standby,
+        mirror_credential,
     }))
 }
 
@@ -706,6 +722,9 @@ pub struct Status {
     pub units: UnitsStatus,
     /// Present when the supersede janitor is enabled.
     pub janitor: Option<crate::janitor::JanitorView>,
+    /// Whether drones are handed git mirror tokens, and when the current one
+    /// expires. Never the token.
+    pub mirror_auth: crate::mirror_auth::MirrorAuthView,
     /// Present when preempted jobs are re-run (preemption and the janitor
     /// are both configured).
     pub requeue: Option<crate::requeue::RequeueView>,
@@ -1035,6 +1054,13 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             }
         },
         janitor: queen.janitor().map(crate::janitor::Janitor::view),
+        mirror_auth: queen.mirror_auth().map_or(
+            crate::mirror_auth::MirrorAuthView {
+                configured: false,
+                expires_at: None,
+            },
+            crate::mirror_auth::MirrorAuth::view,
+        ),
         requeue: queen.requeuer().map(crate::requeue::Requeuer::view),
         reclaim: ReclaimSummary {
             reclaimed_bytes_logged: queen.store().reclaim_bytes_logged().await?,

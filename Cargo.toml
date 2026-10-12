@@ -5,6 +5,7 @@ edition = "2024"
 license = "BUSL-1.1"
 rust-version = "1.95"
 publish = false
+autotests = false
 repository = "https://github.com/dx-corp/borg"
 description = "Self-organizing CI fleet agent: drones probe their host and run ephemeral runners that a queen leases to them."
 
@@ -16,6 +17,25 @@ path = "src/lib.rs"
 name = "borg"
 path = "src/main.rs"
 test = false
+
+# Shared fixtures compile once per suite. The cache test spawns itself by
+# its exact test name and keeps its own target.
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
+
+[[test]]
+name = "host_suite"
+path = "tests/host_suite.rs"
+
+# Keep the largest test module independently compilable for focused edits.
+[[test]]
+name = "queen"
+path = "tests/queen.rs"
+
+[[test]]
+name = "sccache_slots"
+path = "tests/sccache_slots.rs"
 
 [dependencies]
 anyhow = "1.0"

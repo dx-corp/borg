@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use crate::drone::config::GitCaches;
 use crate::drone::exec::Exec;
 use crate::drone::fsops::FsOps;
+use crate::mirror_auth::MirrorCredential;
 
 /// A mirror refreshed this recently is not refreshed again for a new lease.
 const MIN_REFRESH_GAP: Duration = Duration::from_secs(15);
@@ -52,12 +53,61 @@ pub fn remote_url(base: &str, repo: &str) -> String {
     }
 }
 
+const EXTRAHEADER: &str = "http.extraheader=";
+
+/// `args` for a log line, with the credential header hidden.
+fn redacted(args: &[&str]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.starts_with(EXTRAHEADER) {
+                "http.extraheader=<redacted>"
+            } else {
+                a
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The `-c` value that authenticates a fetch from GitHub over https as an
+/// App installation. Passed per command, so the token is never written to the
+/// mirror's config or the stored remote URL.
+fn auth_header_config(token: &str) -> String {
+    let basic = base64(format!("x-access-token:{token}").as_bytes());
+    format!("{EXTRAHEADER}AUTHORIZATION: basic {basic}")
+}
+
 fn run_git(exec: &dyn Exec, git: &str, args: &[&str]) -> Result<(), String> {
     match exec.run(git, args) {
         Ok(out) if out.success => Ok(()),
-        Ok(_) => Err(format!("`git {}` failed", args.join(" "))),
+        Ok(_) => Err(format!("`git {}` failed", redacted(args))),
         Err(e) => Err(format!("{git}: {e}")),
     }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
 }
 
 /// Create the mirror if needed, point it at `url`, and fetch every branch and
@@ -68,6 +118,7 @@ fn refresh_mirror(
     git: &str,
     path: &Path,
     url: &str,
+    auth: Option<&str>,
 ) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs_ops
@@ -93,24 +144,19 @@ fn refresh_mirror(
     // Objects only accumulate: a job borrowing them via alternates must never
     // see them pruned underneath it.
     run_git(exec, git, &["-C", &p, "config", "gc.auto", "0"])?;
-    run_git(
-        exec,
-        git,
-        &[
-            "-C",
-            &p,
-            "-c",
-            "http.lowSpeedLimit=1000",
-            "-c",
-            "http.lowSpeedTime=60",
-            "fetch",
-            "--prune",
-            "--tags",
-            "--force",
-            "--quiet",
-            "origin",
-        ],
-    )
+    let mut args = vec![
+        "-C",
+        &p,
+        "-c",
+        "http.lowSpeedLimit=1000",
+        "-c",
+        "http.lowSpeedTime=60",
+    ];
+    if let Some(header) = auth {
+        args.extend(["-c", header]);
+    }
+    args.extend(["fetch", "--prune", "--tags", "--force", "--quiet", "origin"]);
+    run_git(exec, git, &args)
 }
 
 struct Mirror {
@@ -125,6 +171,10 @@ pub struct GitMirrors {
     exec: Arc<dyn Exec>,
     fs_ops: Arc<dyn FsOps>,
     mirrors: Vec<Mirror>,
+    /// Fetch credentials apply only to an `https://` remote base.
+    https: bool,
+    /// The queen's latest token; memory only, replaced on each heartbeat.
+    credential: std::sync::Mutex<Option<MirrorCredential>>,
     /// Leases that were handed a mirror / ran without one.
     served: AtomicU64,
     missed: AtomicU64,
@@ -152,6 +202,8 @@ impl GitMirrors {
             exec,
             fs_ops,
             mirrors,
+            https: cfg.remote_base.starts_with("https://"),
+            credential: std::sync::Mutex::new(None),
             served: AtomicU64::new(0),
             missed: AtomicU64::new(0),
         }
@@ -161,20 +213,58 @@ impl GitMirrors {
         self.mirrors.is_empty()
     }
 
+    /// Keep the queen's latest credential. Returns true when mirrors were
+    /// configured and no usable credential was held before, so the caller can
+    /// refresh them now instead of at the next timer tick.
+    pub fn set_credential(&self, credential: MirrorCredential) -> bool {
+        let now = unix_now();
+        let Ok(mut held) = self.credential.lock() else {
+            return false;
+        };
+        let was_usable = held.as_ref().is_some_and(|c| c.expires_at > now);
+        *held = Some(credential);
+        !was_usable && !self.mirrors.is_empty() && self.https
+    }
+
+    /// The `-c` auth setting for `repo`, when a held credential covers it and
+    /// has not expired; an expired one is dropped.
+    fn auth_for(&self, repo: &str) -> Option<String> {
+        if !self.https {
+            return None;
+        }
+        let mut held = self.credential.lock().ok()?;
+        if held.as_ref().is_some_and(|c| c.expires_at <= unix_now()) {
+            *held = None;
+        }
+        let c = held.as_ref()?;
+        c.repositories
+            .iter()
+            .any(|r| r == repo)
+            .then(|| auth_header_config(c.token.expose()))
+    }
+
     async fn refresh(&self, mirror: &Mirror, force: bool) {
         let mut last = mirror.refreshed.lock().await;
         if !force && last.is_some_and(|t| t.elapsed() < MIN_REFRESH_GAP) {
             return;
         }
-        let (exec, fs_ops, git, path, url) = (
+        let (exec, fs_ops, git, path, url, auth) = (
             Arc::clone(&self.exec),
             Arc::clone(&self.fs_ops),
             self.git.clone(),
             mirror.path.clone(),
             mirror.url.clone(),
+            self.auth_for(&mirror.repo),
         );
         let job = tokio::task::spawn_blocking(move || {
-            refresh_mirror(exec.as_ref(), fs_ops.as_ref(), &git, &path, &url)
+            refresh_mirror(
+                exec.as_ref(),
+                fs_ops.as_ref(),
+                &git,
+                &path,
+                &url,
+                auth.as_deref(),
+            )
         });
         match tokio::time::timeout(REFRESH_TIMEOUT, job).await {
             Ok(Ok(Ok(()))) => *last = Some(Instant::now()),
@@ -304,6 +394,108 @@ mod tests {
             x.calls().len() > 5,
             "the timer refresh ignores the rate limit"
         );
+    }
+
+    fn credential(expires_at: i64, repos: &[&str]) -> MirrorCredential {
+        MirrorCredential {
+            token: crate::secret::Secret::new("ghs_mirror_token"),
+            expires_at,
+            repositories: repos.iter().map(|r| (*r).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn base64_matches_the_standard_alphabet_and_padding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"x-access-token:abc"), "eC1hY2Nlc3MtdG9rZW46YWJj");
+    }
+
+    #[tokio::test]
+    async fn the_credential_rides_the_fetch_command_and_never_the_stored_url() {
+        let root = tempfile::tempdir().unwrap();
+        let x = Arc::new(FakeExec::default());
+        let m = GitMirrors::new(
+            &cfg(&["example-org/app", "example-org/other"]),
+            root.path(),
+            x.clone(),
+            Arc::new(LocalFs),
+        );
+        let far = unix_now() + 3600;
+        assert!(
+            m.set_credential(credential(far, &["example-org/app"])),
+            "the first usable credential asks for a refresh"
+        );
+        assert!(
+            !m.set_credential(credential(far, &["example-org/app"])),
+            "a replacement does not"
+        );
+        m.refresh_all().await;
+
+        let header = format!(
+            "http.extraheader=AUTHORIZATION: basic {}",
+            base64(b"x-access-token:ghs_mirror_token")
+        );
+        let calls = x.calls();
+        let fetch = |repo: &str| {
+            calls
+                .iter()
+                .find(|c| c.contains("fetch --prune") && c.contains(&format!("{repo}.git")))
+                .cloned()
+                .unwrap()
+        };
+        assert!(fetch("example-org/app").contains(&format!("-c {header} fetch")));
+        assert!(
+            !fetch("example-org/other").contains("extraheader"),
+            "repositories the credential does not name get no header"
+        );
+        for call in &calls {
+            if call.contains("config remote.origin.url") {
+                assert!(
+                    call.ends_with("https://git.example.test/example-org/app.git")
+                        || call.ends_with("https://git.example.test/example-org/other.git"),
+                    "{call}"
+                );
+            }
+            if !call.contains("fetch --prune") {
+                assert!(!call.contains("ghs_mirror_token"), "{call}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_credential_is_dropped_and_ssh_bases_ignore_it() {
+        let root = tempfile::tempdir().unwrap();
+        let x = Arc::new(FakeExec::default());
+        let m = GitMirrors::new(
+            &cfg(&["example-org/app"]),
+            root.path(),
+            x.clone(),
+            Arc::new(LocalFs),
+        );
+        m.set_credential(credential(unix_now() - 1, &["example-org/app"]));
+        m.refresh_all().await;
+        assert!(x.calls().iter().all(|c| !c.contains("extraheader")));
+        assert!(m.credential.lock().unwrap().is_none());
+
+        let ssh = GitCaches {
+            remote_base: "git@git.example.test:".to_owned(),
+            ..cfg(&["example-org/app"])
+        };
+        let m = GitMirrors::new(&ssh, root.path(), x.clone(), Arc::new(LocalFs));
+        assert!(!m.set_credential(credential(unix_now() + 3600, &["example-org/app"])));
+        m.refresh_all().await;
+        assert!(x.calls().iter().all(|c| !c.contains("extraheader")));
+    }
+
+    #[test]
+    fn failure_messages_hide_the_header() {
+        let header = auth_header_config("ghs_mirror_token");
+        let shown = redacted(&["-c", &header, "fetch"]);
+        assert_eq!(shown, "-c http.extraheader=<redacted> fetch");
     }
 
     #[tokio::test]

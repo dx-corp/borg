@@ -1,5 +1,5 @@
 //! A fake GitHub REST API and a running queen, for integration tests.
-//! Shared by several test binaries, each of which uses only part of it.
+//! Compiled once per integration suite; individual modules use parts of it.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -26,6 +26,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub const INSTALLATION_TOKEN: &str = "ghs_installation_for_tests";
+pub const MIRROR_TOKEN: &str = "ghs_mirror_for_tests";
 pub const JANITOR_TOKEN: &str = "ghp_janitor_for_tests";
 pub const ORG: &str = "example-org";
 
@@ -38,6 +39,10 @@ pub struct MockState {
     pub mints: Vec<Value>,
     pub deleted: Vec<u64>,
     pub token_requests: u32,
+    /// Bodies of down-scoped token requests (the mirror App's).
+    pub scoped_requests: Vec<Value>,
+    /// Lifetime of issued tokens in seconds (default one hour).
+    pub token_ttl_secs: Option<i64>,
     pub jwt_rejections: u32,
     pub fail_mint: bool,
     pub fail_runner_list: bool,
@@ -136,15 +141,29 @@ async fn installation(State(s): State<Shared>, h: HeaderMap) -> Result<Json<Valu
     Ok(Json(json!({"id": 77})))
 }
 
-async fn access_token(State(s): State<Shared>, h: HeaderMap) -> Result<Json<Value>, StatusCode> {
+async fn access_token(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, StatusCode> {
     check_jwt(&s, &h)?;
-    lock(&s).token_requests += 1;
-    let expires = (OffsetDateTime::now_utc() + time::Duration::hours(1))
+    let scoped: Option<Value> = serde_json::from_slice(&body).ok();
+    let mut st = lock(&s);
+    let ttl = st.token_ttl_secs.unwrap_or(3600);
+    let expires = (OffsetDateTime::now_utc() + time::Duration::seconds(ttl))
         .format(&Rfc3339)
         .unwrap();
-    Ok(Json(
-        json!({"token": INSTALLATION_TOKEN, "expires_at": expires}),
-    ))
+    let token = match scoped {
+        Some(body) => {
+            st.scoped_requests.push(body);
+            MIRROR_TOKEN
+        }
+        None => {
+            st.token_requests += 1;
+            INSTALLATION_TOKEN
+        }
+    };
+    Ok(Json(json!({"token": token, "expires_at": expires})))
 }
 
 fn check_janitor(headers: &HeaderMap) -> Result<(), StatusCode> {
@@ -360,6 +379,9 @@ pub struct Harness {
     pub queen: Arc<Queen>,
     pub url: String,
     pub http: reqwest::Client,
+    /// The fake GitHub API base and the App key it accepts.
+    pub gh_url: String,
+    pub private_pem: String,
 }
 
 pub fn capacity() -> Capacity {
@@ -476,6 +498,15 @@ impl Harness {
                 settings,
             });
         }
+        if let Some(settings) = queen.config().mirror_auth.clone() {
+            let client =
+                GithubClient::new(&gh_url, ORG, &settings.app_id, private_pem.as_bytes()).unwrap();
+            queen = queen.with_mirror_auth(borg::mirror_auth::MirrorAuth::new(
+                client,
+                ORG,
+                &settings.repositories,
+            ));
+        }
         let queen = Arc::new(queen);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -494,6 +525,8 @@ impl Harness {
             queen,
             url,
             http: reqwest::Client::new(),
+            gh_url,
+            private_pem,
         }
     }
 

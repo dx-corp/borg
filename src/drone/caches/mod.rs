@@ -25,6 +25,7 @@ use crate::api::CacheStat;
 use crate::drone::config::DroneConfig;
 use crate::drone::exec::Exec;
 use crate::drone::fsops::FsOps;
+use crate::mirror_auth::MirrorCredential;
 use crate::probe::{self, Host};
 use git::GitMirrors;
 use kinds::Kind;
@@ -361,6 +362,15 @@ impl Caches {
                 }
             })
             .collect()
+    }
+
+    /// Keep the queen's latest git mirror credential (memory only). The first
+    /// usable one refreshes the mirrors now, not at the next timer tick.
+    pub fn set_mirror_credential(self: &Arc<Self>, credential: MirrorCredential) {
+        if self.git.set_credential(credential) {
+            let caches = Arc::clone(self);
+            tokio::spawn(async move { caches.git.refresh_stale().await });
+        }
     }
 
     /// Refresh git mirrors and run maintenance on a timer until aborted.

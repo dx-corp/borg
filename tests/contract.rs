@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 use borg::enroll;
 use serde_json::{Value, json};

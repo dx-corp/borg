@@ -133,9 +133,11 @@ pub struct GitCaches {
     /// Repositories (`owner/name`). Jobs get each mirror's path in
     /// `BORG_GIT_MIRROR_<OWNER>_<NAME>`.
     pub mirrors: Vec<String>,
-    /// Where mirrors fetch from; `<base>/<owner>/<name>.git`. Credentials are
-    /// the host's business (a credential helper, or an ssh base such as
-    /// `git@host:` with a read-only deploy key for the service user).
+    /// Where mirrors fetch from; `<base>/<owner>/<name>.git`. For an `https://`
+    /// base the queen's short-lived `mirror_credential` authenticates fetches
+    /// of the repositories it names; otherwise credentials are the host's
+    /// business (a credential helper, or an ssh base such as `git@host:` with
+    /// a read-only deploy key for the service user).
     pub remote_base: String,
     pub bin: String,
     pub interval_secs: u64,

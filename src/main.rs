@@ -11,8 +11,9 @@ use borg::drone::exec::SystemExec;
 use borg::drone::install::{self, InstallOptions, Platform};
 use borg::drone::{Drone, pins};
 use borg::enroll;
-use borg::github::GithubClient;
+use borg::github::{GithubClient, TokenSource};
 use borg::janitor::Janitor;
+use borg::mirror_auth::MirrorAuth;
 use borg::probe::{self, system::SystemHost};
 use borg::queen::Queen;
 use borg::requeue::Requeuer;
@@ -408,18 +409,31 @@ fn private_key(cfg: &QueenConfig) -> Result<Vec<u8>> {
     }
 }
 
-fn janitor_token(settings: &JanitorSettings) -> Result<borg::secret::Secret> {
+/// The janitor's token: `token_path`, else `BORG_JANITOR_TOKEN`, else the
+/// queen's own App installation token (the App then needs Actions: write).
+fn janitor_token(settings: &JanitorSettings, cfg: &QueenConfig) -> Result<TokenSource> {
     let raw = match &settings.token_path {
-        Some(path) => std::fs::read_to_string(path)
-            .with_context(|| format!("read janitor token {}", path.display()))?,
-        None => std::env::var("BORG_JANITOR_TOKEN")
-            .context("set supersede_janitor.token_path or BORG_JANITOR_TOKEN")?,
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("read janitor token {}", path.display()))?,
+        ),
+        None => std::env::var("BORG_JANITOR_TOKEN").ok(),
     };
-    let token = raw.trim();
-    if token.is_empty() {
-        bail!("the janitor token is empty");
+    match raw {
+        Some(raw) => {
+            let token = raw.trim();
+            if token.is_empty() {
+                bail!("the janitor token is empty");
+            }
+            Ok(TokenSource::Static(borg::secret::Secret::new(token)))
+        }
+        None => Ok(TokenSource::App(Arc::new(GithubClient::new(
+            &cfg.github.api_base,
+            &cfg.github.org,
+            &cfg.github.app_id,
+            &private_key(cfg)?,
+        )?))),
     }
-    Ok(borg::secret::Secret::new(token))
 }
 
 async fn open_store(cfg: &QueenConfig) -> Result<Store> {
@@ -459,23 +473,31 @@ async fn run_queen(path: &Path) -> Result<()> {
     let mut requeuer = None;
     let janitor = match &cfg.supersede_janitor {
         Some(settings) => {
-            let token = janitor_token(settings)?;
+            let token = janitor_token(settings, &cfg)?;
             tracing::info!(
-                "supersede janitor enabled ({})",
+                "supersede janitor enabled ({}, {} token)",
                 if settings.dry_run {
                     "dry-run"
                 } else {
                     "cancelling"
+                },
+                match token {
+                    TokenSource::Static(_) => "static",
+                    TokenSource::App(_) => "App installation",
                 }
             );
             if cfg.preemption.is_some() {
-                requeuer = Some(Requeuer::new(
+                requeuer = Some(Requeuer::with_token_source(
                     &cfg.github.api_base,
                     token.clone(),
                     settings,
                 )?);
             }
-            Some(Janitor::new(&cfg.github.api_base, token, settings.clone())?)
+            Some(Janitor::with_token_source(
+                &cfg.github.api_base,
+                token,
+                settings.clone(),
+            )?)
         }
         None => None,
     };
@@ -498,6 +520,21 @@ async fn run_queen(path: &Path) -> Result<()> {
     }
     if let Some(r) = requeuer {
         queen = queen.with_requeuer(r);
+    }
+    if let Some(settings) = &queen.config().mirror_auth {
+        let pem = settings.private_key(std::env::var("BORG_MIRROR_APP_PRIVATE_KEY").ok())?;
+        let client = GithubClient::new(
+            &queen.config().github.api_base,
+            &queen.config().github.org,
+            &settings.app_id,
+            &pem,
+        )?;
+        let mirror = MirrorAuth::new(client, &queen.config().github.org, &settings.repositories);
+        tracing::info!(
+            "git mirror credentials enabled for {} repositories",
+            settings.repositories.len()
+        );
+        queen = queen.with_mirror_auth(mirror);
     }
     let queen = Arc::new(queen);
     api::serve(queen, listener, wait_for_shutdown()).await?;
