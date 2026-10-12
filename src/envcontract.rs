@@ -1,7 +1,7 @@
 //! The build environment contract: facts a drone reports about its build
 //! environment, and the queen's pure admission check over them.
 //!
-//! Before work (a CI runner lease or a work unit) is placed on a drone, four
+//! Before work (a CI runner lease or a work unit) is placed on a drone, five
 //! checks are evaluated against what the drone last reported:
 //!
 //! 1. **compiler_cache**: `RUSTC_WRAPPER` resolves to an allowed wrapper
@@ -15,6 +15,9 @@
 //! 4. **resources**: memory available now covers the class's memory, and live
 //!    CPU pressure (PSI) is under a ceiling. (Free capacity after active leases
 //!    is enforced by the allocator itself.)
+//! 5. **tools**: every tool the operator lists as required (globally or for the
+//!    class) resolved on the job user's `PATH` when the drone probed it. The
+//!    list is empty unless the operator writes one.
 //!
 //! The drone is a dumb prober: it reports *facts* ([`EnvFacts`]), every one of
 //! which may be unknown (`None`), cached about a minute on its side. Thresholds
@@ -41,14 +44,25 @@ pub enum CheckKind {
     Toolchain,
     CacheStore,
     Resources,
+    Tools,
 }
 
+/// The tools a drone looks for on the job user's `PATH`, in report order.
+pub const PROBE_TOOLS: [&str; 15] = [
+    "git", "gh", "node", "npm", "pnpm", "python3", "docker", "cargo", "rustc", "bazel", "go", "uv",
+    "mise", "jq", "cosign",
+];
+
+/// The value reported for a probed tool that is not on `PATH`.
+pub const TOOL_MISSING: &str = "missing";
+
 impl CheckKind {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::CompilerCache,
         Self::Toolchain,
         Self::CacheStore,
         Self::Resources,
+        Self::Tools,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -57,6 +71,7 @@ impl CheckKind {
             Self::Toolchain => "toolchain",
             Self::CacheStore => "cache_store",
             Self::Resources => "resources",
+            Self::Tools => "tools",
         }
     }
 }
@@ -142,6 +157,10 @@ pub struct EnvFacts {
     /// where PSI does not exist.
     #[serde(default)]
     pub cpu_psi_some_avg10_pm: Option<u16>,
+    /// For each tool in [`PROBE_TOOLS`], the first line of its `--version`
+    /// output, or `"missing"`; `None` when the drone did not measure it.
+    #[serde(default)]
+    pub tools: Option<BTreeMap<String, String>>,
 }
 
 /// Settings of one class (or the defaults for all).
@@ -152,6 +171,8 @@ pub struct ClassContract {
     pub checks: BTreeMap<CheckKind, Mode>,
     /// The Rust toolchain every build of this class needs.
     pub rust_toolchain: Option<String>,
+    /// Tools this class needs on `PATH`; replaces the global list.
+    pub required_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -177,6 +198,9 @@ pub struct ContractSettings {
     pub max_cpu_psi_pm: u16,
     /// Memory available must be at least this percent of the class's memory.
     pub mem_available_pct: u64,
+    /// Tools (from [`PROBE_TOOLS`]) every class needs on `PATH`. Empty means
+    /// the `tools` check has nothing to require.
+    pub required_tools: Vec<String>,
     pub checks: BTreeMap<CheckKind, Mode>,
     pub classes: BTreeMap<Class, ClassContract>,
 }
@@ -194,6 +218,7 @@ impl Default for ContractSettings {
             min_requests_for_hit_rate: 200,
             max_cpu_psi_pm: 700,
             mem_available_pct: 100,
+            required_tools: Vec::new(),
             // Conservative: only the checks that protect a build from failing
             // outright block by default; the cache checks report.
             checks: BTreeMap::from([
@@ -201,6 +226,7 @@ impl Default for ContractSettings {
                 (CheckKind::Toolchain, Mode::Required),
                 (CheckKind::CacheStore, Mode::Advisory),
                 (CheckKind::Resources, Mode::Required),
+                (CheckKind::Tools, Mode::Advisory),
             ]),
             classes: BTreeMap::new(),
         }
@@ -238,7 +264,31 @@ impl ContractSettings {
                 "env_contract rust_toolchain must look like 1.95.0 or nightly-2026-01-01".into(),
             );
         }
+        let unprobed = |t: &String| !PROBE_TOOLS.contains(&t.as_str());
+        if self
+            .required_tools
+            .iter()
+            .chain(
+                self.classes
+                    .values()
+                    .flat_map(|c| c.required_tools.iter().flatten()),
+            )
+            .any(unprobed)
+        {
+            return Err(format!(
+                "env_contract required_tools must be among: {}",
+                PROBE_TOOLS.join(", ")
+            ));
+        }
         Ok(())
+    }
+
+    /// The tools a class needs on `PATH`: its own list, else the global one.
+    pub fn class_required_tools(&self, class: Class) -> &[String] {
+        self.classes
+            .get(&class)
+            .and_then(|c| c.required_tools.as_deref())
+            .unwrap_or(&self.required_tools)
     }
 
     fn mode(&self, class: Class, kind: CheckKind) -> Mode {
@@ -507,6 +557,51 @@ fn resources(s: &ContractSettings, f: &EnvFacts, need: &Need<'_>) -> Acc {
     a
 }
 
+fn tools(s: &ContractSettings, f: &EnvFacts, need: &Need<'_>) -> Acc {
+    let mut a = Acc::new();
+    let wanted = s.class_required_tools(need.class);
+    a.see("required", wanted.join(","));
+    let Some(have) = &f.tools else {
+        if wanted.is_empty() {
+            return a;
+        }
+        if s.require_report {
+            a.note(CheckState::Fail, "the drone did not report its tools");
+        } else {
+            a.warnings
+                .push("the drone did not report its tools".to_owned());
+        }
+        return a;
+    };
+    a.see(
+        "versions",
+        have.iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    );
+    a.see(
+        "missing",
+        have.iter()
+            .filter(|(_, v)| *v == TOOL_MISSING)
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    let missing: Vec<&str> = wanted
+        .iter()
+        .filter(|t| have.get(*t).is_none_or(|v| v == TOOL_MISSING))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        a.note(
+            CheckState::Fail,
+            format!("required tools missing on PATH: {}", missing.join(", ")),
+        );
+    }
+    a
+}
+
 /// Evaluate the contract for `need` against `facts` at `now`. Pure.
 pub fn evaluate(
     s: &ContractSettings,
@@ -565,6 +660,7 @@ pub fn evaluate(
                 CheckKind::Toolchain => toolchain(f, need),
                 CheckKind::CacheStore => cache_store(s, f),
                 CheckKind::Resources => resources(s, f, need),
+                CheckKind::Tools => tools(s, f, need),
             }
         };
         checks.push(acc.finish(kind, mode));
@@ -634,6 +730,25 @@ mod tests {
             }]),
             mem_available_mib: Some(20_000),
             cpu_psi_some_avg10_pm: Some(100),
+            tools: Some(tool_map(&[
+                ("git", "git version 2.45.0"),
+                ("gh", "gh version 2.50.0"),
+            ])),
+        }
+    }
+
+    fn tool_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    fn tools_on(mode: Mode, required: &[&str]) -> ContractSettings {
+        ContractSettings {
+            checks: BTreeMap::from([(CheckKind::Tools, mode)]),
+            required_tools: required.iter().map(|t| (*t).to_owned()).collect(),
+            ..on()
         }
     }
 
@@ -1020,5 +1135,149 @@ mod tests {
             evaluate(&all_required(), Some(&good()), &n, NOW),
             evaluate(&all_required(), Some(&good()), &n, NOW)
         );
+    }
+
+    #[test]
+    fn a_missing_required_tool_is_not_admitted_and_named() {
+        let s = tools_on(Mode::Required, &["git", "gh", "node"]);
+        let f = EnvFacts {
+            tools: Some(tool_map(&[
+                ("git", "git version 2.45.0"),
+                ("gh", "missing"),
+                ("node", "missing"),
+                ("jq", "missing"),
+            ])),
+            ..good()
+        };
+        let v = evaluate(&s, Some(&f), &need(Class::Light, None), NOW);
+        assert!(!v.admit);
+        let c = check(&v, CheckKind::Tools);
+        assert_eq!(c.state, CheckState::Fail);
+        assert!(c.reason.contains("gh, node"), "{}", c.reason);
+        assert!(!c.reason.contains("git"), "{}", c.reason);
+        assert_eq!(c.observed["missing"], "gh,jq,node");
+        assert!(c.observed["versions"].contains("git=git version 2.45.0"));
+        // A tool that is not in the map at all counts as missing.
+        let f = EnvFacts {
+            tools: Some(tool_map(&[("git", "2")])),
+            ..good()
+        };
+        let v = evaluate(&s, Some(&f), &need(Class::Light, None), NOW);
+        assert!(check(&v, CheckKind::Tools).reason.contains("gh, node"));
+        // Everything present: admitted.
+        let f = EnvFacts {
+            tools: Some(tool_map(&[("git", "2"), ("gh", "2"), ("node", "22")])),
+            ..good()
+        };
+        assert!(evaluate(&s, Some(&f), &need(Class::Light, None), NOW).admit);
+    }
+
+    #[test]
+    fn advisory_tools_warn_in_the_verdict_but_admit() {
+        let s = tools_on(Mode::Advisory, &["gh"]);
+        let f = EnvFacts {
+            tools: Some(tool_map(&[("gh", "missing")])),
+            ..good()
+        };
+        let v = evaluate(&s, Some(&f), &need(Class::Light, None), NOW);
+        assert!(v.admit, "{v:?}");
+        let c = check(&v, CheckKind::Tools);
+        assert_eq!((c.state, c.mode), (CheckState::Fail, Mode::Advisory));
+        assert!(c.reason.contains("gh"));
+    }
+
+    #[test]
+    fn the_default_requires_nothing_and_a_class_list_replaces_the_global_one() {
+        // Enabled with defaults: an empty list passes even with tools missing.
+        let f = EnvFacts {
+            tools: Some(tool_map(&[("gh", "missing")])),
+            ..good()
+        };
+        let v = evaluate(&on(), Some(&f), &need(Class::Light, None), NOW);
+        assert_eq!(check(&v, CheckKind::Tools).mode, Mode::Advisory);
+        assert_eq!(check(&v, CheckKind::Tools).state, CheckState::Pass);
+
+        let mut s = tools_on(Mode::Required, &["gh"]);
+        s.classes.insert(
+            Class::Heavy,
+            ClassContract {
+                required_tools: Some(vec!["docker".into()]),
+                ..ClassContract::default()
+            },
+        );
+        s.classes.insert(
+            Class::Medium,
+            ClassContract {
+                required_tools: Some(Vec::new()),
+                ..ClassContract::default()
+            },
+        );
+        let f = EnvFacts {
+            tools: Some(tool_map(&[("gh", "missing"), ("docker", "27.0")])),
+            ..good()
+        };
+        let admit = |c| evaluate(&s, Some(&f), &need(c, None), NOW).admit;
+        assert!(!admit(Class::Light)); // global gh
+        assert!(admit(Class::Heavy)); // docker only
+        assert!(admit(Class::Medium)); // explicitly nothing
+        let off = ContractSettings {
+            classes: BTreeMap::from([(
+                Class::Light,
+                ClassContract {
+                    checks: BTreeMap::from([(CheckKind::Tools, Mode::Off)]),
+                    ..ClassContract::default()
+                },
+            )]),
+            ..s.clone()
+        };
+        let v = evaluate(&off, Some(&f), &need(Class::Light, None), NOW);
+        assert!(v.admit && v.checks.iter().all(|c| c.kind != CheckKind::Tools));
+    }
+
+    #[test]
+    fn an_absent_tools_map_fails_only_with_require_report() {
+        let f = EnvFacts {
+            tools: None,
+            ..good()
+        };
+        let s = tools_on(Mode::Required, &["gh"]);
+        let v = evaluate(&s, Some(&f), &need(Class::Light, None), NOW);
+        assert!(v.admit, "{v:?}");
+        let c = check(&v, CheckKind::Tools);
+        assert_eq!(c.state, CheckState::Pass);
+        assert_eq!(c.warnings.len(), 1);
+
+        let strict = ContractSettings {
+            require_report: true,
+            ..s.clone()
+        };
+        let v = evaluate(&strict, Some(&f), &need(Class::Light, None), NOW);
+        assert!(!v.admit);
+        assert!(
+            check(&v, CheckKind::Tools)
+                .reason
+                .contains("did not report its tools")
+        );
+        // Nothing required: an absent map is fine even with require_report.
+        let none = ContractSettings {
+            required_tools: Vec::new(),
+            ..strict
+        };
+        assert!(evaluate(&none, Some(&f), &need(Class::Light, None), NOW).admit);
+    }
+
+    #[test]
+    fn required_tools_must_be_tools_the_drone_probes() {
+        assert!(tools_on(Mode::Required, &["git", "jq"]).validate().is_ok());
+        assert!(tools_on(Mode::Required, &["ffmpeg"]).validate().is_err());
+        let mut s = on();
+        s.classes.insert(
+            Class::Light,
+            ClassContract {
+                required_tools: Some(vec!["nope".into()]),
+                ..ClassContract::default()
+            },
+        );
+        assert!(s.validate().is_err());
     }
 }

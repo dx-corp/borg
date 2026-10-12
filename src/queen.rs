@@ -21,26 +21,29 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::Serialize;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::allocator::{
-    ActiveLease, AllocatorInput, ClassIdle, Demand, DroneState, Grant, LeaseState, QueueAge,
-    Reservation, Unmet, WarmFloor, allocate, max_slots,
+    ActiveLease, AllocatorInput, ClassIdle, Demand, DroneAdmission, DroneState, Grant, LeaseState,
+    Promotion, QueueAge, Reservation, Unmet, WarmFloor, allocate, free_room, free_slots, max_slots,
 };
 use crate::bid::{ClassPressure, ScoreWeights};
 use crate::classes::{Class, Scope};
-use crate::config::QueenConfig;
+use crate::config::{QueenConfig, StandbySettings};
 use crate::envcontract::blocked_classes;
 use crate::github::{GithubClient, GithubError, QueuedJob, Runner, WorkflowJob};
 use crate::health::{DroneHealth, DroneInfo, Outcome, OutcomeKind, evaluate};
 use crate::homeostasis::{Controller, KeyInput, KeyReport};
 use crate::janitor::Janitor;
+use crate::preempt::{PreemptInput, Running, select as select_victims};
 use crate::probe::Capacity;
 use crate::profile::{ClassProfile, build_profiles};
+use crate::requeue::Requeuer;
 use crate::rollout::{
     Check as RolloutCheck, DroneView, Observed as RolloutObserved, RolloutState, advance,
     desired_for,
 };
-use crate::store::{LeaseRow, LeaseStatus, Store, StoreError};
+use crate::store::{LeaseRow, LeaseStatus, PreemptionRow, Store, StoreError};
 use crate::tailnet::TailnetEnroll;
 use crate::telemetry::{Conclusion, FailureClass, MAX_REPORT_ROWS, TelemetryRow};
 use crate::units::{Unit, UnitState};
@@ -72,6 +75,8 @@ pub struct Snapshot {
     pub health_systemic: bool,
     /// Slots each class could still be granted, from the last pass.
     pub idle: Vec<ClassIdle>,
+    /// CPU-pressure admission per fresh drone from the last pass.
+    pub admission: Vec<DroneAdmission>,
     /// Warm-floor controller state per key (empty when off).
     pub homeostasis: Vec<KeyReport>,
     /// Learned per-drone, per-class profiles (empty when off).
@@ -81,6 +86,9 @@ pub struct Snapshot {
     pub wake: WakeView,
     /// Non-borg online runners by label, from the last pass.
     pub static_runners: BTreeMap<String, StaticRunners>,
+    /// Standby leases the drones are told to start now (deploy demand is queued
+    /// for them); read by the heartbeat.
+    pub start_standby: BTreeSet<String>,
     /// `unmet` minus what idle non-borg runners with the label can take.
     pub unmet_placeable: Vec<Unmet>,
 }
@@ -157,12 +165,14 @@ pub struct Queen {
     github: GithubClient,
     snapshot: RwLock<Snapshot>,
     janitor: Option<Janitor>,
+    requeuer: Option<Requeuer>,
     tailnet: Option<TailnetEnroll>,
     homeostasis: std::sync::Mutex<Controller>,
     profile_cache: std::sync::Mutex<Option<(i64, Vec<ClassProfile>)>>,
     wake: std::sync::Mutex<WakePlanner>,
     unit_joins: AtomicU64,
     unit_receipts: AtomicU64,
+    units_superseded: AtomicU64,
     wake_sender: Arc<dyn WakeSender>,
     tick_lock: tokio::sync::Mutex<()>,
 }
@@ -235,6 +245,93 @@ fn new_lease_id() -> String {
     hex::encode(b)
 }
 
+fn as_active(l: &LeaseRow) -> ActiveLease {
+    ActiveLease {
+        drone_id: l.drone.clone(),
+        class: l.class,
+        scope: l.scope,
+        state: match l.state {
+            LeaseStatus::Running => LeaseState::Running,
+            LeaseStatus::Standby => LeaseState::Standby,
+            _ => LeaseState::Pending,
+        },
+    }
+}
+
+/// Where a preemptible lease's job lives: repo, run id, job id.
+type JobRef<'a> = (&'a str, u64, u64);
+
+/// Split the active leases into those whose in-progress job is known (the
+/// job's `runner_name` is the lease's runner) and everything else.
+fn split_running<'a>(
+    active: &[LeaseRow],
+    unit_leases: &[ActiveLease],
+    observed: &[(&'a str, WorkflowJob)],
+    preempted: &HashSet<&str>,
+) -> (Vec<Running>, Vec<ActiveLease>, HashMap<String, JobRef<'a>>) {
+    let (mut running, mut others, mut jobs) = (Vec::new(), unit_leases.to_vec(), HashMap::new());
+    for l in active {
+        let found = observed.iter().find_map(|(repo, j)| {
+            let started = OffsetDateTime::parse(j.started_at.as_deref()?, &Rfc3339).ok()?;
+            (j.status == "in_progress" && j.runner_name.as_deref() == Some(&l.runner_name))
+                .then_some((*repo, j.run_id, j.id, started.unix_timestamp()))
+        });
+        match found {
+            Some((repo, run_id, job_id, started_at)) => {
+                jobs.insert(l.id.clone(), (repo, run_id, job_id));
+                running.push(Running {
+                    lease_id: l.id.clone(),
+                    drone: l.drone.clone(),
+                    class: l.class,
+                    scope: l.scope,
+                    started_at,
+                    preempted: preempted.contains(l.id.as_str()),
+                });
+            }
+            None => others.push(as_active(l)),
+        }
+    }
+    (running, others, jobs)
+}
+
+/// What standby minting needs to know about the fleet.
+struct StandbyView<'a> {
+    active: &'a [LeaseRow],
+    drones: &'a [DroneState],
+    capacities: &'a HashMap<String, Capacity>,
+    extra_labels: &'a HashMap<String, Vec<String>>,
+    serves_deploy: &'a BTreeSet<String>,
+}
+
+/// The standby leases to start now: per promoted class, the oldest standby
+/// leases on fresh drones.
+fn promotions(
+    promote: &[Promotion],
+    active: &[LeaseRow],
+    fresh: &HashMap<String, Capacity>,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for p in promote {
+        let mut standby: Vec<&LeaseRow> = active
+            .iter()
+            .filter(|l| {
+                l.state == LeaseStatus::Standby
+                    && l.scope == Scope::Deploy
+                    && l.class == p.class
+                    && fresh.contains_key(&l.drone)
+            })
+            .collect();
+        standby.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        out.extend(
+            standby
+                .into_iter()
+                .take(usize::try_from(p.count).unwrap_or(usize::MAX))
+                .map(|l| l.id.clone()),
+        );
+    }
+    out
+}
+
 fn age_secs(now: OffsetDateTime, then: OffsetDateTime) -> u64 {
     u64::try_from((now - then).whole_seconds()).unwrap_or(0)
 }
@@ -247,15 +344,25 @@ impl Queen {
             github,
             snapshot: RwLock::new(Snapshot::default()),
             janitor: None,
+            requeuer: None,
             tailnet: None,
             homeostasis: std::sync::Mutex::new(Controller::new()),
             profile_cache: std::sync::Mutex::new(None),
             wake: std::sync::Mutex::new(WakePlanner::new()),
             unit_joins: AtomicU64::new(0),
             unit_receipts: AtomicU64::new(0),
+            units_superseded: AtomicU64::new(0),
             wake_sender: Arc::new(UdpWakeSender),
             tick_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Attach the preemption requeuer; `api::serve` runs it after each
+    /// janitor pass.
+    #[must_use]
+    pub fn with_requeuer(mut self, requeuer: Requeuer) -> Self {
+        self.requeuer = Some(requeuer);
+        self
     }
 
     /// Attach the opt-in supersede janitor; `api::serve` runs it.
@@ -287,6 +394,17 @@ impl Queen {
         self.unit_receipts.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn count_units_superseded(&self, n: usize) {
+        self.units_superseded
+            .fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Units cancelled by a newer submission with the same supersede key since
+    /// start.
+    pub fn units_superseded(&self) -> u64 {
+        self.units_superseded.load(Ordering::Relaxed)
+    }
+
     /// Submissions that joined a running unit / reused a receipt since start.
     pub fn unit_reuse_counts(&self) -> (u64, u64) {
         (
@@ -301,6 +419,10 @@ impl Queen {
 
     pub fn janitor(&self) -> Option<&Janitor> {
         self.janitor.as_ref()
+    }
+
+    pub fn requeuer(&self) -> Option<&Requeuer> {
+        self.requeuer.as_ref()
     }
 
     pub fn config(&self) -> &QueenConfig {
@@ -372,6 +494,7 @@ impl Queen {
         let mut fresh_names: BTreeSet<String> = BTreeSet::new();
         let mut capacities: HashMap<String, Capacity> = HashMap::new();
         let mut extra_labels: HashMap<String, Vec<String>> = HashMap::new();
+        let mut serves_deploy: BTreeSet<String> = BTreeSet::new();
         let mut drones = Vec::new();
         for d in &drone_rows {
             let fresh = d
@@ -389,6 +512,13 @@ impl Queen {
                     None,
                     now_ts,
                 );
+                if let Some(a) = &self.cfg.admission {
+                    state.cpu_psi_pm = d
+                        .env_facts
+                        .as_ref()
+                        .filter(|f| now_ts - f.observed_at <= a.facts_max_age_secs)
+                        .and_then(|f| f.cpu_psi_some_avg10_pm);
+                }
                 state.profiles = profiles
                     .iter()
                     .filter(|p| p.drone == d.name)
@@ -396,6 +526,9 @@ impl Queen {
                     .collect();
                 drones.push(state);
                 capacities.insert(d.name.clone(), cap.clone());
+                if d.trust.serves_deploy() {
+                    serves_deploy.insert(d.name.clone());
+                }
                 extra_labels.insert(
                     d.name.clone(),
                     self.cfg.classes.sanitize_extra_labels(&d.extra_labels),
@@ -408,17 +541,8 @@ impl Queen {
         let unit_leases = self.unit_leases().await;
         let leases = active
             .iter()
-            .map(|l| ActiveLease {
-                drone_id: l.drone.clone(),
-                class: l.class,
-                scope: l.scope,
-                state: if l.state == LeaseStatus::Running {
-                    LeaseState::Running
-                } else {
-                    LeaseState::Pending
-                },
-            })
-            .chain(unit_leases)
+            .map(as_active)
+            .chain(unit_leases.iter().cloned())
             .collect::<Vec<ActiveLease>>();
         let schedule_floors = self
             .cfg
@@ -427,6 +551,7 @@ impl Queen {
         let (warm_floors, homeostasis) = self.regulate(now_ts, &schedule_floors, &queue);
         let placement_drones = drones.clone();
         let placement_leases = leases.clone();
+        let preempt_ages = queue_ages.clone();
         let allocation = allocate(&AllocatorInput {
             classes: self.cfg.classes.clone(),
             demand,
@@ -436,6 +561,7 @@ impl Queen {
             queue_ages,
             starvation_after_secs: self.cfg.starvation_after_secs,
             weights: ScoreWeights::default(),
+            admission: self.cfg.admission.as_ref().map(|a| a.thresholds()),
         });
 
         if let Err(e) = self
@@ -443,7 +569,7 @@ impl Queen {
                 now_ts,
                 &placement_drones,
                 &capacities,
-                placement_leases,
+                placement_leases.clone(),
                 &allocation.grants,
             )
             .await
@@ -502,6 +628,83 @@ impl Queen {
             }
         }
 
+        let start_standby = promotions(&allocation.promote, &active, &capacities);
+        if mint_error.is_none()
+            && let Some(st) = &self.cfg.standby
+        {
+            let mut held = placement_leases.clone();
+            held.extend(allocation.grants.iter().map(|g| ActiveLease {
+                drone_id: g.drone_id.clone(),
+                class: g.class,
+                scope: g.scope,
+                state: LeaseState::Pending,
+            }));
+            mint_error = self
+                .top_up_standby(
+                    st,
+                    &StandbyView {
+                        active: &active,
+                        drones: &placement_drones,
+                        capacities: &capacities,
+                        extra_labels: &extra_labels,
+                        serves_deploy: &serves_deploy,
+                    },
+                    held,
+                    &prefix,
+                    now_ts,
+                )
+                .await?;
+        }
+
+        if let Some(p) = &self.cfg.preemption {
+            let preempted = self.store.preempted_active().await?;
+            let (running, others, jobs) = split_running(
+                &active,
+                &unit_leases,
+                &observed,
+                &preempted.iter().map(|(id, _)| id.as_str()).collect(),
+            );
+            let victims = select_victims(&PreemptInput {
+                classes: &self.cfg.classes,
+                settings: p,
+                drones: &placement_drones,
+                others: &others,
+                running: &running,
+                unmet: &unmet_placeable,
+                queue_ages: &preempt_ages,
+                now: now_ts,
+            });
+            for v in victims {
+                let Some((repo, run_id, job_id)) = jobs.get(&v.lease_id) else {
+                    continue;
+                };
+                let row = PreemptionRow {
+                    lease_id: v.lease_id,
+                    drone: v.drone,
+                    class: v.class,
+                    scope: v.scope,
+                    for_scope: v.for_scope,
+                    repo: (*repo).to_owned(),
+                    run_id: *run_id,
+                    job_id: *job_id,
+                    at: now_ts,
+                    requeued_at: None,
+                };
+                if self.store.record_preemption(&row, now_ts).await? {
+                    tracing::warn!(
+                        "preempting {} lease {} on {} (job {} of {}) for starving {} {} demand",
+                        row.scope.as_str(),
+                        row.lease_id,
+                        row.drone,
+                        row.job_id,
+                        row.repo,
+                        v.for_class,
+                        row.for_scope.as_str(),
+                    );
+                }
+            }
+        }
+
         self.update_snapshot(|s| {
             s.last_tick_at = Some(now_ts);
             s.last_error = mint_error.as_ref().map(|e| format!("mint failed: {e}"));
@@ -511,10 +714,12 @@ impl Queen {
             s.warm_floors = warm_floors;
             s.pressure = allocation.pressure.clone();
             s.idle = allocation.idle.clone();
+            s.admission = allocation.admission.clone();
             s.homeostasis = homeostasis;
             s.profiles = profiles;
             s.wake = wake;
             s.static_runners = statics;
+            s.start_standby = start_standby;
             s.unmet_placeable = unmet_placeable;
         });
         if let Err(e) = self
@@ -541,6 +746,95 @@ impl Queen {
             Err(_) => tracing::warn!("GitHub job telemetry collection exceeded its deadline"),
         }
         Ok(())
+    }
+
+    /// Mint standby deploy runners until every drone that serves deploy work
+    /// holds `per_drone` of each configured class. Returns a mint error to
+    /// surface in the snapshot; store failures abort the tick like grants do.
+    async fn top_up_standby(
+        &self,
+        st: &StandbySettings,
+        view: &StandbyView<'_>,
+        mut held: Vec<ActiveLease>,
+        prefix: &str,
+        now_ts: i64,
+    ) -> Result<Option<GithubError>, QueenError> {
+        for drone in view.drones {
+            let (Some(cap), true) = (
+                view.capacities.get(&drone.id),
+                view.serves_deploy.contains(&drone.id),
+            ) else {
+                continue;
+            };
+            for &class in &st.classes {
+                if drone.blocked_classes.contains(&class) {
+                    continue;
+                }
+                let have = view
+                    .active
+                    .iter()
+                    .filter(|l| {
+                        l.state == LeaseStatus::Standby && l.drone == drone.id && l.class == class
+                    })
+                    .count();
+                let spec = self.cfg.classes.spec(class);
+                for _ in have..usize::try_from(st.per_drone).unwrap_or(usize::MAX) {
+                    let room = free_room(drone, &held, &self.cfg.classes);
+                    if free_slots(drone, &room, spec) == 0 {
+                        break;
+                    }
+                    let lease_id = new_lease_id();
+                    let runner_name = format!("{prefix}{}-{lease_id}", drone.id);
+                    let extra = view
+                        .extra_labels
+                        .get(&drone.id)
+                        .map_or(&[][..], Vec::as_slice);
+                    let labels = jit_labels(
+                        &cap.os,
+                        &cap.arch,
+                        extra,
+                        &self.cfg.classes.runner_labels(class, Scope::Deploy),
+                    );
+                    let minted = match self
+                        .github
+                        .mint_jit_runner(
+                            &runner_name,
+                            self.cfg.github.runner_group_id,
+                            &labels,
+                            &self.cfg.work_folder,
+                        )
+                        .await
+                    {
+                        Ok(m) => m,
+                        Err(e) => return Ok(Some(e)),
+                    };
+                    let row = LeaseRow {
+                        id: lease_id,
+                        drone: drone.id.clone(),
+                        class,
+                        scope: Scope::Deploy,
+                        labels,
+                        runner_name,
+                        runner_id: minted.runner_id,
+                        jit_config: Some(minted.jit_config),
+                        state: LeaseStatus::Standby,
+                        created_at: now_ts,
+                        expires_at: i64::MAX,
+                    };
+                    if let Err(e) = self.store.insert_lease(&row).await {
+                        let _ = self.github.delete_runner(minted.runner_id).await;
+                        return Err(e.into());
+                    }
+                    held.push(ActiveLease {
+                        drone_id: drone.id.clone(),
+                        class,
+                        scope: Scope::Deploy,
+                        state: LeaseState::Standby,
+                    });
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// The version `drone` should run: from the gated rollout when it is on,
@@ -639,7 +933,7 @@ impl Queen {
                     Some(ActiveLease {
                         drone_id: u.drone?,
                         class: u.class,
-                        scope: Scope::Pr,
+                        scope: u.scope,
                         state: LeaseState::Running,
                     })
                 })
@@ -761,17 +1055,17 @@ impl Queen {
             if group.is_empty() {
                 continue;
             }
-            let mut demand: BTreeMap<Class, u32> = BTreeMap::new();
+            let mut demand: BTreeMap<(Class, Scope), u32> = BTreeMap::new();
             for u in &units {
-                *demand.entry(u.class).or_default() += 1;
+                *demand.entry((u.class, u.scope)).or_default() += 1;
             }
             let allocation = allocate(&AllocatorInput {
                 classes: self.cfg.classes.clone(),
                 demand: demand
                     .into_iter()
-                    .map(|(class, count)| Demand {
+                    .map(|((class, scope), count)| Demand {
                         class,
-                        scope: Scope::Pr,
+                        scope,
                         count,
                     })
                     .collect(),
@@ -781,18 +1075,25 @@ impl Queen {
                 queue_ages: Vec::new(),
                 starvation_after_secs: None,
                 weights: ScoreWeights::default(),
+                admission: self.cfg.admission.as_ref().map(|a| a.thresholds()),
             });
-            // Grants of a class are interchangeable: hand them to the units
-            // of that class in submission order.
+            // Grants of a (class, scope) are interchangeable: hand them out
+            // deploy first, then main, then pull request, each in submission
+            // order.
             let mut grants: Vec<&Grant> = allocation.grants.iter().collect();
-            for u in units {
-                if let Some(i) = grants.iter().position(|g| g.class == u.class) {
+            let mut ordered = units;
+            ordered.sort_by_key(|u| u.scope);
+            for u in ordered {
+                if let Some(i) = grants
+                    .iter()
+                    .position(|g| g.class == u.class && g.scope == u.scope)
+                {
                     let g = grants.remove(i);
                     if self.store.lease_unit(&u.id, &g.drone_id, now).await? {
                         base.push(ActiveLease {
                             drone_id: g.drone_id.clone(),
                             class: g.class,
-                            scope: Scope::Pr,
+                            scope: g.scope,
                             state: LeaseState::Running,
                         });
                         tracing::info!("unit {} placed on {}", u.id, g.drone_id);
@@ -1073,15 +1374,18 @@ impl Queen {
         for lease in self.store.active_leases().await? {
             let runner = ours.get(lease.runner_name.as_str());
             let overdue = now - lease.created_at > self.cfg.lease_max_secs;
+            let standby = lease.state == LeaseStatus::Standby;
+            // A standby waits for its drone indefinitely: only `lease_max_secs`
+            // rotates it.
             let never_came_online =
-                now > lease.expires_at && runner.is_none_or(|r| r.status != "online");
+                !standby && now > lease.expires_at && runner.is_none_or(|r| r.status != "online");
             match runner {
                 _ if overdue => {
                     self.end(&lease, runner.copied(), LeaseStatus::Expired, now)
                         .await?
                 }
                 Some(r) if r.busy => {
-                    if lease.state == LeaseStatus::Pending {
+                    if matches!(lease.state, LeaseStatus::Pending | LeaseStatus::Standby) {
                         self.store
                             .set_state(&lease.id, LeaseStatus::Running, now)
                             .await?;
@@ -1089,7 +1393,9 @@ impl Queen {
                     still_active.push(lease);
                 }
                 // Ephemeral runners deregister after their one job.
-                None if lease.state == LeaseStatus::Running => {
+                // A standby whose registration is gone was started and has
+                // finished (or GitHub dropped it): the next tick mints another.
+                None if matches!(lease.state, LeaseStatus::Running | LeaseStatus::Standby) => {
                     self.store
                         .set_state(&lease.id, LeaseStatus::Done, now)
                         .await?;
@@ -1228,5 +1534,50 @@ mod tests {
             ["self-hosted", "Linux", "X64", "on-prem", "borg-ci-medium"],
             "extra labels sit between the platform and class labels"
         );
+    }
+
+    fn lease_row(id: &str, runner: &str) -> LeaseRow {
+        LeaseRow {
+            id: id.to_owned(),
+            drone: "host-a".to_owned(),
+            class: Class::Medium,
+            scope: Scope::Pr,
+            labels: Vec::new(),
+            runner_name: runner.to_owned(),
+            runner_id: 1,
+            jit_config: None,
+            state: LeaseStatus::Running,
+            created_at: 0,
+            expires_at: 0,
+        }
+    }
+
+    fn job(id: u64, status: &str, runner: &str) -> WorkflowJob {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "run_id": 77, "status": status, "created_at": "2026-01-01T00:00:00Z",
+            "started_at": "2026-01-01T00:10:00Z", "runner_name": runner,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_leases_with_an_in_progress_job_on_their_runner_are_preemptible() {
+        let active = [
+            lease_row("l1", "borg-host-a-l1"),
+            lease_row("l2", "borg-host-a-l2"),
+            lease_row("l3", "borg-host-a-l3"),
+        ];
+        let observed = [
+            ("example-org/app", job(5, "in_progress", "borg-host-a-l1")),
+            ("example-org/app", job(6, "queued", "borg-host-a-l2")),
+        ];
+        let preempted = HashSet::from(["l1"]);
+        let (running, others, jobs) = split_running(&active, &[], &observed, &preempted);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].lease_id, "l1");
+        assert_eq!(running[0].started_at, 1_767_226_200);
+        assert!(running[0].preempted);
+        assert_eq!(others.len(), 2);
+        assert_eq!(jobs["l1"], ("example-org/app", 77, 5));
     }
 }

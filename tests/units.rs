@@ -597,3 +597,223 @@ async fn a_bundle_that_never_arrives_fails_the_unit_and_bundles_go_with_their_un
     assert!(r.h.queen.store().unit(&c).await.unwrap().is_none());
     assert!(r.h.queen.store().unit_bundle(&c).await.unwrap().is_none());
 }
+
+fn tree(c: char) -> String {
+    c.to_string().repeat(40)
+}
+
+async fn state_of(r: &Rig, id: &str) -> String {
+    r.h.queen
+        .store()
+        .unit(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .state
+        .as_str()
+        .to_owned()
+}
+
+async fn deploy_drone(r: &Rig, name: &str) -> String {
+    let t = r.h.enroll(name).await;
+    r.h.heartbeat_with(&t, json!({"trust": "deploy"})).await;
+    t
+}
+
+async fn scoped_client(r: &Rig, name: &str, max: borg::classes::Scope) -> String {
+    let tok = enroll::new_token();
+    r.h.queen
+        .store()
+        .enroll_client_scoped(name, &enroll::hash_token(&tok), max, 0)
+        .await
+        .unwrap();
+    tok
+}
+
+#[tokio::test]
+async fn scope_round_trips_and_defaults_to_pr() {
+    let r = Rig::new(json!({})).await;
+    r.drone("d1").await;
+    let (_, a) = r.submit(&r.unit(json!({}))).await;
+    let u = r
+        .get(&format!("/v1/units/{}", a["unit_id"].as_str().unwrap()))
+        .await;
+    assert_eq!(u.json::<Value>().await.unwrap()["scope"], "pr");
+
+    let tok = scoped_client(&r, "gate", borg::classes::Scope::Main).await;
+    let body = r.unit(json!({"scope": "main", "tree_sha": tree('1')}));
+    let (code, sub) = r.submit_as(&tok, &body).await;
+    assert_eq!(code, 201, "{sub}");
+    let u = r
+        .get(&format!("/v1/units/{}", sub["unit_id"].as_str().unwrap()))
+        .await;
+    assert_eq!(u.json::<Value>().await.unwrap()["scope"], "main");
+    assert_eq!(
+        r.h.queen.store().client_max_scope("gate").await.unwrap(),
+        borg::classes::Scope::Main
+    );
+}
+
+#[tokio::test]
+async fn a_unit_above_the_clients_maximum_scope_is_refused() {
+    let r = Rig::new(json!({})).await;
+    let hook = scoped_client(&r, "hook", borg::classes::Scope::Pr).await;
+    let resp =
+        r.h.http
+            .post(format!("{}/v1/units", r.h.url))
+            .bearer_auth(&hook)
+            .json(&r.unit(json!({"scope": "deploy"})))
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+    let msg = resp.text().await.unwrap();
+    assert!(
+        msg.contains("up to scope pr") && msg.contains("asked for deploy"),
+        "{msg}"
+    );
+    let (code, _) = r.submit_as(&hook, &r.unit(json!({"scope": "main"}))).await;
+    assert_eq!(code, 403);
+    let (code, _) = r.submit_as(&hook, &r.unit(json!({"scope": "pr"}))).await;
+    assert_eq!(code, 201);
+}
+
+#[tokio::test]
+async fn one_free_slot_goes_to_deploy_then_main_then_pr() {
+    let r = Rig::new(json!({})).await;
+    let tok = scoped_client(&r, "gate", borg::classes::Scope::Deploy).await;
+    let d = deploy_drone(&r, "d1").await;
+    // Oldest first: pr, then main, then deploy. A heavy unit fills the drone.
+    let mut ids = Vec::new();
+    for (scope, c) in [("pr", '1'), ("main", '2'), ("deploy", '3')] {
+        let body = r.unit(json!({"scope": scope, "class": "heavy", "tree_sha": tree(c)}));
+        let (code, sub) = r.submit_as(&tok, &body).await;
+        assert_eq!(code, 201, "{sub}");
+        ids.push(sub["unit_id"].as_str().unwrap().to_owned());
+    }
+    for (n, want) in [2usize, 1, 0].into_iter().enumerate() {
+        r.tick(10 + i64::try_from(n).unwrap()).await;
+        let grants = r.beat(&d, &[]).await["units"].clone();
+        assert_eq!(grants.as_array().unwrap().len(), 1, "round {n}: {grants}");
+        assert_eq!(grants[0]["unit_id"], ids[want].as_str(), "round {n}");
+        r.beat(&d, &[&ids[want]]).await;
+        assert_eq!(r.post_result(&d, &ids[want], 0).await, 204);
+    }
+}
+
+#[tokio::test]
+async fn a_deploy_unit_is_not_placed_on_a_shared_drone() {
+    let r = Rig::new(json!({})).await;
+    let tok = scoped_client(&r, "gate", borg::classes::Scope::Deploy).await;
+    let shared = r.drone("shared").await;
+    let (_, dep) = r.submit_as(&tok, &r.unit(json!({"scope": "deploy"}))).await;
+    let dep = dep["unit_id"].as_str().unwrap().to_owned();
+    let (_, main) = r
+        .submit_as(
+            &tok,
+            &r.unit(json!({"scope": "main", "tree_sha": tree('4')})),
+        )
+        .await;
+    let main = main["unit_id"].as_str().unwrap().to_owned();
+    r.tick(5).await;
+    assert_eq!(state_of(&r, &dep).await, "queued");
+    // A shared drone does run main work, so only the deploy unit waits.
+    let grants = r.beat(&shared, &[]).await["units"].clone();
+    assert_eq!(grants.as_array().unwrap().len(), 1);
+    assert_eq!(grants[0]["unit_id"], main.as_str());
+
+    // A deploy-trust drone takes it.
+    let d = deploy_drone(&r, "dep").await;
+    r.tick(6).await;
+    assert_eq!(state_of(&r, &dep).await, "leased");
+    assert_eq!(r.beat(&d, &[]).await["units"][0]["unit_id"], dep.as_str());
+
+    // A pr unit never runs on a deploy drone: with only one, it waits.
+    let r2 = Rig::new(json!({})).await;
+    let d2 = deploy_drone(&r2, "dep").await;
+    let (_, pr) = r2.submit(&r2.unit(json!({}))).await;
+    r2.tick(5).await;
+    assert_eq!(
+        state_of(&r2, pr["unit_id"].as_str().unwrap()).await,
+        "queued"
+    );
+    assert!(
+        r2.beat(&d2, &[]).await["units"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn the_newest_unit_with_a_supersede_key_wins() {
+    let r = Rig::new(json!({})).await;
+    let d = r.drone("d1").await;
+    let sub = |c: char, extra: Value| {
+        let mut b = r.unit(json!({"tree_sha": tree(c)}));
+        for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+            b[k] = v;
+        }
+        b
+    };
+    let id = |v: &Value| v["unit_id"].as_str().unwrap().to_owned();
+
+    // A record unit, then running (placed and acknowledged), queued, and
+    // other keys. Submitting a record unit with a key supersedes older
+    // non-record units too, so it goes first.
+    let (_, record) = r
+        .submit(&sub('3', json!({"supersede_key": "pr-7", "record": true})))
+        .await;
+    let record = id(&record);
+    let (_, running) = r.submit(&sub('1', json!({"supersede_key": "pr-7"}))).await;
+    let running = id(&running);
+    r.tick(1).await;
+    r.beat(&d, &[]).await;
+    r.beat(&d, &[&running]).await;
+    assert_eq!(state_of(&r, &running).await, "running");
+    let (_, other) = r.submit(&sub('4', json!({"supersede_key": "pr-8"}))).await;
+    let other = id(&other);
+    let (_, plain) = r.submit(&sub('5', json!({}))).await;
+    let plain = id(&plain);
+
+    let (code, newest) = r.submit(&sub('6', json!({"supersede_key": "pr-7"}))).await;
+    assert_eq!(code, 201, "{newest}");
+    assert_eq!(newest["superseded"], json!([running]));
+    let rec = r.h.queen.store().unit(&record).await.unwrap().unwrap();
+    assert!(!rec.cancel_requested && rec.state.as_str() != "failed");
+    assert_eq!(state_of(&r, &other).await, "queued");
+    assert_eq!(state_of(&r, &plain).await, "queued");
+
+    // The running one is told to stop on the drone's next heartbeat.
+    let hb = r.beat(&d, &[&running]).await;
+    assert_eq!(hb["cancel_units"], json!([running]));
+
+    // A queued unit is cancelled at once by the next submission with the key.
+    let (_, third) = r.submit(&sub('2', json!({"supersede_key": "pr-7"}))).await;
+    assert_eq!(third["superseded"], json!([id(&newest)]));
+    let q = r.h.queen.store().unit(&id(&newest)).await.unwrap().unwrap();
+    assert_eq!(q.state.as_str(), "failed");
+    assert_eq!(q.failure.unwrap(), format!("superseded by {}", id(&third)));
+
+    assert_eq!(r.h.status().await["units"]["superseded"], 2);
+    assert!(
+        r.h.metrics()
+            .await
+            .contains("borg_units_superseded_total 2")
+    );
+
+    // Another client's units with the same key are left alone.
+    let tok = scoped_client(&r, "other", borg::classes::Scope::Pr).await;
+    let (_, theirs) = r
+        .submit_as(&tok, &sub('7', json!({"supersede_key": "pr-9"})))
+        .await;
+    let (_, mine) = r.submit(&sub('8', json!({"supersede_key": "pr-9"}))).await;
+    assert!(mine["superseded"].as_array().unwrap().is_empty());
+    assert_eq!(state_of(&r, &id(&theirs)).await, "queued");
+
+    // The key is bounded.
+    let (code, _) = r
+        .submit(&sub('9', json!({"supersede_key": "k".repeat(129)})))
+        .await;
+    assert_eq!(code, 400);
+}

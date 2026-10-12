@@ -8,11 +8,13 @@
 //!
 //! Rules, in priority order:
 //!
-//! 1. Main demand (bare label) is satisfied before pull-request demand, and
-//!    within a scope larger classes are placed first so they are not starved
-//!    of contiguous room by small ones.
+//! 1. Deploy demand is satisfied before main demand (bare label), and main
+//!    before pull-request demand. Within a scope larger classes are placed
+//!    first so they are not starved of contiguous room by small ones.
 //! 2. A main grant carries only the bare label; a pull-request grant carries
-//!    both labels (see [`Classes::runner_labels`]).
+//!    both labels; a deploy grant carries only the `-deploy` label (see
+//!    [`Classes::runner_labels`]). Deploy demand is placed only on
+//!    [`Trust::Deploy`] drones and pull-request demand never is.
 //! 3. Queued demand is first offset by leases that were granted but have not
 //!    yet taken a job ([`LeaseState::Pending`]); only the shortfall is minted.
 //! 4. A warm floor keeps that many pending leases of a (class, scope) alive
@@ -29,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::bid::{
     ClassPressure, DroneBid, ProfileScore, ScoreWeights, demand_pressure, profile_term, score,
 };
-use crate::classes::{Class, ClassSpec, Classes, Scope};
+use crate::classes::{Class, ClassSpec, Classes, Scope, Trust};
 use crate::probe::Capacity;
 
 /// Owner-set limits for one host ("this PC gives at most 8 cores / 24 GiB").
@@ -76,6 +78,68 @@ pub struct DroneState {
     /// right now; see [`crate::envcontract`]. The allocator never places them.
     #[serde(default)]
     pub blocked_classes: Vec<Class>,
+    /// Which scopes the host may run; see [`Trust::admits`].
+    #[serde(default)]
+    pub trust: Trust,
+    /// Recent CPU pressure (`some avg10`, permille); `None` is not measured
+    /// or stale. Only read when [`AllocatorInput::admission`] is set.
+    #[serde(default)]
+    pub cpu_psi_pm: Option<u16>,
+}
+
+/// CPU-pressure thresholds (permille) for admission; see [`AdmissionState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionThresholds {
+    pub psi_soft_pm: u16,
+    pub psi_hard_pm: u16,
+}
+
+/// What a drone may be granted given its CPU pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionState {
+    /// Below the soft threshold, unmeasured, or admission is off.
+    Open,
+    /// At or above soft: pull-request grants are shed, everything else placed.
+    PrBlocked,
+    /// At or above hard: no new grant of any scope.
+    Closed,
+}
+
+impl AdmissionState {
+    pub const ALL: [AdmissionState; 3] = [Self::Open, Self::PrBlocked, Self::Closed];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::PrBlocked => "pr_blocked",
+            Self::Closed => "closed",
+        }
+    }
+
+    pub fn of(psi: Option<u16>, t: Option<AdmissionThresholds>) -> Self {
+        match (psi, t) {
+            (Some(p), Some(t)) if p >= t.psi_hard_pm => Self::Closed,
+            (Some(p), Some(t)) if p >= t.psi_soft_pm => Self::PrBlocked,
+            _ => Self::Open,
+        }
+    }
+
+    fn admits(self, scope: Scope) -> bool {
+        match self {
+            Self::Open => true,
+            Self::PrBlocked => scope != Scope::Pr,
+            Self::Closed => false,
+        }
+    }
+}
+
+/// One drone's admission state this pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DroneAdmission {
+    pub drone_id: String,
+    pub state: AdmissionState,
+    pub cpu_psi_pm: Option<u16>,
 }
 
 impl DroneState {
@@ -94,6 +158,8 @@ impl DroneState {
             bids: Vec::new(),
             profiles: Vec::new(),
             blocked_classes: Vec::new(),
+            cpu_psi_pm: None,
+            trust: Trust::Shared,
         }
     }
 }
@@ -102,6 +168,10 @@ impl DroneState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LeaseState {
+    /// A deploy runner held unstarted by its drone. It holds capacity like a
+    /// pending deploy lease and absorbs deploy demand by promotion: the drone
+    /// is told to start it instead of the queen minting another runner.
+    Standby,
     /// Granted or minted, runner idle: can still absorb queued demand.
     Pending,
     /// Runner is executing a job: only consumes capacity.
@@ -164,6 +234,8 @@ pub struct AllocatorInput {
     /// the guard off.
     pub starvation_after_secs: Option<u64>,
     pub weights: ScoreWeights,
+    /// CPU-pressure admission; `None` turns it off.
+    pub admission: Option<AdmissionThresholds>,
 }
 
 /// An instruction to mint one runner and hand it to one drone.
@@ -204,6 +276,18 @@ pub struct Allocation {
     pub pressure: Vec<ClassPressure>,
     /// Slots each class could still be granted before this pass's grants.
     pub idle: Vec<ClassIdle>,
+    /// Every drone's admission state this pass, by id.
+    pub admission: Vec<DroneAdmission>,
+    /// Standby deploy runners to start now, per class: queued deploy demand
+    /// that pending runners do not cover, up to the standbys that exist.
+    pub promote: Vec<Promotion>,
+}
+
+/// Start `count` standby deploy runners of `class`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Promotion {
+    pub class: Class,
+    pub count: u32,
 }
 
 /// Idle room for one class.
@@ -267,6 +351,7 @@ struct Free<'a> {
     vcpu: u32,
     leases_left: Option<u32>,
     in_flight: u32,
+    admission: AdmissionState,
     /// Grants made to this drone this pass, per key (bounds `available_slots`).
     granted: BTreeMap<(Class, Scope), u32>,
 }
@@ -302,6 +387,7 @@ impl Free<'_> {
 
     fn fits(&self, spec: &ClassSpec) -> bool {
         self.drone.accepting
+            && self.admission != AdmissionState::Closed
             && (!spec.docker || self.drone.docker)
             && self.mem_mib >= spec.mem_mib
             && self.vcpu >= spec.vcpu
@@ -319,6 +405,7 @@ impl Free<'_> {
 
     fn could_ever_fit(&self, spec: &ClassSpec) -> bool {
         self.drone.accepting
+            && self.admission != AdmissionState::Closed
             && (!spec.docker || self.drone.docker)
             && self.drone.mem_mib >= spec.mem_mib
             && self.drone.vcpu >= spec.vcpu
@@ -364,6 +451,8 @@ fn place(
             .iter_mut()
             .filter(|(id, f)| {
                 f.fits(spec)
+                    && f.admission.admits(scope)
+                    && f.drone.trust.admits(scope)
                     && !f.drone.blocked_classes.contains(&class)
                     && reserved
                         .get(**id)
@@ -403,6 +492,7 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
             vcpu: drone.vcpu,
             leases_left: drone.max_leases,
             in_flight: 0,
+            admission: AdmissionState::of(drone.cpu_psi_pm, input.admission),
             granted: BTreeMap::new(),
         });
     }
@@ -427,11 +517,38 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
             .filter(|l| l.state == LeaseState::Pending && free.contains_key(l.drone_id.as_str()))
             .map(|l| (l.class, l.scope, 1)),
     );
+    let standby = sum_counts(
+        input
+            .leases
+            .iter()
+            .filter(|l| l.state == LeaseState::Standby && free.contains_key(l.drone_id.as_str()))
+            .map(|l| (l.class, l.scope, 1)),
+    );
     let get = |m: &Counts, c, s| m.get(&(c, s)).copied().unwrap_or(0);
+    let mut promote: Vec<Promotion> = Vec::new();
 
     // How many runners each (scope, class) still has to mint.
     let mut need: BTreeMap<(Scope, Class), u32> = BTreeMap::new();
     for class in Class::ALL {
+        // Deploy demand is absorbed only by pending deploy runners, which in
+        // turn absorb nothing else.
+        let deploy_total =
+            get(&queued, class, Scope::Deploy).max(get(&floors, class, Scope::Deploy));
+        let pending_deploy = get(&pending, class, Scope::Deploy);
+        // Queued deploy jobs that pending runners do not cover start standby
+        // runners before the queen mints anything.
+        let standby_deploy = get(&standby, class, Scope::Deploy);
+        let promoted = get(&queued, class, Scope::Deploy)
+            .saturating_sub(pending_deploy)
+            .min(standby_deploy);
+        if promoted > 0 {
+            promote.push(Promotion {
+                class,
+                count: promoted,
+            });
+        }
+        let deploy_need = deploy_total.saturating_sub(pending_deploy + standby_deploy);
+
         let pending_main = get(&pending, class, Scope::Main);
         let pending_pr = get(&pending, class, Scope::Pr);
 
@@ -446,6 +563,7 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
         let pr_total = get(&queued, class, Scope::Pr).max(get(&floors, class, Scope::Pr));
         let pr_need = pr_total.saturating_sub(pending_pr_left);
 
+        need.insert((Scope::Deploy, class), deploy_need);
         need.insert((Scope::Main, class), main_need);
         need.insert((Scope::Pr, class), pr_need);
     }
@@ -487,6 +605,15 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
             .map(|(&class, &pressure)| ClassPressure { class, pressure })
             .collect(),
         idle: idle_by_class,
+        admission: free
+            .iter()
+            .map(|(id, f)| DroneAdmission {
+                drone_id: (*id).to_owned(),
+                state: f.admission,
+                cpu_psi_pm: f.drone.cpu_psi_pm,
+            })
+            .collect(),
+        promote,
         ..Allocation::default()
     };
     let mut placed: BTreeMap<(Scope, Class), u32> = BTreeMap::new();
@@ -519,7 +646,9 @@ pub fn allocate(input: &AllocatorInput) -> Allocation {
                         .iter()
                         .filter(|(id, f)| {
                             !reserved.contains_key(**id)
+                                && f.drone.trust.admits(scope)
                                 && f.could_ever_fit(spec)
+                                && f.admission.admits(scope)
                                 && !f.drone.blocked_classes.contains(&class)
                         })
                         .min_by_key(|(id, f)| (f.in_flight, **id))
@@ -587,6 +716,8 @@ mod tests {
             bids: vec![],
             profiles: vec![],
             blocked_classes: vec![],
+            cpu_psi_pm: None,
+            trust: Trust::Shared,
         }
     }
 
@@ -607,6 +738,7 @@ mod tests {
             queue_ages: vec![],
             starvation_after_secs: None,
             weights: ScoreWeights::default(),
+            admission: None,
         }
     }
 
@@ -1206,6 +1338,8 @@ mod tests {
                 bids: vec![],
                 profiles: vec![],
                 blocked_classes: vec![],
+                cpu_psi_pm: None,
+                trust: Trust::Shared,
             },
             DroneState {
                 id: "c".into(),
@@ -1217,6 +1351,8 @@ mod tests {
                 bids: vec![],
                 profiles: vec![],
                 blocked_classes: vec![],
+                cpu_psi_pm: None,
+                trust: Trust::Shared,
             },
         ];
         for lm in 0..3 {
@@ -1488,5 +1624,234 @@ mod tests {
         // a: 3*100 = 300; b: 1000 from the profile.
         assert_eq!(only_drone(&allocate(&i)), "b");
         assert_eq!(allocate(&i), allocate(&i));
+    }
+
+    fn deploy_host(id: &str) -> DroneState {
+        DroneState {
+            trust: Trust::Deploy,
+            ..host(id)
+        }
+    }
+
+    #[test]
+    fn deploy_demand_lands_only_on_deploy_drones_with_only_the_deploy_label() {
+        let a = allocate(&input(
+            &[(Class::Medium, Scope::Deploy, 2)],
+            vec![host("shared"), deploy_host("dep")],
+        ));
+        assert_eq!(count(&a, Class::Medium, Scope::Deploy), 2);
+        assert!(a.grants.iter().all(|g| g.drone_id == "dep"));
+        assert!(
+            a.grants
+                .iter()
+                .all(|g| g.labels == ["borg-ci-medium-deploy"])
+        );
+
+        let a = allocate(&input(
+            &[(Class::Medium, Scope::Deploy, 1)],
+            vec![host("shared")],
+        ));
+        assert!(a.grants.is_empty());
+        assert_eq!(a.unmet.len(), 1);
+        assert_eq!(a.unmet[0].scope, Scope::Deploy);
+    }
+
+    #[test]
+    fn pr_demand_never_lands_on_deploy_drones_but_main_may() {
+        let a = allocate(&input(
+            &[(Class::Light, Scope::Pr, 3), (Class::Light, Scope::Main, 1)],
+            vec![deploy_host("dep")],
+        ));
+        assert_eq!(count(&a, Class::Light, Scope::Pr), 0);
+        assert_eq!(count(&a, Class::Light, Scope::Main), 1);
+        assert_eq!(a.unmet[0].scope, Scope::Pr);
+    }
+
+    #[test]
+    fn deploy_is_placed_before_main_and_pr_under_contention() {
+        let mut d = deploy_host("dep");
+        d.max_leases = Some(1);
+        let a = allocate(&input(
+            &[
+                (Class::Light, Scope::Pr, 1),
+                (Class::Light, Scope::Main, 1),
+                (Class::Light, Scope::Deploy, 1),
+            ],
+            vec![d],
+        ));
+        assert_eq!(a.grants.len(), 1);
+        assert_eq!(a.grants[0].scope, Scope::Deploy);
+    }
+
+    #[test]
+    fn starved_deploy_demand_reserves_only_a_deploy_drone() {
+        let mut i = input(
+            &[(Class::Heavy, Scope::Deploy, 1)],
+            vec![host("shared"), deploy_host("dep")],
+        );
+        i.starvation_after_secs = Some(10);
+        i.queue_ages = vec![QueueAge {
+            class: Class::Heavy,
+            scope: Scope::Deploy,
+            oldest_age_secs: 60,
+        }];
+        i.leases = vec![
+            lease("dep", Class::Heavy, Scope::Main, LeaseState::Running),
+            lease("dep", Class::Light, Scope::Main, LeaseState::Running),
+        ];
+        let a = allocate(&i);
+        assert!(a.grants.is_empty());
+        assert_eq!(a.reserved_for.len(), 1);
+        assert_eq!(a.reserved_for[0].drone_id, "dep");
+    }
+
+    #[test]
+    fn pending_absorption_respects_trust_scopes() {
+        // A pending PR runner (bare label) absorbs main demand, never deploy.
+        let mut i = input(&[(Class::Light, Scope::Main, 1)], vec![host("a")]);
+        i.leases = vec![lease("a", Class::Light, Scope::Pr, LeaseState::Pending)];
+        assert!(allocate(&i).grants.is_empty());
+
+        let mut i = input(
+            &[(Class::Light, Scope::Deploy, 1)],
+            vec![host("a"), deploy_host("dep")],
+        );
+        i.leases = vec![lease("a", Class::Light, Scope::Pr, LeaseState::Pending)];
+        assert_eq!(count(&allocate(&i), Class::Light, Scope::Deploy), 1);
+        i.leases = vec![lease(
+            "dep",
+            Class::Light,
+            Scope::Deploy,
+            LeaseState::Pending,
+        )];
+        assert!(allocate(&i).grants.is_empty());
+
+        // A pending deploy runner carries only the deploy label: main demand
+        // still needs its own runner.
+        let mut i = input(&[(Class::Light, Scope::Main, 1)], vec![deploy_host("dep")]);
+        i.leases = vec![lease(
+            "dep",
+            Class::Light,
+            Scope::Deploy,
+            LeaseState::Pending,
+        )];
+        assert_eq!(count(&allocate(&i), Class::Light, Scope::Main), 1);
+    }
+
+    #[test]
+    fn warm_floors_may_name_the_deploy_scope() {
+        let mut i = input(&[], vec![deploy_host("dep")]);
+        i.warm_floors = vec![WarmFloor {
+            class: Class::Light,
+            scope: Scope::Deploy,
+            count: 2,
+        }];
+        assert_eq!(count(&allocate(&i), Class::Light, Scope::Deploy), 2);
+    }
+
+    fn deploy_only_host(id: &str) -> DroneState {
+        DroneState {
+            trust: Trust::DeployOnly,
+            ..host(id)
+        }
+    }
+
+    #[test]
+    fn deploy_only_drones_take_deploy_demand_and_nothing_else() {
+        let a = allocate(&input(
+            &[
+                (Class::Medium, Scope::Main, 1),
+                (Class::Medium, Scope::Pr, 1),
+            ],
+            vec![deploy_only_host("only")],
+        ));
+        assert!(a.grants.is_empty(), "{:?}", a.grants);
+        assert_eq!(a.unmet.len(), 2);
+        let a = allocate(&input(
+            &[(Class::Medium, Scope::Deploy, 1)],
+            vec![deploy_only_host("only")],
+        ));
+        assert_eq!(count(&a, Class::Medium, Scope::Deploy), 1);
+        assert_eq!(a.grants[0].drone_id, "only");
+    }
+
+    #[test]
+    fn a_standby_holds_capacity_and_counts_as_pending_deploy_capacity() {
+        // No queued deploy demand: the standby keeps the deploy floor met and
+        // nothing is promoted or minted.
+        let mut i = input(&[], vec![deploy_only_host("dep")]);
+        i.warm_floors = vec![WarmFloor {
+            class: Class::Medium,
+            scope: Scope::Deploy,
+            count: 1,
+        }];
+        i.leases = vec![lease(
+            "dep",
+            Class::Medium,
+            Scope::Deploy,
+            LeaseState::Standby,
+        )];
+        let a = allocate(&i);
+        assert!(a.grants.is_empty() && a.promote.is_empty());
+        // It also takes room: a 1-lease cap is full.
+        let mut capped = deploy_only_host("dep");
+        capped.max_leases = Some(1);
+        let mut i = input(&[(Class::Light, Scope::Deploy, 1)], vec![capped]);
+        i.leases = vec![lease(
+            "dep",
+            Class::Medium,
+            Scope::Deploy,
+            LeaseState::Standby,
+        )];
+        assert!(allocate(&i).grants.is_empty());
+    }
+
+    #[test]
+    fn deploy_demand_with_a_standby_promotes_it_instead_of_minting() {
+        let mut i = input(
+            &[(Class::Medium, Scope::Deploy, 1)],
+            vec![deploy_only_host("dep")],
+        );
+        i.leases = vec![lease(
+            "dep",
+            Class::Medium,
+            Scope::Deploy,
+            LeaseState::Standby,
+        )];
+        let a = allocate(&i);
+        assert!(a.grants.is_empty(), "{:?}", a.grants);
+        assert!(a.unmet.is_empty());
+        assert_eq!(
+            a.promote,
+            vec![Promotion {
+                class: Class::Medium,
+                count: 1
+            }]
+        );
+        // Two queued jobs, one standby: one promotion, one mint.
+        let mut i = input(
+            &[(Class::Medium, Scope::Deploy, 2)],
+            vec![deploy_only_host("dep")],
+        );
+        i.leases = vec![lease(
+            "dep",
+            Class::Medium,
+            Scope::Deploy,
+            LeaseState::Standby,
+        )];
+        let a = allocate(&i);
+        assert_eq!(a.promote.len(), 1);
+        assert_eq!(count(&a, Class::Medium, Scope::Deploy), 1);
+        // A pending deploy runner already covers the job: no promotion.
+        let mut i = input(
+            &[(Class::Medium, Scope::Deploy, 1)],
+            vec![deploy_only_host("dep")],
+        );
+        i.leases = vec![
+            lease("dep", Class::Medium, Scope::Deploy, LeaseState::Standby),
+            lease("dep", Class::Medium, Scope::Deploy, LeaseState::Pending),
+        ];
+        let a = allocate(&i);
+        assert!(a.grants.is_empty() && a.promote.is_empty());
     }
 }

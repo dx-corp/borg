@@ -37,6 +37,9 @@ pub struct RunSpec<'a> {
     /// Extra job environment (cache directories, git mirrors).
     pub extra_env: &'a [(String, String)],
     pub max_job: Duration,
+    /// After a preempt signal the runner gets SIGINT, then this long before
+    /// the process group is killed.
+    pub preempt_grace: Duration,
     /// Run the job as this user (see [`crate::drone::jobuser`]); `None` runs it
     /// as the drone's own user.
     pub job_user: Option<&'a JobUser>,
@@ -51,6 +54,8 @@ pub struct RunOutcome {
     pub peak_rss_mib: Option<u64>,
     pub timed_out: bool,
     pub aborted: bool,
+    /// The queen preempted the lease; the runner was interrupted.
+    pub preempted: bool,
 }
 
 /// Exit code reported when a job was killed (128 + SIGKILL).
@@ -132,6 +137,11 @@ async fn spawn_retrying(command: &mut Command) -> io::Result<tokio::process::Chi
     }
 }
 
+fn interrupt_group(exec: &dyn Exec, pgid: u32) {
+    let target = format!("-{pgid}");
+    let _ = exec.run("kill", &["-INT", "--", &target]);
+}
+
 fn kill_group(exec: &dyn Exec, pgid: u32) {
     // Negative pid addresses the whole process group.
     let target = format!("-{pgid}");
@@ -144,6 +154,7 @@ pub async fn run_lease(
     exec: &dyn Exec,
     fs_ops: Arc<dyn FsOps>,
     mut abort: tokio::sync::watch::Receiver<bool>,
+    mut preempt: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<RunOutcome> {
     if !valid_lease_id(spec.lease_id) {
         return Err(io::Error::new(
@@ -216,6 +227,9 @@ pub async fn run_lease(
     tokio::pin!(deadline);
     let mut sample = tokio::time::interval(RSS_SAMPLE_EVERY);
     let (mut peak_kib, mut timed_out, mut aborted) = (0u64, false, false);
+    let mut preempted = false;
+    let grace = tokio::time::sleep(spec.preempt_grace);
+    tokio::pin!(grace);
 
     // Every arm is cancel-safe: `Child::wait`, `Sleep`, `Interval::tick` and
     // `watch::Receiver::changed` keep no partially consumed state.
@@ -224,6 +238,17 @@ pub async fn run_lease(
             status = child.wait() => break status?,
             () = &mut deadline => {
                 timed_out = true;
+                if let Some(pgid) = pgid { kill_group(exec, pgid); }
+                break child.wait().await?;
+            }
+            changed = preempt.changed(), if !preempted => {
+                if changed.is_ok() && *preempt.borrow() {
+                    preempted = true;
+                    grace.as_mut().reset(tokio::time::Instant::now() + spec.preempt_grace);
+                    if let Some(pgid) = pgid { interrupt_group(exec, pgid); }
+                }
+            }
+            () = &mut grace, if preempted => {
                 if let Some(pgid) = pgid { kill_group(exec, pgid); }
                 break child.wait().await?;
             }
@@ -255,6 +280,7 @@ pub async fn run_lease(
         peak_rss_mib: (peak_kib > 0).then_some(peak_kib / 1024),
         timed_out,
         aborted,
+        preempted,
     })
 }
 
@@ -289,13 +315,16 @@ mod tests {
             extra_env: &[],
             job_user: None,
             max_job,
+            preempt_grace: Duration::from_secs(5),
             proc_root: Path::new("/proc"),
         };
+        let (_ptx, prx) = tokio::sync::watch::channel(false);
         let out = run_lease(
             &spec,
             &SystemExec,
             Arc::new(crate::drone::fsops::LocalFs),
             rx,
+            prx,
         )
         .await
         .unwrap();
@@ -405,8 +434,10 @@ mod tests {
             extra_env: &[],
             job_user: None,
             max_job: Duration::from_secs(60),
+            preempt_grace: Duration::from_secs(5),
             proc_root: Path::new("/proc"),
         };
+        let (_ptx, prx) = tokio::sync::watch::channel(false);
         let abort = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let _ = tx.send(true);
@@ -417,11 +448,55 @@ mod tests {
             &SystemExec,
             Arc::new(crate::drone::fsops::LocalFs),
             rx,
+            prx,
         )
         .await
         .unwrap();
         let _tx = abort.await.unwrap();
         assert!(out.aborted && !out.timed_out);
+    }
+
+    #[tokio::test]
+    async fn preempt_interrupts_the_runner_then_kills_it_after_the_grace_period() {
+        let dir = tempfile::tempdir().unwrap();
+        // Ignores SIGINT, so only the grace-period kill can end it.
+        let runner = runner_with_script(dir.path(), "trap '' INT\necho up > up.txt\nsleep 300");
+        let work = dir.path().join("work");
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let (ptx, prx) = tokio::sync::watch::channel(false);
+        let secret = Secret::new("x");
+        let cache = dir.path().join("cache");
+        let spec = RunSpec {
+            lease_id: "lease3",
+            jit_config: &secret,
+            runner_dir: &runner,
+            lease_dir: &work.join("slot-0"),
+            cache_root: &cache,
+            extra_env: &[],
+            job_user: None,
+            max_job: Duration::from_secs(60),
+            preempt_grace: Duration::from_millis(500),
+            proc_root: Path::new("/proc"),
+        };
+        let stop = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = ptx.send(true);
+            ptx
+        });
+        let started = Instant::now();
+        let out = run_lease(
+            &spec,
+            &SystemExec,
+            Arc::new(crate::drone::fsops::LocalFs),
+            rx,
+            prx,
+        )
+        .await
+        .unwrap();
+        let _ptx = stop.await.unwrap();
+        assert!(out.preempted && !out.timed_out && !out.aborted);
+        assert_eq!(out.exit_code, KILLED_EXIT_CODE);
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     #[tokio::test]
@@ -439,14 +514,17 @@ mod tests {
             extra_env: &[],
             job_user: None,
             max_job: Duration::from_secs(1),
+            preempt_grace: Duration::from_secs(1),
             proc_root: Path::new("/proc"),
         };
+        let (_ptx, prx) = tokio::sync::watch::channel(false);
         assert!(
             run_lease(
                 &spec,
                 &SystemExec,
                 Arc::new(crate::drone::fsops::LocalFs),
-                rx
+                rx,
+                prx
             )
             .await
             .is_err()

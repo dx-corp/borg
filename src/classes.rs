@@ -1,7 +1,8 @@
 //! Runner classes: the resources a job of each size needs.
 //!
 //! Jobs ask for a class through its runner label (`<prefix><class>` for main
-//! and merge-group jobs, `<prefix><class>-pr` for pull requests). The prefix
+//! and merge-group jobs, `<prefix><class>-pr` for pull requests,
+//! `<prefix><class>-deploy` for deploy-path jobs). The prefix
 //! and the per-class requirements are configuration with generic defaults.
 
 use std::collections::BTreeMap;
@@ -15,6 +16,8 @@ pub const DEFAULT_LABEL_PREFIX: &str = "borg-ci-";
 pub const MAX_EXTRA_LABELS: usize = 16;
 /// Suffix marking pull-request demand.
 const PR_SUFFIX: &str = "-pr";
+/// Suffix marking deploy-path demand.
+const DEPLOY_SUFFIX: &str = "-deploy";
 
 /// A runner size class. Ordered smallest to largest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -44,17 +47,89 @@ impl fmt::Display for Class {
     }
 }
 
-/// Where a queued job comes from. Main jobs (main branch, merge groups) are
+/// Where a queued job comes from. Deploy jobs (prod OIDC, signing, registry
+/// push) are scheduled before main jobs (main branch, merge groups), which are
 /// scheduled before pull-request jobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
+    Deploy,
     Main,
     Pr,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 2] = [Scope::Main, Scope::Pr];
+    /// Every scope in scheduling order.
+    pub const ALL: [Scope; 3] = [Scope::Deploy, Scope::Main, Scope::Pr];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Deploy => "deploy",
+            Scope::Main => "main",
+            Scope::Pr => "pr",
+        }
+    }
+}
+
+/// How much a drone's host is trusted with deploy-path jobs. A deploy drone
+/// never runs a pull-request job or a work unit; a shared drone never runs a
+/// deploy job; a deploy-only drone runs nothing but deploy jobs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Trust {
+    #[default]
+    Shared,
+    Deploy,
+    DeployOnly,
+}
+
+impl Trust {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Trust::Shared => "shared",
+            Trust::Deploy => "deploy",
+            Trust::DeployOnly => "deploy-only",
+        }
+    }
+
+    /// Whether demand of `scope` may be placed on a drone of this trust.
+    pub fn admits(self, scope: Scope) -> bool {
+        match scope {
+            Scope::Deploy => self != Trust::Shared,
+            Scope::Main => self != Trust::DeployOnly,
+            Scope::Pr => self == Trust::Shared,
+        }
+    }
+
+    /// Whether drones of this trust hold standby deploy runners.
+    pub fn serves_deploy(self) -> bool {
+        self != Trust::Shared
+    }
+}
+
+/// What an alias label stands for: a bare class name (main scope) or an object
+/// naming both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Alias {
+    Main(Class),
+    Scoped(AliasTarget),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AliasTarget {
+    pub class: Class,
+    pub scope: Scope,
+}
+
+impl Alias {
+    pub fn target(self) -> (Class, Scope) {
+        match self {
+            Alias::Main(class) => (class, Scope::Main),
+            Alias::Scoped(t) => (t.class, t.scope),
+        }
+    }
 }
 
 /// Resources reserved for one running job of a class.
@@ -77,10 +152,13 @@ pub struct Classes {
     pub medium: ClassSpec,
     pub heavy: ClassSpec,
     /// Existing runner labels that borg also answers, each mapped to the class
-    /// that serves it (for example a deploy lane's `runs-on` label). Queued
-    /// jobs with an alias label count as main demand for the class, and every
-    /// runner of that class carries the alias labels so it can take them.
-    pub aliases: BTreeMap<String, Class>,
+    /// that serves it (for example a deploy lane's `runs-on` label). A plain
+    /// class name (`"medium"`) is main demand; `{"class": "medium", "scope":
+    /// "deploy"}` is deploy demand. Queued jobs with an alias label count as
+    /// demand of its scope, and a runner carries the alias label only when its
+    /// grant scope equals the alias's (main aliases also ride on PR runners,
+    /// which carry the bare label).
+    pub aliases: BTreeMap<String, Alias>,
 }
 
 impl Default for Classes {
@@ -117,7 +195,9 @@ pub enum ClassesError {
     Parse(#[from] serde_json::Error),
     #[error("label prefix must not be empty")]
     EmptyPrefix,
-    #[error("alias label {0:?} is malformed or starts with the class label prefix")]
+    #[error(
+        "alias label {0:?} is malformed, starts with the class label prefix, or has scope \"pr\""
+    )]
     BadAlias(String),
     #[error("class {class} must reserve at least 1 MiB and 1 vCPU")]
     Empty { class: Class },
@@ -147,8 +227,11 @@ impl Classes {
         if self.label_prefix.is_empty() {
             return Err(ClassesError::EmptyPrefix);
         }
-        for label in self.aliases.keys() {
-            if !valid_extra_label(label) || label.starts_with(self.label_prefix.as_str()) {
+        for (label, alias) in &self.aliases {
+            if !valid_extra_label(label)
+                || label.starts_with(self.label_prefix.as_str())
+                || alias.target().1 == Scope::Pr
+            {
                 return Err(ClassesError::BadAlias(label.clone()));
             }
         }
@@ -202,18 +285,22 @@ impl Classes {
         match scope {
             Scope::Main => format!("{}{class}", self.label_prefix),
             Scope::Pr => format!("{}{class}{PR_SUFFIX}", self.label_prefix),
+            Scope::Deploy => format!("{}{class}{DEPLOY_SUFFIX}", self.label_prefix),
         }
     }
 
     /// Parse a job's `runs-on` label into its class and scope.
     pub fn parse_label(&self, label: &str) -> Option<(Class, Scope)> {
-        if let Some(&class) = self.aliases.get(label) {
-            return Some((class, Scope::Main));
+        if let Some(alias) = self.aliases.get(label) {
+            return Some(alias.target());
         }
         let rest = label.strip_prefix(self.label_prefix.as_str())?;
-        let (name, scope) = match rest.strip_suffix(PR_SUFFIX) {
-            Some(name) => (name, Scope::Pr),
-            None => (rest, Scope::Main),
+        let (name, scope) = if let Some(name) = rest.strip_suffix(DEPLOY_SUFFIX) {
+            (name, Scope::Deploy)
+        } else if let Some(name) = rest.strip_suffix(PR_SUFFIX) {
+            (name, Scope::Pr)
+        } else {
+            (rest, Scope::Main)
         };
         let class = Class::ALL.into_iter().find(|c| c.as_str() == name)?;
         Some((class, scope))
@@ -222,16 +309,25 @@ impl Classes {
     /// The exact label set a runner is minted with.
     ///
     /// Main grants carry only the bare label so GitHub can hand them nothing
-    /// but main jobs. Pull-request grants carry both labels.
+    /// but main jobs. Pull-request grants carry both labels. Deploy grants
+    /// carry only the `-deploy` label, so GitHub can hand them nothing but
+    /// deploy jobs. Alias labels ride on the runners whose scope they name.
     pub fn runner_labels(&self, class: Class, scope: Scope) -> Vec<String> {
-        let mut labels = vec![self.job_label(class, Scope::Main)];
-        if scope == Scope::Pr {
-            labels.push(self.job_label(class, Scope::Pr));
-        }
+        let mut labels = match scope {
+            Scope::Deploy => vec![self.job_label(class, Scope::Deploy)],
+            Scope::Main => vec![self.job_label(class, Scope::Main)],
+            Scope::Pr => vec![
+                self.job_label(class, Scope::Main),
+                self.job_label(class, Scope::Pr),
+            ],
+        };
         labels.extend(
             self.aliases
                 .iter()
-                .filter(|&(_, &c)| c == class)
+                .filter(|&(_, a)| {
+                    let (c, s) = a.target();
+                    c == class && (s == scope || (s == Scope::Main && scope == Scope::Pr))
+                })
                 .map(|(l, _)| l.clone()),
         );
         labels
@@ -439,6 +535,98 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn deploy_labels_round_trip_and_deploy_runners_carry_only_their_label() {
+        let c = Classes::default();
+        assert_eq!(
+            c.job_label(Class::Medium, Scope::Deploy),
+            "borg-ci-medium-deploy"
+        );
+        assert_eq!(
+            c.parse_label("borg-ci-heavy-deploy"),
+            Some((Class::Heavy, Scope::Deploy))
+        );
+        assert_eq!(c.parse_label("borg-ci-heavy-deploy-pr"), None);
+        assert_eq!(
+            c.runner_labels(Class::Medium, Scope::Deploy),
+            ["borg-ci-medium-deploy"]
+        );
+        assert_eq!(
+            c.labels_scope(&c.runner_labels(Class::Light, Scope::Deploy)),
+            Some((Class::Light, Scope::Deploy))
+        );
+        assert!(Scope::Deploy < Scope::Main && Scope::Main < Scope::Pr);
+    }
+
+    #[test]
+    fn trust_admits_scopes() {
+        assert!(Trust::Deploy.admits(Scope::Deploy) && Trust::Deploy.admits(Scope::Main));
+        assert!(!Trust::Deploy.admits(Scope::Pr));
+        assert!(Trust::Shared.admits(Scope::Main) && Trust::Shared.admits(Scope::Pr));
+        assert!(!Trust::Shared.admits(Scope::Deploy));
+        assert!(Trust::DeployOnly.admits(Scope::Deploy));
+        assert!(!Trust::DeployOnly.admits(Scope::Main));
+        assert!(!Trust::DeployOnly.admits(Scope::Pr));
+    }
+
+    #[test]
+    fn deploy_only_trust_serializes_kebab_case() {
+        assert_eq!(Trust::DeployOnly.as_str(), "deploy-only");
+        let t: Trust = serde_json::from_str("\"deploy-only\"").unwrap();
+        assert_eq!(t, Trust::DeployOnly);
+        assert_eq!(serde_json::to_string(&t).unwrap(), "\"deploy-only\"");
+        assert!(Trust::Deploy.serves_deploy() && !Trust::Shared.serves_deploy());
+    }
+
+    #[test]
+    fn scoped_aliases_ride_only_on_runners_of_their_scope() {
+        let c = Classes::from_json(
+            r#"{"label_prefix":"x-ci-","aliases":{
+                "promote":{"class":"medium","scope":"deploy"},
+                "legacy":"medium"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.parse_label("promote"),
+            Some((Class::Medium, Scope::Deploy))
+        );
+        assert_eq!(c.parse_label("legacy"), Some((Class::Medium, Scope::Main)));
+        assert_eq!(
+            c.runner_labels(Class::Medium, Scope::Deploy),
+            ["x-ci-medium-deploy", "promote"]
+        );
+        assert_eq!(
+            c.runner_labels(Class::Medium, Scope::Main),
+            ["x-ci-medium", "legacy"]
+        );
+        assert_eq!(
+            c.runner_labels(Class::Medium, Scope::Pr),
+            ["x-ci-medium", "x-ci-medium-pr", "legacy"]
+        );
+        assert_eq!(
+            c.runner_labels(Class::Heavy, Scope::Deploy),
+            ["x-ci-heavy-deploy"]
+        );
+    }
+
+    #[test]
+    fn alias_labels_must_not_look_like_class_labels() {
+        for bad in [
+            r#"{"aliases":{"borg-ci-medium-deploy":"light"}}"#,
+            r#"{"aliases":{"borg-ci-medium":{"class":"light","scope":"deploy"}}}"#,
+            r#"{"aliases":{"lane":{"class":"light","scope":"pr"}}}"#,
+        ] {
+            assert!(
+                matches!(Classes::from_json(bad), Err(ClassesError::BadAlias(_))),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            Classes::from_json(r#"{"aliases":{"lane":{"class":"light","scope":"deploy","x":1}}}"#),
+            Err(ClassesError::Parse(_))
+        ));
     }
 
     #[test]

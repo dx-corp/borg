@@ -97,6 +97,27 @@ impl ExecFs {
         Self { exec }
     }
 
+    fn run_dirs_writable(&self, path: &Path) -> io::Result<()> {
+        self.run(
+            "find",
+            &[
+                &path.to_string_lossy(),
+                "-type",
+                "d",
+                "-exec",
+                "chmod",
+                "u+w",
+                "{}",
+                "+",
+            ],
+        )
+    }
+
+    /// Best effort: a missing path or a failed chmod must not block removal.
+    fn make_dirs_writable(&self, path: &Path) {
+        let _ = self.run_dirs_writable(path);
+    }
+
     fn run(&self, program: &str, args: &[&str]) -> io::Result<()> {
         let out = self.exec.run(program, args)?;
         if out.success {
@@ -130,6 +151,10 @@ impl FsOps for ExecFs {
     }
 
     fn remove_all(&self, path: &Path) -> io::Result<()> {
+        // Cloned slot directories keep the runner tree's read-only modes; a
+        // read-only directory cannot have its entries removed. Directories
+        // only: files are hard links shared with the pinned runner install.
+        self.make_dirs_writable(path);
         self.run("rm", &["-rf", "--", &path.to_string_lossy()])
     }
 
@@ -141,7 +166,10 @@ impl FsOps for ExecFs {
         self.run(
             "cp",
             &["-al", "--", &src.to_string_lossy(), &dst.to_string_lossy()],
-        )
+        )?;
+        // The runner writes `run-helper.sh`, `_diag` and `_work` into the
+        // slot, so its directories must be writable (the pinned install's are not).
+        self.run_dirs_writable(dst)
     }
 }
 
@@ -176,14 +204,16 @@ mod tests {
             .unwrap();
         let calls = fake.calls();
         assert_eq!(calls[0], "mkdir -p -- /c/git");
-        assert_eq!(calls[1], "rm -rf -- /w/slot-0");
-        assert_eq!(calls[2], "mkdir -p -- /w");
-        assert_eq!(calls[3], "cp -al -- /r /w/slot-0");
-        assert!(calls[4].starts_with("sh -c "), "{}", calls[4]);
+        assert_eq!(calls[1], "find /w/slot-0 -type d -exec chmod u+w {} +");
+        assert_eq!(calls[2], "rm -rf -- /w/slot-0");
+        assert_eq!(calls[3], "mkdir -p -- /w");
+        assert_eq!(calls[4], "cp -al -- /r /w/slot-0");
+        assert_eq!(calls[5], "find /w/slot-0 -type d -exec chmod u+w {} +");
+        assert!(calls[6].starts_with("sh -c "), "{}", calls[6]);
         assert!(
-            calls[4].ends_with("sh common --x\n; rm -rf / /h/.bazelrc"),
+            calls[6].ends_with("sh common --x\n; rm -rf / /h/.bazelrc"),
             "content is an argument, not script text: {}",
-            calls[4]
+            calls[6]
         );
     }
 

@@ -7,11 +7,12 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::allocator::{WarmFloor, default_warm_floors};
-use crate::classes::{Classes, ClassesError};
+use crate::allocator::{AdmissionThresholds, WarmFloor, default_warm_floors};
+use crate::classes::{Class, Classes, ClassesError};
 use crate::envcontract::ContractSettings;
 use crate::health::HealthSettings;
 use crate::homeostasis::HomeostasisSettings;
+use crate::preempt::PreemptSettings;
 use crate::profile::ProfileSettings;
 use crate::rollout::RolloutSettings;
 use crate::schedule::WarmSchedule;
@@ -78,6 +79,13 @@ pub struct JanitorSettings {
     /// Hard cap on cancellations (or dry-run matches) per pass.
     #[serde(default = "default_janitor_max")]
     pub max_cancels_per_pass: u32,
+    /// Also cancel superseded runs that are already `in_progress`.
+    #[serde(default)]
+    pub cancel_running: bool,
+    /// Cancel queued runs that duplicate another run of the same workflow,
+    /// commit, event and pull request.
+    #[serde(default)]
+    pub dedupe_same_sha: bool,
 }
 
 fn yes() -> bool {
@@ -88,6 +96,61 @@ fn default_janitor_interval() -> u64 {
 }
 fn default_janitor_max() -> u32 {
     20
+}
+
+/// Standby deploy runners; present means enabled. See `docs/operations.md`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandbySettings {
+    /// Classes each deploy or deploy-only drone keeps standby runners for.
+    pub classes: Vec<Class>,
+    /// Standby runners per drone and class, 1 to 4.
+    pub per_drone: u32,
+}
+
+impl StandbySettings {
+    fn validate(&self) -> Result<(), String> {
+        if self.classes.is_empty() {
+            return Err("standby.classes must not be empty".to_owned());
+        }
+        if !(1..=4).contains(&self.per_drone) {
+            return Err("standby.per_drone must be between 1 and 4".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Admission by CPU pressure; present means enabled. See
+/// [`crate::allocator::AdmissionThresholds`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionSettings {
+    /// From this `cpu some avg10` (permille) a drone takes no new
+    /// pull-request grants.
+    pub psi_soft_pm: u16,
+    /// From this pressure a drone takes no new grants at all.
+    pub psi_hard_pm: u16,
+    /// A drone's reported pressure older than this counts as unknown.
+    pub facts_max_age_secs: i64,
+}
+
+impl AdmissionSettings {
+    pub fn thresholds(&self) -> AdmissionThresholds {
+        AdmissionThresholds {
+            psi_soft_pm: self.psi_soft_pm,
+            psi_hard_pm: self.psi_hard_pm,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.psi_soft_pm == 0 || self.psi_soft_pm > self.psi_hard_pm || self.psi_hard_pm > 1000 {
+            return Err("admission needs 0 < psi_soft_pm <= psi_hard_pm <= 1000".to_owned());
+        }
+        if self.facts_max_age_secs <= 0 {
+            return Err("admission.facts_max_age_secs must be positive".to_owned());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -161,9 +224,18 @@ pub struct QueenConfig {
     /// `/status`): drones update themselves, the queen never forces it.
     #[serde(default)]
     pub rollout_target_version: Option<String>,
+    /// Absent (the default) disables standby deploy runners.
+    #[serde(default)]
+    pub standby: Option<StandbySettings>,
+    /// Absent (the default) disables admission by CPU pressure.
+    #[serde(default)]
+    pub admission: Option<AdmissionSettings>,
     /// Absent (the default) disables the supersede janitor.
     #[serde(default)]
     pub supersede_janitor: Option<JanitorSettings>,
+    /// Absent (the default) disables preemption; see [`crate::preempt`].
+    #[serde(default)]
+    pub preemption: Option<PreemptSettings>,
 }
 
 fn default_listen() -> SocketAddr {
@@ -275,6 +347,12 @@ impl QueenConfig {
         self.profiles.validate().map_err(ConfigError::Invalid)?;
         self.homeostasis.validate().map_err(ConfigError::Invalid)?;
         self.health.validate().map_err(ConfigError::Invalid)?;
+        if let Some(a) = &self.admission {
+            a.validate().map_err(ConfigError::Invalid)?;
+        }
+        if let Some(st) = &self.standby {
+            st.validate().map_err(ConfigError::Invalid)?;
+        }
         if let Some(t) = &self.tailnet_enroll {
             t.validate().map_err(ConfigError::Invalid)?;
         }
@@ -287,6 +365,9 @@ impl QueenConfig {
             return bad(
                 "supersede_janitor interval_secs and max_cancels_per_pass must be positive",
             );
+        }
+        if let Some(p) = &self.preemption {
+            p.validate().map_err(ConfigError::Invalid)?;
         }
         Ok(())
     }
@@ -333,6 +414,7 @@ mod tests {
                 .unwrap();
         let j = c.supersede_janitor.unwrap();
         assert!(j.dry_run);
+        assert!(!j.cancel_running && !j.dedupe_same_sha);
         assert_eq!((j.interval_secs, j.max_cancels_per_pass), (60, 20));
         for bad in [
             "{\"interval_secs\":0}",
@@ -365,6 +447,50 @@ mod tests {
     }
 
     #[test]
+    fn standby_is_off_by_default_and_validated() {
+        assert!(QueenConfig::from_json(MIN).unwrap().standby.is_none());
+        let with = |a: &str| {
+            QueenConfig::from_json(&MIN.replace("\"repos\"", &format!("\"standby\":{a},\"repos\"")))
+        };
+        let ok = with(r#"{"classes":["medium"],"per_drone":1}"#).unwrap();
+        let st = ok.standby.unwrap();
+        assert_eq!((st.classes, st.per_drone), (vec![Class::Medium], 1));
+        for bad in [
+            r#"{"classes":[],"per_drone":1}"#,
+            r#"{"classes":["medium"],"per_drone":0}"#,
+            r#"{"classes":["medium"],"per_drone":5}"#,
+            r#"{"classes":["huge"],"per_drone":1}"#,
+            r#"{"classes":["medium"],"per_drone":1,"nope":1}"#,
+            r#"{"per_drone":1}"#,
+        ] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn admission_is_off_by_default_and_validated() {
+        assert!(QueenConfig::from_json(MIN).unwrap().admission.is_none());
+        let with = |a: &str| {
+            QueenConfig::from_json(
+                &MIN.replace("\"repos\"", &format!("\"admission\":{a},\"repos\"")),
+            )
+        };
+        let ok = with(r#"{"psi_soft_pm":300,"psi_hard_pm":600,"facts_max_age_secs":180}"#).unwrap();
+        let t = ok.admission.unwrap().thresholds();
+        assert_eq!((t.psi_soft_pm, t.psi_hard_pm), (300, 600));
+        for bad in [
+            r#"{"psi_soft_pm":700,"psi_hard_pm":600,"facts_max_age_secs":180}"#,
+            r#"{"psi_soft_pm":0,"psi_hard_pm":600,"facts_max_age_secs":180}"#,
+            r#"{"psi_soft_pm":300,"psi_hard_pm":1001,"facts_max_age_secs":180}"#,
+            r#"{"psi_soft_pm":300,"psi_hard_pm":600,"facts_max_age_secs":0}"#,
+            r#"{"psi_soft_pm":300,"psi_hard_pm":600,"facts_max_age_secs":180,"nope":1}"#,
+            r#"{"psi_soft_pm":300,"psi_hard_pm":600}"#,
+        ] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn zero_telemetry_retention_is_rejected() {
         let json = MIN.replace("\"repos\"", "\"telemetry_retention_days\":0,\"repos\"");
         assert!(QueenConfig::from_json(&json).is_err());
@@ -390,6 +516,27 @@ mod tests {
             ok.tailnet_enroll.unwrap().socket_path.to_str(),
             Some("/var/run/tailscale/tailscaled.sock")
         );
+    }
+
+    #[test]
+    fn preemption_is_off_by_default_and_validated() {
+        assert!(QueenConfig::from_json(MIN).unwrap().preemption.is_none());
+        let with = |p: &str| {
+            QueenConfig::from_json(
+                &MIN.replace("\"repos\"", &format!("\"preemption\":{p},\"repos\"")),
+            )
+        };
+        let ok = with(r#"{"after_secs":600,"max_per_pass":1,"min_victim_age_secs":60}"#).unwrap();
+        assert_eq!(ok.preemption.unwrap().after_secs, 600);
+        for bad in [
+            r#"{"after_secs":0,"max_per_pass":1,"min_victim_age_secs":60}"#,
+            r#"{"after_secs":600,"max_per_pass":0,"min_victim_age_secs":60}"#,
+            r#"{"after_secs":600,"max_per_pass":1,"min_victim_age_secs":0}"#,
+            r#"{"after_secs":600,"max_per_pass":1}"#,
+            r#"{"after_secs":600,"max_per_pass":1,"min_victim_age_secs":60,"nope":1}"#,
+        ] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -422,7 +569,8 @@ mod tests {
       "starvation_after_secs": null,
       "health": {"auto_quarantine": false},
       "units": {"enabled": true},
-      "supersede_janitor": {"dry_run": false}
+      "admission": {"psi_soft_pm": 300, "psi_hard_pm": 600, "facts_max_age_secs": 180},
+      "supersede_janitor": {"dry_run": false, "cancel_running": true, "dedupe_same_sha": true}
     }"#;
 
     const FULL_TOML: &str = r#"
@@ -452,8 +600,15 @@ auto_quarantine = false
 [units]
 enabled = true
 
+[admission]
+psi_soft_pm = 300
+psi_hard_pm = 600
+facts_max_age_secs = 180
+
 [supersede_janitor]
 dry_run = false
+cancel_running = true
+dedupe_same_sha = true
 "#;
 
     #[test]
@@ -464,6 +619,9 @@ dry_run = false
         assert_eq!(t.repos.len(), 2);
         assert_eq!(t.starvation_after_secs, None);
         assert!(t.units.enabled);
+        assert_eq!(t.admission.unwrap().psi_hard_pm, 600);
+        let j = t.supersede_janitor.unwrap();
+        assert!(!j.dry_run && j.cancel_running && j.dedupe_same_sha);
     }
 
     #[test]

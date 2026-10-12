@@ -17,8 +17,9 @@ pub mod pins;
 pub mod runner;
 pub mod selfupdate;
 pub mod slots;
+pub mod standby;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,6 +39,7 @@ use jobuser::JobExec;
 use runner::{RunSpec, run_lease};
 use selfupdate::{Handled, Plan, SelfUpdate};
 use slots::{SlotGuard, Slots, slot_dir, slot_name};
+use standby::{Standbys, should_fail_open};
 
 /// Attempts to deliver a lease result before giving up (the lease then
 /// expires on the queen's side). The waits grow to a minute, so a queen that
@@ -46,9 +48,13 @@ const RESULT_ATTEMPTS: u32 = 20;
 
 type Held = Arc<Mutex<HashSet<String>>>;
 
+/// Per running lease, the switch the queen's `cancel_leases` flips.
+type Preempts = Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>;
+
 /// Removes a lease id from the held set when its task ends, even by panic.
 struct HeldGuard {
     held: Held,
+    preempts: Preempts,
     id: String,
 }
 
@@ -56,6 +62,9 @@ impl Drop for HeldGuard {
     fn drop(&mut self) {
         if let Ok(mut held) = self.held.lock() {
             held.remove(&self.id);
+        }
+        if let Ok(mut preempts) = self.preempts.lock() {
+            preempts.remove(&self.id);
         }
     }
 }
@@ -70,6 +79,9 @@ pub struct Drone {
     /// File operations on job-owned directories.
     fs_ops: Arc<dyn FsOps>,
     held: Held,
+    /// Standby deploy runners held unstarted.
+    standbys: Standbys,
+    preempts: Preempts,
     abort: tokio::sync::watch::Sender<bool>,
     proc_root: Arc<Path>,
     caches: Arc<Caches>,
@@ -78,6 +90,8 @@ pub struct Drone {
     selfupdate: Option<SelfUpdate>,
     /// The queen wants another version: stop taking leases until idle.
     update_wanted: AtomicBool,
+    /// The last tools probe, reused for a minute.
+    tools_cache: probe::ToolsCache,
 }
 
 impl Drone {
@@ -111,10 +125,12 @@ impl Drone {
             Arc::clone(&host),
         ));
         let selfupdate = cfg.state_dir.clone().map(SelfUpdate::new);
+        let standbys = Standbys::load(cfg.state_dir.clone());
         Self {
             cfg,
             selfupdate,
             update_wanted: AtomicBool::new(false),
+            tools_cache: probe::ToolsCache::default(),
             client: Arc::new(client),
             host,
             exec,
@@ -123,6 +139,8 @@ impl Drone {
             caches,
             slots: Slots::new(slot_count),
             held: Held::default(),
+            standbys,
+            preempts: Preempts::default(),
             abort,
             proc_root: Arc::from(Path::new("/proc")),
         }
@@ -187,6 +205,21 @@ impl Drone {
                 path: format!("probe: {e}"),
                 status: 0,
             })?;
+        let host = Arc::clone(&self.host);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut env_facts =
+            tokio::task::spawn_blocking(move || probe::env_facts(host.as_ref(), now))
+                .await
+                .map_err(|e| ClientError::Status {
+                    path: format!("probe: {e}"),
+                    status: 0,
+                })?;
+        // The tools probe never fails the heartbeat: no map means not measured.
+        let (exec, cache) = (Arc::clone(&self.job_exec), self.tools_cache.clone());
+        env_facts.tools = tokio::task::spawn_blocking(move || cache.get(exec.as_ref(), now))
+            .await
+            .ok()
+            .flatten();
         let req = HeartbeatRequest {
             capacity,
             caps: self.cfg.host_caps(),
@@ -195,6 +228,8 @@ impl Drone {
             cache_stats: self.caches.stats(),
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             extra_labels: self.cfg.extra_labels.clone(),
+            trust: self.cfg.trust,
+            held_standby: self.standbys.ids(),
             bids: Vec::new(),
             reclaim: None,
             update_report: self
@@ -202,42 +237,105 @@ impl Drone {
                 .as_ref()
                 .and_then(SelfUpdate::pending_report),
             active_units: Vec::new(),
-            env_facts: None,
+            env_facts: Some(env_facts),
         };
         let resp = self.client.heartbeat(&req).await?;
         let defer = self.after_heartbeat(&req, resp.desired_version.as_deref());
+        if let Ok(preempts) = self.preempts.lock() {
+            for id in &resp.cancel_leases {
+                if let Some(tx) = preempts.get(id) {
+                    let _ = tx.send(true);
+                }
+            }
+        }
+        for id in &resp.drop_standby {
+            self.standbys.remove(id);
+        }
+        for grant in resp.standby {
+            self.standbys.insert(grant);
+        }
         let mut started = 0;
         for grant in resp.leases {
-            if !accepting || defer || !self.admit(&grant.lease_id) {
-                continue;
+            if accepting && !defer && self.start_lease(grant, tasks) {
+                started += 1;
             }
-            let held = HeldGuard {
-                held: Arc::clone(&self.held),
-                id: grant.lease_id.clone(),
-            };
-            let Some(slot) = self.slots.acquire(&grant.lease_id) else {
-                tracing::warn!(
-                    "no free slot for lease {}; leaving it unstarted",
-                    grant.lease_id
-                );
-                continue;
-            };
-            let ctx = LeaseContext {
-                cfg: Arc::clone(&self.cfg),
-                client: Arc::clone(&self.client),
-                exec: Arc::clone(&self.exec),
-                job_exec: Arc::clone(&self.job_exec),
-                fs_ops: Arc::clone(&self.fs_ops),
-                abort: self.abort.subscribe(),
-                proc_root: Arc::clone(&self.proc_root),
-                caches: Arc::clone(&self.caches),
-                slot,
-                _held: held,
-            };
-            tasks.spawn(handle_lease(ctx, grant));
-            started += 1;
+        }
+        if accepting && !defer {
+            started += self.start_standbys(Some(&resp.start_standby), tasks);
         }
         Ok(started)
+    }
+
+    /// Start held standby runners: the ones in `only`, or all of them. A
+    /// standby that cannot start now (no slot) stays held.
+    fn start_standbys(&self, only: Option<&[String]>, tasks: &mut JoinSet<()>) -> usize {
+        let ids = match only {
+            Some(ids) => ids.to_vec(),
+            None => self.standbys.ids(),
+        };
+        let mut started = 0;
+        for id in ids {
+            let Some(grant) = self.standbys.get(&id) else {
+                continue;
+            };
+            if self.start_lease(grant, tasks) {
+                // The lease now lives in `active_leases`; the JIT config is
+                // single use, so a restart must not find it again.
+                self.standbys.remove(&id);
+                started += 1;
+            }
+        }
+        started
+    }
+
+    /// Start every held standby because the queen has been unreachable.
+    fn fail_open(&self, tasks: &mut JoinSet<()>) {
+        if self.standbys.ids().is_empty() {
+            return;
+        }
+        let started = self.start_standbys(None, tasks);
+        if started > 0 {
+            tracing::warn!("queen unreachable: started {started} standby deploy runner(s)");
+        }
+    }
+
+    /// Claim a slot for `grant` and run it as a lease. Returns whether it
+    /// started.
+    fn start_lease(&self, grant: LeaseGrant, tasks: &mut JoinSet<()>) -> bool {
+        if !self.admit(&grant.lease_id) {
+            return false;
+        }
+        let held = HeldGuard {
+            held: Arc::clone(&self.held),
+            preempts: Arc::clone(&self.preempts),
+            id: grant.lease_id.clone(),
+        };
+        let (preempt_tx, preempt) = tokio::sync::watch::channel(false);
+        if let Ok(mut preempts) = self.preempts.lock() {
+            preempts.insert(grant.lease_id.clone(), preempt_tx);
+        }
+        let Some(slot) = self.slots.acquire(&grant.lease_id) else {
+            tracing::warn!(
+                "no free slot for lease {}; leaving it unstarted",
+                grant.lease_id
+            );
+            return false;
+        };
+        let ctx = LeaseContext {
+            cfg: Arc::clone(&self.cfg),
+            client: Arc::clone(&self.client),
+            exec: Arc::clone(&self.exec),
+            job_exec: Arc::clone(&self.job_exec),
+            fs_ops: Arc::clone(&self.fs_ops),
+            abort: self.abort.subscribe(),
+            preempt,
+            proc_root: Arc::clone(&self.proc_root),
+            caches: Arc::clone(&self.caches),
+            slot,
+            _held: held,
+        };
+        tasks.spawn(handle_lease(ctx, grant));
+        true
     }
 
     /// What a successful heartbeat means for self-update: the queen has the
@@ -339,14 +437,22 @@ impl Drone {
         // arrives, and heartbeats are retried with backoff.
         let mut failures = 0u32;
         let mut retry_at = tokio::time::Instant::now();
+        let mut last_ok_at = time::OffsetDateTime::now_utc().unix_timestamp();
         loop {
             tokio::select! {
                 _ = every.tick() => {
+                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                    if should_fail_open(last_ok_at, now, self.cfg.fail_open_after_secs) {
+                        self.fail_open(&mut tasks);
+                    }
                     if tokio::time::Instant::now() < retry_at {
                         continue;
                     }
                     match self.heartbeat_once(true, &mut tasks).await {
-                        Ok(_) => failures = 0,
+                        Ok(_) => {
+                            failures = 0;
+                            last_ok_at = time::OffsetDateTime::now_utc().unix_timestamp();
+                        }
                         Err(e) => {
                             failures = failures.saturating_add(1);
                             let wait = selfupdate::backoff(self.cfg.heartbeat_secs, failures);
@@ -393,6 +499,7 @@ struct LeaseContext {
     job_exec: Arc<dyn Exec>,
     fs_ops: Arc<dyn FsOps>,
     abort: tokio::sync::watch::Receiver<bool>,
+    preempt: tokio::sync::watch::Receiver<bool>,
     proc_root: Arc<Path>,
     caches: Arc<Caches>,
     /// Dropped before `_held`, so the slot is free whenever the id is.
@@ -419,6 +526,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         cache_root: &ctx.cfg.cache_root,
         extra_env: &extra_env,
         max_job: Duration::from_secs(ctx.cfg.max_job_secs),
+        preempt_grace: Duration::from_secs(ctx.cfg.preempt_grace_secs),
         job_user: ctx.cfg.job_user.as_ref(),
         proc_root: &ctx.proc_root,
     };
@@ -427,6 +535,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         ctx.job_exec.as_ref(),
         Arc::clone(&ctx.fs_ops),
         ctx.abort.clone(),
+        ctx.preempt.clone(),
     )
     .await;
 
@@ -472,6 +581,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
             duration_secs: o.duration_secs,
             peak_rss_mib: o.peak_rss_mib,
             telemetry: None,
+            preempted: o.preempted,
         },
         Err(e) => {
             tracing::warn!("lease {} could not run: {e}", grant.lease_id);
@@ -480,6 +590,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
                 duration_secs: 0,
                 peak_rss_mib: None,
                 telemetry: None,
+                preempted: false,
             }
         }
     };

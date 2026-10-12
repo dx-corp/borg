@@ -21,10 +21,15 @@ Configuration, scheduling, drone administration, and protocol details for
   - [Warm-floor controller](#warm-floor-controller)
   - [Host health](#host-health)
   - [Tailnet enrollment](#tailnet-enrollment)
+  - [Cloud burst drones](#cloud-burst-drones)
   - [Starvation guard](#starvation-guard)
+  - [Preemption](#preemption)
+  - [Admission by CPU pressure](#admission-by-cpu-pressure)
+  - [Standby runners and deploy fail-open](#standby-runners-and-deploy-fail-open)
 - [Drone](#drone)
   - [Separate job user (Linux)](#separate-job-user-linux)
   - [Labels, environment, hooks](#labels-environment-hooks)
+  - [Drone trust](#drone-trust)
   - [Owner caps](#owner-caps)
   - [What a lease does](#what-a-lease-does)
   - [Host caches](#host-caches)
@@ -41,6 +46,15 @@ carries both labels. With this workflow labeling convention, default-branch
 and merge-queue jobs request the bare label; pull-request jobs request the
 `-pr` label. Labels route jobs; they do not enforce an event restriction.
 
+Deploy-path jobs (prod OIDC, signing, registry push) ask for
+`<prefix><class>-deploy`. A runner minted for deploy demand carries only that
+label, so GitHub can hand it nothing but deploy jobs. Deploy demand is
+scheduled before main demand, and main before pull-request demand.
+
+A deploy drone never runs a pull-request job or a work unit; a shared drone
+never runs a deploy job. Which drones are deploy drones is set per drone with
+`trust` (see [Drone trust](#drone-trust)).
+
 ## Classes config
 
 The `classes` table is partial; omitted fields keep their defaults:
@@ -52,16 +66,21 @@ heavy = { mem_mib = 20480, vcpu = 6, docker = true }
 ```
 
 Existing `runs-on` labels outside the prefix can be answered too with
-`aliases`, a map from label to class:
+`aliases`, a map from label to a class name (main scope) or to an object
+naming the class and scope:
 
 ```toml
 [classes.aliases]
-"example-deploy-lane" = "medium"
+"example-legacy-lane" = "medium"
+"example-promote-lane" = { class = "medium", scope = "deploy" }
 ```
 
-Queued jobs with an alias label count as main demand for that class, and every
-runner minted for the class also carries the alias labels. Alias labels must
-not start with the prefix.
+Queued jobs with an alias label count as demand of the alias's scope, so a
+`deploy` alias is deploy demand. A runner carries an alias label only when its
+grant scope equals the alias's scope: a deploy alias rides on deploy runners
+only, and a main alias rides on main and pull-request runners (both carry the
+bare label). Alias labels must not start with the prefix and the scope must be
+`main` or `deploy`.
 
 ## Config files
 
@@ -116,7 +135,20 @@ through canaries and waves (see [Quorum rollout](#quorum-rollout)).
 `warm_floors` keep idle runners alive per class and scope; the optional
 `warm_schedule` raises them in time-of-day windows (`{"class": "light", "scope":
 "pr", "count": 4, "start": "08:00", "end": "20:00", "days": ["mon", "tue"]}`)
-at a fixed `utc_offset_minutes`. A window never lowers a floor.
+at a fixed `utc_offset_minutes`. A window never lowers a floor. Floors and
+windows may name `"scope": "deploy"`; the allocator keeps those runners on
+deploy drones.
+
+Pending runners absorb queued demand of the same label: a pending
+pull-request runner (it carries the bare label) may absorb main demand, but
+deploy demand is absorbed only by pending deploy runners, and a pending deploy
+runner absorbs nothing else.
+
+### Leader lease
+
+The fenced leader lease for running several queens (`src/lead.rs`) exists as a
+tested module and is not wired into the queen yet. There is no config key, no
+store setting and no flag for it; run a single queen until the wiring ships.
 
 ### Job telemetry
 
@@ -244,7 +276,7 @@ Targets are IPv4 addresses or `addr/len` networks. See `/status` `wake`.
 
 Optional (`env_contract.enabled`, off by default). Before a CI runner lease or a
 work unit is placed on a drone, the queen checks what the drone last reported
-about its build environment. Four checks, each `required`, `advisory` or `off`
+about its build environment. Five checks, each `required`, `advisory` or `off`
 globally and per class (`env_contract.checks`, `env_contract.classes.<class>`):
 
 * `compiler_cache`: `RUSTC_WRAPPER` is an allowed wrapper (`allowed_wrappers`,
@@ -262,13 +294,30 @@ globally and per class (`env_contract.checks`, `env_contract.classes.<class>`):
 * `resources`: memory available covers the class's memory (`mem_available_pct`)
   and CPU pressure is at most `max_cpu_psi_pm`. (Free capacity after active
   leases is the allocator's own rule.)
+* `tools`: every tool in `required_tools` is on the job user's `PATH`.
 
 A required check that fails **or is unknown** makes the drone ineligible for the
 class; nothing else changes about placement. Facts older than
 `facts_max_age_secs` (180) count as unknown. A drone that has never reported is
 skipped unless `require_report`, so enabling the contract does not cut off
 drones that predate it. Defaults when enabled: `toolchain` and `resources`
-required, `compiler_cache` and `cache_store` advisory.
+required, `compiler_cache`, `cache_store` and `tools` advisory.
+
+The `tools` check covers what a job expects to find on `PATH`, such as `gh` or
+`node`. `env_contract.required_tools` lists the tools every class needs and
+`env_contract.classes.<class>.required_tools` replaces that list for one class.
+Both lists default to empty, so the check passes until the operator names tools;
+names must come from the drone's probe list (`git`, `gh`, `node`, `npm`, `pnpm`,
+`python3`, `docker`, `cargo`, `rustc`, `bazel`, `go`, `uv`, `mise`, `jq`,
+`cosign`). A drone whose facts show a required tool as `missing` fails the check,
+and the reason names the missing tools. A drone whose facts carry no `tools` map
+(an older binary) passes with a warning, and fails when `require_report` is set.
+`/status` shows the missing tools and every probed version under the check's
+observed values.
+
+```json
+"env_contract": { "enabled": true, "checks": { "tools": "required" }, "required_tools": ["git", "gh", "node", "docker"] }
+```
 
 `/status` shows each drone's `contract` (the checks with state, reason, observed
 values and warnings, and the admission per class with the reason) and
@@ -296,6 +345,7 @@ old as unknown, so probe at least that often):
 | `toolchains` | For each toolchain `rustup toolchain list` shows, `{channel, rustc_version}`: the channel as `rust-toolchain.toml` would name it (`1.95.0`, `stable`, `nightly-2026-01-01`; strip the host triple) and the `release:` line of `rustc +<channel> -vV`. `null` if rustup could not be queried. |
 | `mem_available_mib` | Linux `MemAvailable` from `/proc/meminfo`; macOS (free + inactive + speculative pages) times the page size, in MiB. |
 | `cpu_psi_some_avg10_pm` | Linux `/proc/pressure/cpu` line `some`, `avg10` times ten, rounded; absent where PSI does not exist. |
+| `tools` | For each of `git`, `gh`, `node`, `npm`, `pnpm`, `python3`, `docker`, `cargo`, `rustc`, `bazel`, `go`, `uv`, `mise`, `jq`, `cosign`: resolve the executable on the job user's `PATH` (as the job user, with the job environment) and record the first line of `<tool> --version` (`go version` for `go`), trimmed, at most 80 characters. `"missing"` when it is not on `PATH`, `"unknown"` when it is but prints nothing. The map is absent when the probe did not run. |
 
 A unit's toolchain (`rust_toolchain`) matches an installed `channel` or
 `rustc_version` exactly.
@@ -340,13 +390,31 @@ with `borg queen enroll-client <name>` (prints a token once).
 
 Client API (bearer: client token):
 
-* `POST /v1/units` with `{repo, tree_sha, argv, platform, toolchain, class, timeout_secs?, force?}`
+* `POST /v1/units` with `{repo, tree_sha, argv, platform, toolchain, class, timeout_secs?, force?, scope?, supersede_key?, record?}`
   returns `201` `{outcome: "new", unit_id, ...}`, or `200` with `outcome:
   "joined"` (an identical unit is queued or running) or `"receipt"` (an
   identical unit succeeded recently; `receipt` has the proof). The key is
   (repo, tree SHA, argv, platform, toolchain); only successes are reused, never
   for another tree, and `force` skips reuse. `platform` is `<os>-<arch>`
   (`linux-x86_64`, `macos-aarch64`).
+* `scope` is `deploy`, `main` or `pr` (default `pr`). The unit holds capacity
+  under that scope and runs only on drones whose trust admits it (see
+  [Drone trust](#drone-trust)): a `deploy` unit runs only on a deploy drone, a
+  `pr` unit never does, and a `main` unit runs on either. Scope is part of the
+  single-flight key, so a `main` or `deploy` unit never joins or reuses the
+  result of a lower-scope run. Enroll a client with `borg queen enroll-client
+  <name> --max-scope deploy|main|pr` (default `pr`) to set the highest scope
+  its token may submit; a submission above that is refused with `403` and a
+  message naming both scopes. `borg run --scope main` (or `BORG_RUN_SCOPE`)
+  sets the scope on the client side.
+* `supersede_key` (at most 128 characters) makes the newest submission win:
+  when a new unit is created with a key, every queued unit from the same client
+  with the same key is cancelled, and every running one is cancelled through
+  the `cancel_units` heartbeat entry. A cancelled unit ends in state `failed`
+  with `failure` set to `superseded by <unit_id>`. A unit submitted with
+  `"record": true` (default `false`) is never superseded. The response lists
+  the cancelled ids in `superseded`; `/status` `units.superseded` and the
+  `borg_units_superseded_total` metric count them since the queen started.
 * `GET /v1/units/{id}` returns the unit (state `queued|leased|running|done|failed`,
   `exit_code`, `receipt`).
 * `GET /v1/units/{id}/log?from=N&wait=S` returns log bytes from offset `N`,
@@ -385,7 +453,10 @@ Drone protocol (bearer: drone token):
 
 Units are placed by the runner allocator (class capacity, owner caps, bids,
 profiles, quarantine and probation) on drones whose `<os>-<arch>` matches, using
-capacity left after CI runner demand.
+capacity left after CI runner demand. Among queued units the order is the one
+runner leases use: `deploy` before `main` before `pr`, older first within a
+scope, and `pr` units are the first held back when a drone is under CPU
+pressure (see [Admission by CPU pressure](#admission-by-cpu-pressure)).
 
 ### Build-box reclaim
 
@@ -465,7 +536,26 @@ The optional supersede janitor cancels queued pull-request workflow runs whose
 head commit is no longer the pull request's head. Add a `supersede_janitor`
 block (`token_path` or `BORG_JANITOR_TOKEN` for a token with `actions: write`,
 `dry_run` defaulting to true, `interval_secs`, `max_cancels_per_pass`) to turn
-it on. It never cancels a run that has started.
+it on. By default it never cancels a run that has started.
+
+Two further switches, both off by default and both subject to `dry_run` and
+`max_cancels_per_pass`, remove other waste. `cancel_running = true` also
+cancels superseded pull-request runs that are already in progress; a run that
+finished between the listing and the cancel is counted as `raced`.
+`dedupe_same_sha = true` looks at the queued and in-progress runs of each
+repository and groups them by workflow, head commit, event and pull request
+number. In a group of more than one it keeps the in-progress run (the lowest id
+if several are running), or else the queued run with the lowest id, and cancels
+the others only if they are still queued; a running duplicate is never
+cancelled. `workflow_dispatch` and `merge_group` runs are never grouped,
+because publication waits on those exact runs. Each cancellation is logged with
+the id of the run that was kept. With `dry_run` the log and `would_cancel` show
+what would have been cancelled. When the janitor is enabled, `GET /status` has
+a `janitor` object (`passes`, `last`, `total`, each with the counters
+`considered`, `superseded`, `cancelled`, `cancelled_running`, `duplicates`,
+`dedup_cancelled`, `would_cancel`, `deferred`, `raced`, `errors`) and
+`GET /metrics` has `borg_janitor_<counter>_total`, summed over passes since the
+queen started.
 
 The GitHub App needs organization self-hosted runners: read and write, plus
 read access to Actions on the listed repositories. Set
@@ -486,6 +576,66 @@ Manage drones with `borg queen drone list` and `borg queen drone remove <name>`
 Drone requests carry `Authorization: Bearer <token>`. The queen stores only
 the SHA-256 of each token.
 
+### Cloud burst drones
+
+A burst drone is a short-lived cloud VM that joins the fleet to drain a queue
+and then deletes itself. Two things decide whether it is cheap and safe: how
+its traffic leaves the cloud network, and how it reaches the queen.
+
+A burst image must carry the same tools as the on-prem runners (`gh`, `node`
+and the rest of the `required_tools` list). The `tools` check is how the queen
+refuses a drone whose image does not.
+
+**Egress: a public IP per VM, no NAT gateway.** Give each VM its own
+ephemeral external IPv4 address. Traffic to GitHub, crate registries and
+container registries then leaves the VM directly. Do not put burst drones
+behind a managed NAT gateway (for example GCP Cloud NAT): the gateway bills
+per gateway-hour and per gigabyte processed, on top of normal egress, and a
+CI fleet pulls tens of gigabytes per host per day. Inbound transfer into the
+cloud is free; you pay normal egress only for what the job uploads
+(artifacts, caches, images).
+
+**Reaching the queen: Tailscale, not NAT.** The queen usually lives on a
+private network behind a home or office router. The burst drone joins the
+tailnet and reaches the queen over it, so the router needs no port forward
+and the cloud side needs no VPN gateway. Tailscale does not change how
+traffic to the internet is billed; the public IP above is what avoids NAT
+charges. Tailscale only carries the drone-to-queen connection.
+
+**Containment.** Burst drones run pull-request code, so treat them as
+untrusted:
+
+- Join with an ephemeral, pre-approved, tagged auth key (for example
+  `tag:borg-drone`). In the tailnet policy, allow that tag to reach only the
+  queen's port. Nothing else on the tailnet should be reachable from it.
+- Enroll through [tailnet enrollment](#tailnet-enrollment) with that tag in
+  `allowed_tags`, so no token is copied onto the VM by hand.
+- Create the VM without cloud credentials: no service account and no API
+  scopes, so a job cannot read the metadata server for a cloud token.
+- Put the VM on a dedicated network with no inbound firewall rules. Manage it
+  through the cloud's identity-aware tunnel or Tailscale SSH.
+- Do not serve deploy-trust work (image publishing, promotion, anything that
+  signs or holds production credentials) from a burst drone that also runs
+  pull-request jobs.
+
+**Lifetime.** Use spot or preemptible capacity with a hard maximum run
+duration and delete-on-termination, so a forgotten drone costs at most one
+run duration. On GCP:
+
+```sh
+gcloud compute instances create burst-drone-1 \
+  --machine-type=c2d-highcpu-56 --provisioning-model=SPOT \
+  --instance-termination-action=DELETE --max-run-duration=12h \
+  --no-service-account --no-scopes \
+  --network=borg-burst --subnet=borg-burst \
+  --image-family=ubuntu-2404-lts-amd64 --image-project=ubuntu-os-cloud
+```
+
+The VM keeps its ephemeral external IP by default; do not pass `--no-address`
+unless a NAT gateway exists, which this setup avoids. If the cloud reclaims a
+spot VM mid-job, GitHub fails that job when its runner stops responding; rerun
+it. Queued jobs are unaffected and go to other drones.
+
 ### Starvation guard
 
 When demand for a class has waited longer than `starvation_after_secs`, the
@@ -493,6 +643,122 @@ allocator places it first. If it still does not fit, it holds back the drone
 that can free up soonest (fewest in-flight leases, ties by name) and grants no
 smaller lease there until the starving lease fits. Held drones are listed in
 `/status` under `reserved_for`.
+
+### Preemption
+
+Off unless the queen config has a `preemption` block:
+
+```json
+"preemption": { "after_secs": 600, "max_per_pass": 1, "min_victim_age_secs": 60 }
+```
+
+`after_secs` is how long the oldest queued job of a `(class, scope)` must have
+waited, `max_per_pass` caps cancellations in one queen pass, and
+`min_victim_age_secs` is how long a job must have been running before it can be
+cancelled. All three must be greater than 0.
+
+When demand the allocator could not place has waited `after_secs`, the queen
+cancels one running lease whose scope ranks strictly below the starving
+demand's scope (a `pr` lease for `main` demand; the order is the `Scope`
+order). It only picks a lease whose drone could hold the starving class once
+that lease's resources are freed, and only a lease whose in-progress job GitHub
+reports on its runner, since the job's start time sets its age. Among the
+candidates it takes the lowest-priority scope, then the smallest class, then the
+most recently started lease. A lease that is already being cancelled counts as
+covering the starving demand, so one starving job cancels one lease, not one per
+pass.
+
+The queen stamps `preempted_at` on the lease, records the job (repo, run id,
+job id) in the `preemptions` table, and returns the lease id in `cancel_leases`
+on every heartbeat response to its drone until the lease ends. The drone sends
+SIGINT to the runner's process group, which makes the Actions runner report the
+job as cancelled to GitHub, waits `preempt_grace_secs` (drone config, default
+30, must be greater than 0), then kills the group as it does at `max_job_secs`.
+The result is reported with `preempted: true`, and the lease ends normally.
+Drones that predate `cancel_leases` ignore it, so update drones before turning
+preemption on.
+
+`/status` lists the last 20 preemptions under `preemptions` (lease, drone,
+class, victim `scope`, starving `for_scope`, repo, run, job, `at`,
+`requeued_at`) and the all-time counts under `preemption_counts`. The metric
+`borg_preemptions_total{from_scope,to_scope}` counts them by victim scope and
+starving scope.
+
+A preempted job is re-run automatically when both `preemption` and
+`supersede_janitor` are configured. After each janitor pass the queen reads the
+runs of preemptions with `requeued_at` unset and, once a run has completed,
+calls `POST /repos/{repo}/actions/jobs/{job_id}/rerun` with the janitor's token
+and sets `requeued_at`. It does at most `max_cancels_per_pass` reruns per pass,
+marks rows older than 24 hours without re-running them, treats a 403, 404 or 409
+answer as final, retries other errors on the next pass, and in the janitor's
+`dry_run` only logs `would rerun`. `/status` shows the counters under `requeue`
+and `/metrics` as `borg_requeue_<field>_total` (`checked`, `rerun`, `waiting`,
+`stale`, `terminal`, `errors`).
+
+### Admission by CPU pressure
+
+Slots count memory, vCPUs and leases, not CPU load, so several drones sharing
+one saturated host can all show free slots. Optional and off unless the queen
+config has an `admission` block:
+
+```json
+"admission": { "psi_soft_pm": 300, "psi_hard_pm": 600, "facts_max_age_secs": 180 }
+```
+
+Each drone reports Linux PSI `cpu some avg10` in permille on every heartbeat
+(the higher of `/proc/pressure/cpu` and the cgroup file
+`/sys/fs/cgroup/cpu.pressure`). At or above `psi_soft_pm` the drone takes no
+new pull-request grant; main work is still placed. At or above `psi_hard_pm` it
+takes no new grant of any scope. Leases already granted are not touched. A
+reading older than `facts_max_age_secs`, or no reading, puts no restriction on
+the drone. The starvation guard obeys the same rule: a starving pull-request
+lease is not placed on a soft-blocked drone. Requires `0 < psi_soft_pm <=
+psi_hard_pm <= 1000` and a positive age.
+
+`/status` shows `admission: {state, cpu_psi_pm}` per drone (`state` is `open`,
+`pr_blocked` or `closed`).
+Metrics: `borg_drone_cpu_psi_pm{drone}` and `borg_drone_admission{drone,state}`.
+The build environment contract's `resources` check is separate and still works.
+
+### Standby runners and deploy fail-open
+
+Deploy jobs (image promotion) should not depend on one queen host. Optional and
+off unless the queen config has a `standby` block:
+
+```json
+"standby": { "classes": ["medium"], "per_drone": 1 }
+```
+
+`classes` must not be empty and `per_drone` is 1 to 4. For every fresh drone
+with trust `deploy` or `deploy-only`, the queen keeps `per_drone` leases of
+each listed class in the state `standby`: a JIT runner minted with the deploy
+labels only (plus the drone's extra labels). The queen sends the JIT config in
+the heartbeat response (`standby`) and resends it until the drone lists the
+lease id in `held_standby`. The drone does not start it. A standby holds
+capacity like a pending deploy lease, is exempt from `lease_ttl_secs`, and is
+rotated only when `lease_max_secs` passes; its registration is never reaped.
+
+Promotion rule: when deploy jobs are queued for a class that pending deploy
+runners do not cover, the queen does not mint another runner while a standby
+exists. It lists the standby in `start_standby` and the drone starts it as an
+ordinary lease. When the drone reports the lease in `active_leases` the queen
+marks it `pending`, then `running` once GitHub shows the runner busy; the next
+tick mints a replacement standby. A standby that ended on the queen's side is
+listed in `drop_standby` and the drone forgets it.
+
+Fail-open rule: the drone config key `fail_open_after_secs` (default 120, `0`
+disables it; `borg drone install --fail-open-after-secs N`) is how long the
+queen may go without answering a heartbeat. After that the drone starts all
+the standbys it holds, with no instruction from the queen, and keeps retrying
+heartbeats. The drone keeps standbys in memory and, when `state_dir` is set, in
+`<state_dir>/standby/<lease id>.json` (mode 0600), so a restart while the queen
+is down still has them; the file is deleted when the standby starts. When the
+queen returns, `held_standby` reports what is unstarted and `active_leases`
+what runs, and the queen reconciles.
+
+A standby is a single-use ephemeral runner, so after fail-open consumes it no
+further deploy job runs until the queen returns and mints another. Pair it with
+`--trust deploy-only` for a dedicated promotion box.
 
 ## Drone
 
@@ -551,6 +817,19 @@ jobs run as the drone's own account and the drone logs a warning.
 * `borg drone run --token-file F` and `borg drone install --token-file F` read
   the token from a file instead of the command line.
 
+### Drone trust
+
+`trust` in the drone config is `"shared"` (default), `"deploy"` or
+`"deploy-only"`. A `deploy-only` drone serves deploy-scope leases and nothing
+else: no main, no pull-request work, no work units. The drone
+reports it in every heartbeat and `/status` shows it per drone. The queen
+places deploy demand only on `deploy` drones, never places pull-request demand
+or work units on them, and may place main demand on either. Set it on the
+host, for example `"trust": "deploy"` in `drone.json` or
+`borg drone install --trust deploy`; nothing is set on the queen. A deploy
+drone should be a host that no pull-request job has touched, since the
+invariant only covers what the queen schedules.
+
 ### Owner caps
 
 `--max-vcpu`, `--max-mem-mib` and `--max-leases` (config keys of the same
@@ -566,7 +845,9 @@ budget, so an owner can say "this PC gives at most 8 vCPUs and 24 GiB".
    environment. Jobs see `BORG_LEASE_ID`, `BORG_DOCKER_PREFIX`,
    `COMPOSE_PROJECT_NAME` (both `borg-<lease_id>`) and `BORG_CACHE_ROOT`.
 2. When the runner exits, or `max_job_secs` passes, the process group is
-   killed, and the work directory (including `_diag`) is deleted.
+   killed, and the work directory (including `_diag`) is deleted. If the queen
+   preempts the lease (see [Preemption](#preemption)), the group gets SIGINT
+   first and is killed after `preempt_grace_secs` (default 30).
 3. Docker containers, networks and volumes are removed only if `docker
    inspect` shows they carry the label `borg.lease=<lease_id>`, the compose
    project `borg-<lease_id>`, or a name that is exactly that prefix or starts

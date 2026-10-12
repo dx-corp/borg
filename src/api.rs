@@ -20,10 +20,11 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::allocator::{
-    ActiveLease, HostCaps, LeaseState, Reservation, Unmet, free_room, free_slots, max_slots,
+    ActiveLease, AdmissionState, HostCaps, LeaseState, Reservation, Unmet, free_room, free_slots,
+    max_slots,
 };
 use crate::bid::{ClassPressure, DroneBid};
-use crate::classes::{Class, Scope};
+use crate::classes::{Class, Scope, Trust};
 use crate::enroll::hash_token;
 use crate::envcontract::{CheckState, EnvFacts, Need, Verdict, blocked_classes, evaluate};
 use crate::health::{DroneHealth, HealthState};
@@ -56,6 +57,13 @@ pub struct HeartbeatRequest {
     /// Labels the drone asks to have added to its runners.
     #[serde(default)]
     pub extra_labels: Vec<String>,
+    /// `shared` (default), `deploy` or `deploy-only`; see [`Trust`].
+    #[serde(default)]
+    pub trust: Trust,
+    /// Standby lease ids the drone holds unstarted; acknowledges their JIT
+    /// configs. Leases the drone started are in `active_leases` instead.
+    #[serde(default)]
+    pub held_standby: Vec<String>,
     /// Outcome of an update this drone just ran. The queen may use it as
     /// rollout evidence or ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,6 +106,18 @@ fn sanitize_facts(f: &EnvFacts, now: i64) -> EnvFacts {
             t.rustc_version = clip(&t.rustc_version);
         }
     }
+    // Only probe-list names, with bounded printable versions.
+    out.tools = out.tools.as_ref().map(|m| {
+        m.iter()
+            .filter(|(k, _)| crate::envcontract::PROBE_TOOLS.contains(&k.as_str()))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.chars().filter(|c| !c.is_control()).take(80).collect(),
+                )
+            })
+            .collect()
+    });
     out
 }
 
@@ -139,7 +159,7 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseGrant {
     pub lease_id: String,
     pub class: Class,
@@ -177,6 +197,20 @@ pub struct HeartbeatResponse {
     /// Demand pressure per class, for the drone to set its bids against.
     #[serde(default)]
     pub pressure: Vec<ClassPressure>,
+    /// Leases the queen preempted for higher-priority demand; stop their jobs
+    /// (resent until the lease ends).
+    #[serde(default)]
+    pub cancel_leases: Vec<String>,
+    /// Standby deploy runners to hold unstarted (resent until the drone lists
+    /// them in `held_standby`).
+    #[serde(default)]
+    pub standby: Vec<LeaseGrant>,
+    /// Held standby leases to start now: deploy jobs are queued for them.
+    #[serde(default)]
+    pub start_standby: Vec<String>,
+    /// Held standby leases that ended on the queen's side; forget them.
+    #[serde(default)]
+    pub drop_standby: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -188,6 +222,9 @@ pub struct ResultRequest {
     /// Compact per-job summary; see [`crate::telemetry`] for the wire format.
     #[serde(default)]
     pub telemetry: Option<JobTelemetry>,
+    /// The drone stopped the job because the queen preempted the lease.
+    #[serde(default)]
+    pub preempted: bool,
 }
 
 #[derive(Debug)]
@@ -198,6 +235,8 @@ pub enum ApiError {
     Unauthorized,
     NotFound,
     Forbidden,
+    /// 403 with a message the client can show.
+    ForbiddenWith(String),
     Conflict,
     Unprocessable,
     Internal(String),
@@ -224,6 +263,7 @@ impl IntoResponse for ApiError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
             Self::NotFound => StatusCode::NOT_FOUND.into_response(),
             Self::Forbidden => StatusCode::FORBIDDEN.into_response(),
+            Self::ForbiddenWith(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
             Self::Conflict => StatusCode::CONFLICT.into_response(),
             Self::Unprocessable => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
             Self::Internal(msg) => {
@@ -343,6 +383,7 @@ async fn heartbeat(
         .set_version(&drone, sanitize_version(req.version.as_deref()), now)
         .await?;
     store.set_extra_labels(&drone, &req.extra_labels).await?;
+    store.set_trust(&drone, req.trust).await?;
     store.set_bids(&drone, &sanitize_bids(&req.bids)).await?;
     if let Some(facts) = &req.env_facts {
         store
@@ -353,6 +394,42 @@ async fn heartbeat(
         store.record_reclaim(&drone, stats).await?;
     }
     store.acknowledge(&drone, &req.active_leases).await?;
+    store
+        .promote_standby(
+            &drone,
+            &req.active_leases,
+            now,
+            queen.config().lease_ttl_secs,
+        )
+        .await?;
+    let standby_rows = store.standby_leases(&drone).await?;
+    let start = queen.snapshot().start_standby;
+    let start_standby: Vec<String> = standby_rows
+        .iter()
+        .filter(|l| start.contains(&l.id))
+        .map(|l| l.id.clone())
+        .collect();
+    let drop_standby: Vec<String> = req
+        .held_standby
+        .iter()
+        .filter(|id| !standby_rows.iter().any(|l| &l.id == *id))
+        .cloned()
+        .collect();
+    let standby: Vec<LeaseGrant> = standby_rows
+        .into_iter()
+        .filter(|l| !req.held_standby.contains(&l.id))
+        .filter_map(|l| {
+            Some(LeaseGrant {
+                lease_id: l.id,
+                class: l.class,
+                scope: l.scope,
+                labels: l.labels,
+                runner_name: l.runner_name,
+                jit_config: l.jit_config?,
+                expires_at: l.expires_at,
+            })
+        })
+        .collect();
     let (units, cancel_units) = if queen.config().units.enabled {
         store.ack_units(&drone, &req.active_units, now).await?;
         store
@@ -406,6 +483,15 @@ async fn heartbeat(
         cancel_units,
         desired_version: queen.desired_version(&drone),
         pressure: queen.snapshot().pressure,
+        cancel_leases: store
+            .preempted_active()
+            .await?
+            .into_iter()
+            .filter_map(|(id, d)| (d == drone).then_some(id))
+            .collect(),
+        standby,
+        start_standby,
+        drop_standby,
     }))
 }
 
@@ -448,8 +534,10 @@ async fn lease_result(
 
 #[derive(Debug, Serialize)]
 pub struct ClassStatus {
+    pub queued_deploy: u32,
     pub queued_main: u32,
     pub queued_pr: u32,
+    pub oldest_age_secs_deploy: u64,
     pub oldest_age_secs_main: u64,
     pub oldest_age_secs_pr: u64,
     /// Leases of this class the fleet could hold if it were empty (theoretical
@@ -458,10 +546,37 @@ pub struct ClassStatus {
     /// Leases of this class that fit right now: capacity minus every active
     /// lease, on drones that are fresh and take new leases.
     pub free_slots: u32,
+    pub demand_deploy: ScopeDemand,
     pub demand_main: ScopeDemand,
     pub demand_pr: ScopeDemand,
     pub leases_pending: u32,
     pub leases_running: u32,
+}
+
+impl ClassStatus {
+    fn queued(&self, scope: Scope) -> u32 {
+        match scope {
+            Scope::Deploy => self.queued_deploy,
+            Scope::Main => self.queued_main,
+            Scope::Pr => self.queued_pr,
+        }
+    }
+
+    fn oldest_age_secs(&self, scope: Scope) -> u64 {
+        match scope {
+            Scope::Deploy => self.oldest_age_secs_deploy,
+            Scope::Main => self.oldest_age_secs_main,
+            Scope::Pr => self.oldest_age_secs_pr,
+        }
+    }
+
+    fn demand(&self, scope: Scope) -> &ScopeDemand {
+        match scope {
+            Scope::Deploy => &self.demand_deploy,
+            Scope::Main => &self.demand_main,
+            Scope::Pr => &self.demand_pr,
+        }
+    }
 }
 
 /// Queued demand for one label, split by who can serve it. The split is an
@@ -487,6 +602,8 @@ pub struct DroneStatus {
     pub heartbeat_age_secs: Option<i64>,
     pub fresh: bool,
     pub accepting: bool,
+    /// `shared` or `deploy`: which scopes the drone may run.
+    pub trust: Trust,
     pub hostname: Option<String>,
     pub kind: Option<crate::probe::HostKind>,
     pub vcpu: Option<u32>,
@@ -514,6 +631,16 @@ pub struct DroneStatus {
     /// The build environment contract as it stands for this drone; absent when
     /// the contract is off.
     pub contract: Option<ContractStatus>,
+    /// CPU-pressure admission from the last pass; absent for drones the last
+    /// pass did not consider.
+    pub admission: Option<DroneAdmissionView>,
+}
+
+/// What CPU pressure currently lets this drone take.
+#[derive(Debug, Serialize)]
+pub struct DroneAdmissionView {
+    pub state: AdmissionState,
+    pub cpu_psi_pm: Option<u16>,
 }
 
 /// One drone's build environment contract.
@@ -577,8 +704,17 @@ pub struct Status {
     /// entries.
     pub reclaim: ReclaimSummary,
     pub units: UnitsStatus,
+    /// Present when the supersede janitor is enabled.
+    pub janitor: Option<crate::janitor::JanitorView>,
+    /// Present when preempted jobs are re-run (preemption and the janitor
+    /// are both configured).
+    pub requeue: Option<crate::requeue::RequeueView>,
     /// The newest quarantine and health audit entries.
     pub health_events: Vec<crate::store::HealthLogRow>,
+    /// The newest leases cancelled for higher-priority demand.
+    pub preemptions: Vec<crate::store::PreemptionRow>,
+    /// All-time preemption counts by victim scope and starving scope.
+    pub preemption_counts: Vec<(Scope, Scope, u64)>,
 }
 
 #[derive(Debug, Serialize)]
@@ -595,6 +731,9 @@ pub struct UnitsStatus {
     pub joins: u64,
     /// Submissions answered with a stored receipt since the queen started.
     pub receipt_hits: u64,
+    /// Units cancelled by a newer submission with the same `supersede_key`
+    /// since the queen started.
+    pub superseded: u64,
     pub oldest_queued_age_secs: u64,
     pub recent: Vec<crate::units::Unit>,
     /// Why queued units are not admitted on drones that otherwise match them
@@ -756,6 +895,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             heartbeat_age_secs: age,
             fresh,
             accepting: d.accepting,
+            trust: d.trust,
             hostname: d.capacity.as_ref().map(|c| c.hostname.clone()),
             kind: d.capacity.as_ref().map(|c| c.kind),
             vcpu: d.capacity.as_ref().map(|c| c.vcpu),
@@ -774,6 +914,14 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             version: d.version.clone(),
             health: snap.health.get(&d.name).cloned(),
             reclaim: d.reclaim.clone(),
+            admission: snap
+                .admission
+                .iter()
+                .find(|a| a.drone_id == d.name)
+                .map(|a| DroneAdmissionView {
+                    state: a.state,
+                    cpu_psi_pm: a.cpu_psi_pm,
+                }),
             contract: cfg.env_contract.enabled.then(|| {
                 let verdict = |class| {
                     let need =
@@ -823,12 +971,15 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         classes.insert(
             class,
             ClassStatus {
+                queued_deploy: entry(Scope::Deploy).map_or(0, |q| q.queued),
                 queued_main: entry(Scope::Main).map_or(0, |q| q.queued),
                 queued_pr: entry(Scope::Pr).map_or(0, |q| q.queued),
+                oldest_age_secs_deploy: entry(Scope::Deploy).map_or(0, |q| q.oldest_age_secs),
                 oldest_age_secs_main: entry(Scope::Main).map_or(0, |q| q.oldest_age_secs),
                 oldest_age_secs_pr: entry(Scope::Pr).map_or(0, |q| q.oldest_age_secs),
                 slots: slots.get(&class).copied().unwrap_or(0),
                 free_slots: free_by_class.get(&class).copied().unwrap_or(0),
+                demand_deploy: scope_demand(&snap, cfg, class, Scope::Deploy),
                 demand_main: scope_demand(&snap, cfg, class, Scope::Main),
                 demand_pr: scope_demand(&snap, cfg, class, Scope::Pr),
                 leases_pending: count(LeaseStatus::Pending),
@@ -875,6 +1026,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
                 counts: store.unit_counts().await?,
                 joins,
                 receipt_hits,
+                superseded: queen.units_superseded(),
                 oldest_queued_age_secs: queued
                     .first()
                     .map_or(0, |u| u64::try_from(now - u.created_at).unwrap_or(0)),
@@ -882,11 +1034,15 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
                 not_admitted: unit_blocks(cfg, &rows, &queued, now),
             }
         },
+        janitor: queen.janitor().map(crate::janitor::Janitor::view),
+        requeue: queen.requeuer().map(crate::requeue::Requeuer::view),
         reclaim: ReclaimSummary {
             reclaimed_bytes_logged: queen.store().reclaim_bytes_logged().await?,
             events: queen.store().reclaim_log(20).await?,
         },
         health_events: queen.store().health_log(20).await?,
+        preemptions: queen.store().preemptions(20).await?,
+        preemption_counts: queen.store().preemption_counts().await?,
     })
 }
 
@@ -954,13 +1110,7 @@ pub fn render_metrics(status: &Status) -> String {
     gauge(
         "borg_queued_jobs",
         "Queued jobs per class and scope.",
-        both(&|s, sc| {
-            f64::from(if sc == Scope::Main {
-                s.queued_main
-            } else {
-                s.queued_pr
-            })
-        }),
+        both(&|s, sc| f64::from(s.queued(sc))),
     );
     gauge(
         "borg_oldest_queued_age_seconds",
@@ -970,11 +1120,7 @@ pub fn render_metrics(status: &Status) -> String {
                 clippy::cast_precision_loss,
                 reason = "ages are far below 2^52 seconds"
             )]
-            let v = (if sc == Scope::Main {
-                s.oldest_age_secs_main
-            } else {
-                s.oldest_age_secs_pr
-            }) as f64;
+            let v = s.oldest_age_secs(sc) as f64;
             v
         }),
     );
@@ -1082,24 +1228,12 @@ pub fn render_metrics(status: &Status) -> String {
     gauge(
         "borg_queued_borg_placeable",
         "Queued jobs borg has to place: queued minus idle non-borg runners with the label (estimate).",
-        both(&|s, sc| {
-            f64::from(if sc == Scope::Main {
-                s.demand_main.borg_placeable
-            } else {
-                s.demand_pr.borg_placeable
-            })
-        }),
+        both(&|s, sc| f64::from(s.demand(sc).borg_placeable)),
     );
     gauge(
         "borg_queued_claimable_by_static",
         "Queued jobs idle non-borg runners with the label can take (estimate).",
-        both(&|s, sc| {
-            f64::from(if sc == Scope::Main {
-                s.demand_main.claimable_by_static_estimate
-            } else {
-                s.demand_pr.claimable_by_static_estimate
-            })
-        }),
+        both(&|s, sc| f64::from(s.demand(sc).claimable_by_static_estimate)),
     );
     gauge(
         "borg_active_leases",
@@ -1152,6 +1286,42 @@ pub fn render_metrics(status: &Status) -> String {
                             st.as_str()
                         ),
                         f64::from(u8::from(h.state == st)),
+                    )
+                })
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_drone_cpu_psi_pm",
+        "Fresh CPU pressure (`some avg10`, permille) reported by the drone; absent when unknown or admission is off.",
+        status
+            .drones
+            .iter()
+            .filter_map(|d| {
+                let psi = d.admission.as_ref()?.cpu_psi_pm?;
+                Some((
+                    format!("drone=\"{}\"", label_value(&d.name)),
+                    f64::from(psi),
+                ))
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_drone_admission",
+        "1 for the drone's CPU-pressure admission state (open, pr_blocked, closed).",
+        status
+            .drones
+            .iter()
+            .filter_map(|d| d.admission.as_ref().map(|a| (d, a)))
+            .flat_map(|(d, a)| {
+                AdmissionState::ALL.into_iter().map(move |st| {
+                    (
+                        format!(
+                            "drone=\"{}\",state=\"{}\"",
+                            label_value(&d.name),
+                            st.as_str()
+                        ),
+                        f64::from(u8::from(a.state == st)),
                     )
                 })
             })
@@ -1442,10 +1612,109 @@ pub fn render_metrics(status: &Status) -> String {
             vec![(String::new(), status.units.receipt_hits as f64)],
         );
         gauge(
+            "borg_units_superseded_total",
+            "Work units cancelled by a newer submission with the same supersede key since the queen started.",
+            vec![(String::new(), status.units.superseded as f64)],
+        );
+        gauge(
             "borg_unit_oldest_queued_age_seconds",
             "Age of the oldest queued work unit.",
             vec![(String::new(), status.units.oldest_queued_age_secs as f64)],
         );
+    }
+    if let Some(j) = &status.janitor {
+        let t = &j.total;
+        for (field, help, v) in [
+            (
+                "considered",
+                "Pull-request runs the janitor examined",
+                t.considered,
+            ),
+            (
+                "superseded",
+                "Runs whose head was no longer the pull request's head",
+                t.superseded,
+            ),
+            (
+                "cancelled",
+                "Queued superseded runs the janitor cancelled",
+                t.cancelled,
+            ),
+            (
+                "cancelled_running",
+                "Running superseded runs the janitor cancelled",
+                t.cancelled_running,
+            ),
+            (
+                "duplicates",
+                "Same-workflow same-commit runs beyond the one kept",
+                t.duplicates,
+            ),
+            (
+                "dedup_cancelled",
+                "Queued duplicate runs the janitor cancelled",
+                t.dedup_cancelled,
+            ),
+            (
+                "would_cancel",
+                "Runs a dry-run janitor would have cancelled",
+                t.would_cancel,
+            ),
+            (
+                "deferred",
+                "Runs left for a later pass by the per-pass cap",
+                t.deferred,
+            ),
+            (
+                "raced",
+                "Runs that changed state before the janitor cancelled them",
+                t.raced,
+            ),
+            (
+                "errors",
+                "Janitor per-run or per-pull-request failures",
+                t.errors,
+            ),
+        ] {
+            gauge(
+                &format!("borg_janitor_{field}_total"),
+                &format!("{help}, summed over passes since the queen started."),
+                vec![(String::new(), f64::from(v))],
+            );
+        }
+    }
+    if let Some(r) = &status.requeue {
+        let t = &r.total;
+        for (field, help, v) in [
+            ("checked", "Preempted jobs the requeuer examined", t.checked),
+            ("rerun", "Preempted jobs re-run", t.rerun),
+            (
+                "waiting",
+                "Preempted jobs whose run had not completed",
+                t.waiting,
+            ),
+            (
+                "stale",
+                "Preempted jobs older than 24 hours, skipped",
+                t.stale,
+            ),
+            (
+                "terminal",
+                "Preempted jobs GitHub refused to re-run (403, 404 or 409)",
+                t.terminal,
+            ),
+            (
+                "errors",
+                "Requeue failures retried on a later pass",
+                t.errors,
+            ),
+        ] {
+            gauge(
+                &format!("borg_requeue_{field}_total"),
+                &format!("{help}, summed over passes since the queen started."),
+                vec![(String::new(), f64::from(v))],
+            );
+        }
     }
     gauge(
         "borg_reservations",
@@ -1524,6 +1793,18 @@ pub fn render_metrics(status: &Status) -> String {
             },
         )],
     );
+    let _ = writeln!(
+        out,
+        "# HELP borg_preemptions_total Leases cancelled for higher-priority demand.\n# TYPE borg_preemptions_total counter"
+    );
+    for (from, to, n) in &status.preemption_counts {
+        let _ = writeln!(
+            out,
+            "borg_preemptions_total{{from_scope=\"{}\",to_scope=\"{}\"}} {n}",
+            from.as_str(),
+            to.as_str()
+        );
+    }
     out
 }
 
@@ -1535,10 +1816,7 @@ fn label_value(v: &str) -> String {
 }
 
 fn scope_name(s: Scope) -> &'static str {
-    match s {
-        Scope::Main => "main",
-        Scope::Pr => "pr",
-    }
+    s.as_str()
 }
 
 async fn metrics(State(queen): State<Arc<Queen>>) -> Result<Response, ApiError> {
@@ -1598,8 +1876,13 @@ pub async fn serve(
                 // Cancel-safe for the same reason as the ticker above.
                 tokio::select! {
                     _ = every.tick() => {
-                        let report = janitor.pass(&queen.config().repos).await;
-                        tracing::debug!("janitor pass: {report:?}");
+                        janitor.pass(&queen.config().repos).await;
+                        if let Some(requeuer) = queen.requeuer() {
+                            let now = OffsetDateTime::now_utc().unix_timestamp();
+                            if let Err(e) = requeuer.pass(queen.store(), now).await {
+                                tracing::warn!("requeue pass failed: {e}");
+                            }
+                        }
                     }
                     _ = stop_rx.changed() => break,
                 }
