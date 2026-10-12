@@ -25,15 +25,6 @@ name = "suite"
 path = "tests/suite.rs"
 
 [[test]]
-name = "host_suite"
-path = "tests/host_suite.rs"
-
-# Keep the largest test module independently compilable for focused edits.
-[[test]]
-name = "queen"
-path = "tests/queen.rs"
-
-[[test]]
 name = "sccache_slots"
 path = "tests/sccache_slots.rs"
 

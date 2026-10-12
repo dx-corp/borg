@@ -1,5 +1,5 @@
 //! Exercise the public CLI's local and authenticated HTTP history reads.
-mod support;
+use crate::support;
 
 use std::path::Path;
 use std::process::Output;

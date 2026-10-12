@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 use borg::allocator::{AllocatorInput, Demand, DroneState, HostCaps, PlacementDecision, allocate};
 use borg::bid::ScoreWeights;
