@@ -711,15 +711,20 @@ fn the_cli_remote_only_flag_prevents_local_execution_and_emits_a_result() {
         clippy::disallowed_methods,
         reason = "test invokes the Borg CLI with a local sentinel"
     )]
-    let output = Command::new(env!("CARGO_BIN_EXE_borg"))
-        .current_dir(&r.dir)
-        .env_remove("BORG_QUEEN")
-        .env_remove("BORG_RUN_REMOTE_ONLY")
-        .args(["run", "--remote-only", "--result-file"])
-        .arg(&result_path)
-        .args(["--", "sh", "-c", "touch ran-locally"])
-        .output()
-        .unwrap();
+    let output = Command::new(
+        option_env!("CARGO_BIN_EXE_borg")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("CARGO_BIN_EXE_borg").map(PathBuf::from))
+            .expect("Cargo binary path available at runtime"),
+    )
+    .current_dir(&r.dir)
+    .env_remove("BORG_QUEEN")
+    .env_remove("BORG_RUN_REMOTE_ONLY")
+    .args(["run", "--remote-only", "--result-file"])
+    .arg(&result_path)
+    .args(["--", "sh", "-c", "touch ran-locally"])
+    .output()
+    .unwrap();
     assert_eq!(output.status.code(), Some(125));
     assert!(output.stdout.is_empty());
     assert!(!Path::new(&marker(&r)).exists());
