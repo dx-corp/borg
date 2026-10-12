@@ -1,6 +1,6 @@
 //! Real privilege separation. Needs root (to change user) and util-linux
 //! `setpriv`; skipped otherwise. Run it with, for example,
-//! `sudo -E cargo test --test job_user -- --nocapture`.
+//! `sudo -E cargo test --test host_suite job_user:: -- --nocapture`.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

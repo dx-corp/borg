@@ -1241,3 +1241,87 @@ async fn a_standby_started_during_an_outage_is_reconciled_when_the_queen_returns
     let body = standby_beat(&h, &dep, &[&id], &[]).await;
     assert_eq!(body["drop_standby"], json!([id]));
 }
+
+fn mirror_cfg() -> Value {
+    json!({"mirror_auth": {
+        "app_id": "12345",
+        "private_key_path": "/etc/borg/mirror-app.pem",
+        "repositories": ["app"]
+    }})
+}
+
+#[tokio::test]
+async fn the_minter_scopes_the_token_to_contents_read_on_the_named_repositories() {
+    let h = Harness::start(json!({})).await;
+    let client =
+        borg::github::GithubClient::new(&h.gh_url, support::ORG, "12345", h.private_pem.as_bytes())
+            .unwrap();
+    let (token, expires_at) = client
+        .installation_token_scoped(&json!({"contents": "read"}), &["app".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(token.expose(), support::MIRROR_TOKEN);
+    assert!(expires_at > OffsetDateTime::now_utc().unix_timestamp());
+    let bodies = h.state().scoped_requests.clone();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["permissions"]["contents"], "read");
+    assert_eq!(bodies[0]["repositories"], json!(["app"]));
+    assert_eq!(
+        bodies[0]["permissions"].as_object().unwrap().len(),
+        1,
+        "no other permission is requested"
+    );
+}
+
+#[tokio::test]
+async fn heartbeats_carry_the_mirror_credential_only_when_configured() {
+    let off = Harness::start(json!({})).await;
+    let token = off.enroll("d1").await;
+    let body = off.heartbeat_with(&token, json!({})).await;
+    assert!(body.get("mirror_credential").is_none(), "{body}");
+    assert_eq!(
+        off.status().await["mirror_auth"],
+        json!({"configured": false, "expires_at": null})
+    );
+
+    let on = Harness::start(mirror_cfg()).await;
+    let token = on.enroll("d1").await;
+    let body = on.heartbeat_with(&token, json!({})).await;
+    let cred = &body["mirror_credential"];
+    assert_eq!(cred["token"], support::MIRROR_TOKEN);
+    assert_eq!(cred["repositories"], json!(["example-org/app"]));
+    let expires_at = cred["expires_at"].as_i64().unwrap();
+    assert!(expires_at > OffsetDateTime::now_utc().unix_timestamp());
+
+    let status = on.status().await;
+    assert_eq!(
+        status["mirror_auth"],
+        json!({"configured": true, "expires_at": expires_at})
+    );
+    assert!(
+        !status.to_string().contains(support::MIRROR_TOKEN),
+        "/status never shows the token"
+    );
+}
+
+#[tokio::test]
+async fn the_mirror_token_is_cached_until_ten_minutes_of_life_remain() {
+    let h = Harness::start(mirror_cfg()).await;
+    let token = h.enroll("d1").await;
+    for _ in 0..3 {
+        h.heartbeat_with(&token, json!({})).await;
+    }
+    assert_eq!(
+        h.state().scoped_requests.len(),
+        1,
+        "heartbeats reuse the cached token"
+    );
+
+    // A token that lives five minutes is always inside the re-mint window.
+    let short = Harness::start(mirror_cfg()).await;
+    short.state().token_ttl_secs = Some(300);
+    let token = short.enroll("d1").await;
+    short.heartbeat_with(&token, json!({})).await;
+    short.heartbeat_with(&token, json!({})).await;
+    assert_eq!(short.state().scoped_requests.len(), 2);
+}

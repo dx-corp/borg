@@ -196,6 +196,23 @@ fn unix_now() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
 }
 
+/// Where a GitHub API caller gets its bearer token: a fixed secret, or the
+/// queen's own App installation token, minted and refreshed on demand.
+#[derive(Clone)]
+pub enum TokenSource {
+    Static(Secret),
+    App(std::sync::Arc<GithubClient>),
+}
+
+impl TokenSource {
+    pub async fn bearer(&self) -> Result<Secret, GithubError> {
+        match self {
+            TokenSource::Static(s) => Ok(s.clone()),
+            TokenSource::App(c) => c.installation_token().await,
+        }
+    }
+}
+
 impl GithubClient {
     pub fn new(
         api_base: &str,
@@ -262,18 +279,66 @@ impl GithubClient {
         serde_json::from_slice(&bytes).map_err(|e| GithubError::Decode(format!("{path}: {e}")))
     }
 
-    /// A valid installation token, refreshed when near expiry.
-    async fn installation_token(&self) -> Result<Secret, GithubError> {
+    /// The App's installation id in the configured org, looked up once.
+    async fn installation_id(&self, auth: &mut AuthState, jwt: &str) -> Result<u64, GithubError> {
         #[derive(Deserialize)]
         struct Installation {
             id: u64,
         }
+        if let Some(id) = auth.installation_id {
+            return Ok(id);
+        }
+        let path = format!("/orgs/{}/installation", self.org);
+        let rb = self.request(Method::GET, &path).bearer_auth(jwt);
+        let found: Installation = self.send(Method::GET, &path, rb).await?;
+        auth.installation_id = Some(found.id);
+        Ok(found.id)
+    }
+
+    /// POST `/app/installations/{id}/access_tokens`; a `body` down-scopes the token.
+    async fn mint(
+        &self,
+        auth: &mut AuthState,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(Secret, i64), GithubError> {
         #[derive(Deserialize)]
         struct Issued {
             token: String,
             expires_at: String,
         }
+        let jwt = self.app_jwt()?;
+        let installation_id = self.installation_id(auth, &jwt).await?;
+        let path = format!("/app/installations/{installation_id}/access_tokens");
+        let mut rb = self.request(Method::POST, &path).bearer_auth(&jwt);
+        if let Some(body) = body {
+            rb = rb.json(body);
+        }
+        let issued: Issued = self.send(Method::POST, &path, rb).await?;
+        let expires_at = OffsetDateTime::parse(&issued.expires_at, &Rfc3339)
+            .map_err(|e| GithubError::Decode(format!("expires_at: {e}")))?
+            .unix_timestamp();
+        Ok((Secret::new(issued.token), expires_at))
+    }
 
+    /// Mint a fresh installation token limited to `permissions` (for example
+    /// `{"contents": "read"}`) on the named `repositories` (bare names in the
+    /// org), returning it with its expiry (unix seconds). Not cached here: the
+    /// caller decides how long to keep it.
+    pub async fn installation_token_scoped(
+        &self,
+        permissions: &serde_json::Value,
+        repositories: &[String],
+    ) -> Result<(Secret, i64), GithubError> {
+        let body = serde_json::json!({
+            "permissions": permissions,
+            "repositories": repositories,
+        });
+        let mut auth = self.auth.lock().await;
+        self.mint(&mut auth, Some(&body)).await
+    }
+
+    /// A valid installation token, refreshed when near expiry.
+    pub(crate) async fn installation_token(&self) -> Result<Secret, GithubError> {
         let mut auth = self.auth.lock().await;
         let now = unix_now();
         if let Some(t) = &auth.token
@@ -281,24 +346,7 @@ impl GithubClient {
         {
             return Ok(t.value.clone());
         }
-        let jwt = self.app_jwt()?;
-        let installation_id = match auth.installation_id {
-            Some(id) => id,
-            None => {
-                let path = format!("/orgs/{}/installation", self.org);
-                let rb = self.request(Method::GET, &path).bearer_auth(&jwt);
-                let found: Installation = self.send(Method::GET, &path, rb).await?;
-                auth.installation_id = Some(found.id);
-                found.id
-            }
-        };
-        let path = format!("/app/installations/{installation_id}/access_tokens");
-        let rb = self.request(Method::POST, &path).bearer_auth(&jwt);
-        let issued: Issued = self.send(Method::POST, &path, rb).await?;
-        let expires_at = OffsetDateTime::parse(&issued.expires_at, &Rfc3339)
-            .map_err(|e| GithubError::Decode(format!("expires_at: {e}")))?
-            .unix_timestamp();
-        let value = Secret::new(issued.token);
+        let (value, expires_at) = self.mint(&mut auth, None).await?;
         auth.token = Some(CachedToken {
             value: value.clone(),
             expires_at,

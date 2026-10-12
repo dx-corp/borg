@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 use borg::classes::{Class, Scope};
 use borg::store::{LeaseRow, LeaseStatus};

@@ -241,6 +241,9 @@ impl Drone {
         };
         let resp = self.client.heartbeat(&req).await?;
         let defer = self.after_heartbeat(&req, resp.desired_version.as_deref());
+        if let Some(credential) = resp.mirror_credential {
+            self.caches.set_mirror_credential(credential);
+        }
         if let Ok(preempts) = self.preempts.lock() {
             for id in &resp.cancel_leases {
                 if let Some(tx) = preempts.get(id) {

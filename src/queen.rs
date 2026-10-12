@@ -35,6 +35,7 @@ use crate::github::{GithubClient, GithubError, QueuedJob, Runner, WorkflowJob};
 use crate::health::{DroneHealth, DroneInfo, Outcome, OutcomeKind, evaluate};
 use crate::homeostasis::{Controller, KeyInput, KeyReport};
 use crate::janitor::Janitor;
+use crate::mirror_auth::MirrorAuth;
 use crate::preempt::{PreemptInput, Running, select as select_victims};
 use crate::probe::Capacity;
 use crate::profile::{ClassProfile, build_profiles};
@@ -167,6 +168,7 @@ pub struct Queen {
     janitor: Option<Janitor>,
     requeuer: Option<Requeuer>,
     tailnet: Option<TailnetEnroll>,
+    mirror_auth: Option<MirrorAuth>,
     homeostasis: std::sync::Mutex<Controller>,
     profile_cache: std::sync::Mutex<Option<(i64, Vec<ClassProfile>)>>,
     wake: std::sync::Mutex<WakePlanner>,
@@ -346,6 +348,7 @@ impl Queen {
             janitor: None,
             requeuer: None,
             tailnet: None,
+            mirror_auth: None,
             homeostasis: std::sync::Mutex::new(Controller::new()),
             profile_cache: std::sync::Mutex::new(None),
             wake: std::sync::Mutex::new(WakePlanner::new()),
@@ -377,6 +380,17 @@ impl Queen {
     pub fn with_tailnet_enroll(mut self, enroll: TailnetEnroll) -> Self {
         self.tailnet = Some(enroll);
         self
+    }
+
+    /// Hand drones short-lived read-only tokens for their git mirrors.
+    #[must_use]
+    pub fn with_mirror_auth(mut self, mirror_auth: MirrorAuth) -> Self {
+        self.mirror_auth = Some(mirror_auth);
+        self
+    }
+
+    pub fn mirror_auth(&self) -> Option<&MirrorAuth> {
+        self.mirror_auth.as_ref()
     }
 
     /// Replace how magic packets are sent (tests use a recording fake).

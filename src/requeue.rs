@@ -4,9 +4,9 @@
 //! slot. The queen records `(repo, run, job)` in the `preemptions` table with
 //! `requeued_at` unset. This pass re-runs each recorded job through the jobs
 //! rerun API once its run has completed (GitHub refuses to re-run a job of a
-//! run that is still in progress). It uses the supersede janitor's token,
-//! which has `actions: write`, and the janitor's `dry_run` and
-//! `max_cancels_per_pass` settings.
+//! run that is still in progress). It uses the supersede janitor's token
+//! source (the queen's App token by default), which has `actions: write`, and
+//! the janitor's `dry_run` and `max_cancels_per_pass` settings.
 //!
 //! * a run that is not `completed` is left for a later pass;
 //! * a rerun answered 403, 404 or 409 (job gone, retention expired, or already
@@ -23,7 +23,7 @@ use reqwest::{Method, RequestBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::config::JanitorSettings;
-use crate::github::GithubError;
+use crate::github::{GithubError, TokenSource};
 use crate::janitor::status_error;
 use crate::secret::Secret;
 use crate::store::{Store, StoreError};
@@ -78,7 +78,7 @@ struct Run {
 pub struct Requeuer {
     http: reqwest::Client,
     api_base: String,
-    token: Secret,
+    token: TokenSource,
     dry_run: bool,
     max_per_pass: u32,
     view: Mutex<RequeueView>,
@@ -89,6 +89,14 @@ impl Requeuer {
     pub fn new(
         api_base: &str,
         token: Secret,
+        settings: &JanitorSettings,
+    ) -> Result<Self, GithubError> {
+        Self::with_token_source(api_base, TokenSource::Static(token), settings)
+    }
+
+    pub fn with_token_source(
+        api_base: &str,
+        token: TokenSource,
         settings: &JanitorSettings,
     ) -> Result<Self, GithubError> {
         let http = reqwest::Client::builder()
@@ -109,17 +117,19 @@ impl Requeuer {
         self.view.lock().expect("requeue view lock").clone()
     }
 
-    fn request(&self, method: Method, path: &str) -> RequestBuilder {
-        self.http
+    async fn request(&self, method: Method, path: &str) -> Result<RequestBuilder, GithubError> {
+        let token = self.token.bearer().await?;
+        Ok(self
+            .http
             .request(method, format!("{}{path}", self.api_base))
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(self.token.expose())
+            .bearer_auth(token.expose()))
     }
 
     async fn run_status(&self, repo: &str, run: u64) -> Result<String, GithubError> {
         let path = format!("/repos/{repo}/actions/runs/{run}");
-        let resp = self.request(Method::GET, &path).send().await?;
+        let resp = self.request(Method::GET, &path).await?.send().await?;
         let status = resp.status();
         if !status.is_success() {
             return Err(status_error("GET", &path, status.as_u16(), resp).await);
@@ -133,7 +143,7 @@ impl Requeuer {
     /// Re-run a job. `Ok(Some(code))` is a terminal refusal (403, 404, 409).
     async fn rerun(&self, repo: &str, job: u64) -> Result<Option<u16>, GithubError> {
         let path = format!("/repos/{repo}/actions/jobs/{job}/rerun");
-        let resp = self.request(Method::POST, &path).send().await?;
+        let resp = self.request(Method::POST, &path).await?.send().await?;
         match resp.status().as_u16() {
             200..=299 => Ok(None),
             code @ (403 | 404 | 409) => Ok(Some(code)),

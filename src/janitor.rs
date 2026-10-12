@@ -8,9 +8,10 @@
 //! duplicates of a run of the same workflow, commit, event and pull request.
 //! Duplicate groups never include `workflow_dispatch` or `merge_group` runs,
 //! and a running duplicate is never cancelled. The
-//! janitor is opt-in (`supersede_janitor` in the queen config) and uses its own
-//! token, because cancelling runs needs `actions: write` and the queen's App
-//! deliberately does not have it.
+//! janitor is opt-in (`supersede_janitor` in the queen config). Cancelling
+//! runs needs `actions: write`: the janitor uses the queen's App installation
+//! token (minted and refreshed on demand) unless the config names a static
+//! token.
 //!
 //! Safety rules, all enforced here:
 //! * only runs that are `queued` are candidates (`in_progress` ones too when
@@ -34,7 +35,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::config::JanitorSettings;
-use crate::github::GithubError;
+use crate::github::{GithubError, TokenSource};
 use crate::secret::Secret;
 
 /// Upper bound on pages of queued runs read per repository (100 per page).
@@ -120,15 +121,24 @@ struct PullHead {
 pub struct Janitor {
     http: reqwest::Client,
     api_base: String,
-    token: Secret,
+    token: TokenSource,
     settings: JanitorSettings,
     view: Mutex<JanitorView>,
 }
 
 impl Janitor {
+    /// A janitor with a fixed token.
     pub fn new(
         api_base: &str,
         token: Secret,
+        settings: JanitorSettings,
+    ) -> Result<Self, GithubError> {
+        Self::with_token_source(api_base, TokenSource::Static(token), settings)
+    }
+
+    pub fn with_token_source(
+        api_base: &str,
+        token: TokenSource,
         settings: JanitorSettings,
     ) -> Result<Self, GithubError> {
         let http = reqwest::Client::builder()
@@ -152,16 +162,18 @@ impl Janitor {
         &self.settings
     }
 
-    fn request(&self, method: Method, path: &str) -> RequestBuilder {
-        self.http
+    async fn request(&self, method: Method, path: &str) -> Result<RequestBuilder, GithubError> {
+        let token = self.token.bearer().await?;
+        Ok(self
+            .http
             .request(method, format!("{}{path}", self.api_base))
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(self.token.expose())
+            .bearer_auth(token.expose()))
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, GithubError> {
-        let resp = self.request(Method::GET, path).send().await?;
+        let resp = self.request(Method::GET, path).await?.send().await?;
         let status = resp.status();
         if !status.is_success() {
             return Err(status_error("GET", path, status.as_u16(), resp).await);
@@ -174,7 +186,7 @@ impl Janitor {
     /// cancelled (already finished), which is fine.
     async fn cancel(&self, repo: &str, run: u64) -> Result<bool, GithubError> {
         let path = format!("/repos/{repo}/actions/runs/{run}/cancel");
-        let resp = self.request(Method::POST, &path).send().await?;
+        let resp = self.request(Method::POST, &path).await?.send().await?;
         let status = resp.status();
         match status.as_u16() {
             200..=299 => Ok(true),

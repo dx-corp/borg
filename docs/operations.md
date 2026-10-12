@@ -534,7 +534,9 @@ front), and its service user needs access to the tailscaled socket
 
 The optional supersede janitor cancels queued pull-request workflow runs whose
 head commit is no longer the pull request's head. Add a `supersede_janitor`
-block (`token_path` or `BORG_JANITOR_TOKEN` for a token with `actions: write`,
+block (optionally `token_path` or `BORG_JANITOR_TOKEN` for a static token with
+`actions: write`; without either the janitor uses the queen's own App installation
+token, minted and refreshed on demand, so the App needs Actions: read and write;
 `dry_run` defaulting to true, `interval_secs`, `max_cancels_per_pass`) to turn
 it on. By default it never cancels a run that has started.
 
@@ -925,10 +927,43 @@ Notes on each kind:
   ```
 
   Mirrors fetch from `remote_base` (default `https://github.com`) plus
-  `<owner>/<name>.git`. The drone holds no GitHub credentials: for a private
-  repository give the service user a credential helper, or set `remote_base` to
-  an ssh base such as `git@host:` with a read-only deploy key. A failed refresh
-  keeps the previous mirror and never blocks a job.
+  `<owner>/<name>.git`. The drone holds no long-lived GitHub credentials and no
+  App key. For a private repository either let the queen hand it a short-lived
+  read-only token (see Mirror credentials below), give the service user a
+  credential helper, or set `remote_base` to an ssh base such as `git@host:`
+  with a read-only deploy key. A failed refresh keeps the previous mirror and
+  never blocks a job.
+
+  **Mirror credentials.** When deploy keys are disabled, a second GitHub App
+  (installed on the organization with repository permission Contents: read)
+  can refresh private mirrors. Its key stays on the queen. Add to `queen.toml`:
+
+  ```toml
+  [mirror_auth]
+  app_id = "12345"
+  private_key_path = "/etc/borg/mirror-app.pem"
+  repositories = ["app"]
+  ```
+
+  `repositories` are bare names in `github.org` (no slashes). Set
+  `BORG_MIRROR_APP_PRIVATE_KEY` to the PEM text instead of `private_key_path`
+  to pass the key in the environment. Without a `mirror_auth` block nothing
+  changes. The queen mints an installation token limited to `contents: read` on
+  those repositories, which GitHub expires after one hour, keeps it, and mints a
+  new one when under ten minutes of life remain. Every heartbeat response then
+  carries `mirror_credential` (`token`, `expires_at`, and the `owner/name`
+  repositories it covers), so resending is the refresh. The drone keeps it in
+  memory only, replaces it on each heartbeat and drops it at `expires_at`. For a
+  repository in the credential, and only when `caches.git.remote_base` is an
+  `https://` base, the drone fetches with `git -c http.extraheader=...`: the
+  token is never written to the mirror's config, the stored remote URL stays
+  credential-free, and an ssh base ignores the credential. While a fetch runs
+  the header is visible in that drone's process list. The queen speaks plain
+  HTTP, so run the drone-to-queen channel over TLS or a trusted LAN. `GET
+  /status` shows `mirror_auth` as `{"configured": true, "expires_at": <unix
+  seconds>}` and never the token; the queen never logs it. The first
+  credential after a drone starts refreshes its mirrors at once. Drones need a
+  borg build that understands `mirror_credential`; older drones ignore it.
 
 #### Slots, path remapping and compile-cache keys
 
