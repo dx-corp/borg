@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 use borg::allocator::{
     ActiveLease, Allocation, AllocatorInput, Demand, DroneState, HostCaps, LeaseState, QueueAge,
