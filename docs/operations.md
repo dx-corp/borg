@@ -392,7 +392,7 @@ See [remote execution](remote-execution.md) for remote-only runs and JSON
 results, [work-unit fairness](work-unit-fairness.md) for capacity shares, and
 [placement diagnostics](placement-diagnostics.md) for `borg explain`.
 
-Optional (`units.enabled`, off by default). Clients such as `borg run`, the
+Optional (`units.enabled`, off by default). While off, `/status` `units` shows only `enabled: false`, with empty counts and no recent units. Clients such as `borg run`, the
 pre-commit hook and `mq` submit whole commands; drones run them. Enroll a client
 with `borg queen enroll-client <name>` (prints a token once).
 
@@ -527,6 +527,51 @@ after a cooldown, on probation (one lease at a time), once a few jobs succeed.
 Tune it with a `health` block in the queen config (`auto_quarantine`,
 `half_life_secs`, `window_secs`, `corroboration_runs`, `cooldown_secs`,
 `proof_jobs`, and the bounds); `/status` shows each drone's `health`.
+
+### Drone availability and expiry
+
+A drone whose last heartbeat is older than `drone_stale_secs` (60) is
+`stale`. It holds no schedulable capacity: it is left out of `slots`,
+`free_slots` and placement, whatever its `health` says. `health` and
+`profiles` describe past failures and speed only. Each drone in `/status`
+carries `availability` (`alive` or `stale`), `last_seen_age_secs` and, for a
+stale drone that will be removed, `expires_in_secs`. `stale_drones` lists the
+stale names. When a drone goes stale, a `drone_stale` health event is logged.
+
+A drone that stays silent past its expiry is removed with its token and lease
+records, and a `drone_expired` health event is logged. Configure the expiry in
+the queen config:
+
+```json
+"drone_expiry": {"after_secs": 604800, "burst_prefixes": ["gcp-burst-"], "burst_after_secs": 1800}
+```
+
+`after_secs` (7 days by default) applies to every drone. `burst_after_secs`
+(30 minutes) applies to drones whose name starts with one of
+`burst_prefixes`; cloud burst drones delete themselves and never come back
+under the same token. 0 turns either expiry off. A drone named in
+`wake.hosts`, or one that has never sent a heartbeat, is never removed. A
+removed drone that comes back has to be enrolled again.
+
+`/status` `capacity` shows, per class, `schedulable_slots` (what the alive,
+accepting drones could hold if empty) and `free_slots` next to `unmet_main`,
+`unmet_pr` and `unmet_deploy`. The unmet counts are the last pass's
+`unmet_placeable`. When main demand of a class in `capacity_alarm.classes`
+stays unmet for `capacity_alarm.after_secs` while that class has at most
+`capacity_alarm.max_slots` schedulable slots, the queen logs a
+`capacity_starved` event (drone `fleet`; the reason names the stale drones).
+When the condition clears, it logs `capacity_restored`. `capacity.<class>.alarm`
+and the metric `borg_capacity_starved{class}` show whether the alarm is
+raised, and `borg_unmet_jobs{class,scope}` exports the unmet counts. The
+alarm is on by default for heavy and medium, with `max_slots` 2 and
+`after_secs` 600:
+
+```json
+"capacity_alarm": {"enabled": true, "classes": ["heavy", "medium"], "max_slots": 2, "after_secs": 600}
+```
+
+All of these events go to the same audit trail as quarantines: `health_log`,
+shown as `health_events` in `/status`, and a `WARN` line in the queen journal.
 
 ### Tailnet enrollment
 
@@ -1128,7 +1173,23 @@ sccache server per host (its configuration then applies to all jobs, and a job
 whose sccache version differs from the host binary's restarts it); the drone
 reads its totals with `sccache --show-stats --stats-format json` and reports
 hits and misses for `sccache` in heartbeats, `/status` and `borg_cache_hits`.
-Without it those fields stay empty.
+Without it, `hits` and `misses` are null and each cache's `counters` says
+`unknown`. mono's `setup-sccache` action starts one server per job on its own
+socket, so the real counts for those builds are in each job's log, in the
+`sccache --show-stats` step. `counters` is `reported` when the numbers are
+real, and `not_tracked` for kinds that have no hit counters.
+
+`size_status` says whether `size_bytes` covers the whole cache. `measured`
+means every directory was listed. `partial` means some directories could not
+be listed by the drone's user, so the size is a lower bound and the drone logs
+a warning. With a separate job user, sccache creates its directories `0750`
+and owned by the job user. `borg drone install` therefore adds the drone's
+user to the job user's group. On a drone installed before that change, run
+`usermod -aG borg-job borg` and restart the drone between jobs (a self-update
+restarts it too). Until then, `/status` shows `partial` and a size far below
+the real one. On a GCP burst drone on Oct 16, `du` as root measured 4.3G in
+`sccache` while the drone reported 852K. `unknown` means the drone is older
+than these fields.
 
 Every heartbeat carries each cache's size, cap, evicted bytes and last
 collection time (and, for git, how many leases were given a mirror and how many

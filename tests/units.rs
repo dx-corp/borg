@@ -1583,3 +1583,13 @@ async fn pending_pr_runner_covering_main_does_not_inflate_deploy_pressure() {
                     .contains(&Rejection::BidThreshold)
         })));
 }
+
+#[tokio::test]
+async fn disabled_units_show_only_that_they_are_off() {
+    let h = support::Harness::start(json!({})).await;
+    let s = h.status().await;
+    assert_eq!(s["units"]["enabled"], false);
+    assert_eq!(s["units"]["counts"], json!({}));
+    assert_eq!(s["units"]["recent"], json!([]));
+    assert!(!h.metrics().await.contains("borg_units{"));
+}

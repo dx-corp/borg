@@ -95,6 +95,22 @@ pub struct Snapshot {
     pub start_standby: BTreeSet<String>,
     /// `unmet` minus what idle non-borg runners with the label can take.
     pub unmet_placeable: Vec<Unmet>,
+    /// Per class, slots the fresh accepting drones could hold if empty.
+    pub schedulable_slots: BTreeMap<Class, u32>,
+    /// Per class, since when main demand has been unmet with schedulable
+    /// slots at or under `capacity_alarm.max_slots`.
+    pub starved_since: BTreeMap<Class, i64>,
+    /// Classes whose `capacity_starved` event is raised and not yet restored.
+    pub starved: BTreeSet<Class>,
+}
+
+/// What the fleet watch remembers between passes.
+#[derive(Debug, Default)]
+struct FleetWatch {
+    /// Fresh drones at the previous pass; `None` before the first.
+    prev_fresh: Option<BTreeSet<String>>,
+    starved_since: BTreeMap<Class, i64>,
+    raised: BTreeSet<Class>,
 }
 
 /// Runners in the organization that borg did not mint, for one label.
@@ -212,6 +228,7 @@ pub struct Queen {
     unit_cursor: std::sync::Mutex<BTreeMap<Scope, String>>,
     wake_sender: Arc<dyn WakeSender>,
     tick_lock: tokio::sync::Mutex<()>,
+    watch: std::sync::Mutex<FleetWatch>,
 }
 
 /// The full label set a JIT runner is registered with: the labels GitHub
@@ -393,6 +410,7 @@ impl Queen {
             unit_cursor: std::sync::Mutex::new(BTreeMap::new()),
             wake_sender: Arc::new(UdpWakeSender),
             tick_lock: tokio::sync::Mutex::new(()),
+            watch: std::sync::Mutex::new(FleetWatch::default()),
         }
     }
 
@@ -540,6 +558,9 @@ impl Queen {
             tracing::warn!("rollout pass failed: {e}");
         }
         let profiles = self.profiles(now_ts).await;
+        if let Err(e) = self.expire_drones(now_ts).await {
+            tracing::warn!("drone expiry failed: {e}");
+        }
         let drone_rows = self.store.drones().await?;
         let mut fresh_names: BTreeSet<String> = BTreeSet::new();
         let mut capacities: HashMap<String, Capacity> = HashMap::new();
@@ -597,6 +618,7 @@ impl Queen {
                 );
             }
         }
+        let schedulable_slots = self.class_slots(&drones);
         if let Err(e) = self.advance_units(now_ts, &fresh_names).await {
             tracing::warn!("unit pass failed: {e}");
         }
@@ -730,6 +752,15 @@ impl Queen {
         // hosts for.
         let unmet_placeable = placeable_unmet(&allocation.unmet, &statics, &self.cfg.classes);
         let wake = self.wake_pass(now_ts, &unmet_placeable, &fresh_names).await;
+        let (starved_since, starved) = self
+            .watch_fleet(
+                now_ts,
+                &drone_rows,
+                &fresh_names,
+                &schedulable_slots,
+                &unmet_placeable,
+            )
+            .await;
         let mut mint_error = None;
         let mut lease_error = None;
         let mut persisted = BTreeSet::new();
@@ -917,6 +948,9 @@ impl Queen {
             s.static_runners = statics;
             s.start_standby = start_standby;
             s.unmet_placeable = unmet_placeable;
+            s.schedulable_slots = schedulable_slots;
+            s.starved_since = starved_since;
+            s.starved = starved;
         });
         if let Err(e) = self
             .store
@@ -1931,6 +1965,119 @@ impl Queen {
     }
 
     /// Per-class totals for status and metrics: slots the fleet could hold.
+    /// Remove drones silent past their `drone_expiry` window (never one named
+    /// in `wake.hosts`, never one that has not heartbeated yet) and log each
+    /// removal as a `drone_expired` health event.
+    async fn expire_drones(&self, now: i64) -> Result<(), StoreError> {
+        for d in self.store.drones().await? {
+            let Some(last) = d.last_heartbeat else {
+                continue;
+            };
+            let Some(after) = self.cfg.drone_expiry.expiry_for(&d.name) else {
+                continue;
+            };
+            let silent = now - last;
+            if silent <= after.max(self.cfg.drone_stale_secs)
+                || self.cfg.wake.hosts.iter().any(|h| h.name == d.name)
+            {
+                continue;
+            }
+            if let Some(dropped) = self.store.remove_drone(&d.name).await? {
+                let reason = format!(
+                    "no heartbeat for {silent}s (expiry {after}s); {dropped} unfinished leases dropped"
+                );
+                tracing::warn!("expired drone {}: {reason}", d.name);
+                self.store
+                    .record_health_event(now, &d.name, "drone_expired", &reason)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Log drones that went stale since the last pass, and raise or clear the
+    /// capacity alarm per class. Returns the alarm state for the snapshot.
+    async fn watch_fleet(
+        &self,
+        now: i64,
+        rows: &[DroneRow],
+        fresh: &BTreeSet<String>,
+        slots: &BTreeMap<Class, u32>,
+        unmet: &[Unmet],
+    ) -> (BTreeMap<Class, i64>, BTreeSet<Class>) {
+        let alarm = &self.cfg.capacity_alarm;
+        let stale: Vec<&str> = rows
+            .iter()
+            .filter(|d| !fresh.contains(&d.name))
+            .map(|d| d.name.as_str())
+            .collect();
+        let mut events: Vec<(String, &'static str, String)> = Vec::new();
+        let state = {
+            let mut w = self.watch.lock().expect("fleet watch lock");
+            if let Some(prev) = &w.prev_fresh {
+                for d in rows
+                    .iter()
+                    .filter(|d| prev.contains(&d.name) && !fresh.contains(&d.name))
+                {
+                    let age = d.last_heartbeat.map_or(-1, |t| now - t);
+                    events.push((
+                        d.name.clone(),
+                        "drone_stale",
+                        format!("no heartbeat for {age}s"),
+                    ));
+                }
+            }
+            w.prev_fresh = Some(fresh.clone());
+            for class in Class::ALL {
+                let main: u32 = unmet
+                    .iter()
+                    .filter(|u| u.class == class && u.scope == Scope::Main)
+                    .map(|u| u.count)
+                    .sum();
+                let have = slots.get(&class).copied().unwrap_or(0);
+                if alarm.enabled
+                    && alarm.classes.contains(&class)
+                    && main > 0
+                    && have <= alarm.max_slots
+                {
+                    let since = *w.starved_since.entry(class).or_insert(now);
+                    if now - since >= alarm.after_secs && w.raised.insert(class) {
+                        events.push((
+                            "fleet".to_owned(),
+                            "capacity_starved",
+                            format!(
+                                "{class}: {main} main jobs unmet for {}s with {have} schedulable slots; stale drones: [{}]",
+                                now - since,
+                                stale.join(", ")
+                            ),
+                        ));
+                    }
+                } else {
+                    w.starved_since.remove(&class);
+                    if w.raised.remove(&class) {
+                        events.push((
+                            "fleet".to_owned(),
+                            "capacity_restored",
+                            format!("{class}: {have} schedulable slots, {main} main jobs unmet"),
+                        ));
+                    }
+                }
+            }
+            (w.starved_since.clone(), w.raised.clone())
+        };
+        for (drone, event, reason) in events {
+            tracing::warn!("{event} {drone}: {reason}");
+            if let Err(e) = self
+                .store
+                .record_health_event(now, &drone, event, &reason)
+                .await
+            {
+                tracing::warn!("record {event} failed: {e}");
+            }
+        }
+        state
+    }
+
     pub(crate) fn class_slots(&self, drones: &[DroneState]) -> BTreeMap<Class, u32> {
         Class::ALL
             .into_iter()
