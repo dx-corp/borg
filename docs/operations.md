@@ -560,12 +560,58 @@ the others only if they are still queued; a running duplicate is never
 cancelled. `workflow_dispatch` and `merge_group` runs are never grouped,
 because publication waits on those exact runs. Each cancellation is logged with
 the id of the run that was kept. With `dry_run` the log and `would_cancel` show
-what would have been cancelled. When the janitor is enabled, `GET /status` has
-a `janitor` object (`passes`, `last`, `total`, each with the counters
-`considered`, `superseded`, `cancelled`, `cancelled_running`, `duplicates`,
-`dedup_cancelled`, `would_cancel`, `deferred`, `raced`, `errors`) and
-`GET /metrics` has `borg_janitor_<counter>_total`, summed over passes since the
-queen started.
+what would have been cancelled.
+
+The pull request's current head comes from the run's own `pull_requests`
+entry, which GitHub fills at read time with the open pull requests whose head
+branch matches. The janitor reads the pulls API only when that entry carries no
+head, so the App does not need pull-request read access.
+
+Two more lists, both empty by default, cover the runs a closed pull request or
+a newer push leaves behind:
+
+* `closed_pr_workflows`: workflow file paths (`.github/workflows/ci.yml`) or
+  names. A queued `pull_request` run of one of them (a running one too with
+  `cancel_running`) whose head repository is the repository itself and which
+  names no open pull request belongs to a pull request that was closed or
+  merged, and is cancelled. A fresh read must still show no pull request. Do
+  not list a workflow that runs on the `closed` event (teardown, cleanup): its
+  runs look the same.
+* `superseded_push_branches`: branch names, for example `["main"]`. A queued
+  `push` run on one of them is cancelled when a newer queued or running run of
+  the same workflow on the same branch is on another commit. Running push runs
+  are never cancelled, so the branch always finishes its newest started run.
+
+When the janitor is enabled, `GET /status` has a `janitor` object:
+
+* `since`: unix time the queen started; `total` counts from here.
+* `last_pass_at`: unix time of the last pass.
+* `passes`: passes since `since`.
+* `last`: what the last pass alone found. A run that stays queued is found
+  again by every pass, so `last` is the current state.
+* `total`: `last` summed over every pass. Because a run that stays queued or
+  running is counted again on each pass, `duplicates`, `raced`,
+  `uncancellable` and `errors` grow with time even when nothing changes; read
+  `last` to judge the present and the rate of `total` to judge a trend.
+
+| Counter | Meaning |
+| --- | --- |
+| `considered` | `pull_request` runs examined: queued ones, plus running ones with `cancel_running`, that name exactly one pull request or (with `closed_pr_workflows`) none. |
+| `superseded` | Of those, runs whose head is no longer the pull request's head. |
+| `closed_pr` | Runs of `closed_pr_workflows` whose pull request is closed or merged. |
+| `superseded_push` | Queued push runs on `superseded_push_branches` with a newer run of the same workflow. |
+| `cancelled` | Queued runs cancelled for any of the three reasons above. |
+| `cancelled_running` | Running runs cancelled as superseded or closed-PR (`cancel_running`). |
+| `duplicates` | Runs beyond the one kept in a same-workflow, same-commit group (`dedupe_same_sha`), queued or running. Running duplicates are never cancelled, so they are counted again on every pass while they run. |
+| `dedup_cancelled` | Queued duplicates cancelled. |
+| `would_cancel` | Runs `dry_run` would have cancelled, of any kind. |
+| `deferred` | Runs left for a later pass by `max_cancels_per_pass`. |
+| `raced` | Runs whose status, head or pull request changed between the listing and the re-read just before the cancel; left alone. |
+| `uncancellable` | Runs whose cancel GitHub answered with 409. Runs stuck in `queued` for days (for example `workflow_run` runs GitHub never started) answer 409 on every pass and are counted each time. |
+| `errors` | Failed GitHub calls: a run listing for a repository, a pulls API read, a run re-read or a cancel. Each is logged as a `janitor:` warning in the queen journal. |
+
+`GET /metrics` has `borg_janitor_<counter>_total` for each counter, summed over
+passes since the queen started.
 
 The GitHub App needs organization self-hosted runners: read and write, plus
 read access to Actions on the listed repositories. Set

@@ -99,7 +99,7 @@ const TOOLS_TTL_SECS: i64 = 60;
 const TOOL_VERSION_MAX: usize = 80;
 
 /// The first line of a tool's `--version` output, trimmed and clipped to
-/// [`TOOL_VERSION_MAX`] characters; `"unknown"` when there is no output.
+/// `TOOL_VERSION_MAX` characters; `"unknown"` when there is no output.
 pub fn tool_version_line(output: &str) -> String {
     let line = output.lines().map(str::trim).find(|l| !l.is_empty());
     match line {
@@ -140,7 +140,7 @@ pub fn tool_versions(exec: &dyn Exec) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The last tools probe, reused for [`TOOLS_TTL_SECS`].
+/// The last tools probe, reused for `TOOLS_TTL_SECS`.
 #[derive(Clone, Default)]
 pub struct ToolsCache(Arc<Mutex<Option<ToolsProbe>>>);
 

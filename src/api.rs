@@ -1741,13 +1741,23 @@ pub fn render_metrics(status: &Status) -> String {
                 t.superseded,
             ),
             (
+                "closed_pr",
+                "Runs of listed workflows whose pull request was closed or merged",
+                t.closed_pr,
+            ),
+            (
+                "superseded_push",
+                "Queued push runs with a newer run of the same workflow on the branch",
+                t.superseded_push,
+            ),
+            (
                 "cancelled",
-                "Queued superseded runs the janitor cancelled",
+                "Queued superseded, closed-PR or superseded-push runs the janitor cancelled",
                 t.cancelled,
             ),
             (
                 "cancelled_running",
-                "Running superseded runs the janitor cancelled",
+                "Running superseded or closed-PR runs the janitor cancelled",
                 t.cancelled_running,
             ),
             (
@@ -1774,6 +1784,11 @@ pub fn render_metrics(status: &Status) -> String {
                 "raced",
                 "Runs that changed state before the janitor cancelled them",
                 t.raced,
+            ),
+            (
+                "uncancellable",
+                "Runs whose cancel GitHub answered with 409",
+                t.uncancellable,
             ),
             (
                 "errors",
