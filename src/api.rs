@@ -150,9 +150,45 @@ pub struct CacheStat {
     pub max_bytes: Option<u64>,
     pub evicted_bytes: u64,
     pub last_gc_at: Option<i64>,
-    /// Git mirrors only: leases that were handed a mirror / ran without one.
+    /// Git: leases that were handed a mirror / ran without one. sccache:
+    /// the host server's totals (`caches.sccache.server`). See `counters`.
     pub hits: Option<u64>,
     pub misses: Option<u64>,
+    /// Whether `size_bytes` covers the whole cache.
+    #[serde(default)]
+    pub size_status: SizeStatus,
+    /// Whether `hits` and `misses` are real counts.
+    #[serde(default)]
+    pub counters: Counters,
+}
+
+/// How complete a cache's `size_bytes` is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizeStatus {
+    /// Every directory was listed.
+    Measured,
+    /// Some directories could not be listed by the drone's user (for
+    /// example the job user's 0750 sccache directories): a lower bound.
+    Partial,
+    /// The drone did not say (a drone older than this field).
+    #[default]
+    Unknown,
+}
+
+/// What a cache's `hits` and `misses` mean.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Counters {
+    /// Real counts.
+    Reported,
+    /// Counts exist but the drone cannot read them: sccache without a host
+    /// server keeps its counters in each job's own server, which exits with
+    /// the job. Read the job's `sccache --show-stats` output instead.
+    #[default]
+    Unknown,
+    /// The cache kind has no hit counters.
+    NotTracked,
 }
 
 /// A running unit the drone stops listing is considered lost after this.
@@ -679,6 +715,15 @@ pub struct DroneStatus {
     pub name: String,
     pub heartbeat_age_secs: Option<i64>,
     pub fresh: bool,
+    /// `alive` (heartbeat within `drone_stale_secs`) or `stale`. A stale
+    /// drone holds no schedulable capacity whatever its `health` says;
+    /// `health` is the historical failure evidence only.
+    pub availability: Availability,
+    /// Seconds since the last heartbeat; `None` if it never sent one.
+    pub last_seen_age_secs: Option<i64>,
+    /// Seconds until a stale drone is removed (`drone_expiry`); `None` while
+    /// alive or when it is never removed.
+    pub expires_in_secs: Option<i64>,
     pub accepting: bool,
     /// Enforced independently of the optional environment contract.
     pub disk_admission: crate::envcontract::DiskAdmission,
@@ -714,6 +759,31 @@ pub struct DroneStatus {
     /// CPU-pressure admission from the last pass; absent for drones the last
     /// pass did not consider.
     pub admission: Option<DroneAdmissionView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Availability {
+    Alive,
+    Stale,
+}
+
+/// One class's schedulable capacity next to its unmet demand.
+#[derive(Debug, Serialize)]
+pub struct CapacityStatus {
+    /// Slots the alive, accepting drones could hold if empty.
+    pub schedulable_slots: u32,
+    /// Slots free right now on alive, accepting drones.
+    pub free_slots: u32,
+    /// Jobs borg could not place at the last pass (`unmet_placeable`).
+    pub unmet_main: u32,
+    pub unmet_pr: u32,
+    pub unmet_deploy: u32,
+    /// Since when main demand has been unmet with schedulable slots at or
+    /// under `capacity_alarm.max_slots`.
+    pub starved_since: Option<i64>,
+    /// The `capacity_starved` health event is raised and not yet restored.
+    pub alarm: bool,
 }
 
 /// What CPU pressure currently lets this drone take.
@@ -765,6 +835,10 @@ pub struct Status {
     pub classes: BTreeMap<Class, ClassStatus>,
     pub queue: Vec<QueueEntry>,
     pub drones: Vec<DroneStatus>,
+    /// Per class: schedulable slots on alive drones next to unmet demand.
+    pub capacity: BTreeMap<Class, CapacityStatus>,
+    /// Names of drones whose heartbeat is older than `drone_stale_secs`.
+    pub stale_drones: Vec<String>,
     /// Demand the allocator could not place. Counts jobs that non-borg runners
     /// may serve; see `unmet_placeable`.
     pub unmet: Vec<Unmet>,
@@ -991,6 +1065,20 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             name: d.name.clone(),
             heartbeat_age_secs: age,
             fresh,
+            availability: if fresh {
+                Availability::Alive
+            } else {
+                Availability::Stale
+            },
+            last_seen_age_secs: age,
+            expires_in_secs: match (fresh, age, cfg.drone_expiry.expiry_for(&d.name)) {
+                (false, Some(age), Some(after))
+                    if !cfg.wake.hosts.iter().any(|h| h.name == d.name) =>
+                {
+                    Some((after.max(cfg.drone_stale_secs) - age).max(0))
+                }
+                _ => None,
+            },
             accepting: d.accepting && !disk.blocked(),
             disk_admission: disk,
             trust: d.trust,
@@ -1050,6 +1138,35 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
     }
 
     let slots = queen.class_slots(&states);
+    let unmet_of = |class: Class, scope: Scope| -> u32 {
+        snap.unmet_placeable
+            .iter()
+            .filter(|u| u.class == class && u.scope == scope)
+            .map(|u| u.count)
+            .sum()
+    };
+    let capacity: BTreeMap<Class, CapacityStatus> = Class::ALL
+        .into_iter()
+        .map(|class| {
+            (
+                class,
+                CapacityStatus {
+                    schedulable_slots: slots.get(&class).copied().unwrap_or(0),
+                    free_slots: free_by_class.get(&class).copied().unwrap_or(0),
+                    unmet_main: unmet_of(class, Scope::Main),
+                    unmet_pr: unmet_of(class, Scope::Pr),
+                    unmet_deploy: unmet_of(class, Scope::Deploy),
+                    starved_since: snap.starved_since.get(&class).copied(),
+                    alarm: snap.starved.contains(&class),
+                },
+            )
+        })
+        .collect();
+    let stale_drones: Vec<String> = drones
+        .iter()
+        .filter(|d| d.availability == Availability::Stale)
+        .map(|d| d.name.clone())
+        .collect();
     let mut classes = BTreeMap::new();
     for class in Class::ALL {
         let entry = |scope| {
@@ -1105,6 +1222,8 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         classes,
         queue: snap.queue,
         drones,
+        capacity,
+        stale_drones,
         unmet: snap.unmet,
         unmet_placeable: snap.unmet_placeable,
         reserved_for: snap.reserved_for,
@@ -1115,7 +1234,20 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         homeostasis: snap.homeostasis,
         profiles: snap.profiles,
         wake: snap.wake,
-        units: {
+        // Disabled units show only `enabled: false`: old records are not
+        // live state, and no unit is placed or served.
+        units: if !cfg.units.enabled {
+            UnitsStatus {
+                enabled: false,
+                counts: BTreeMap::new(),
+                joins: 0,
+                receipt_hits: 0,
+                superseded: 0,
+                oldest_queued_age_secs: 0,
+                recent: Vec::new(),
+                not_admitted: Vec::new(),
+            }
+        } else {
             let (joins, receipt_hits) = queen.unit_reuse_counts();
             let store = queen.store();
             let queued = store.units_in(&[crate::units::UnitState::Queued]).await?;
@@ -1297,6 +1429,31 @@ pub fn render_metrics(status: &Status) -> String {
             .classes
             .iter()
             .map(|(c, s)| (format!("class=\"{c}\""), f64::from(s.free_slots)))
+            .collect(),
+    );
+    gauge(
+        "borg_unmet_jobs",
+        "Jobs borg could not place at the last pass, less what idle non-borg runners can take.",
+        status
+            .capacity
+            .iter()
+            .flat_map(|(c, v)| {
+                [
+                    ("main", v.unmet_main),
+                    ("pr", v.unmet_pr),
+                    ("deploy", v.unmet_deploy),
+                ]
+                .map(|(scope, n)| (format!("class=\"{c}\",scope=\"{scope}\""), f64::from(n)))
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_capacity_starved",
+        "1 while the capacity_starved health event is raised for a class.",
+        status
+            .capacity
+            .iter()
+            .map(|(c, v)| (format!("class=\"{c}\""), f64::from(u8::from(v.alarm))))
             .collect(),
     );
     gauge(

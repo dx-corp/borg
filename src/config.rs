@@ -108,6 +108,70 @@ fn default_janitor_max() -> u32 {
     20
 }
 
+/// A drone silent past `drone_stale_secs` is `stale`: it holds no
+/// schedulable capacity. One silent past its expiry is removed (token and
+/// lease records with it) and the removal is logged as a health event.
+/// Drones named in `wake.hosts` are never removed.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DroneExpirySettings {
+    /// Remove a drone silent this long; 0 never removes.
+    pub after_secs: i64,
+    /// Name prefixes of short-lived cloud drones (for example `gcp-burst-`).
+    pub burst_prefixes: Vec<String>,
+    /// Remove a drone matching `burst_prefixes` silent this long; 0 never.
+    pub burst_after_secs: i64,
+}
+
+impl Default for DroneExpirySettings {
+    fn default() -> Self {
+        Self {
+            after_secs: 7 * 86_400,
+            burst_prefixes: Vec::new(),
+            burst_after_secs: 1800,
+        }
+    }
+}
+
+impl DroneExpirySettings {
+    /// The silence after which `name` is removed, if ever.
+    pub fn expiry_for(&self, name: &str) -> Option<i64> {
+        let secs = if self
+            .burst_prefixes
+            .iter()
+            .any(|p| name.starts_with(p.as_str()))
+        {
+            self.burst_after_secs
+        } else {
+            self.after_secs
+        };
+        (secs > 0).then_some(secs)
+    }
+}
+
+/// Raise a `capacity_starved` health event when main demand of a class stays
+/// unmet while the fleet's schedulable slots for it are at most `max_slots`
+/// for `after_secs`, and `capacity_restored` when that ends.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CapacityAlarmSettings {
+    pub enabled: bool,
+    pub classes: Vec<Class>,
+    pub max_slots: u32,
+    pub after_secs: i64,
+}
+
+impl Default for CapacityAlarmSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            classes: vec![Class::Heavy, Class::Medium],
+            max_slots: 2,
+            after_secs: 600,
+        }
+    }
+}
+
 /// Standby deploy runners; present means enabled. See `docs/operations.md`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -187,6 +251,12 @@ pub struct QueenConfig {
     /// A drone silent for longer than this gets no new leases.
     #[serde(default = "default_drone_stale")]
     pub drone_stale_secs: i64,
+    /// When silent drones are removed; see [`DroneExpirySettings`].
+    #[serde(default)]
+    pub drone_expiry: DroneExpirySettings,
+    /// The fleet-capacity alarm; see [`CapacityAlarmSettings`].
+    #[serde(default)]
+    pub capacity_alarm: CapacityAlarmSettings,
     /// Demand older than this triggers the starvation guard. `false` (or JSON
     /// `null`) disables it; TOML has no null.
     #[serde(default = "default_starvation", deserialize_with = "secs_or_off")]

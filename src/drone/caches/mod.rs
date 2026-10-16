@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use tokio::sync::{OnceCell, OwnedRwLockReadGuard, RwLock};
 
-use crate::api::CacheStat;
+use crate::api::{CacheStat, Counters, SizeStatus};
 use crate::drone::config::DroneConfig;
 use crate::drone::exec::Exec;
 use crate::drone::fsops::FsOps;
@@ -59,6 +59,8 @@ struct Track {
     /// sccache only, from the host server.
     hits: Option<u64>,
     misses: Option<u64>,
+    /// The last measurement missed directories the drone could not list.
+    partial: bool,
 }
 
 pub struct Caches {
@@ -296,9 +298,10 @@ impl Caches {
         let root = self.cfg.cache_root.clone();
         let fs_ops = Arc::clone(&self.fs_ops);
         let work = tokio::task::spawn_blocking(move || {
-            let mut out: Vec<(&'static str, u64, u64)> = Vec::new();
+            let mut out: Vec<(&'static str, u64, u64, bool)> = Vec::new();
             for (kind, cap) in plan {
-                let (mut size, _) = gc::measure(&kind.dir(&root));
+                let measured = gc::measure_tree(&kind.dir(&root));
+                let mut size = measured.size;
                 let mut freed = 0;
                 if let Some(cap) = cap
                     && size > cap
@@ -308,19 +311,25 @@ impl Caches {
                     freed = gc::evict_lru(fs_ops.as_ref(), units, pool, cap).freed_bytes;
                     size = size.saturating_sub(freed);
                 }
-                out.push((kind.name(), size, freed));
+                out.push((kind.name(), size, freed, measured.unreadable_dirs > 0));
             }
-            let (git_size, _) = gc::measure(&root.join("git"));
-            out.push(("git", git_size, 0));
+            let git = gc::measure_tree(&root.join("git"));
+            out.push(("git", git.size, 0, git.unreadable_dirs > 0));
             out
         })
         .await;
         let Ok(results) = work else { return };
         let now = unix_now();
         if let Ok(mut tracks) = self.tracks.lock() {
-            for (name, size, freed) in results {
+            for (name, size, freed, partial) in results {
+                if partial {
+                    tracing::warn!(
+                        "cache {name}: some directories are not readable by the drone's user; size {size} is a lower bound"
+                    );
+                }
                 let t = tracks.entry(name).or_default();
                 t.size_bytes = size;
+                t.partial = partial;
                 if freed > 0 {
                     t.evicted_bytes += freed;
                     t.last_gc_at = Some(now);
@@ -351,6 +360,11 @@ impl Caches {
                 } else {
                     (t.hits, t.misses)
                 };
+                let counters = match (name, hits) {
+                    (_, Some(_)) => Counters::Reported,
+                    ("sccache", None) => Counters::Unknown,
+                    _ => Counters::NotTracked,
+                };
                 CacheStat {
                     name: name.to_owned(),
                     size_bytes: t.size_bytes,
@@ -359,6 +373,12 @@ impl Caches {
                     last_gc_at: t.last_gc_at,
                     hits,
                     misses,
+                    size_status: if t.partial {
+                        SizeStatus::Partial
+                    } else {
+                        SizeStatus::Measured
+                    },
+                    counters,
                 }
             })
             .collect()
@@ -592,6 +612,7 @@ mod tests {
         c.maintain().await;
         let git = c.stats().into_iter().find(|s| s.name == "git").unwrap();
         assert_eq!((git.hits, git.misses), (Some(1), Some(0)));
+        assert_eq!(git.counters, Counters::Reported);
     }
 
     #[tokio::test]
@@ -638,6 +659,10 @@ mod tests {
             Some(100 << 30),
             "sccache reports its own cap"
         );
+        // No host server: the counts live in each job's own server.
+        assert_eq!((sccache.hits, sccache.counters), (None, Counters::Unknown));
+        assert_eq!(sccache.size_status, SizeStatus::Measured);
+        assert_eq!(cargo.counters, Counters::NotTracked);
     }
 
     #[tokio::test]

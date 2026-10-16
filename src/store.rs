@@ -785,6 +785,18 @@ impl Store {
         Ok(true)
     }
 
+    /// Append a fleet or drone event (stale, expired, capacity) to the
+    /// health audit trail that `/status` shows as `health_events`.
+    pub async fn record_health_event(
+        &self,
+        at: i64,
+        drone: &str,
+        event: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        self.log_health(at, drone, event, Some(reason), None).await
+    }
+
     async fn log_health(
         &self,
         at: i64,
@@ -1768,6 +1780,8 @@ VALUES ('l1', 'd1', 'medium', 'pr', '[\"a\"]', 'borg-d1-l1', 7, 'jit', 'pending'
             last_gc_at: Some(100),
             hits: None,
             misses: None,
+            size_status: crate::api::SizeStatus::Measured,
+            counters: crate::api::Counters::NotTracked,
         };
         s.record_heartbeat(
             "d1",

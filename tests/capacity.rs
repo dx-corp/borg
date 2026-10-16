@@ -127,3 +127,118 @@ async fn wake_on_lan_ignores_demand_that_non_borg_runners_will_take() {
     }
     assert_eq!(h.wakes.0.lock().unwrap().len(), 1);
 }
+
+fn events(s: &Value) -> Vec<(String, String)> {
+    s["health_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["drone"].as_str().unwrap().to_owned(),
+                e["event"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+async fn status_at(h: &Harness, at: OffsetDateTime) -> Value {
+    let s = borg::api::build_status(&h.queen, at.unix_timestamp())
+        .await
+        .unwrap();
+    serde_json::to_value(s).unwrap()
+}
+
+#[tokio::test]
+async fn silent_drones_are_stale_then_expired_burst_drones_first() {
+    let h = Harness::start(json!({
+        "drone_expiry": {"after_secs": 3600, "burst_prefixes": ["gcp-burst-"], "burst_after_secs": 600},
+        "capacity_alarm": {"enabled": false}
+    }))
+    .await;
+    let burst = h.enroll("gcp-burst-1").await;
+    let onprem = h.enroll("pve-1").await;
+    h.heartbeat(&burst, &[]).await;
+    h.heartbeat(&onprem, &[]).await;
+    let t0 = OffsetDateTime::now_utc();
+    h.queen.tick(t0).await.unwrap();
+
+    let s = status_at(&h, t0).await;
+    assert_eq!(drone(&s, "gcp-burst-1")["availability"], "alive");
+    assert_eq!(s["capacity"]["heavy"]["schedulable_slots"], 2);
+    assert_eq!(s["stale_drones"], json!([]));
+
+    // Silent past drone_stale_secs: stale, no schedulable capacity, health
+    // untouched, and one drone_stale event each.
+    let t1 = t0 + time::Duration::seconds(120);
+    h.queen.tick(t1).await.unwrap();
+    let s = status_at(&h, t1).await;
+    let d = drone(&s, "gcp-burst-1");
+    assert_eq!(d["availability"], "stale");
+    assert!(d["last_seen_age_secs"].as_i64().unwrap() >= 120);
+    assert!(d["expires_in_secs"].as_i64().unwrap() <= 480);
+    assert_eq!(s["capacity"]["heavy"]["schedulable_slots"], 0);
+    assert_eq!(s["stale_drones"], json!(["gcp-burst-1", "pve-1"]));
+    let ev = events(&s);
+    assert!(
+        ev.contains(&("gcp-burst-1".into(), "drone_stale".into())),
+        "{ev:?}"
+    );
+    assert!(
+        ev.contains(&("pve-1".into(), "drone_stale".into())),
+        "{ev:?}"
+    );
+
+    // Past the burst expiry only the burst drone is removed.
+    let t2 = t0 + time::Duration::seconds(700);
+    h.queen.tick(t2).await.unwrap();
+    let s = status_at(&h, t2).await;
+    let names: Vec<&str> = s["drones"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["pve-1"]);
+    assert!(events(&s).contains(&("gcp-burst-1".into(), "drone_expired".into())));
+    assert!(h.heartbeat(&burst, &[]).await.status().is_client_error());
+
+    let t3 = t0 + time::Duration::seconds(3700);
+    h.queen.tick(t3).await.unwrap();
+    assert_eq!(status_at(&h, t3).await["drones"], json!([]));
+}
+
+#[tokio::test]
+async fn unmet_main_demand_without_capacity_raises_and_clears_the_alarm() {
+    let h = Harness::start(json!({
+        "capacity_alarm": {"after_secs": 60, "max_slots": 0}
+    }))
+    .await;
+    h.queue_job(1, "borg-ci-heavy", 5);
+    let t0 = OffsetDateTime::now_utc();
+    h.queen.tick(t0).await.unwrap();
+    let s = status_at(&h, t0).await;
+    assert_eq!(s["capacity"]["heavy"]["unmet_main"], 1);
+    assert_eq!(s["capacity"]["heavy"]["schedulable_slots"], 0);
+    assert_eq!(s["capacity"]["heavy"]["alarm"], false);
+    assert!(s["capacity"]["heavy"]["starved_since"].is_i64());
+
+    let t1 = t0 + time::Duration::seconds(61);
+    h.queen.tick(t1).await.unwrap();
+    let s = status_at(&h, t1).await;
+    assert_eq!(s["capacity"]["heavy"]["alarm"], true);
+    assert!(events(&s).contains(&("fleet".into(), "capacity_starved".into())));
+    assert!(
+        h.metrics()
+            .await
+            .contains("borg_capacity_starved{class=\"heavy\"} 1")
+    );
+
+    // A drone that can take the job arrives: the alarm clears.
+    let t = h.enroll("d1").await;
+    h.heartbeat(&t, &[]).await;
+    h.tick().await;
+    let s = h.status().await;
+    assert_eq!(s["capacity"]["heavy"]["alarm"], false);
+    assert!(events(&s).contains(&("fleet".into(), "capacity_restored".into())));
+}

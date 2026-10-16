@@ -580,6 +580,30 @@ impl Installer<'_> {
             && job != daemon
         {
             self.ensure_user(&job, &self.layout.job_home.clone())?;
+            // The job user's caches (sccache makes its directories 0750) must
+            // be readable by the drone to measure them; without the group the
+            // drone reports a fraction of their size.
+            if self.opts.platform == Platform::Linux {
+                self.ensure_in_group(&daemon, &job)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_in_group(&mut self, user: &str, group: &str) -> Result<(), InstallError> {
+        let member = self
+            .exec
+            .run("id", &["-nG", user])
+            .is_ok_and(|o| o.success && o.stdout.split_whitespace().any(|g| g == group));
+        if member {
+            self.note("unchanged", format_args!("user {user} in group {group}"));
+        } else if self.opts.dry_run {
+            self.changed = true;
+            self.note("would add", format_args!("user {user} to group {group}"));
+        } else {
+            self.changed = true;
+            self.must("usermod", &["-aG", group, user])?;
+            self.note("added", format_args!("user {user} to group {group}"));
         }
         Ok(())
     }
@@ -1043,7 +1067,7 @@ mod tests {
     fn exec() -> FakeExec {
         let x = FakeExec::default();
         x.on("getent group docker", "docker:x:999:");
-        x.on("id -nG borg", "borg docker");
+        x.on("id -nG borg", "borg docker borg-job");
         x.on("id -nG borg-job", "borg-job docker");
         x
     }
@@ -1374,6 +1398,10 @@ mod tests {
             "the job user is never given the drone's files: {calls:?}"
         );
         assert!(calls.contains(&"usermod -aG docker borg-job".to_owned()));
+        assert!(
+            calls.contains(&"usermod -aG borg-job borg".to_owned()),
+            "the drone reads the job user's caches: {calls:?}"
+        );
         let unit =
             fs::read_to_string(e.root.join("etc/systemd/system/borg-drone.service")).unwrap();
         assert!(

@@ -35,8 +35,25 @@ pub fn parse_size(text: &str) -> Option<u64> {
 /// Total size and the newest file modification/access time under `path`.
 /// Symlinks are counted as themselves, never followed.
 pub fn measure(path: &Path) -> (u64, SystemTime) {
+    let m = measure_tree(path);
+    (m.size, m.newest)
+}
+
+/// What [`measure_tree`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Measured {
+    pub size: u64,
+    pub newest: SystemTime,
+    /// Directories that could not be listed (for example owned by the job
+    /// user and closed to the drone's user): `size` is then a lower bound.
+    pub unreadable_dirs: u64,
+}
+
+/// [`measure`], also counting directories that could not be listed.
+pub fn measure_tree(path: &Path) -> Measured {
     let mut size = 0;
     let mut newest = SystemTime::UNIX_EPOCH;
+    let mut unreadable_dirs = 0;
     let mut stack = vec![path.to_owned()];
     while let Some(dir) = stack.pop() {
         let Ok(meta) = fs::symlink_metadata(&dir) else {
@@ -46,8 +63,11 @@ pub fn measure(path: &Path) -> (u64, SystemTime) {
         if meta.is_dir() {
             // Directory times only record when entries were added or listed;
             // so recency comes from the files.
-            if let Ok(entries) = fs::read_dir(&dir) {
-                stack.extend(entries.flatten().map(|e| e.path()));
+            match fs::read_dir(&dir) {
+                Ok(entries) => stack.extend(entries.flatten().map(|e| e.path())),
+                // Removed between the listing and now: nothing to count.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => unreadable_dirs += 1,
             }
         } else {
             for t in [meta.modified(), meta.accessed()].into_iter().flatten() {
@@ -55,7 +75,11 @@ pub fn measure(path: &Path) -> (u64, SystemTime) {
             }
         }
     }
-    (size, newest)
+    Measured {
+        size,
+        newest,
+        unreadable_dirs,
+    }
 }
 
 /// One evictable entry.
@@ -160,6 +184,22 @@ mod tests {
         for bad in ["", "G", "50", "5g", "5.5G", "-1G", "99999999999999999999G"] {
             assert_eq!(parse_size(bad), None, "{bad}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_directory_makes_the_size_a_lower_bound() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        file(&dir.path().join("open/a"), 10, 5);
+        file(&dir.path().join("closed/b"), 10, 5);
+        let closed = dir.path().join("closed");
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+        let m = measure_tree(dir.path());
+        let listable = fs::read_dir(&closed).is_ok(); // root reads anything
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(m.unreadable_dirs, u64::from(!listable));
+        assert_eq!(measure_tree(dir.path()).unreadable_dirs, 0);
     }
 
     #[test]
