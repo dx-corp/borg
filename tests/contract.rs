@@ -429,3 +429,89 @@ async fn class_specific_job_user_proofs_gate_ci_and_survive_heartbeat_storage() 
             < now() - 3500
     );
 }
+
+#[tokio::test]
+async fn disk_floor_blocks_new_delivery_and_placement_with_contract_off_but_keeps_active_work() {
+    let h = Harness::start(
+        json!({"env_contract": {"enabled": false, "min_cache_dir_free_bytes": 32u64 << 30}}),
+    )
+    .await;
+    let token = h.enroll("disk").await;
+    h.heartbeat_with(&token, json!({})).await;
+    h.queue_job(101, "borg-ci-light-pr", 1);
+    h.tick().await;
+    let initial = h.heartbeat_with(&token, json!({})).await;
+    assert_eq!(initial["min_free_disk_bytes"], 32u64 << 30);
+    let active = initial["leases"][0]["lease_id"].as_str().unwrap();
+    let mut low = serde_json::to_value(support::capacity()).unwrap();
+    low["free_disk_mib"] = json!(8192);
+    let held = h
+        .heartbeat_with(&token, json!({"capacity": low, "active_leases": [active]}))
+        .await;
+    assert!(held["leases"].as_array().unwrap().is_empty());
+    assert!(held["cancel_leases"].as_array().unwrap().is_empty());
+    h.queue_job(102, "borg-ci-light-pr", 2);
+    h.tick().await;
+    assert_eq!(h.state().mints.len(), 1, "no new lease under the floor");
+    let status = h.status().await;
+    let d = drone(&status, "disk");
+    assert_eq!(d["accepting"], false);
+    assert_eq!(d["active_leases"], 1);
+    assert_eq!(d["disk_admission"]["state"], "fail");
+    assert!(
+        d["contract"].is_null(),
+        "safety does not enable the optional contract"
+    );
+    h.heartbeat_with(&token, json!({"active_leases": [active]}))
+        .await;
+    h.tick().await;
+    assert_eq!(h.state().mints.len(), 2, "recovery restores admission");
+}
+
+#[tokio::test]
+async fn low_cache_blocks_pending_delivery_without_cache_stats_and_recovers_at_exact_floor() {
+    let h = Harness::start(json!({"env_contract": {"checks": {"cache_store": "advisory"}}})).await;
+    let token = h.enroll("disk").await;
+    h.heartbeat_with(&token, json!({})).await;
+    h.queue_job(201, "borg-ci-light-pr", 1);
+    h.tick().await;
+    let low = h
+        .heartbeat_with(
+            &token,
+            json!({"env_facts": {"observed_at": now(), "cache_dir_free_bytes": 1}}),
+        )
+        .await;
+    assert!(
+        low["leases"].as_array().unwrap().is_empty(),
+        "pending JIT remains unstarted"
+    );
+    let leases = h.queen.store().active_leases().await.unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].state, borg::store::LeaseStatus::Pending);
+    let recovered = h
+        .heartbeat_with(
+            &token,
+            json!({"env_facts": {"observed_at": now(), "cache_dir_free_bytes": 10u64 << 30}}),
+        )
+        .await;
+    assert_eq!(recovered["leases"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn stale_cache_space_is_unknown_and_does_not_override_current_work_capacity() {
+    let h = Harness::start(json!({"env_contract": {"facts_max_age_secs": 2}})).await;
+    let token = h.enroll("disk").await;
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": {"observed_at": now() - 10, "cache_dir_free_bytes": 0}}),
+    )
+    .await;
+    h.queue_job(301, "borg-ci-light-pr", 1);
+    h.tick().await;
+    assert_eq!(h.state().mints.len(), 1);
+    let status = h.status().await;
+    let d = drone(&status, "disk");
+    assert_eq!(d["accepting"], true);
+    assert_eq!(d["disk_admission"]["state"], "unknown");
+    assert!(d["disk_admission"]["cache_free_bytes"].is_null());
+}

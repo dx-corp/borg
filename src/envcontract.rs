@@ -209,6 +209,53 @@ pub struct EnvFacts {
     pub capabilities: BTreeMap<Capability, CapabilityFact>,
 }
 
+/// Admission safety, independent of optional cache efficiency checks.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiskAdmission {
+    pub state: CheckState,
+    pub minimum_free_bytes: u64,
+    pub work_free_bytes: Option<u64>,
+    pub cache_free_bytes: Option<u64>,
+}
+
+impl DiskAdmission {
+    pub fn blocked(&self) -> bool {
+        self.state == CheckState::Fail
+    }
+}
+
+pub const DEFAULT_MIN_DISK_FREE_BYTES: u64 = 10 << 30;
+pub fn default_min_disk_free_bytes() -> u64 {
+    DEFAULT_MIN_DISK_FREE_BYTES
+}
+
+/// A floor guards admission; it does not reserve space for active jobs.
+/// Any known low filesystem blocks. Unknown measurements retain compatibility.
+pub fn disk_admission(
+    minimum_free_bytes: u64,
+    work_free_mib: Option<u64>,
+    cache_free_bytes: Option<u64>,
+) -> DiskAdmission {
+    let work_free_bytes = work_free_mib.map(|mib| mib.saturating_mul(1 << 20));
+    let low = [work_free_bytes, cache_free_bytes]
+        .into_iter()
+        .flatten()
+        .any(|free| free < minimum_free_bytes);
+    let state = if low {
+        CheckState::Fail
+    } else if work_free_bytes.is_none() || cache_free_bytes.is_none() {
+        CheckState::Unknown
+    } else {
+        CheckState::Pass
+    };
+    DiskAdmission {
+        state,
+        minimum_free_bytes,
+        work_free_bytes,
+        cache_free_bytes,
+    }
+}
+
 /// Settings of one class (or the defaults for all).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -262,7 +309,7 @@ impl Default for ContractSettings {
             require_report: false,
             facts_max_age_secs: 180,
             allowed_wrappers: vec!["sccache".into()],
-            min_cache_dir_free_bytes: 10 << 30,
+            min_cache_dir_free_bytes: DEFAULT_MIN_DISK_FREE_BYTES,
             max_cache_error_pm: 50,
             hit_rate_warn_pm: 10,
             min_requests_for_hit_rate: 200,
@@ -865,6 +912,24 @@ pub fn blocked_classes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_admission_blocks_either_known_low_mount_and_keeps_unknown_explicit() {
+        let floor = 32 << 30;
+        assert!(disk_admission(floor, Some(8 * 1024), Some(100 << 30)).blocked());
+        assert!(disk_admission(floor, Some(100 * 1024), Some(8 << 30)).blocked());
+        assert!(disk_admission(floor, None, Some(0)).blocked());
+        assert_eq!(
+            disk_admission(floor, Some(32 * 1024), Some(floor)).state,
+            CheckState::Pass
+        );
+        assert_eq!(disk_admission(floor, None, None).state, CheckState::Unknown);
+        assert_eq!(
+            disk_admission(floor, Some(100 * 1024), None).state,
+            CheckState::Unknown
+        );
+        assert!(!disk_admission(floor, None, None).blocked());
+    }
 
     const NOW: i64 = 10_000;
 

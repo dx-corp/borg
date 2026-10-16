@@ -555,6 +555,18 @@ impl Queen {
             }
             if let (true, Some(cap)) = (fresh, &d.capacity) {
                 let mut state = d.allocator_state(cap, now_ts);
+                state.accepting &= !crate::envcontract::disk_admission(
+                    self.cfg.env_contract.min_cache_dir_free_bytes,
+                    cap.free_disk_mib,
+                    d.env_facts
+                        .as_ref()
+                        .filter(|facts| {
+                            (0..=self.cfg.env_contract.facts_max_age_secs)
+                                .contains(&(now_ts - facts.observed_at))
+                        })
+                        .and_then(|facts| facts.cache_dir_free_bytes),
+                )
+                .blocked();
                 state.blocked_classes = blocked_classes(
                     &self.cfg.env_contract,
                     d.env_facts.as_ref(),

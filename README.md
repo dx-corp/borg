@@ -53,7 +53,7 @@ borg queen enroll --config queen.toml host-a > host-a.token
 borg queen run --config queen.toml
 ```
 
-Enrollment prints the token once, to stdout; diagnostics go to stderr. Keep
+Enrollment prints the token once, to `stdout`; diagnostics go to `stderr`. Keep
 `host-a.token` private. The queen stores its hash.
 
 The queen serves plain HTTP. Put its loopback listener behind an HTTPS
@@ -72,8 +72,8 @@ sudo "$(command -v borg)" drone install \
 ```
 
 On Linux, the installer creates a daemon account and a separate job account,
-installs the pinned GitHub runner, and writes a systemd unit. WSL needs
-systemd enabled. On macOS, add `--run-as <existing-user>` to select the
+installs the pinned GitHub runner, and writes a `systemd` unit. WSL needs
+`systemd` enabled. On macOS, add `--run-as <existing-user>` to select the
 LaunchDaemon's account. See the [drone guide](docs/operations.md#drone) for
 platform setup and isolation details.
 
@@ -160,4 +160,4 @@ upstream so the next projection preserves them.
 
 ## License
 
-[Business Source License 1.1](LICENSE) (BUSL-1.1).
+[Business Source License 1.1](../../../LICENSE) (BUSL-1.1).

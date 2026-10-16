@@ -22,7 +22,7 @@ pub mod standby;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -93,6 +93,8 @@ pub struct Drone {
     update_wanted: AtomicBool,
     /// The last tools probe, reused for a minute.
     tools_cache: probe::ToolsCache,
+    /// Last Queen floor, retained while the Queen is unreachable.
+    disk_floor: AtomicU64,
     capability_cache: capabilities::CapabilityCache,
 }
 
@@ -133,6 +135,7 @@ impl Drone {
             selfupdate,
             update_wanted: AtomicBool::new(false),
             tools_cache: probe::ToolsCache::default(),
+            disk_floor: AtomicU64::new(crate::envcontract::DEFAULT_MIN_DISK_FREE_BYTES),
             capability_cache: capabilities::CapabilityCache::default(),
             client: Arc::new(client),
             host,
@@ -202,12 +205,18 @@ impl Drone {
         // another version it stops accepting and updates when idle.
         let accepting = accepting && !self.update_wanted.load(Ordering::Relaxed);
         let host = Arc::clone(&self.host);
-        let capacity = tokio::task::spawn_blocking(move || probe::probe(host.as_ref()))
-            .await
-            .map_err(|e| ClientError::Status {
-                path: format!("probe: {e}"),
-                status: 0,
-            })?;
+        let cfg = Arc::clone(&self.cfg);
+        let (capacity, cache_free) = tokio::task::spawn_blocking(move || {
+            let capacity = probe::probe_at(host.as_ref(), &cfg.work_root);
+            let cache_free = probe::free_disk_mib_at(host.as_ref(), &cfg.cache_root)
+                .map(|mib| mib.saturating_mul(1 << 20));
+            (capacity, cache_free)
+        })
+        .await
+        .map_err(|e| ClientError::Status {
+            path: format!("probe: {e}"),
+            status: 0,
+        })?;
         let host = Arc::clone(&self.host);
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let mut env_facts =
@@ -217,6 +226,14 @@ impl Drone {
                     path: format!("probe: {e}"),
                     status: 0,
                 })?;
+        env_facts.cache_dir_free_bytes = cache_free;
+        let accepting = accepting
+            && !crate::envcontract::disk_admission(
+                self.disk_floor.load(Ordering::Relaxed),
+                capacity.free_disk_mib,
+                cache_free,
+            )
+            .blocked();
         // The tools probe never fails the heartbeat: no map means not measured.
         let (exec, cache) = (Arc::clone(&self.job_exec), self.tools_cache.clone());
         env_facts.tools = tokio::task::spawn_blocking(move || cache.get(exec.as_ref(), now))
@@ -255,6 +272,15 @@ impl Drone {
             env_facts: Some(env_facts),
         };
         let resp = self.client.heartbeat(&req).await?;
+        self.disk_floor
+            .store(resp.min_free_disk_bytes, Ordering::Relaxed);
+        let accepting = accepting
+            && !crate::envcontract::disk_admission(
+                resp.min_free_disk_bytes,
+                req.capacity.free_disk_mib,
+                cache_free,
+            )
+            .blocked();
         let defer = self.after_heartbeat(&req, resp.desired_version.as_deref());
         if let Some(credential) = resp.mirror_credential {
             self.caches.set_mirror_credential(credential);
@@ -307,8 +333,27 @@ impl Drone {
     }
 
     /// Start every held standby because the queen has been unreachable.
-    fn fail_open(&self, tasks: &mut JoinSet<()>) {
+    async fn fail_open(&self, tasks: &mut JoinSet<()>) {
         if self.standbys.ids().is_empty() {
+            return;
+        }
+        let host = Arc::clone(&self.host);
+        let cfg = Arc::clone(&self.cfg);
+        let Ok((work_free, cache_free)) = tokio::task::spawn_blocking(move || {
+            probe::job_disk_space(host.as_ref(), &cfg.work_root, &cfg.cache_root)
+        })
+        .await
+        else {
+            return;
+        };
+        if crate::envcontract::disk_admission(
+            self.disk_floor.load(Ordering::Relaxed),
+            work_free,
+            cache_free,
+        )
+        .blocked()
+        {
+            tracing::warn!("disk below admission floor: leaving standby runners unstarted");
             return;
         }
         let started = self.start_standbys(None, tasks);
@@ -461,7 +506,7 @@ impl Drone {
                 _ = every.tick() => {
                     let now = time::OffsetDateTime::now_utc().unix_timestamp();
                     if should_fail_open(last_ok_at, now, self.cfg.fail_open_after_secs) {
-                        self.fail_open(&mut tasks);
+                        self.fail_open(&mut tasks).await;
                     }
                     if tokio::time::Instant::now() < retry_at {
                         continue;
@@ -623,5 +668,86 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
                 tokio::time::sleep(Duration::from_secs((u64::from(attempt) * 5).min(60))).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+    use crate::classes::{Class, Scope as JobScope};
+    use crate::drone::exec::Output;
+    use crate::secret::Secret;
+
+    struct DiskHost;
+    impl Host for DiskHost {
+        fn read_to_string(&self, _: &Path) -> Option<String> {
+            None
+        }
+        fn exists(&self, _: &Path) -> bool {
+            false
+        }
+        fn run(&self, program: &str, args: &[&str]) -> Option<String> {
+            if program != "df" {
+                return None;
+            }
+            let available_kib = if args.last() == Some(&"/work") {
+                20 * 1024 * 1024
+            } else {
+                100 * 1024 * 1024
+            };
+            Some(format!(
+                "fs blocks used avail cap mount\ndisk 999999999 0 {available_kib} 0% /"
+            ))
+        }
+        fn os(&self) -> &'static str {
+            "linux"
+        }
+        fn arch(&self) -> &'static str {
+            "x86_64"
+        }
+        fn available_parallelism(&self) -> Option<u32> {
+            Some(1)
+        }
+    }
+    struct NoExec;
+    impl Exec for NoExec {
+        fn run(&self, _: &str, _: &[&str]) -> std::io::Result<Output> {
+            panic!("disk-blocked standby must not run commands")
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_open_retains_standby_and_active_lease_below_learned_queen_floor() {
+        let cfg = DroneConfig::from_json(r#"{"queen_url":"http://127.0.0.1:1","allow_insecure":true,"runner_dir":"/runner","work_root":"/work","cache_root":"/cache"}"#).unwrap();
+        let client = QueenClient::new(&cfg, Secret::new("test".to_owned())).unwrap();
+        let drone = Drone::new(cfg, client, Arc::new(DiskHost), Arc::new(NoExec));
+        drone.disk_floor.store(32 << 30, Ordering::Relaxed);
+        drone.held.lock().unwrap().insert("active".into());
+        drone.standbys.insert(LeaseGrant {
+            lease_id: "standby".into(),
+            class: Class::Light,
+            scope: JobScope::Deploy,
+            labels: vec![],
+            runner_name: "standby".into(),
+            jit_config: Secret::new("jit".to_owned()),
+            expires_at: i64::MAX,
+        });
+        let mut tasks = JoinSet::new();
+        drone.fail_open(&mut tasks).await;
+        assert!(tasks.is_empty());
+        assert_eq!(drone.standbys.ids(), vec!["standby"]);
+        assert_eq!(drone.held_ids(), vec!["active"]);
+        assert!(drone.slot_assignments().is_empty());
+        assert!(!*drone.abort.subscribe().borrow());
+    }
+
+    #[test]
+    fn older_queen_response_keeps_default_floor_and_new_response_carries_configured_floor() {
+        let mut response = serde_json::json!({"leases": []});
+        let old: crate::api::HeartbeatResponse = serde_json::from_value(response.clone()).unwrap();
+        assert_eq!(old.min_free_disk_bytes, 10 << 30);
+        response["min_free_disk_bytes"] = serde_json::json!(32u64 << 30);
+        let new: crate::api::HeartbeatResponse = serde_json::from_value(response).unwrap();
+        assert_eq!(new.min_free_disk_bytes, 32 << 30);
     }
 }

@@ -22,6 +22,7 @@ Configuration, scheduling, drone administration, and protocol details for
   - [Host health](#host-health)
   - [Tailnet enrollment](#tailnet-enrollment)
   - [Cloud burst drones](#cloud-burst-drones)
+  - [Deploy-trust drone](#deploy-trust-drone)
   - [Starvation guard](#starvation-guard)
   - [Preemption](#preemption)
   - [Admission by CPU pressure](#admission-by-cpu-pressure)
@@ -644,6 +645,76 @@ The VM keeps its ephemeral external IP by default; do not pass `--no-address`
 unless a NAT gateway exists, which this setup avoids. If the cloud reclaims a
 spot VM mid-job, GitHub fails that job when its runner stops responding; rerun
 it. Queued jobs are unaffected and go to other drones.
+
+### Deploy-trust drone
+
+Deploy-scope jobs (labels ending `-deploy`) run only on a drone whose trust is
+`deploy` or `deploy-only`. Without one they queue indefinitely
+(`queued_deploy` in `/status`). A deploy-only drone is a separate, on-demand
+VM that never takes pull-request or main work. Do not reuse a burst drone.
+
+Create the VM. Standard provisioning, no max run duration, no service account,
+the same dedicated network, and an ephemeral external IP:
+
+```sh
+gcloud compute networks subnets create borg-burst-usc1 --network=borg-burst \
+  --region=us-central1 --range=192.0.2.0/24   # replace with your private subnet range
+gcloud compute instances create borg-deploy-1 --zone=us-central1-c \
+  --machine-type=n2d-standard-8 --provisioning-model=STANDARD \
+  --no-service-account --no-scopes \
+  --network=borg-burst --subnet=borg-burst-usc1 \
+  --image-family=ubuntu-2204-lts --image-project=ubuntu-os-cloud \
+  --boot-disk-size=200GB --boot-disk-type=pd-balanced
+```
+
+Use Ubuntu 22.04: iac `scripts/install-owned-runner-toolchain.sh` refuses
+24.04. Zones can be out of capacity (`stockout`); try another zone in the
+region. Reach the VM with `gcloud compute ssh --tunnel-through-iap`.
+
+Install the toolchain and arm64 emulation:
+
+```sh
+sudo useradd -m -s /bin/bash runner          # the script checks as this user
+sudo apt-get install -y shellcheck qemu-user-static binfmt-support
+sudo bash install-owned-runner-toolchain.sh  # docker, gh, node 22, rust, kani
+sudo docker run --rm --platform linux/arm64 alpine uname -m   # aarch64
+```
+
+The script ends with `sudo: a password is required` from its
+`sudo -n true` check on the `runner` user. Every tool check before it has
+passed; the failure is expected and the user stays without sudo.
+
+Join the tailnet with an ephemeral, pre-approved auth key tagged
+`tag:borg-deploy` (its ACL reaches the queen on 443 only; mint it with the
+Tailscale OAuth client in 1Password). Do not use `tag:borg-drone`, which is for
+drones that run pull requests:
+
+```sh
+sudo tailscale up --auth-key=file:/tmp/ts.key --hostname=borg-deploy-1 \
+  --advertise-tags=tag:borg-deploy
+shred -u /tmp/ts.key
+```
+
+Leave MagicDNS on: the queen is addressed by name. The queen's
+`tailscale serve` publishes its HTTPS URL on port 443, proxying the LAN
+listener. Use that URL in place of `https://queen.example.test` below; the drone needs no
+`--allow-insecure` and no `--ca-cert`.
+
+Enroll and install. Use the queen's own binary on the VM; it is a glibc 2.35
+build and runs on 22.04 and 24.04:
+
+```sh
+# on the Proxmox node hosting the queen container (CT 102)
+pct exec 102 -- /usr/local/bin/borg queen enroll --config /etc/borg/queen.json borg-deploy-1 > drone.token
+# copy the binary and token to the VM, then
+sudo ./borg drone install --queen https://queen.example.test \
+  --token-file ./drone.token --trust deploy-only --max-vcpu 8 --max-mem-mib 24576
+shred -u drone.token
+```
+
+Check `/status`: `borg-deploy-1` is `fresh`, `accepting`, `trust:
+deploy-only`, and `queued_deploy` falls as leases start. Neither the queen
+config nor the queen binary changes.
 
 ### Starvation guard
 

@@ -185,6 +185,9 @@ pub struct UpdateReport {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HeartbeatResponse {
+    /// Existing Queen disk floor; older Queens omit it and drones use 10 GiB.
+    #[serde(default = "crate::envcontract::default_min_disk_free_bytes")]
+    pub min_free_disk_bytes: u64,
     pub leases: Vec<LeaseGrant>,
     /// Work units to run (resent until acknowledged in `active_units`).
     #[serde(default)]
@@ -418,12 +421,24 @@ async fn heartbeat(
     let drone = authenticate(&queen, &headers).await?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let store = queen.store();
+    let disk = crate::envcontract::disk_admission(
+        queen.config().env_contract.min_cache_dir_free_bytes,
+        req.capacity.free_disk_mib,
+        req.env_facts
+            .as_ref()
+            .filter(|facts| {
+                (0..=queen.config().env_contract.facts_max_age_secs)
+                    .contains(&(now - facts.observed_at))
+            })
+            .and_then(|facts| facts.cache_dir_free_bytes),
+    );
+    let accepting = req.accepting && !disk.blocked();
     store
         .record_heartbeat(
             &drone,
             &req.capacity,
             &req.caps,
-            req.accepting,
+            accepting,
             &req.cache_stats,
             now,
         )
@@ -455,7 +470,7 @@ async fn heartbeat(
     let start = queen.snapshot().start_standby;
     let start_standby: Vec<String> = standby_rows
         .iter()
-        .filter(|l| start.contains(&l.id))
+        .filter(|l| accepting && start.contains(&l.id))
         .map(|l| l.id.clone())
         .collect();
     let drop_standby: Vec<String> = req
@@ -494,6 +509,7 @@ async fn heartbeat(
             .unacked_units(&drone)
             .await?
             .into_iter()
+            .filter(|_| accepting)
             .map(|u| UnitGrant {
                 unit_id: u.id,
                 repo: u.repo,
@@ -514,6 +530,7 @@ async fn heartbeat(
         .undelivered(&drone)
         .await?
         .into_iter()
+        .filter(|_| accepting)
         .filter_map(|l| {
             Some(LeaseGrant {
                 lease_id: l.id,
@@ -537,6 +554,7 @@ async fn heartbeat(
         None => None,
     };
     Ok(Json(HeartbeatResponse {
+        min_free_disk_bytes: queen.config().env_contract.min_cache_dir_free_bytes,
         leases,
         units,
         cancel_units,
@@ -662,6 +680,8 @@ pub struct DroneStatus {
     pub heartbeat_age_secs: Option<i64>,
     pub fresh: bool,
     pub accepting: bool,
+    /// Enforced independently of the optional environment contract.
+    pub disk_admission: crate::envcontract::DiskAdmission,
     /// `shared` or `deploy`: which scopes the drone may run.
     pub trust: Trust,
     pub hostname: Option<String>,
@@ -919,11 +939,25 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
     for d in &rows {
         let age = d.last_heartbeat.map(|t| now - t);
         let fresh = age.is_some_and(|a| a <= cfg.drone_stale_secs);
+        let disk = crate::envcontract::disk_admission(
+            cfg.env_contract.min_cache_dir_free_bytes,
+            d.capacity
+                .as_ref()
+                .filter(|_| fresh)
+                .and_then(|cap| cap.free_disk_mib),
+            d.env_facts
+                .as_ref()
+                .filter(|facts| {
+                    (0..=cfg.env_contract.facts_max_age_secs).contains(&(now - facts.observed_at))
+                })
+                .and_then(|facts| facts.cache_dir_free_bytes),
+        );
         let mut budget = None;
         let mut free_slots_here = BTreeMap::new();
         let mut theoretical_here = BTreeMap::new();
         if let (true, Some(cap)) = (fresh, &d.capacity) {
             let mut state = d.allocator_state(cap, now);
+            state.accepting &= !disk.blocked();
             state.blocked_classes = blocked_classes(
                 &cfg.env_contract,
                 d.env_facts.as_ref(),
@@ -957,7 +991,8 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             name: d.name.clone(),
             heartbeat_age_secs: age,
             fresh,
-            accepting: d.accepting,
+            accepting: d.accepting && !disk.blocked(),
+            disk_admission: disk,
             trust: d.trust,
             hostname: d.capacity.as_ref().map(|c| c.hostname.clone()),
             kind: d.capacity.as_ref().map(|c| c.kind),
