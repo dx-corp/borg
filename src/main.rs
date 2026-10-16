@@ -500,18 +500,16 @@ async fn run_queen(path: &Path) -> Result<()> {
     let janitor = match &cfg.supersede_janitor {
         Some(settings) => {
             let token = janitor_token(settings, &cfg)?;
-            tracing::info!(
-                "supersede janitor enabled ({}, {} token)",
-                if settings.dry_run {
-                    "dry-run"
-                } else {
-                    "cancelling"
-                },
-                match token {
-                    TokenSource::Static(_) => "static",
-                    TokenSource::App(_) => "App installation",
-                }
-            );
+            let mode = if settings.dry_run {
+                "dry-run"
+            } else {
+                "cancelling"
+            };
+            let credential_kind = match token {
+                TokenSource::Static(_) => "static",
+                TokenSource::App(_) => "App installation",
+            };
+            tracing::info!("supersede janitor enabled ({mode}, {credential_kind} credential)");
             if cfg.preemption.is_some() {
                 requeuer = Some(Requeuer::with_token_source(
                     &cfg.github.api_base,
@@ -859,6 +857,7 @@ async fn run_command(a: RunArgs) -> u8 {
 
 #[tokio::main]
 async fn main() -> Result<std::process::ExitCode> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
     if let Command::Run(a) = cli.command {
         return Ok(std::process::ExitCode::from(run_command(a).await));

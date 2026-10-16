@@ -286,12 +286,26 @@ impl GitMirrors {
         }
     }
 
-    /// The `BORG_GIT_MIRROR_*` variables for mirrors that exist, counting the
-    /// lease as served or not.
+    /// Advertise only mirrors with a real branch ref. `git init --bare`
+    /// creates HEAD before the first fetch; if that fetch fails, handing the
+    /// empty repository to a job makes its "local" checkout fetch everything.
+    /// `show-ref` reads loose and packed refs without fetching blob contents.
+    fn usable(&self, mirror: &Mirror) -> bool {
+        if !mirror.path.join("HEAD").is_file() {
+            return false;
+        }
+        let path = mirror.path.to_string_lossy();
+        self.exec
+            .run(&self.git, &["-C", &path, "show-ref", "--heads", "--quiet"])
+            .is_ok_and(|output| output.success)
+    }
+
+    /// The `BORG_GIT_MIRROR_*` variables for usable mirrors only, counting
+    /// a lease as a miss if initialization or the first fetch never finished.
     pub fn env(&self) -> Vec<(String, String)> {
         let mut env = Vec::new();
         for m in &self.mirrors {
-            if m.path.join("HEAD").exists() {
+            if self.usable(m) {
                 self.served.fetch_add(1, Ordering::Relaxed);
                 env.push((mirror_var(&m.repo), m.path.to_string_lossy().into_owned()));
             } else {
@@ -521,6 +535,89 @@ mod tests {
             x.calls().len() > after_first,
             "failure does not start the rate-limit window"
         );
+    }
+
+    #[test]
+    fn empty_bare_mirror_is_not_advertised_after_failed_fetch() {
+        // Real Git fixture: a failed first fetch can leave a valid HEAD file
+        // but no branches or objects. The runner must use its normal fallback.
+        let root = tempfile::tempdir().unwrap();
+        let path = mirror_path(root.path(), "example-org/app");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let init = crate::drone::exec::SystemExec
+            .run(
+                "git",
+                &["init", "--bare", "--quiet", path.to_str().unwrap()],
+            )
+            .unwrap();
+        assert!(init.success);
+        assert!(path.join("HEAD").exists());
+        let m = GitMirrors::new(
+            &cfg(&["example-org/app"]),
+            root.path(),
+            Arc::new(crate::drone::exec::SystemExec),
+            Arc::new(LocalFs),
+        );
+        assert!(m.env().is_empty(), "a bare HEAD is not a populated mirror");
+        assert_eq!(m.hit_counts(), (0, 1));
+    }
+
+    #[test]
+    fn populated_bare_mirror_is_advertised() {
+        let root = tempfile::tempdir().unwrap();
+        let path = mirror_path(root.path(), "example-org/app");
+        let seed = root.path().join("seed");
+        let exec = crate::drone::exec::SystemExec;
+        for args in [
+            vec!["init", "--quiet", "-b", "main", seed.to_str().unwrap()],
+            vec![
+                "-C",
+                seed.to_str().unwrap(),
+                "-c",
+                "user.email=ci@example.test",
+                "-c",
+                "user.name=CI",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+                "--quiet",
+            ],
+        ] {
+            assert!(exec.run("git", &args).unwrap().success);
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(
+            exec.run(
+                "git",
+                &["init", "--bare", "--quiet", path.to_str().unwrap()]
+            )
+            .unwrap()
+            .success
+        );
+        assert!(
+            exec.run(
+                "git",
+                &[
+                    "-C",
+                    path.to_str().unwrap(),
+                    "fetch",
+                    "--quiet",
+                    seed.to_str().unwrap(),
+                    "main:main"
+                ]
+            )
+            .unwrap()
+            .success
+        );
+        let m = GitMirrors::new(
+            &cfg(&["example-org/app"]),
+            root.path(),
+            Arc::new(crate::drone::exec::SystemExec),
+            Arc::new(LocalFs),
+        );
+        assert_eq!(m.env().len(), 1);
+        assert_eq!(m.hit_counts(), (1, 0));
     }
 
     #[test]

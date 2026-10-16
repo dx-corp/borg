@@ -61,6 +61,11 @@ pub struct Capacity {
 const DISK_PROBE_PATH: &str = "/";
 
 pub fn probe(host: &dyn Host) -> Capacity {
+    probe_at(host, Path::new(DISK_PROBE_PATH))
+}
+
+/// Capacity of the filesystem actually used for leases.
+pub fn probe_at(host: &dyn Host, work_root: &Path) -> Capacity {
     Capacity {
         hostname: hostname(host),
         os: host.os().to_owned(),
@@ -68,7 +73,7 @@ pub fn probe(host: &dyn Host) -> Capacity {
         kind: host_kind(host),
         vcpu: host.available_parallelism().unwrap_or(1).max(1),
         mem_mib: mem_mib(host).unwrap_or(0),
-        free_disk_mib: free_disk_mib(host),
+        free_disk_mib: free_disk_mib_at(host, work_root),
         docker_usable: host
             .run("docker", &["info", "--format", "{{.ServerVersion}}"])
             .is_some(),
@@ -305,8 +310,16 @@ fn cgroup_mem_limit_mib(host: &dyn Host) -> Option<u64> {
     .map(|bytes| bytes / (1024 * 1024))
 }
 
-fn free_disk_mib(host: &dyn Host) -> Option<u64> {
-    free_disk_mib_at(host, Path::new(DISK_PROBE_PATH))
+/// Fresh available blocks on the configured job filesystems (which may differ).
+pub fn job_disk_space(
+    host: &dyn Host,
+    work_root: &Path,
+    cache_root: &Path,
+) -> (Option<u64>, Option<u64>) {
+    (
+        free_disk_mib_at(host, work_root),
+        free_disk_mib_at(host, cache_root).map(|mib| mib.saturating_mul(1 << 20)),
+    )
 }
 
 /// Free space, in MiB, on the filesystem holding `path`.
@@ -344,8 +357,16 @@ mod tests {
         fn exists(&self, path: &Path) -> bool {
             path.to_str().is_some_and(|p| self.files.contains_key(p))
         }
-        fn run(&self, program: &str, _args: &[&str]) -> Option<String> {
-            self.commands.get(program).map(|s| (*s).to_owned())
+        fn run(&self, program: &str, args: &[&str]) -> Option<String> {
+            let key = if program == "df" {
+                args.last()
+                    .copied()
+                    .filter(|path| self.commands.contains_key(path))
+                    .unwrap_or(program)
+            } else {
+                program
+            };
+            self.commands.get(key).map(|s| (*s).to_owned())
         }
         fn os(&self) -> &'static str {
             self.os
@@ -356,6 +377,39 @@ mod tests {
         fn available_parallelism(&self) -> Option<u32> {
             self.cpus
         }
+    }
+
+    #[test]
+    fn job_disk_probes_use_each_configured_filesystem_and_preserve_unknown() {
+        let host = FakeHost {
+            commands: HashMap::from([
+                (
+                    "/",
+                    "fs blocks used available cap mount\nroot 999999999 0 999999999 0% /",
+                ),
+                (
+                    "/work",
+                    "fs blocks used available cap mount\nwork 99999999 0 8388608 0% /work",
+                ),
+                (
+                    "/cache",
+                    "fs blocks used available cap mount\ncache 99999999 0 52428800 0% /cache",
+                ),
+            ]),
+            ..linux()
+        };
+        assert_eq!(
+            probe_at(&host, Path::new("/work")).free_disk_mib,
+            Some(8192)
+        );
+        assert_eq!(
+            job_disk_space(&host, Path::new("/work"), Path::new("/cache")),
+            (Some(8192), Some(50 << 30))
+        );
+        assert_eq!(
+            job_disk_space(&host, Path::new("/missing"), Path::new("/cache")),
+            (None, Some(50 << 30))
+        );
     }
 
     fn linux() -> FakeHost {
@@ -577,7 +631,7 @@ mod tests {
             "df",
             "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 100000000 1000000 52428800 2% /",
         );
-        assert_eq!(free_disk_mib(&h), Some(51200));
+        assert_eq!(free_disk_mib_at(&h, Path::new("/")), Some(51200));
     }
 
     #[test]

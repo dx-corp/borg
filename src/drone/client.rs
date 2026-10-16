@@ -40,9 +40,7 @@ impl QueenClient {
                 source,
             })?;
             let cert = reqwest::Certificate::from_pem(&pem).map_err(ClientError::CaParse)?;
-            builder = builder
-                .tls_built_in_root_certs(false)
-                .add_root_certificate(cert);
+            builder = builder.tls_certs_only([cert]);
         }
         Ok(Self {
             http: builder.build()?,
