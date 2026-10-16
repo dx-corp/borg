@@ -1,5 +1,8 @@
 //! The supersede janitor: cancels queued pull-request workflow runs whose head
-//! commit is no longer the pull request's head.
+//! commit is no longer the pull request's head, runs of listed workflows for
+//! pull requests that were closed or merged (`closed_pr_workflows`), and queued
+//! push runs on listed branches that a newer run of the same workflow
+//! supersedes (`superseded_push_branches`).
 //!
 //! A push to a pull request branch makes every run of the older commit
 //! pointless, but GitHub keeps them queued and they occupy runner demand. Two
@@ -19,11 +22,17 @@
 //!   cancelling, so a run whose status changed in between is left alone;
 //! * only `pull_request` runs that name exactly one pull request are touched;
 //!   runs from forks (no pull request attached) and merge groups never are;
-//! * the pull request's current head comes from the pulls API, not from the
-//!   run's own snapshot;
+//! * the pull request's current head comes from the run's `pull_requests`
+//!   entry, which GitHub fills at read time with the open pull requests whose
+//!   head matches, and from the pulls API only when that entry has no head;
+//! * a `pull_request` run with no open pull request is treated as belonging
+//!   to a closed one only when its head repository is the repository itself
+//!   (forks never) and its workflow is listed in `closed_pr_workflows`, and a
+//!   fresh read must still show no pull request;
 //! * at most `max_cancels_per_pass` cancellations per pass, one pass per
 //!   `interval_secs`;
-//! * a cancel that finds the run already finished (409) is a no-op;
+//! * a cancel that GitHub refuses with 409 is a no-op, counted as
+//!   `uncancellable`;
 //! * every cancellation (or, in dry-run, every would-be cancellation) is logged.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,9 +57,14 @@ pub struct PassReport {
     pub considered: u32,
     /// Runs whose head is no longer the pull request's head.
     pub superseded: u32,
-    /// Queued superseded runs cancelled.
+    /// Runs of `closed_pr_workflows` whose pull request is closed or merged.
+    pub closed_pr: u32,
+    /// Queued push runs on `superseded_push_branches` with a newer run of the
+    /// same workflow on the branch.
+    pub superseded_push: u32,
+    /// Queued runs cancelled as superseded, closed-PR or superseded-push.
     pub cancelled: u32,
-    /// Running superseded runs cancelled (`cancel_running`).
+    /// Running runs cancelled as superseded or closed-PR (`cancel_running`).
     pub cancelled_running: u32,
     /// Runs beyond the first in a same-workflow, same-commit group
     /// (`dedupe_same_sha`), queued or running.
@@ -61,8 +75,12 @@ pub struct PassReport {
     pub would_cancel: u32,
     /// Runs left for a later pass by the per-pass cap.
     pub deferred: u32,
-    /// Runs that changed state before the cancel and were left alone.
+    /// Runs that changed state between the listing and the cancel and were
+    /// left alone.
     pub raced: u32,
+    /// Runs whose cancel GitHub answered with 409 (already finished, or stuck
+    /// in a state GitHub will not cancel).
+    pub uncancellable: u32,
     /// Per-run or per-pull-request failures (logged, not fatal).
     pub errors: u32,
 }
@@ -71,6 +89,8 @@ impl PassReport {
     fn add(&mut self, o: &PassReport) {
         self.considered += o.considered;
         self.superseded += o.superseded;
+        self.closed_pr += o.closed_pr;
+        self.superseded_push += o.superseded_push;
         self.cancelled += o.cancelled;
         self.cancelled_running += o.cancelled_running;
         self.duplicates += o.duplicates;
@@ -78,6 +98,7 @@ impl PassReport {
         self.would_cancel += o.would_cancel;
         self.deferred += o.deferred;
         self.raced += o.raced;
+        self.uncancellable += o.uncancellable;
         self.errors += o.errors;
     }
 }
@@ -86,8 +107,15 @@ impl PassReport {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct JanitorView {
     pub passes: u64,
+    /// Unix time the queen started; `total` counts from here.
+    pub since: i64,
+    /// Unix time of the last pass; `None` before the first.
+    pub last_pass_at: Option<i64>,
+    /// What the last pass alone found. Runs still queued are found again by
+    /// every pass, so this is the current state.
     pub last: PassReport,
-    /// Sums over every pass since the queen started.
+    /// Sums over every pass since `since`. A run that stays queued is counted
+    /// once per pass, so these grow with time even when nothing changes.
     pub total: PassReport,
 }
 
@@ -96,16 +124,31 @@ struct Run {
     id: u64,
     #[serde(default)]
     workflow_id: u64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    path: String,
     status: String,
     event: String,
     head_sha: String,
+    #[serde(default)]
+    head_branch: Option<String>,
+    #[serde(default)]
+    head_repository: Option<RepoRef>,
     #[serde(default)]
     pull_requests: Vec<PullRef>,
 }
 
 #[derive(Debug, Deserialize)]
+struct RepoRef {
+    full_name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct PullRef {
     number: u64,
+    #[serde(default)]
+    head: Option<PullHead>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,7 +193,10 @@ impl Janitor {
             api_base: api_base.trim_end_matches('/').to_owned(),
             token,
             settings,
-            view: Mutex::default(),
+            view: Mutex::new(JanitorView {
+                since: now(),
+                ..JanitorView::default()
+            }),
         })
     }
 
@@ -234,9 +280,11 @@ impl Janitor {
             }
         }
         tracing::debug!(
-            "janitor pass: considered {} superseded {} cancelled {} cancelled_running {} duplicates {} dedup_cancelled {} would_cancel {} deferred {} raced {} errors {}",
+            "janitor pass: considered {} superseded {} closed_pr {} superseded_push {} cancelled {} cancelled_running {} duplicates {} dedup_cancelled {} would_cancel {} deferred {} raced {} uncancellable {} errors {}",
             report.considered,
             report.superseded,
+            report.closed_pr,
+            report.superseded_push,
             report.cancelled,
             report.cancelled_running,
             report.duplicates,
@@ -244,10 +292,12 @@ impl Janitor {
             report.would_cancel,
             report.deferred,
             report.raced,
+            report.uncancellable,
             report.errors
         );
         let mut view = self.view.lock().expect("janitor view lock");
         view.passes += 1;
+        view.last_pass_at = Some(now());
         view.total.add(&report);
         view.last = report.clone();
         drop(view);
@@ -261,7 +311,10 @@ impl Janitor {
         report: &mut PassReport,
     ) -> Result<(), GithubError> {
         let st = &self.settings;
-        let event = (!st.dedupe_same_sha).then_some("pull_request");
+        let all_events = st.dedupe_same_sha
+            || !st.closed_pr_workflows.is_empty()
+            || !st.superseded_push_branches.is_empty();
+        let event = (!all_events).then_some("pull_request");
         let mut runs = self.list_runs(repo, "queued", event).await?;
         if st.cancel_running || st.dedupe_same_sha {
             runs.extend(self.list_runs(repo, "in_progress", event).await?);
@@ -278,48 +331,57 @@ impl Janitor {
             {
                 continue;
             }
-            // A fork's run carries no pull request; with more than one the
-            // answer is ambiguous. Leave both alone.
-            let [pr] = run.pull_requests.as_slice() else {
-                continue;
-            };
-            report.considered += 1;
-            let head = if let Some(cached) = heads.get(&pr.number) {
-                cached.clone()
-            } else {
-                let fetched = match self
-                    .get::<Pull>(&format!("/repos/{repo}/pulls/{}", pr.number))
-                    .await
-                {
-                    Ok(p) => Some(p.head.sha),
-                    Err(e) => {
-                        tracing::warn!("janitor: {repo}#{}: {e}", pr.number);
-                        report.errors += 1;
-                        None
+            let why = match run.pull_requests.as_slice() {
+                // No open pull request matches this same-repository run: its
+                // pull request was closed or merged.
+                [] if self.closed_pr_workflow(repo, run) => {
+                    report.considered += 1;
+                    report.closed_pr += 1;
+                    format!(
+                        "for branch {}: no open pull request",
+                        run.head_branch.as_deref().unwrap_or("?")
+                    )
+                }
+                [pr] => {
+                    report.considered += 1;
+                    let Some(current) = self.pr_head(repo, pr, &mut heads, report).await else {
+                        continue;
+                    };
+                    if run.head_sha == current {
+                        continue;
                     }
-                };
-                heads.insert(pr.number, fetched.clone());
-                fetched
+                    report.superseded += 1;
+                    format!(
+                        "for #{}: head {} superseded by {current}",
+                        pr.number, run.head_sha
+                    )
+                }
+                // A fork's run carries no pull request; with more than one
+                // the answer is ambiguous. Leave both alone.
+                _ => continue,
             };
-            let Some(current) = head else {
-                continue;
-            };
-            if run.head_sha == current {
+            stale.insert(run.id);
+            if *budget == 0 {
+                report.deferred += 1;
                 continue;
             }
-            report.superseded += 1;
+            let kind = if running { Kind::Running } else { Kind::Stale };
+            let outcome = self.cancel_if_unchanged(repo, run, &why).await;
+            tally(report, budget, repo, run.id, kind, outcome);
+        }
+        for (run, newer) in superseded_pushes(&runs, &st.superseded_push_branches) {
+            report.superseded_push += 1;
             stale.insert(run.id);
             if *budget == 0 {
                 report.deferred += 1;
                 continue;
             }
             let why = format!(
-                "for #{}: head {} superseded by {current}",
-                pr.number, run.head_sha
+                "on {}: superseded by run {newer}",
+                run.head_branch.as_deref().unwrap_or("?")
             );
-            let kind = if running { Kind::Running } else { Kind::Stale };
             let outcome = self.cancel_if_unchanged(repo, run, &why).await;
-            tally(report, budget, repo, run.id, kind, outcome);
+            tally(report, budget, repo, run.id, Kind::Stale, outcome);
         }
         if st.dedupe_same_sha {
             for (run, kept) in surplus(&runs, &stale) {
@@ -342,6 +404,48 @@ impl Janitor {
         Ok(())
     }
 
+    /// Whether `run` is a same-repository run of a `closed_pr_workflows` entry.
+    fn closed_pr_workflow(&self, repo: &str, run: &Run) -> bool {
+        run.head_repository
+            .as_ref()
+            .is_some_and(|r| r.full_name.eq_ignore_ascii_case(repo))
+            && self
+                .settings
+                .closed_pr_workflows
+                .iter()
+                .any(|w| *w == run.path || *w == run.name)
+    }
+
+    /// The pull request's current head: the run's own entry when GitHub filled
+    /// it, else the pulls API (cached per pass; `None` after a logged error).
+    async fn pr_head(
+        &self,
+        repo: &str,
+        pr: &PullRef,
+        heads: &mut BTreeMap<u64, Option<String>>,
+        report: &mut PassReport,
+    ) -> Option<String> {
+        if let Some(head) = &pr.head {
+            return Some(head.sha.clone());
+        }
+        if let Some(cached) = heads.get(&pr.number) {
+            return cached.clone();
+        }
+        let fetched = match self
+            .get::<Pull>(&format!("/repos/{repo}/pulls/{}", pr.number))
+            .await
+        {
+            Ok(p) => Some(p.head.sha),
+            Err(e) => {
+                tracing::warn!("janitor: {repo}#{}: {e}", pr.number);
+                report.errors += 1;
+                None
+            }
+        };
+        heads.insert(pr.number, fetched.clone());
+        fetched
+    }
+
     /// Cancel `run` unless a fresh read shows its status or head changed.
     async fn cancel_if_unchanged(
         &self,
@@ -352,7 +456,10 @@ impl Janitor {
         let fresh: Run = self
             .get(&format!("/repos/{repo}/actions/runs/{}", run.id))
             .await?;
-        if fresh.status != run.status || fresh.head_sha != run.head_sha {
+        if fresh.status != run.status
+            || fresh.head_sha != run.head_sha
+            || fresh.pull_requests.len() != run.pull_requests.len()
+        {
             return Ok(Outcome::Raced);
         }
         let state = &run.status;
@@ -367,7 +474,8 @@ impl Janitor {
             tracing::info!("janitor: cancelled {state} {repo} run {} {why}", run.id);
             Ok(Outcome::Cancelled)
         } else {
-            Ok(Outcome::Raced)
+            tracing::debug!("janitor: {repo} run {} answered 409 to cancel", run.id);
+            Ok(Outcome::Uncancellable)
         }
     }
 }
@@ -401,6 +509,7 @@ fn tally(
             report.would_cancel += 1;
         }
         Ok(Outcome::Raced) => report.raced += 1,
+        Ok(Outcome::Uncancellable) => report.uncancellable += 1,
         Err(e) => {
             tracing::warn!("janitor: {repo} run {run}: {e}");
             report.errors += 1;
@@ -442,6 +551,41 @@ enum Outcome {
     Cancelled,
     DryRun,
     Raced,
+    Uncancellable,
+}
+
+fn now() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// Queued `push` runs on `branches`, each with the id of the newest queued or
+/// running run of the same workflow on the same branch, when that newer run
+/// is on another commit.
+fn superseded_pushes<'a>(runs: &'a [Run], branches: &[String]) -> Vec<(&'a Run, u64)> {
+    let mut newest: BTreeMap<(u64, &str), &Run> = BTreeMap::new();
+    let on_branch = |r: &&'a Run| {
+        r.event == "push"
+            && matches!(r.status.as_str(), "queued" | "in_progress")
+            && r.head_branch.as_ref().is_some_and(|b| branches.contains(b))
+    };
+    for run in runs.iter().filter(on_branch) {
+        let key = (
+            run.workflow_id,
+            run.head_branch.as_deref().unwrap_or_default(),
+        );
+        let e = newest.entry(key).or_insert(run);
+        if run.id > e.id {
+            *e = run;
+        }
+    }
+    runs.iter()
+        .filter(on_branch)
+        .filter(|r| r.status == "queued")
+        .filter_map(|r| {
+            let n = newest[&(r.workflow_id, r.head_branch.as_deref().unwrap_or_default())];
+            (n.id > r.id && n.head_sha != r.head_sha).then_some((r, n.id))
+        })
+        .collect()
 }
 
 pub(crate) async fn status_error(
@@ -472,10 +616,17 @@ mod tests {
         Run {
             id,
             workflow_id: wf,
+            name: String::new(),
+            path: String::new(),
             status: status.into(),
             event: event.into(),
             head_sha: sha.into(),
-            pull_requests: prs.iter().map(|&number| PullRef { number }).collect(),
+            head_branch: Some("main".into()),
+            head_repository: None,
+            pull_requests: prs
+                .iter()
+                .map(|&number| PullRef { number, head: None })
+                .collect(),
         }
     }
 
@@ -486,6 +637,27 @@ mod tests {
             .collect();
         v.sort_unstable();
         v
+    }
+
+    #[test]
+    fn only_older_queued_pushes_on_listed_branches_are_superseded() {
+        let runs = [
+            run(1, 1, "queued", "push", "a", &[]),
+            run(2, 1, "in_progress", "push", "b", &[]),
+            run(3, 1, "queued", "push", "c", &[]),
+            run(4, 2, "queued", "push", "c", &[]),
+            run(5, 2, "queued", "push", "c", &[]),
+            run(6, 3, "queued", "pull_request", "a", &[9]),
+            run(7, 3, "queued", "pull_request", "b", &[9]),
+        ];
+        let mut got: Vec<_> = superseded_pushes(&runs, &["main".into()])
+            .into_iter()
+            .map(|(r, n)| (r.id, n))
+            .collect();
+        got.sort_unstable();
+        // Run 2 is running (never cancelled); run 4 shares run 5's commit.
+        assert_eq!(got, [(1, 3)]);
+        assert!(superseded_pushes(&runs, &["release".into()]).is_empty());
     }
 
     #[test]

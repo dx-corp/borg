@@ -67,7 +67,107 @@ async fn an_already_finished_run_answering_409_is_not_an_error() {
     h.queue_pr_run(1, 10, "old", "new");
     h.state().uncancellable.push(1);
     let r = h.janitor_pass().await;
-    assert_eq!((r.raced, r.cancelled, r.errors), (1, 0, 0), "{r:?}");
+    assert_eq!(
+        (r.uncancellable, r.raced, r.cancelled, r.errors),
+        (1, 0, 0, 0),
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_run_s_own_pull_request_head_needs_no_pulls_api() {
+    // The queen's App may lack pull-request read access: with the head in the
+    // run's entry the pulls API is never asked.
+    let h = Harness::start(enabled(false, 20)).await;
+    h.state().pr_runs.push(json!({
+        "id": 1, "status": "queued", "event": "pull_request", "head_sha": "old",
+        "pull_requests": [{"number": 10, "head": {"sha": "new"}}]
+    }));
+    h.state().pr_runs.push(json!({
+        "id": 2, "status": "queued", "event": "pull_request", "head_sha": "new",
+        "pull_requests": [{"number": 10, "head": {"sha": "new"}}]
+    }));
+    let r = h.janitor_pass().await;
+    assert_eq!((r.superseded, r.cancelled, r.errors), (1, 1, 0), "{r:?}");
+    assert_eq!(h.state().cancelled, [1]);
+}
+
+#[tokio::test]
+async fn runs_of_closed_pull_requests_are_cancelled_for_listed_workflows_only() {
+    let h = Harness::start(with(json!({
+        "cancel_running": true,
+        "closed_pr_workflows": [".github/workflows/pr-gates.yml", "platform-ci"]
+    })))
+    .await;
+    let closed = |id: u64, status: &str, path: &str, name: &str, repo: &str| {
+        json!({"id": id, "status": status, "event": "pull_request", "head_sha": "a",
+            "head_branch": "feat/x", "path": path, "name": name,
+            "head_repository": {"full_name": repo}, "pull_requests": []})
+    };
+    {
+        let mut st = h.state();
+        st.pr_runs.push(closed(
+            1,
+            "queued",
+            ".github/workflows/pr-gates.yml",
+            "pr-gates",
+            "example-org/app",
+        ));
+        st.pr_runs.push(closed(
+            2,
+            "in_progress",
+            ".github/workflows/platform-ci.yml",
+            "platform-ci",
+            "example-org/app",
+        ));
+        // Not listed: a teardown that runs on the closed event.
+        st.pr_runs.push(closed(
+            3,
+            "queued",
+            ".github/workflows/teardown.yml",
+            "teardown",
+            "example-org/app",
+        ));
+        // A fork's run never names a pull request either.
+        st.pr_runs.push(closed(
+            4,
+            "queued",
+            ".github/workflows/pr-gates.yml",
+            "pr-gates",
+            "fork/r",
+        ));
+    }
+    let r = h.janitor_pass().await;
+    assert_eq!(
+        (r.closed_pr, r.cancelled, r.cancelled_running),
+        (2, 1, 1),
+        "{r:?}"
+    );
+    let mut cancelled = h.state().cancelled.clone();
+    cancelled.sort_unstable();
+    assert_eq!(cancelled, [1, 2]);
+}
+
+#[tokio::test]
+async fn older_queued_main_pushes_are_cancelled_and_running_ones_kept() {
+    let h = Harness::start(with(json!({"superseded_push_branches": ["main"]}))).await;
+    let push = |id: u64, status: &str, sha: &str, branch: &str| {
+        json!({"id": id, "workflow_id": 1, "status": status, "event": "push",
+            "head_sha": sha, "head_branch": branch, "pull_requests": []})
+    };
+    {
+        let mut st = h.state();
+        st.pr_runs.push(push(1, "queued", "a", "main"));
+        st.pr_runs.push(push(2, "queued", "b", "main"));
+        st.pr_runs.push(push(3, "queued", "c", "main"));
+        st.pr_runs.push(push(4, "queued", "a", "feat"));
+        st.pr_runs.push(push(5, "queued", "b", "feat"));
+    }
+    let r = h.janitor_pass().await;
+    assert_eq!((r.superseded_push, r.cancelled), (2, 2), "{r:?}");
+    let mut cancelled = h.state().cancelled.clone();
+    cancelled.sort_unstable();
+    assert_eq!(cancelled, [1, 2]);
 }
 
 #[tokio::test]
@@ -227,6 +327,8 @@ async fn totals_reach_status_and_metrics() {
     h.janitor_pass().await;
     let status = h.status().await;
     assert_eq!(status["janitor"]["passes"], 2);
+    assert!(status["janitor"]["since"].as_i64().unwrap() > 0);
+    assert!(status["janitor"]["last_pass_at"].as_i64().unwrap() > 0);
     assert_eq!(status["janitor"]["total"]["cancelled"], 1);
     assert_eq!(status["janitor"]["last"]["cancelled"], 0);
     let metrics = h

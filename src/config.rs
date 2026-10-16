@@ -86,6 +86,16 @@ pub struct JanitorSettings {
     /// commit, event and pull request.
     #[serde(default)]
     pub dedupe_same_sha: bool,
+    /// Workflows, by file path (`.github/workflows/ci.yml`) or name, whose
+    /// pull-request runs are cancelled once the pull request is closed or
+    /// merged. Leave out workflows that run on the `closed` event.
+    #[serde(default)]
+    pub closed_pr_workflows: Vec<String>,
+    /// Branches whose queued `push` runs are cancelled when a newer run of the
+    /// same workflow on the branch is queued or running. Running push runs
+    /// are never cancelled.
+    #[serde(default)]
+    pub superseded_push_branches: Vec<String>,
 }
 
 fn yes() -> bool {
