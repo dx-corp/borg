@@ -321,8 +321,9 @@ The allocator drops a bid with no `available_slots` or above the current
 pressure, and scores the rest with integers:
 `3*cache_affinity - 3*resource_pressure - 2*start - 1*(cost-1000)`, where
 `start` is `estimated_start_ms` as permille of 60 s, all scaled by
-`confidence/1000`. The highest score wins; ties go to the tightest memory fit,
-then the drone name. A drone that sends no bids, or only expired ones, is
+`confidence/1000`. A drone's total score is that bid score plus its learned
+profile term (see [Learned profiles](#learned-profiles)) plus a host term. The
+highest score wins; ties go to the tightest memory fit, then the drone name. A drone that sends no bids, or only expired ones, is
 treated as before (always eligible, neutral score); a drone that bids but not
 for a key declines that key. GitHub still chooses which queued job a runner
 takes: bids steer only which host receives a freshly minted runner.
@@ -569,6 +570,18 @@ reliability from host-caused failures only. They add to the bid score in
 proportion to the evidence, so proven faster and more reliable hosts are
 preferred when placing a runner. See `profiles` in the queen config and
 `profiles[]` in `/status`.
+
+The host term covers how loaded a drone is right now:
+`-1 * pressure + 250 * free_vcpu / budget_vcpu` for medium and heavy work, and
+`-1 * pressure` for light work. Here `pressure` is the drone's fresh CPU
+pressure in permille: PSI, or the load estimate without PSI (see
+[Admission by CPU pressure](#admission-by-cpu-pressure)), and 0 when unknown or
+when admission is off. With both terms, main heavy and medium work goes to
+drones that are fast and idle first. A host that is historically slow (speed
+550 permille costs 450 points) or loaded (PSI 450 permille costs 450 points)
+gets work only when nothing better has room, and above the admission
+thresholds it gets none. Light work keeps packing onto the tightest fit.
+`/explain` shows each candidate's `host` term next to `bid` and `profile`.
 
 ### Warm-floor controller
 

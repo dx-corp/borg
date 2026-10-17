@@ -109,7 +109,7 @@ pub fn render_text(report: &Explanation) -> String {
         for host in &d.candidates {
             let _ = writeln!(
                 out,
-                "  {}: {} / {} MiB, {} / {} vCPU free; lease slots {:?}; score {:?} (bid {}, profile {}); {:?}; reservation {:?}",
+                "  {}: {} / {} MiB, {} / {} vCPU free; lease slots {:?}; score {:?} (bid {}, profile {}, host {}); {:?}; reservation {:?}",
                 host.drone_id,
                 host.room.mem_mib,
                 host.budget.mem_mib,
@@ -119,6 +119,7 @@ pub fn render_text(report: &Explanation) -> String {
                 host.score,
                 host.bid_score,
                 host.profile_score,
+                host.host_score,
                 host.rejection_reasons,
                 host.reserved_for
             );
