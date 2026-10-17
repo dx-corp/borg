@@ -381,7 +381,27 @@ pub struct Candidate {
     pub bid: Option<DroneBid>,
     pub bid_score: i64,
     pub profile_score: i64,
+    /// Current load: minus the drone's CPU pressure, plus its idle share for
+    /// medium and heavy work. See [`host_term`].
+    #[serde(default)]
+    pub host_score: i64,
     pub score: Option<i64>,
+}
+
+/// The placement term for how loaded a drone is right now: `-host_pressure *
+/// pressure` (PSI, or the load estimate without PSI; unknown counts as 0) and,
+/// for medium and heavy work, `+idle_share * free vCPU share`. Light work packs
+/// as before. Together with the learned speed in the profile term, main heavy
+/// and medium work goes to fast, idle drones first and to slow or loaded ones
+/// only when nothing better has room.
+pub fn host_term(drone: &DroneState, free_vcpu: u32, class: Class, w: &ScoreWeights) -> i64 {
+    let pressure = i64::from(drone.admission_pressure_pm().unwrap_or(0).min(1000));
+    let idle = if class == Class::Light || drone.vcpu == 0 {
+        0
+    } else {
+        i64::from(free_vcpu.min(drone.vcpu)) * 1000 / i64::from(drone.vcpu)
+    };
+    -w.host_pressure * pressure + w.idle_share * idle / 1000
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -478,6 +498,7 @@ struct BidEvaluation {
     bid: Option<DroneBid>,
     bid_score: i64,
     profile_score: i64,
+    host_score: i64,
     rejection_reasons: Vec<Rejection>,
     score: Option<i64>,
 }
@@ -496,6 +517,7 @@ impl Free<'_> {
             .iter()
             .find(|p| p.class == class)
             .map_or(0, |p| profile_term(p, weights));
+        let host_score = host_term(self.drone, self.vcpu, class, weights);
         let bid = self
             .drone
             .bids
@@ -522,9 +544,12 @@ impl Free<'_> {
             bid,
             bid_score,
             profile_score,
-            score: rejection_reasons
-                .is_empty()
-                .then_some(bid_score.saturating_add(profile_score)),
+            host_score,
+            score: rejection_reasons.is_empty().then_some(
+                bid_score
+                    .saturating_add(profile_score)
+                    .saturating_add(host_score),
+            ),
             rejection_reasons,
         }
     }
@@ -616,6 +641,7 @@ impl Free<'_> {
             bid: evaluated.bid,
             bid_score: evaluated.bid_score,
             profile_score: evaluated.profile_score,
+            host_score: evaluated.host_score,
         }
     }
 
@@ -1122,6 +1148,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn profile(class: Class, speed: u32) -> ProfileScore {
+        ProfileScore {
+            class,
+            speed_permille: speed,
+            speed_confidence_permille: 1000,
+            reliability_permille: 1000,
+        }
+    }
+
+    #[test]
+    fn main_heavy_prefers_fast_idle_drones_and_slow_or_loaded_ones_take_overflow() {
+        let fast = DroneState {
+            profiles: vec![profile(Class::Heavy, 1100)],
+            ..host("fast")
+        };
+        // Ids sort before "fast", so ties would go to them.
+        // As fast, but its host is under CPU pressure right now.
+        let loaded = DroneState {
+            cpu_psi_pm: Some(450),
+            profiles: vec![profile(Class::Heavy, 1100)],
+            ..host("a-loaded")
+        };
+        // Idle, but historically half as fast.
+        let slow = DroneState {
+            profiles: vec![profile(Class::Heavy, 550)],
+            ..host("0-slow")
+        };
+        let drones = vec![loaded.clone(), slow.clone(), fast.clone()];
+        let first = |n| {
+            let a = allocate(&input(&[(Class::Heavy, Scope::Main, n)], drones.clone()));
+            a.grants
+                .iter()
+                .map(|g| g.drone_id.clone())
+                .collect::<Vec<_>>()
+        };
+        // One default heavy fits per 28 GiB host. Overflow goes to the less
+        // loaded of the rest; the historically slow host comes last.
+        assert_eq!(first(1), ["fast"]);
+        assert_eq!(first(2), ["fast", "a-loaded"]);
+        assert_eq!(first(3), ["fast", "a-loaded", "0-slow"]);
+
+        // Same speed: the idle host wins medium/heavy, light still packs.
+        let busy = host("busy");
+        let idle = host("idle");
+        let mut i = input(
+            &[(Class::Medium, Scope::Main, 1)],
+            vec![busy.clone(), idle.clone()],
+        );
+        i.leases = vec![lease(
+            "busy",
+            Class::Medium,
+            Scope::Main,
+            LeaseState::Running,
+        )];
+        assert_eq!(allocate(&i).grants[0].drone_id, "idle");
+        i.demand = vec![Demand {
+            class: Class::Light,
+            scope: Scope::Main,
+            count: 1,
+        }];
+        assert_eq!(allocate(&i).grants[0].drone_id, "busy");
+
+        let w = ScoreWeights::default();
+        assert_eq!(host_term(&loaded, 16, Class::Heavy, &w), -450 + 250);
+        assert_eq!(host_term(&slow, 8, Class::Heavy, &w), 125);
+        assert_eq!(host_term(&loaded, 16, Class::Light, &w), -450);
     }
 
     #[test]
