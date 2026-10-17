@@ -210,6 +210,7 @@ mod tests {
             blocked_classes: Vec::new(),
             trust: crate::classes::Trust::Shared,
             cpu_psi_pm: None,
+            cpu_load_pm: None,
         }
     }
 

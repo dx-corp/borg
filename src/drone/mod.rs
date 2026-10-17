@@ -96,6 +96,8 @@ pub struct Drone {
     /// Last Queen floor, retained while the Queen is unreachable.
     disk_floor: AtomicU64,
     capability_cache: capabilities::CapabilityCache,
+    /// Busy-cores rate of the host, fed by heartbeats and lease samples.
+    cpu_meter: Arc<crate::hostdiag::CpuMeter>,
 }
 
 impl Drone {
@@ -137,6 +139,7 @@ impl Drone {
             tools_cache: probe::ToolsCache::default(),
             disk_floor: AtomicU64::new(crate::envcontract::DEFAULT_MIN_DISK_FREE_BYTES),
             capability_cache: capabilities::CapabilityCache::default(),
+            cpu_meter: Arc::default(),
             client: Arc::new(client),
             host,
             exec,
@@ -218,14 +221,26 @@ impl Drone {
             status: 0,
         })?;
         let host = Arc::clone(&self.host);
+        let meter = Arc::clone(&self.cpu_meter);
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut env_facts =
-            tokio::task::spawn_blocking(move || probe::env_facts(host.as_ref(), now))
-                .await
-                .map_err(|e| ClientError::Status {
-                    path: format!("probe: {e}"),
-                    status: 0,
-                })?;
+        let mut env_facts = tokio::task::spawn_blocking(move || {
+            let now_ms =
+                i64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+                    .unwrap_or(i64::MAX);
+            let busy = crate::hostdiag::observe_cpu(host.as_ref(), &meter, now_ms);
+            let mut facts = probe::env_facts(host.as_ref(), now);
+            facts.cpu_busy_pm = busy.zip(host.available_parallelism()).map(|(b, cpus)| {
+                (b / f64::from(cpus.max(1)) * 1000.0)
+                    .round()
+                    .clamp(0.0, 1000.0) as u16
+            });
+            facts
+        })
+        .await
+        .map_err(|e| ClientError::Status {
+            path: format!("probe: {e}"),
+            status: 0,
+        })?;
         env_facts.cache_dir_free_bytes = cache_free;
         let accepting = accepting
             && !crate::envcontract::disk_admission(
@@ -386,6 +401,8 @@ impl Drone {
         };
         let ctx = LeaseContext {
             cfg: Arc::clone(&self.cfg),
+            host: Arc::clone(&self.host),
+            cpu_meter: Arc::clone(&self.cpu_meter),
             client: Arc::clone(&self.client),
             exec: Arc::clone(&self.exec),
             job_exec: Arc::clone(&self.job_exec),
@@ -395,7 +412,7 @@ impl Drone {
             proc_root: Arc::clone(&self.proc_root),
             caches: Arc::clone(&self.caches),
             slot,
-            _held: held,
+            held,
         };
         tasks.spawn(handle_lease(ctx, grant));
         true
@@ -557,6 +574,8 @@ impl Drone {
 
 struct LeaseContext {
     cfg: Arc<DroneConfig>,
+    host: Arc<dyn Host + Send + Sync>,
+    cpu_meter: Arc<crate::hostdiag::CpuMeter>,
     client: Arc<QueenClient>,
     exec: Arc<dyn Exec>,
     job_exec: Arc<dyn Exec>,
@@ -565,9 +584,39 @@ struct LeaseContext {
     preempt: tokio::sync::watch::Receiver<bool>,
     proc_root: Arc<Path>,
     caches: Arc<Caches>,
-    /// Dropped before `_held`, so the slot is free whenever the id is.
+    /// Dropped before `held`, so the slot is free whenever the id is.
     slot: SlotGuard,
-    _held: HeldGuard,
+    held: HeldGuard,
+}
+
+/// Sample the host for this lease's diagnostics. Never fails the lease.
+async fn sample_host(ctx: &LeaseContext) -> Option<crate::hostdiag::HostSample> {
+    let (host, cfg, meter) = (
+        Arc::clone(&ctx.host),
+        Arc::clone(&ctx.cfg),
+        Arc::clone(&ctx.cpu_meter),
+    );
+    let active = ctx
+        .held
+        .held
+        .lock()
+        .map(|h| u32::try_from(h.len()).unwrap_or(u32::MAX))
+        .unwrap_or(0);
+    tokio::task::spawn_blocking(move || {
+        let now_ms =
+            i64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+                .unwrap_or(i64::MAX);
+        crate::hostdiag::sample(
+            host.as_ref(),
+            &cfg.work_root,
+            &cfg.cache_root,
+            active,
+            &meter,
+            now_ms,
+        )
+    })
+    .await
+    .ok()
 }
 
 /// Run one lease, clean up unconditionally, report the result.
@@ -593,6 +642,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         job_user: ctx.cfg.job_user.as_ref(),
         proc_root: &ctx.proc_root,
     };
+    let host_start = sample_host(&ctx).await;
     let outcome = run_lease(
         &spec,
         ctx.job_exec.as_ref(),
@@ -601,6 +651,11 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         ctx.preempt.clone(),
     )
     .await;
+    let host_end = sample_host(&ctx).await;
+    let host = Some(crate::hostdiag::LeaseHostReport {
+        start: host_start,
+        end: host_end,
+    });
 
     // Runs whether the job passed, failed, timed out, was aborted or never started.
     let (work_root, id, slot_name, docker, exec, fs_ops) = (
@@ -645,6 +700,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
             peak_rss_mib: o.peak_rss_mib,
             telemetry: None,
             preempted: o.preempted,
+            host,
         },
         Err(e) => {
             tracing::warn!("lease {} could not run: {e}", grant.lease_id);
@@ -654,6 +710,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
                 peak_rss_mib: None,
                 telemetry: None,
                 preempted: false,
+                host,
             }
         }
     };

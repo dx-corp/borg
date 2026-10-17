@@ -198,6 +198,19 @@ async fn runs_a_granted_lease_cleans_up_and_reports_the_result() {
             .is_empty(),
         "result reported, lease done"
     );
+    let diag = rig
+        .h
+        .queen
+        .store()
+        .lease_host(&lease_id, 30.0)
+        .await
+        .unwrap()
+        .expect("host samples stored with the result");
+    assert_eq!(diag.drone, "d1");
+    assert_eq!(diag.exit_code, Some(0));
+    let (start, end) = (diag.start.unwrap(), diag.end.unwrap());
+    assert_eq!((start.cpus, start.active_leases), (Some(16), 1));
+    assert!(end.at >= start.at);
     let calls = rig.exec.0.lock().unwrap().clone();
     assert!(
         calls

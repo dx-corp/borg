@@ -200,6 +200,14 @@ pub struct EnvFacts {
     /// where PSI does not exist.
     #[serde(default)]
     pub cpu_psi_some_avg10_pm: Option<u16>,
+    /// `/proc/loadavg` 1-minute average per CPU, in permille (1000 is one
+    /// runnable task per CPU). Admission falls back to it without PSI.
+    #[serde(default)]
+    pub load_per_cpu_pm: Option<u32>,
+    /// Share of the host's CPUs busy since the previous heartbeat, from the
+    /// root cgroup's `cpu.stat`, in permille.
+    #[serde(default)]
+    pub cpu_busy_pm: Option<u16>,
     /// For each tool in [`PROBE_TOOLS`], the first line of its `--version`
     /// output, or `"missing"`; `None` when the drone did not measure it.
     #[serde(default)]
@@ -958,6 +966,8 @@ mod tests {
             }]),
             mem_available_mib: Some(20_000),
             cpu_psi_some_avg10_pm: Some(100),
+            load_per_cpu_pm: None,
+            cpu_busy_pm: None,
             tools: Some(tool_map(&[
                 ("git", "git version 2.45.0"),
                 ("gh", "gh version 2.50.0"),

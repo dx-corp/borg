@@ -595,12 +595,15 @@ impl Queen {
                     None,
                     now_ts,
                 );
-                if let Some(a) = &self.cfg.admission {
-                    state.cpu_psi_pm = d
+                if let Some(a) = &self.cfg.admission
+                    && let Some(f) = d
                         .env_facts
                         .as_ref()
                         .filter(|f| now_ts - f.observed_at <= a.facts_max_age_secs)
-                        .and_then(|f| f.cpu_psi_some_avg10_pm);
+                {
+                    state.cpu_psi_pm = f.cpu_psi_some_avg10_pm;
+                    state.cpu_load_pm =
+                        crate::allocator::load_pressure_pm(f.load_per_cpu_pm, f.cpu_busy_pm);
                 }
                 state.profiles = profiles
                     .iter()
@@ -962,6 +965,16 @@ impl Queen {
         let keep = i64::from(self.cfg.telemetry_retention_days) * 86_400;
         if let Err(e) = self.store.prune_telemetry(now_ts - keep).await {
             tracing::warn!("prune telemetry failed: {e}");
+        }
+        if let Err(e) = self
+            .store
+            .prune_lease_hosts(
+                now_ts - crate::hostdiag::KEEP_SECS,
+                crate::hostdiag::MAX_ROWS,
+            )
+            .await
+        {
+            tracing::warn!("prune lease host diagnostics failed: {e}");
         }
         // Grants and the snapshot are published before optional feedback. Bound
         // this pass so unavailable job history cannot stall subsequent ticks.
@@ -1366,11 +1379,10 @@ impl Queen {
                 groups[&(u.platform.as_str(), u.rust_toolchain.as_deref())]
                     .iter()
                     .filter(|d| {
-                        let state = AdmissionState::of(d.cpu_psi_pm, admission);
                         d.accepting
                             && d.trust.admits(u.scope)
-                            && state != AdmissionState::Closed
-                            && (state != AdmissionState::PrBlocked || u.scope != Scope::Pr)
+                            && AdmissionState::of(d.admission_pressure_pm(), admission)
+                                .admits(u.class, u.scope)
                             && !d.blocked_classes.contains(&u.class)
                             && max_slots(d, self.cfg.classes.spec(u.class)) > 0
                             && (d.bids.is_empty()
@@ -1641,6 +1653,9 @@ impl Queen {
                 && let Some(lease) = self.store.lease_for_runner(id, name).await?
             {
                 self.store.remember_job(&lease, repo, job.id, now).await?;
+                self.store
+                    .bind_lease_host_job(&lease, repo, job.run_id, job.id, &job.name)
+                    .await?;
             }
         }
         let mut pending = self.store.pending_jobs().await?;
@@ -1687,6 +1702,9 @@ impl Queen {
             {
                 continue;
             }
+            self.store
+                .bind_lease_host_job(&lease, &repo, job.run_id, job.id, &job.name)
+                .await?;
             if let Some((telemetry, duration, finished)) = job.telemetry(&repo) {
                 self.store
                     .record_github_telemetry(&lease, &telemetry, duration, finished)

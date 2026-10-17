@@ -10,6 +10,7 @@ Configuration, scheduling, drone administration, and protocol details for
 - [Config files](#config-files)
 - [Queen](#queen)
   - [Job telemetry](#job-telemetry)
+  - [Per-job host diagnostics](#per-job-host-diagnostics)
   - [Drone bids and demand pressure](#drone-bids-and-demand-pressure)
   - [Wake-on-LAN](#wake-on-lan)
   - [Build environment contract](#build-environment-contract)
@@ -236,6 +237,66 @@ their meaning. Keep it consistent across drones:
   `duration_secs`. A retried result may be sent again; the queen keeps the
   latest.
 
+### Per-job host diagnostics
+
+A job that fails on an overloaded drone looks like a code failure unless
+someone compares runners by hand. The drone samples its host just before the
+runner starts and again when it exits, and sends both samples with the lease
+result (`host: {start, end}` next to `exit_code`). Each sample has:
+
+| Field | Source |
+| --- | --- |
+| `at`, `cpus` | Unix seconds; CPUs the drone may use. |
+| `load` | `/proc/loadavg` 1, 5 and 15 minute averages. Inside an LXC, lxcfs computes this and it over-reports, so use the pressure and busy fields instead. |
+| `cpu_psi`, `memory_psi`, `io_psi` | `/proc/pressure/*`, `some`/`full` `avg10`/`avg60` in percent. |
+| `cgroup_cpu_psi`, `cgroup_memory_psi` | `/sys/fs/cgroup/*.pressure`: the cgroup-namespace root, which is the whole container in an LXC. |
+| `host_cpu_usage_usec`, `host_cpu_busy_cores` | `usage_usec` of `/sys/fs/cgroup/cpu.stat`, and the cores busy since the drone's previous reading (heartbeats feed it, so at most one heartbeat old). |
+| `drone_cpu_usage_usec`, `drone_cpu_throttled_usec` | `cpu.stat` of the drone's own cgroup (`/proc/self/cgroup`). Jobs run inside it. |
+| `mem_available_mib`, `work_free_mib`, `cache_free_mib` | `MemAvailable`; `df` of `work_root` and `cache_root`. |
+| `active_leases` | Leases the drone held at that moment, this one included. |
+
+Every field is optional, and a field the drone cannot read is left out. A drone
+that predates this sends no `host`, and the row still records which drone ran
+the job.
+
+The queen stores one row per lease in `lease_hosts`. It adds the GitHub run id,
+job id and job name when its queue poll sees the job on a runner it minted
+(the same match as [GitHub job feedback](#github-job-feedback)). Rows are kept
+for 7 days and at most 50,000 rows, oldest first. Two read endpoints are
+unauthenticated like `/status`:
+
+- `GET /jobs/{job_id}` returns the lease that ran the job, or 404.
+- `GET /runs/{run_id}` returns `{run_id, jobs: [...]}`, oldest lease first.
+
+```json
+{
+  "lease_id": "a1b2c3", "drone": "shared-box", "class": "heavy", "scope": "main",
+  "repo": "example-org/app", "run_id": 123456789, "job_id": 987654321, "job_name": "ui-e2e (shard 3)",
+  "leased_at": 1760650000, "finished_at": 1760651800, "duration_secs": 1790, "exit_code": 1,
+  "start": { "at": 1760650010, "cpus": 16, "load": [77.1, 60.2, 50.3],
+             "cgroup_cpu_psi": { "some_avg10": 54.9, "some_avg60": 52.4 },
+             "host_cpu_busy_cores": 15.2, "active_leases": 2, "…": "…" },
+  "end": { "…": "…" },
+  "during": { "secs": 1790, "host_cpu_busy_cores": 15.5, "drone_cpu_busy_cores": 3.0,
+              "drone_cpu_throttled_secs": 0.0 },
+  "slow_host": true,
+  "slow_host_reasons": ["cpu pressure 54.9% at start (threshold 30%)"]
+}
+```
+
+`slow_host` is true when any of these held: CPU pressure (`some avg10`, the
+higher of the host and cgroup files) at start at or above the admission soft
+threshold (`psi_soft_pm / 10`, or 30% without an `admission` block); memory
+pressure at start at or above 10%; load average per CPU at start at or above
+1.5, used only when the host has no CPU pressure reading; 90% of the CPUs busy
+at start or on average during the job; less than 10 GiB free on the work or
+cache volume at start. `during` is computed from the two samples.
+
+The job id is known only if a queue poll saw the job while it ran or a direct
+lookup found it afterwards (see [GitHub job feedback](#github-job-feedback)).
+A job that starts and finishes between polls has a row without `job_id`, and
+`/jobs/{job_id}` returns 404 for it.
+
 ### Drone bids and demand pressure
 
 A drone may add `bids` to its heartbeat: at most one per `(class, scope)` it is
@@ -349,6 +410,8 @@ old as unknown, so probe at least that often):
 | `toolchains` | For each toolchain `rustup toolchain list` shows, `{channel, rustc_version}`: the channel as `rust-toolchain.toml` would name it (`1.95.0`, `stable`, `nightly-2026-01-01`; strip the host triple) and the `release:` line of `rustc +<channel> -vV`. `null` if rustup could not be queried. |
 | `mem_available_mib` | Linux `MemAvailable` from `/proc/meminfo`; macOS (free + inactive + speculative pages) times the page size, in MiB. |
 | `cpu_psi_some_avg10_pm` | Linux `/proc/pressure/cpu` line `some`, `avg10` times ten, rounded; absent where PSI does not exist. |
+| `load_per_cpu_pm` | `/proc/loadavg` 1-minute average divided by the usable CPUs, times 1000. |
+| `cpu_busy_pm` | Share of the CPUs busy since the previous heartbeat, from `usage_usec` in `/sys/fs/cgroup/cpu.stat`, in permille. |
 | `tools` | For each of `git`, `gh`, `node`, `npm`, `pnpm`, `python3`, `docker`, `cargo`, `rustc`, `bazel`, `go`, `uv`, `mise`, `jq`, `cosign`: resolve the executable on the job user's `PATH` (as the job user, with the job environment) and record the first line of `<tool> --version` (`go version` for `go`), trimmed, at most 80 characters. `"missing"` when it is not on `PATH`, `"unknown"` when it is but prints nothing. The map is absent when the probe did not run. |
 
 A unit's toolchain (`rust_toolchain`) matches an installed `channel` or
@@ -873,23 +936,55 @@ one saturated host can all show free slots. Optional and off unless the queen
 config has an `admission` block:
 
 ```json
-"admission": { "psi_soft_pm": 300, "psi_hard_pm": 600, "facts_max_age_secs": 180 }
+"admission": { "psi_soft_pm": 300, "psi_light_only_pm": 500, "psi_hard_pm": 600, "facts_max_age_secs": 180 }
 ```
 
 Each drone reports Linux PSI `cpu some avg10` in permille on every heartbeat
 (the higher of `/proc/pressure/cpu` and the cgroup file
-`/sys/fs/cgroup/cpu.pressure`). At or above `psi_soft_pm` the drone takes no
-new pull-request grant; main work is still placed. At or above `psi_hard_pm` it
-takes no new grant of any scope. Leases already granted are not touched. A
-reading older than `facts_max_age_secs`, or no reading, puts no restriction on
-the drone. The starvation guard obeys the same rule: a starving pull-request
-lease is not placed on a soft-blocked drone. Requires `0 < psi_soft_pm <=
-psi_hard_pm <= 1000` and a positive age.
+`/sys/fs/cgroup/cpu.pressure`). The queen compares it with three thresholds:
 
-`/status` shows `admission: {state, cpu_psi_pm}` per drone (`state` is `open`,
-`pr_blocked` or `closed`).
-Metrics: `borg_drone_cpu_psi_pm{drone}` and `borg_drone_admission{drone,state}`.
-The build environment contract's `resources` check is separate and still works.
+| Pressure | State | New grants |
+| --- | --- | --- |
+| below `psi_soft_pm` | `open` | all |
+| at or above `psi_soft_pm` | `pr_blocked` | no pull-request work |
+| at or above `psi_light_only_pm` | `light_only` | no pull-request work and no main medium or heavy work; main light and deploy work still placed |
+| at or above `psi_hard_pm` | `closed` | none |
+
+`psi_light_only_pm` is optional and must lie between the other two. Without
+it a drone goes from `pr_blocked` straight to `closed`. Leases already granted
+are not touched. A reading older than `facts_max_age_secs`, or no reading at
+all, puts no restriction on the drone. The starvation guard obeys the same
+rule: a starving pull-request lease is not placed on a soft-blocked drone, and
+a starving main heavy lease is not placed on a `light_only` drone. Requires
+`0 < psi_soft_pm <= psi_hard_pm <= 1000` and a positive age.
+
+**Hosts without PSI.** A kernel without PSI (or booted with `psi=0`) reports
+no pressure. Such a drone would never be blocked, however loaded. The drone
+therefore also reports `load_per_cpu_pm`, the 1-minute load average divided by
+its usable CPUs in permille, and `cpu_busy_pm`, the share of CPUs busy since the
+previous heartbeat from the root cgroup's `cpu.stat`. When PSI is missing the
+queen estimates pressure as `(load - cpus) / load`, the share of runnable tasks
+that wait for a CPU (load 93 on 16 CPUs gives 828 permille). The estimate is 0
+when the load is at or below one task per CPU, or when `cpu_busy_pm` is under
+900. In that case the CPUs have idle time, so the run queue is I/O wait or an
+lxcfs-computed load average, not CPU contention. PSI always wins when present.
+
+**A null `cpu_psi_pm` usually means an old drone binary.** Drones built before
+CPU-pressure admission send no pressure at all, so `/status` shows
+`cpu_psi_pm: null` and the drone is never blocked. Before trusting admission,
+check that every drone runs a current binary (see
+[Updating a drone](#updating-a-drone)). Inside an LXC, `/proc/loadavg` is
+lxcfs's estimate and over-reports badly, while the container's
+`/sys/fs/cgroup/cpu.pressure` is kernel-computed. An LXC drone with a current
+binary therefore admits on real pressure.
+
+`/status` shows `admission: {state, cpu_psi_pm, cpu_load_pm}` per drone
+(`state` is `open`, `pr_blocked`, `light_only` or `closed`; `cpu_load_pm` is the
+load estimate, used only when `cpu_psi_pm` is null). Placement diagnostics name
+the rejection `pr_pressure`, `light_only_pressure` or `admission_closed`.
+Metrics: `borg_drone_cpu_psi_pm{drone}`, `borg_drone_cpu_load_pm{drone}` and
+`borg_drone_admission{drone,state}`. The build environment contract's
+`resources` check is separate and still works.
 
 ### Standby runners and deploy fail-open
 
