@@ -43,7 +43,7 @@ pub fn measure(path: &Path) -> (u64, SystemTime) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Measured {
     pub(super) size: u64,
-    pub(super) newest: SystemTime,
+    newest: SystemTime,
     /// Directories that could not be listed (for example owned by the job
     /// user and closed to the drone's user): `size` is then a lower bound.
     pub(super) unreadable_dirs: u64,
