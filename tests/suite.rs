@@ -14,6 +14,7 @@ mod drone;
 mod explain;
 mod explain_cli;
 mod health;
+mod hostdiag_wire;
 mod janitor;
 mod job_user;
 mod placement_batch;

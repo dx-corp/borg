@@ -203,11 +203,11 @@ pub struct EnvFacts {
     /// `/proc/loadavg` 1-minute average per CPU, in permille (1000 is one
     /// runnable task per CPU). Admission falls back to it without PSI.
     #[serde(default)]
-    pub load_per_cpu_pm: Option<u32>,
+    pub(crate) load_per_cpu_pm: Option<u32>,
     /// Share of the host's CPUs busy since the previous heartbeat, from the
     /// root cgroup's `cpu.stat`, in permille.
     #[serde(default)]
-    pub cpu_busy_pm: Option<u16>,
+    pub(crate) cpu_busy_pm: Option<u16>,
     /// For each tool in [`PROBE_TOOLS`], the first line of its `--version`
     /// output, or `"missing"`; `None` when the drone did not measure it.
     #[serde(default)]

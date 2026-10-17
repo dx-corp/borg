@@ -22,22 +22,22 @@ use crate::probe::{self, Host};
 use crate::store::{LeaseResult, LeaseRow, Store, StoreError};
 
 /// Rows are kept this long after the lease was granted.
-pub const KEEP_SECS: i64 = 7 * 86_400;
+pub(crate) const KEEP_SECS: i64 = 7 * 86_400;
 /// At most this many rows are kept; the oldest go first.
-pub const MAX_ROWS: i64 = 50_000;
+pub(crate) const MAX_ROWS: i64 = 50_000;
 /// CPU pressure (`some avg10`, percent) at job start that marks a slow host
 /// when the queen has no `admission` block.
-pub const SLOW_CPU_PSI_PCT: f64 = 30.0;
+pub(crate) const SLOW_CPU_PSI_PCT: f64 = 30.0;
 /// Memory pressure (`some avg10`, percent) at job start that marks a slow host.
-pub const SLOW_MEM_PSI_PCT: f64 = 10.0;
+const SLOW_MEM_PSI_PCT: f64 = 10.0;
 /// Load average per CPU that marks a slow host. Only used when the host has no
 /// CPU pressure reading, because an LXC's load average is computed by lxcfs and
 /// over-reports.
-pub const SLOW_LOAD_PER_CPU: f64 = 1.5;
+const SLOW_LOAD_PER_CPU: f64 = 1.5;
 /// Share of the host's CPUs busy that marks a slow host.
-pub const SLOW_BUSY_SHARE: f64 = 0.9;
+const SLOW_BUSY_SHARE: f64 = 0.9;
 /// Free disk on the work or cache volume that marks a slow host.
-pub const SLOW_FREE_DISK_MIB: u64 = 10 * 1024;
+const SLOW_FREE_DISK_MIB: u64 = 10 * 1024;
 
 const MAX_NAME_CHARS: usize = 120;
 
@@ -45,19 +45,19 @@ const MAX_NAME_CHARS: usize = 120;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Psi {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub some_avg10: Option<f64>,
+    some_avg10: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub some_avg60: Option<f64>,
+    some_avg60: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub full_avg10: Option<f64>,
+    full_avg10: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub full_avg60: Option<f64>,
+    full_avg60: Option<f64>,
 }
 
 impl Psi {
     /// Parse `some avg10=1.00 avg60=...` / `full ...` lines. `None` when no
     /// field could be read.
-    pub fn parse(text: &str) -> Option<Self> {
+    fn parse(text: &str) -> Option<Self> {
         let field = |kind: &str, key: &str| -> Option<f64> {
             text.lines()
                 .find(|l| l.starts_with(kind))?
@@ -99,44 +99,44 @@ pub struct HostSample {
     /// `/proc/loadavg` 1, 5 and 15 minute averages. Inside an LXC this is
     /// lxcfs's estimate and over-reports; prefer the pressure and busy fields.
     #[serde(default)]
-    pub load: Option<[f64; 3]>,
+    load: Option<[f64; 3]>,
     /// `/proc/pressure/cpu`.
     #[serde(default)]
-    pub cpu_psi: Option<Psi>,
+    cpu_psi: Option<Psi>,
     /// `/proc/pressure/memory`.
     #[serde(default)]
-    pub memory_psi: Option<Psi>,
+    memory_psi: Option<Psi>,
     /// `/proc/pressure/io`.
     #[serde(default)]
-    pub io_psi: Option<Psi>,
+    io_psi: Option<Psi>,
     /// `/sys/fs/cgroup/cpu.pressure`: the cgroup-namespace root, which is the
     /// whole container inside an LXC.
     #[serde(default)]
-    pub cgroup_cpu_psi: Option<Psi>,
+    cgroup_cpu_psi: Option<Psi>,
     /// `/sys/fs/cgroup/memory.pressure`.
     #[serde(default)]
-    pub cgroup_memory_psi: Option<Psi>,
+    cgroup_memory_psi: Option<Psi>,
     /// `usage_usec` of `/sys/fs/cgroup/cpu.stat` (whole host or container).
     #[serde(default)]
-    pub host_cpu_usage_usec: Option<u64>,
+    host_cpu_usage_usec: Option<u64>,
     /// Cores busy in that cgroup, averaged since the drone's previous sample
     /// (at most one heartbeat ago).
     #[serde(default)]
-    pub host_cpu_busy_cores: Option<f64>,
+    host_cpu_busy_cores: Option<f64>,
     /// `usage_usec` of the drone's own cgroup; jobs run inside it.
     #[serde(default)]
-    pub drone_cpu_usage_usec: Option<u64>,
+    drone_cpu_usage_usec: Option<u64>,
     /// `throttled_usec` of the drone's own cgroup.
     #[serde(default)]
-    pub drone_cpu_throttled_usec: Option<u64>,
+    drone_cpu_throttled_usec: Option<u64>,
     #[serde(default)]
-    pub mem_available_mib: Option<u64>,
+    mem_available_mib: Option<u64>,
     /// Free space on the filesystem holding the drone's `work_root`.
     #[serde(default)]
-    pub work_free_mib: Option<u64>,
+    work_free_mib: Option<u64>,
     /// Free space on the filesystem holding the drone's `cache_root`.
     #[serde(default)]
-    pub cache_free_mib: Option<u64>,
+    cache_free_mib: Option<u64>,
     /// Leases the drone held at this moment, this one included.
     #[serde(default)]
     pub active_leases: u32,
@@ -144,7 +144,7 @@ pub struct HostSample {
 
 impl HostSample {
     /// Clamp what a drone sent: finite non-negative numbers, no future time.
-    pub fn sanitized(mut self, now: i64) -> Self {
+    fn sanitized(mut self, now: i64) -> Self {
         let num = |v: f64| v.is_finite().then(|| v.max(0.0));
         self.at = self.at.min(now);
         self.load = self
@@ -164,7 +164,7 @@ impl HostSample {
     }
 
     /// The higher CPU `some avg10` of the host file and the cgroup file.
-    pub fn cpu_some_avg10(&self) -> Option<f64> {
+    fn cpu_some_avg10(&self) -> Option<f64> {
         [self.cpu_psi, self.cgroup_cpu_psi]
             .into_iter()
             .flatten()
@@ -185,9 +185,9 @@ impl HostSample {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LeaseHostReport {
     #[serde(default)]
-    pub start: Option<HostSample>,
+    pub(crate) start: Option<HostSample>,
     #[serde(default)]
-    pub end: Option<HostSample>,
+    pub(crate) end: Option<HostSample>,
 }
 
 /// Turns successive `cpu.stat` readings into a busy-cores rate.
@@ -208,7 +208,7 @@ impl CpuMeter {
     /// Record a reading and return the latest rate. A reading that arrives
     /// within two seconds of the stored one returns the stored rate, so a lease
     /// that starts right after a heartbeat still gets a measured value.
-    pub fn observe(&self, at_ms: i64, usage_usec: u64) -> Option<f64> {
+    fn observe(&self, at_ms: i64, usage_usec: u64) -> Option<f64> {
         let mut slot = self.0.lock().ok()?;
         let next = match *slot {
             Some(prev) if at_ms - prev.at_ms < METER_MIN_GAP_MS && at_ms >= prev.at_ms => {
@@ -266,14 +266,14 @@ fn loadavg(host: &dyn Host) -> Option<[f64; 3]> {
 
 /// Feed the meter from the root cgroup and return the busy-cores rate. Called
 /// on every heartbeat so a lease start has a recent rate.
-pub fn observe_cpu(host: &dyn Host, meter: &CpuMeter, at_ms: i64) -> Option<f64> {
+pub(crate) fn observe_cpu(host: &dyn Host, meter: &CpuMeter, at_ms: i64) -> Option<f64> {
     let (usage, _) = cpu_stat(host, Path::new("/sys/fs/cgroup"));
     meter.observe(at_ms, usage?)
 }
 
 /// Sample the host for a lease start or end. Every field degrades to `None`
 /// on its own; this never fails.
-pub fn sample(
+pub(crate) fn sample(
     host: &dyn Host,
     work_root: &Path,
     cache_root: &Path,
@@ -311,15 +311,15 @@ pub fn sample(
 /// Averages over the job, from the start and end samples.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct During {
-    pub secs: i64,
+    secs: i64,
     /// Cores busy on the whole host (or container).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub host_cpu_busy_cores: Option<f64>,
+    host_cpu_busy_cores: Option<f64>,
     /// Cores used by the drone's cgroup: this job and any other lease.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub drone_cpu_busy_cores: Option<f64>,
+    drone_cpu_busy_cores: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub drone_cpu_throttled_secs: Option<f64>,
+    drone_cpu_throttled_secs: Option<f64>,
 }
 
 fn during(start: &HostSample, end: &HostSample) -> Option<During> {
@@ -343,7 +343,7 @@ fn during(start: &HostSample, end: &HostSample) -> Option<During> {
 
 /// Why a job's host was overloaded, or nothing. `cpu_psi_pct` is the CPU
 /// pressure threshold (the queen's admission soft threshold when set).
-pub fn slow_host_reasons(
+fn slow_host_reasons(
     start: Option<&HostSample>,
     during: Option<&During>,
     cpu_psi_pct: f64,
@@ -404,27 +404,27 @@ pub fn slow_host_reasons(
 /// One lease as `GET /jobs/{id}` and `GET /runs/{id}` show it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobHostView {
-    pub lease_id: String,
+    lease_id: String,
     pub drone: String,
-    pub class: Class,
-    pub scope: Scope,
-    pub repo: Option<String>,
-    pub run_id: Option<u64>,
-    pub job_id: Option<u64>,
-    pub job_name: Option<String>,
+    class: Class,
+    scope: Scope,
+    repo: Option<String>,
+    run_id: Option<u64>,
+    job_id: Option<u64>,
+    job_name: Option<String>,
     /// When the queen granted the lease.
-    pub leased_at: i64,
+    leased_at: i64,
     /// When the drone reported the result.
-    pub finished_at: Option<i64>,
+    finished_at: Option<i64>,
     /// Runner wall time the drone reported.
-    pub duration_secs: Option<u64>,
+    duration_secs: Option<u64>,
     pub exit_code: Option<i32>,
     pub start: Option<HostSample>,
     pub end: Option<HostSample>,
-    pub during: Option<During>,
+    during: Option<During>,
     /// The drone was overloaded when the job started or while it ran.
-    pub slow_host: bool,
-    pub slow_host_reasons: Vec<String>,
+    slow_host: bool,
+    slow_host_reasons: Vec<String>,
 }
 
 fn to_i64(v: u64) -> i64 {
@@ -461,7 +461,7 @@ const SELECT: &str = "SELECT lease_id, drone, class, scope, repo, run_id, job_id
 
 impl Store {
     /// Record a drone's result and host samples for its lease.
-    pub async fn record_lease_host(
+    pub(crate) async fn record_lease_host(
         &self,
         lease: &LeaseRow,
         result: &LeaseResult,
@@ -498,7 +498,7 @@ impl Store {
     }
 
     /// Attach the GitHub job a lease's runner picked up.
-    pub async fn bind_lease_host_job(
+    pub(crate) async fn bind_lease_host_job(
         &self,
         lease: &LeaseRow,
         repo: &str,
@@ -533,7 +533,7 @@ impl Store {
     }
 
     /// The lease that ran GitHub job `job_id` (the newest, if several did).
-    pub async fn job_host(
+    pub(crate) async fn job_host(
         &self,
         job_id: u64,
         cpu_psi_pct: f64,
@@ -563,7 +563,7 @@ impl Store {
     }
 
     /// Every lease that ran a job of workflow run `run_id`, oldest first.
-    pub async fn run_hosts(
+    pub(crate) async fn run_hosts(
         &self,
         run_id: u64,
         cpu_psi_pct: f64,
@@ -579,7 +579,11 @@ impl Store {
     }
 
     /// Drop rows granted before `before`, then all but the newest `max_rows`.
-    pub async fn prune_lease_hosts(&self, before: i64, max_rows: i64) -> Result<u64, StoreError> {
+    pub(crate) async fn prune_lease_hosts(
+        &self,
+        before: i64,
+        max_rows: i64,
+    ) -> Result<u64, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         let old = sqlx::query("DELETE FROM lease_hosts WHERE leased_at < ?")
             .bind(before)

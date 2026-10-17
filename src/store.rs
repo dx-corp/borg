@@ -808,7 +808,7 @@ impl Store {
 
     /// Append a fleet or drone event (stale, expired, capacity) to the
     /// health audit trail that `/status` shows as `health_events`.
-    pub async fn record_health_event(
+    pub(crate) async fn record_health_event(
         &self,
         at: i64,
         drone: &str,
