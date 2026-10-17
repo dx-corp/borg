@@ -89,8 +89,22 @@ pub fn env_facts(host: &dyn Host, now: i64) -> EnvFacts {
         observed_at: now,
         mem_available_mib: mem_available_mib(host),
         cpu_psi_some_avg10_pm: cpu_psi_pm(host),
+        load_per_cpu_pm: load_per_cpu_pm(host),
         ..EnvFacts::default()
     }
+}
+
+/// The 1-minute load average per usable CPU, in permille.
+fn load_per_cpu_pm(host: &dyn Host) -> Option<u32> {
+    let load = host
+        .read_to_string(Path::new("/proc/loadavg"))?
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+        .filter(|l| l.is_finite() && *l >= 0.0)?;
+    let cpus = f64::from(host.available_parallelism()?.max(1));
+    Some((load / cpus * 1000.0).round().min(f64::from(u32::MAX)) as u32)
 }
 
 /// How long a tools probe is reused before the tools are looked up again.
@@ -162,7 +176,7 @@ impl ToolsCache {
     }
 }
 
-fn mem_available_mib(host: &dyn Host) -> Option<u64> {
+pub(crate) fn mem_available_mib(host: &dyn Host) -> Option<u64> {
     let meminfo = host.read_to_string(Path::new("/proc/meminfo"))?;
     let kib = meminfo
         .lines()
@@ -508,6 +522,18 @@ mod tests {
         assert_eq!(exec.calls.lock().unwrap().len(), n);
         cache.get(&exec, 1060).unwrap();
         assert!(exec.calls.lock().unwrap().len() > n);
+    }
+
+    #[test]
+    fn load_per_cpu_is_permille_of_usable_cpus() {
+        let mut h = linux();
+        assert_eq!(load_per_cpu_pm(&h), None);
+        h.files
+            .insert("/proc/loadavg", "93.40 78.56 69.31 90/3277 3570264\n");
+        assert_eq!(load_per_cpu_pm(&h), Some(5838));
+        assert_eq!(env_facts(&h, 1).load_per_cpu_pm, Some(5838));
+        h.files.insert("/proc/loadavg", "garbage");
+        assert_eq!(load_per_cpu_pm(&h), None);
     }
 
     #[test]

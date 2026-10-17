@@ -1,7 +1,8 @@
 //! HTTP surface of the queen.
 //!
-//! * `GET /status` and `GET /metrics` are read-only and unauthenticated; bind
-//!   them to a private interface.
+//! * `GET /status`, `GET /metrics`, `GET /report`, `GET /jobs/{job_id}` and
+//!   `GET /runs/{run_id}` are read-only and unauthenticated; bind them to a
+//!   private interface.
 //! * `POST /v1/heartbeat` and `POST /v1/leases/{id}/result` are the drone API,
 //!   authenticated with `Authorization: Bearer <enrollment token>`.
 //!
@@ -29,6 +30,7 @@ use crate::enroll::hash_token;
 use crate::envcontract::{CheckState, EnvFacts, Need, Verdict, blocked_classes, evaluate};
 use crate::health::{DroneHealth, HealthState};
 use crate::homeostasis::KeyReport;
+use crate::hostdiag::{JobHostView, LeaseHostReport};
 use crate::probe::Capacity;
 use crate::queen::RolloutView;
 use crate::queen::{Queen, QueenError, QueueEntry};
@@ -97,6 +99,7 @@ fn sanitize_facts(f: &EnvFacts, now: i64) -> EnvFacts {
     };
     let mut out = f.clone();
     out.observed_at = out.observed_at.min(now);
+    out.cpu_busy_pm = out.cpu_busy_pm.map(|b| b.min(1000));
     for fact in out.capabilities.values_mut() {
         fact.observed_at = fact.observed_at.min(now);
     }
@@ -272,6 +275,10 @@ pub struct ResultRequest {
     /// The drone stopped the job because the queen preempted the lease.
     #[serde(default)]
     pub preempted: bool,
+    /// Host load when the runner started and when it exited; see
+    /// [`crate::hostdiag`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<LeaseHostReport>,
 }
 
 #[derive(Debug)]
@@ -327,6 +334,8 @@ pub fn router(queen: Arc<Queen>) -> Router {
         .route("/metrics", get(metrics))
         .route("/report", get(report))
         .route("/explain", get(explain))
+        .route("/jobs/{job_id}", get(job_host))
+        .route("/runs/{run_id}", get(run_hosts))
         .route("/v1/enroll", post(tailnet_enroll))
         .route("/v1/heartbeat", post(heartbeat))
         .route("/v1/leases/{id}/result", post(lease_result))
@@ -627,6 +636,15 @@ async fn lease_result(
         .finish_lease(&id, &drone, &result, now)
         .await?
     {
+        if let Some(lease) = queen.store().lease(&id).await?
+            && let Err(e) = queen
+                .store()
+                .record_lease_host(&lease, &result, req.host.as_ref(), now)
+                .await
+        {
+            // Diagnostics never fail a result.
+            tracing::warn!("lease {id}: host diagnostics not stored: {e}");
+        }
         if let Some(t) = req.telemetry {
             match t.sanitized() {
                 Some(t) => {
@@ -791,6 +809,9 @@ pub struct CapacityStatus {
 pub struct DroneAdmissionView {
     pub state: AdmissionState,
     pub cpu_psi_pm: Option<u16>,
+    /// Pressure estimated from the load average; `state` uses it only when
+    /// `cpu_psi_pm` is null.
+    pub cpu_load_pm: Option<u16>,
 }
 
 /// One drone's build environment contract.
@@ -1107,6 +1128,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
                 .map(|a| DroneAdmissionView {
                     state: a.state,
                     cpu_psi_pm: a.cpu_psi_pm,
+                    cpu_load_pm: a.cpu_load_pm,
                 }),
             contract: cfg.env_contract.enabled.then(|| {
                 let verdict = |class| {
@@ -1309,6 +1331,54 @@ async fn report(
         window,
         q.limit.unwrap_or(20).min(500),
     )))
+}
+
+/// The CPU pressure (percent) above which a job's host counts as slow: the
+/// admission soft threshold when admission is on.
+fn slow_cpu_psi_pct(queen: &Queen) -> f64 {
+    queen
+        .config()
+        .admission
+        .as_ref()
+        .map_or(crate::hostdiag::SLOW_CPU_PSI_PCT, |a| {
+            f64::from(a.psi_soft_pm) / 10.0
+        })
+}
+
+/// `GET /jobs/{job_id}`: the drone that ran GitHub job `job_id` and its host
+/// load at start and end. 404 when the queen never saw that job on a runner it
+/// minted, or the row aged out. Unauthenticated like `/status`.
+async fn job_host(
+    State(queen): State<Arc<Queen>>,
+    Path(job_id): Path<u64>,
+) -> Result<Json<JobHostView>, ApiError> {
+    queen
+        .store()
+        .job_host(job_id, slow_cpu_psi_pct(&queen))
+        .await?
+        .map(Json)
+        .ok_or(ApiError::NotFound)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RunHosts {
+    pub run_id: u64,
+    pub jobs: Vec<JobHostView>,
+}
+
+/// `GET /runs/{run_id}`: every job of a workflow run that ran on a borg
+/// runner, oldest lease first. An unknown run has an empty `jobs` list.
+async fn run_hosts(
+    State(queen): State<Arc<Queen>>,
+    Path(run_id): Path<u64>,
+) -> Result<Json<RunHosts>, ApiError> {
+    Ok(Json(RunHosts {
+        run_id,
+        jobs: queen
+            .store()
+            .run_hosts(run_id, slow_cpu_psi_pct(&queen))
+            .await?,
+    }))
 }
 
 async fn status(State(queen): State<Arc<Queen>>) -> Result<Json<Status>, ApiError> {
@@ -1569,8 +1639,23 @@ pub fn render_metrics(status: &Status) -> String {
             .collect(),
     );
     gauge(
+        "borg_drone_cpu_load_pm",
+        "CPU pressure (permille) estimated from the drone's load average; admission uses it when PSI is absent.",
+        status
+            .drones
+            .iter()
+            .filter_map(|d| {
+                let load = d.admission.as_ref()?.cpu_load_pm?;
+                Some((
+                    format!("drone=\"{}\"", label_value(&d.name)),
+                    f64::from(load),
+                ))
+            })
+            .collect(),
+    );
+    gauge(
         "borg_drone_admission",
-        "1 for the drone's CPU-pressure admission state (open, pr_blocked, closed).",
+        "1 for the drone's CPU-pressure admission state (open, pr_blocked, light_only, closed).",
         status
             .drones
             .iter()

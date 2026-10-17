@@ -786,6 +786,168 @@ async fn observed_running_job_is_collected_after_workflow_leaves_the_queue() {
 }
 
 #[tokio::test]
+async fn job_and_run_endpoints_show_the_drone_and_its_host_load() {
+    let h = Harness::start(
+        json!({"admission": {"psi_soft_pm": 300, "psi_hard_pm": 600, "facts_max_age_secs": 180}}),
+    )
+    .await;
+    let token = h.enroll("shared-box").await;
+    h.heartbeat(&token, &[]).await;
+    let lease_id = lease_for(&h, &token, "borg-ci-heavy", 4242).await;
+    let lease = h.queen.store().lease(&lease_id).await.unwrap().unwrap();
+    let start = OffsetDateTime::now_utc() - time::Duration::seconds(45);
+    let ts = start
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    h.state().jobs = vec![json!({
+        "id": 4242, "run_id": 1, "name": "ui-e2e (shard 3)", "status": "in_progress",
+        "conclusion": null, "labels": ["borg-ci-heavy"],
+        "runner_id": lease.runner_id, "runner_name": lease.runner_name,
+        "created_at": ts, "started_at": ts, "completed_at": null, "steps": []
+    })];
+    h.tick().await;
+
+    // Seen running, no result yet: the drone is known, samples are not.
+    let job: Value = h
+        .http
+        .get(format!("{}/jobs/4242", h.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(job["drone"], "shared-box");
+    // The mock serves this job under queued run 1.
+    assert_eq!(job["run_id"], 1);
+    assert_eq!(job["job_name"], "ui-e2e (shard 3)");
+    assert_eq!(job["start"], Value::Null);
+    assert_eq!(job["slow_host"], false);
+
+    let status = post_result(
+        &h,
+        &token,
+        &lease_id,
+        json!({"exit_code": 1, "duration_secs": 100, "host": {
+            "start": {"at": 1000, "cpus": 16, "load": [77.0, 60.0, 50.0],
+                      "cgroup_cpu_psi": {"some_avg10": 54.9, "some_avg60": 52.4},
+                      "host_cpu_usage_usec": 0, "drone_cpu_usage_usec": 0,
+                      "work_free_mib": 30000, "cache_free_mib": 30000, "active_leases": 2},
+            "end": {"at": 1100, "cpus": 16, "host_cpu_usage_usec": 1550000000u64,
+                    "drone_cpu_usage_usec": 300000000, "active_leases": 1}}}),
+    )
+    .await;
+    assert_eq!(status, 204);
+
+    let job: Value = h
+        .http
+        .get(format!("{}/jobs/4242", h.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(job["exit_code"], 1);
+    assert_eq!(job["duration_secs"], 100);
+    assert_eq!(job["start"]["active_leases"], 2);
+    assert_eq!(job["during"]["host_cpu_busy_cores"], 15.5);
+    assert_eq!(job["during"]["drone_cpu_busy_cores"], 3.0);
+    assert_eq!(job["slow_host"], true);
+    let reasons = job["slow_host_reasons"].as_array().unwrap();
+    assert!(
+        reasons[0]
+            .as_str()
+            .unwrap()
+            .starts_with("cpu pressure 54.9% at start"),
+        "{reasons:?}"
+    );
+
+    let run: Value = h
+        .http
+        .get(format!("{}/runs/1", h.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(run["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(run["jobs"][0]["job_id"], 4242);
+
+    let missing = h
+        .http
+        .get(format!("{}/jobs/1", h.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    let empty: Value = h
+        .http
+        .get(format!("{}/runs/2", h.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(empty["jobs"], json!([]));
+}
+
+#[tokio::test]
+async fn admission_falls_back_to_load_without_psi_and_light_only_sheds_main_heavy() {
+    let h = Harness::start(json!({"admission": {
+        "psi_soft_pm": 300, "psi_light_only_pm": 500, "psi_hard_pm": 600, "facts_max_age_secs": 180}}))
+    .await;
+    let token = h.enroll("no-psi").await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    // No PSI, load 93 on 16 saturated CPUs: estimated 828 permille, closed.
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": {"observed_at": now, "load_per_cpu_pm": 5838, "cpu_busy_pm": 990}}),
+    )
+    .await;
+    h.queue_job(1, "borg-ci-heavy", 5);
+    h.tick().await;
+    let s = h.status().await;
+    let a = &s["drones"][0]["admission"];
+    assert_eq!(a["state"], "closed", "{a}");
+    assert_eq!(a["cpu_psi_pm"], Value::Null);
+    assert_eq!(a["cpu_load_pm"], 828);
+    assert!(
+        h.state().mints.is_empty(),
+        "an overloaded drone without PSI gets no main heavy"
+    );
+    assert!(
+        h.metrics()
+            .await
+            .contains("borg_drone_cpu_load_pm{drone=\"no-psi\"} 828")
+    );
+
+    // With PSI 540 the drone is light-only: main light placed, main heavy not.
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": {"observed_at": now, "cpu_psi_some_avg10_pm": 540,
+                             "load_per_cpu_pm": 5838, "cpu_busy_pm": 990}}),
+    )
+    .await;
+    h.queue_job(2, "borg-ci-light", 5);
+    h.tick().await;
+    assert_eq!(
+        h.status().await["drones"][0]["admission"]["state"],
+        "light_only"
+    );
+    let minted: Vec<String> = h
+        .state()
+        .mints
+        .iter()
+        .map(|m| m["labels"].to_string())
+        .collect();
+    assert_eq!(minted.len(), 1, "{minted:?}");
+    assert!(minted[0].contains("borg-ci-light"), "{minted:?}");
+}
+
+#[tokio::test]
 async fn github_telemetry_requires_exact_runner_identity_and_preserves_drone_evidence() {
     let h = Harness::start(json!({})).await;
     let token = h.enroll("d1").await;

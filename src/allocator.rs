@@ -85,12 +85,34 @@ pub struct DroneState {
     /// or stale. Only read when [`AllocatorInput::admission`] is set.
     #[serde(default)]
     pub cpu_psi_pm: Option<u16>,
+    /// CPU pressure estimated from the load average, for a drone without PSI
+    /// (see [`load_pressure_pm`]). Admission uses it only when `cpu_psi_pm`
+    /// is `None`.
+    #[serde(default)]
+    pub cpu_load_pm: Option<u16>,
+}
+
+/// CPU pressure (permille) estimated from the 1-minute load average per CPU
+/// (`load_per_cpu_pm`, 1000 = one runnable task per CPU) for hosts without
+/// PSI. With `L` runnable tasks on `N` CPUs, `(L - N) / L` of them wait, which
+/// approximates PSI `cpu some`. When the root cgroup shows the CPUs under 90%
+/// busy (`cpu_busy_pm`), the run queue is not CPU contention (I/O wait, or an
+/// lxcfs load average) and the estimate is 0.
+pub fn load_pressure_pm(load_per_cpu_pm: Option<u32>, cpu_busy_pm: Option<u16>) -> Option<u16> {
+    let load = u64::from(load_per_cpu_pm?);
+    if load <= 1000 || cpu_busy_pm.is_some_and(|b| b < 900) {
+        return Some(0);
+    }
+    u16::try_from((load - 1000) * 1000 / load).ok()
 }
 
 /// CPU-pressure thresholds (permille) for admission; see [`AdmissionState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionThresholds {
     pub psi_soft_pm: u16,
+    /// From this pressure only light main and deploy grants; at or above
+    /// `psi_hard_pm` it has no effect.
+    pub psi_light_only_pm: u16,
     pub psi_hard_pm: u16,
 }
 
@@ -102,35 +124,53 @@ pub enum AdmissionState {
     Open,
     /// At or above soft: pull-request grants are shed, everything else placed.
     PrBlocked,
+    /// At or above `psi_light_only_pm`: pull-request grants are shed, and main
+    /// work only of the light class; deploy work is still placed.
+    LightOnly,
     /// At or above hard: no new grant of any scope.
     Closed,
 }
 
 impl AdmissionState {
-    pub const ALL: [AdmissionState; 3] = [Self::Open, Self::PrBlocked, Self::Closed];
+    pub const ALL: [AdmissionState; 4] =
+        [Self::Open, Self::PrBlocked, Self::LightOnly, Self::Closed];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Open => "open",
             Self::PrBlocked => "pr_blocked",
+            Self::LightOnly => "light_only",
             Self::Closed => "closed",
         }
     }
 
-    pub fn of(psi: Option<u16>, t: Option<AdmissionThresholds>) -> Self {
-        match (psi, t) {
+    /// The state for a drone's pressure: its PSI reading, or the load
+    /// estimate when it has no PSI.
+    pub fn of(pressure: Option<u16>, t: Option<AdmissionThresholds>) -> Self {
+        match (pressure, t) {
             (Some(p), Some(t)) if p >= t.psi_hard_pm => Self::Closed,
+            (Some(p), Some(t)) if p >= t.psi_light_only_pm => Self::LightOnly,
             (Some(p), Some(t)) if p >= t.psi_soft_pm => Self::PrBlocked,
             _ => Self::Open,
         }
     }
 
-    fn admits(self, scope: Scope) -> bool {
+    pub fn admits(self, class: Class, scope: Scope) -> bool {
         match self {
             Self::Open => true,
             Self::PrBlocked => scope != Scope::Pr,
+            Self::LightOnly => {
+                scope == Scope::Deploy || (scope == Scope::Main && class == Class::Light)
+            }
             Self::Closed => false,
         }
+    }
+}
+
+impl DroneState {
+    /// The pressure admission uses: PSI when measured, else the load estimate.
+    pub fn admission_pressure_pm(&self) -> Option<u16> {
+        self.cpu_psi_pm.or(self.cpu_load_pm)
     }
 }
 
@@ -140,6 +180,10 @@ pub struct DroneAdmission {
     pub drone_id: String,
     pub state: AdmissionState,
     pub cpu_psi_pm: Option<u16>,
+    /// The load-average estimate; drives `state` only when `cpu_psi_pm` is
+    /// `None`.
+    #[serde(default)]
+    pub cpu_load_pm: Option<u16>,
 }
 
 impl DroneState {
@@ -159,6 +203,7 @@ impl DroneState {
             profiles: Vec::new(),
             blocked_classes: Vec::new(),
             cpu_psi_pm: None,
+            cpu_load_pm: None,
             trust: Trust::Shared,
         }
     }
@@ -299,6 +344,8 @@ pub enum Rejection {
     NotAccepting,
     AdmissionClosed,
     PrPressure,
+    /// CPU pressure at or above `psi_light_only_pm`: no main medium or heavy.
+    LightOnlyPressure,
     Trust,
     Environment,
     Docker,
@@ -511,7 +558,12 @@ impl Free<'_> {
         }
         match self.admission {
             AdmissionState::Closed => reasons.push(Rejection::AdmissionClosed),
-            AdmissionState::PrBlocked if scope == Scope::Pr => reasons.push(Rejection::PrPressure),
+            AdmissionState::PrBlocked | AdmissionState::LightOnly if scope == Scope::Pr => {
+                reasons.push(Rejection::PrPressure);
+            }
+            AdmissionState::LightOnly if !self.admission.admits(class, scope) => {
+                reasons.push(Rejection::LightOnlyPressure);
+            }
             _ => {}
         }
         if !self.drone.trust.admits(scope) {
@@ -732,7 +784,7 @@ fn allocate_inner(
             vcpu: drone.vcpu,
             leases_left: drone.max_leases,
             in_flight: 0,
-            admission: AdmissionState::of(drone.cpu_psi_pm, input.admission),
+            admission: AdmissionState::of(drone.admission_pressure_pm(), input.admission),
             granted: BTreeMap::new(),
         });
     }
@@ -865,6 +917,7 @@ fn allocate_inner(
                 drone_id: (*id).to_owned(),
                 state: f.admission,
                 cpu_psi_pm: f.drone.cpu_psi_pm,
+                cpu_load_pm: f.drone.cpu_load_pm,
             })
             .collect(),
         promote,
@@ -905,7 +958,7 @@ fn allocate_inner(
                             !reserved.contains_key(**id)
                                 && f.drone.trust.admits(scope)
                                 && f.could_ever_fit(spec)
-                                && f.admission.admits(scope)
+                                && f.admission.admits(class, scope)
                                 && !f.drone.blocked_classes.contains(&class)
                                 && f.offer(
                                     class,
@@ -988,6 +1041,7 @@ mod tests {
             profiles: vec![],
             blocked_classes: vec![],
             cpu_psi_pm: None,
+            cpu_load_pm: None,
             trust: Trust::Shared,
         }
     }
@@ -1068,6 +1122,94 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn load_estimate_approximates_waiting_share_and_ignores_idle_cpus() {
+        assert_eq!(load_pressure_pm(None, Some(1000)), None);
+        assert_eq!(load_pressure_pm(Some(800), None), Some(0));
+        assert_eq!(load_pressure_pm(Some(1000), Some(1000)), Some(0));
+        // Load 93 on 16 CPUs, CPUs saturated: ~83% of runnable tasks wait.
+        assert_eq!(load_pressure_pm(Some(5838), Some(990)), Some(828));
+        assert_eq!(load_pressure_pm(Some(2000), None), Some(500));
+        // Same run queue with idle CPU time is not CPU contention.
+        assert_eq!(load_pressure_pm(Some(5838), Some(550)), Some(0));
+    }
+
+    #[test]
+    fn light_only_sheds_pr_and_main_medium_heavy_but_keeps_light_main_and_deploy() {
+        let t = AdmissionThresholds {
+            psi_soft_pm: 300,
+            psi_light_only_pm: 500,
+            psi_hard_pm: 600,
+        };
+        let of = |p| AdmissionState::of(Some(p), Some(t));
+        assert_eq!(of(299), AdmissionState::Open);
+        assert_eq!(of(300), AdmissionState::PrBlocked);
+        assert_eq!(of(540), AdmissionState::LightOnly);
+        assert_eq!(of(600), AdmissionState::Closed);
+        let s = AdmissionState::LightOnly;
+        assert!(s.admits(Class::Light, Scope::Main));
+        assert!(s.admits(Class::Heavy, Scope::Deploy));
+        assert!(!s.admits(Class::Medium, Scope::Main));
+        assert!(!s.admits(Class::Heavy, Scope::Main));
+        assert!(!s.admits(Class::Light, Scope::Pr));
+        // Unset light-only tier (== hard): PR-blocked straight to closed.
+        let old = AdmissionThresholds {
+            psi_light_only_pm: 600,
+            ..t
+        };
+        assert_eq!(
+            AdmissionState::of(Some(540), Some(old)),
+            AdmissionState::PrBlocked
+        );
+
+        // A loaded drone without PSI: its load estimate drives admission.
+        let loaded = DroneState {
+            cpu_load_pm: Some(828),
+            ..host("loaded")
+        };
+        let mut i = input(
+            &[
+                (Class::Heavy, Scope::Main, 1),
+                (Class::Medium, Scope::Main, 1),
+                (Class::Light, Scope::Main, 1),
+            ],
+            vec![loaded.clone()],
+        );
+        i.admission = Some(t);
+        let a = allocate(&i);
+        assert_eq!(a.admission[0].state, AdmissionState::Closed);
+        assert!(a.grants.is_empty());
+
+        let busy = DroneState {
+            cpu_psi_pm: Some(540),
+            ..loaded
+        };
+        i.drones = vec![busy];
+        let a = allocate(&i);
+        assert_eq!(
+            a.admission[0].state,
+            AdmissionState::LightOnly,
+            "PSI wins over the load estimate"
+        );
+        assert_eq!(count(&a, Class::Light, Scope::Main), 1);
+        assert_eq!(count(&a, Class::Medium, Scope::Main), 0);
+        assert_eq!(count(&a, Class::Heavy, Scope::Main), 0);
+        let rejected: Vec<_> = a
+            .decisions
+            .iter()
+            .filter(|d| d.class == Class::Heavy)
+            .flat_map(|d| {
+                d.candidates
+                    .iter()
+                    .flat_map(|c| c.rejection_reasons.clone())
+            })
+            .collect();
+        assert!(
+            rejected.contains(&Rejection::LightOnlyPressure),
+            "{rejected:?}"
+        );
     }
 
     #[test]
@@ -1610,6 +1752,7 @@ mod tests {
                 profiles: vec![],
                 blocked_classes: vec![],
                 cpu_psi_pm: None,
+                cpu_load_pm: None,
                 trust: Trust::Shared,
             },
             DroneState {
@@ -1623,6 +1766,7 @@ mod tests {
                 profiles: vec![],
                 blocked_classes: vec![],
                 cpu_psi_pm: None,
+                cpu_load_pm: None,
                 trust: Trust::Shared,
             },
         ];

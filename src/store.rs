@@ -178,6 +178,27 @@ CREATE TABLE IF NOT EXISTS job_telemetry (
     finished_at     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS job_telemetry_finished ON job_telemetry(finished_at);
+-- Host load at lease start and end, with the GitHub job the lease ran; see
+-- hostdiag.rs. Pruned after seven days and to a row cap.
+CREATE TABLE IF NOT EXISTS lease_hosts (
+    lease_id      TEXT PRIMARY KEY,
+    drone         TEXT NOT NULL,
+    class         TEXT NOT NULL,
+    scope         TEXT NOT NULL,
+    leased_at     INTEGER NOT NULL,
+    repo          TEXT,
+    run_id        INTEGER,
+    job_id        INTEGER,
+    job_name      TEXT,
+    finished_at   INTEGER,
+    exit_code     INTEGER,
+    duration_secs INTEGER,
+    start_sample  TEXT,
+    end_sample    TEXT
+);
+CREATE INDEX IF NOT EXISTS lease_hosts_job ON lease_hosts(job_id);
+CREATE INDEX IF NOT EXISTS lease_hosts_run ON lease_hosts(run_id);
+CREATE INDEX IF NOT EXISTS lease_hosts_leased ON lease_hosts(leased_at);
 CREATE TABLE IF NOT EXISTS preemptions (
     lease_id     TEXT PRIMARY KEY,
     drone        TEXT NOT NULL,

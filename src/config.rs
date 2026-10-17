@@ -202,6 +202,12 @@ pub struct AdmissionSettings {
     /// From this `cpu some avg10` (permille) a drone takes no new
     /// pull-request grants.
     pub psi_soft_pm: u16,
+    /// From this pressure a drone takes, besides deploy work, only light main
+    /// grants: no medium or heavy main work. Optional; between `psi_soft_pm`
+    /// and `psi_hard_pm`. Unset, the drone goes from pull-request blocked
+    /// straight to closed.
+    #[serde(default)]
+    pub psi_light_only_pm: Option<u16>,
     /// From this pressure a drone takes no new grants at all.
     pub psi_hard_pm: u16,
     /// A drone's reported pressure older than this counts as unknown.
@@ -212,6 +218,7 @@ impl AdmissionSettings {
     pub fn thresholds(&self) -> AdmissionThresholds {
         AdmissionThresholds {
             psi_soft_pm: self.psi_soft_pm,
+            psi_light_only_pm: self.psi_light_only_pm.unwrap_or(self.psi_hard_pm),
             psi_hard_pm: self.psi_hard_pm,
         }
     }
@@ -219,6 +226,13 @@ impl AdmissionSettings {
     fn validate(&self) -> Result<(), String> {
         if self.psi_soft_pm == 0 || self.psi_soft_pm > self.psi_hard_pm || self.psi_hard_pm > 1000 {
             return Err("admission needs 0 < psi_soft_pm <= psi_hard_pm <= 1000".to_owned());
+        }
+        if let Some(l) = self.psi_light_only_pm
+            && !(self.psi_soft_pm..=self.psi_hard_pm).contains(&l)
+        {
+            return Err(
+                "admission needs psi_soft_pm <= psi_light_only_pm <= psi_hard_pm".to_owned(),
+            );
         }
         if self.facts_max_age_secs <= 0 {
             return Err("admission.facts_max_age_secs must be positive".to_owned());
@@ -665,6 +679,12 @@ mod tests {
         let ok = with(r#"{"psi_soft_pm":300,"psi_hard_pm":600,"facts_max_age_secs":180}"#).unwrap();
         let t = ok.admission.unwrap().thresholds();
         assert_eq!((t.psi_soft_pm, t.psi_hard_pm), (300, 600));
+        assert_eq!(t.psi_light_only_pm, 600, "unset means no light-only tier");
+        let t = with(r#"{"psi_soft_pm":300,"psi_light_only_pm":500,"psi_hard_pm":600,"facts_max_age_secs":180}"#)
+            .unwrap()
+            .admission
+            .unwrap();
+        assert_eq!(t.thresholds().psi_light_only_pm, 500);
         for bad in [
             r#"{"psi_soft_pm":700,"psi_hard_pm":600,"facts_max_age_secs":180}"#,
             r#"{"psi_soft_pm":0,"psi_hard_pm":600,"facts_max_age_secs":180}"#,
@@ -672,6 +692,8 @@ mod tests {
             r#"{"psi_soft_pm":300,"psi_hard_pm":600,"facts_max_age_secs":0}"#,
             r#"{"psi_soft_pm":300,"psi_hard_pm":600,"facts_max_age_secs":180,"nope":1}"#,
             r#"{"psi_soft_pm":300,"psi_hard_pm":600}"#,
+            r#"{"psi_soft_pm":300,"psi_light_only_pm":200,"psi_hard_pm":600,"facts_max_age_secs":180}"#,
+            r#"{"psi_soft_pm":300,"psi_light_only_pm":700,"psi_hard_pm":600,"facts_max_age_secs":180}"#,
         ] {
             assert!(with(bad).is_err(), "{bad}");
         }
