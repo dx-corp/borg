@@ -90,12 +90,12 @@ pub struct JanitorSettings {
     /// pull-request runs are cancelled once the pull request is closed or
     /// merged. Leave out workflows that run on the `closed` event.
     #[serde(default)]
-    pub closed_pr_workflows: Vec<String>,
+    pub(crate) closed_pr_workflows: Vec<String>,
     /// Branches whose queued `push` runs are cancelled when a newer run of the
     /// same workflow on the branch is queued or running. Running push runs
     /// are never cancelled.
     #[serde(default)]
-    pub superseded_push_branches: Vec<String>,
+    pub(crate) superseded_push_branches: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -116,11 +116,11 @@ fn default_janitor_max() -> u32 {
 #[serde(deny_unknown_fields, default)]
 pub struct DroneExpirySettings {
     /// Remove a drone silent this long; 0 never removes.
-    pub after_secs: i64,
+    after_secs: i64,
     /// Name prefixes of short-lived cloud drones (for example `gcp-burst-`).
-    pub burst_prefixes: Vec<String>,
+    burst_prefixes: Vec<String>,
     /// Remove a drone matching `burst_prefixes` silent this long; 0 never.
-    pub burst_after_secs: i64,
+    burst_after_secs: i64,
 }
 
 impl Default for DroneExpirySettings {
@@ -135,7 +135,7 @@ impl Default for DroneExpirySettings {
 
 impl DroneExpirySettings {
     /// The silence after which `name` is removed, if ever.
-    pub fn expiry_for(&self, name: &str) -> Option<i64> {
+    pub(crate) fn expiry_for(&self, name: &str) -> Option<i64> {
         let secs = if self
             .burst_prefixes
             .iter()
@@ -155,10 +155,10 @@ impl DroneExpirySettings {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CapacityAlarmSettings {
-    pub enabled: bool,
-    pub classes: Vec<Class>,
-    pub max_slots: u32,
-    pub after_secs: i64,
+    pub(crate) enabled: bool,
+    pub(crate) classes: Vec<Class>,
+    pub(crate) max_slots: u32,
+    pub(crate) after_secs: i64,
 }
 
 impl Default for CapacityAlarmSettings {
@@ -207,7 +207,7 @@ pub struct AdmissionSettings {
     /// and `psi_hard_pm`. Unset, the drone goes from pull-request blocked
     /// straight to closed.
     #[serde(default)]
-    pub psi_light_only_pm: Option<u16>,
+    psi_light_only_pm: Option<u16>,
     /// From this pressure a drone takes no new grants at all.
     pub psi_hard_pm: u16,
     /// A drone's reported pressure older than this counts as unknown.
@@ -267,10 +267,10 @@ pub struct QueenConfig {
     pub drone_stale_secs: i64,
     /// When silent drones are removed; see [`DroneExpirySettings`].
     #[serde(default)]
-    pub drone_expiry: DroneExpirySettings,
+    pub(crate) drone_expiry: DroneExpirySettings,
     /// The fleet-capacity alarm; see [`CapacityAlarmSettings`].
     #[serde(default)]
-    pub capacity_alarm: CapacityAlarmSettings,
+    pub(crate) capacity_alarm: CapacityAlarmSettings,
     /// Demand older than this triggers the starvation guard. `false` (or JSON
     /// `null`) disables it; TOML has no null.
     #[serde(default = "default_starvation", deserialize_with = "secs_or_off")]

@@ -108,9 +108,9 @@ impl PassReport {
 pub struct JanitorView {
     pub passes: u64,
     /// Unix time the queen started; `total` counts from here.
-    pub since: i64,
+    since: i64,
     /// Unix time of the last pass; `None` before the first.
-    pub last_pass_at: Option<i64>,
+    last_pass_at: Option<i64>,
     /// What the last pass alone found. Runs still queued are found again by
     /// every pass, so this is the current state.
     pub last: PassReport,

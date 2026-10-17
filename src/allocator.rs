@@ -89,7 +89,7 @@ pub struct DroneState {
     /// (see [`load_pressure_pm`]). Admission uses it only when `cpu_psi_pm`
     /// is `None`.
     #[serde(default)]
-    pub cpu_load_pm: Option<u16>,
+    pub(crate) cpu_load_pm: Option<u16>,
 }
 
 /// CPU pressure (permille) estimated from the 1-minute load average per CPU
@@ -98,7 +98,10 @@ pub struct DroneState {
 /// approximates PSI `cpu some`. When the root cgroup shows the CPUs under 90%
 /// busy (`cpu_busy_pm`), the run queue is not CPU contention (I/O wait, or an
 /// lxcfs load average) and the estimate is 0.
-pub fn load_pressure_pm(load_per_cpu_pm: Option<u32>, cpu_busy_pm: Option<u16>) -> Option<u16> {
+pub(crate) fn load_pressure_pm(
+    load_per_cpu_pm: Option<u32>,
+    cpu_busy_pm: Option<u16>,
+) -> Option<u16> {
     let load = u64::from(load_per_cpu_pm?);
     if load <= 1000 || cpu_busy_pm.is_some_and(|b| b < 900) {
         return Some(0);
@@ -112,7 +115,7 @@ pub struct AdmissionThresholds {
     pub psi_soft_pm: u16,
     /// From this pressure only light main and deploy grants; at or above
     /// `psi_hard_pm` it has no effect.
-    pub psi_light_only_pm: u16,
+    pub(crate) psi_light_only_pm: u16,
     pub psi_hard_pm: u16,
 }
 
@@ -155,7 +158,7 @@ impl AdmissionState {
         }
     }
 
-    pub fn admits(self, class: Class, scope: Scope) -> bool {
+    pub(crate) fn admits(self, class: Class, scope: Scope) -> bool {
         match self {
             Self::Open => true,
             Self::PrBlocked => scope != Scope::Pr,
@@ -169,7 +172,7 @@ impl AdmissionState {
 
 impl DroneState {
     /// The pressure admission uses: PSI when measured, else the load estimate.
-    pub fn admission_pressure_pm(&self) -> Option<u16> {
+    pub(crate) fn admission_pressure_pm(&self) -> Option<u16> {
         self.cpu_psi_pm.or(self.cpu_load_pm)
     }
 }
@@ -183,7 +186,7 @@ pub struct DroneAdmission {
     /// The load-average estimate; drives `state` only when `cpu_psi_pm` is
     /// `None`.
     #[serde(default)]
-    pub cpu_load_pm: Option<u16>,
+    pub(crate) cpu_load_pm: Option<u16>,
 }
 
 impl DroneState {
@@ -384,7 +387,7 @@ pub struct Candidate {
     /// Current load: minus the drone's CPU pressure, plus its idle share for
     /// medium and heavy work. See [`host_term`].
     #[serde(default)]
-    pub host_score: i64,
+    pub(crate) host_score: i64,
     pub score: Option<i64>,
 }
 
@@ -394,7 +397,7 @@ pub struct Candidate {
 /// as before. Together with the learned speed in the profile term, main heavy
 /// and medium work goes to fast, idle drones first and to slow or loaded ones
 /// only when nothing better has room.
-pub fn host_term(drone: &DroneState, free_vcpu: u32, class: Class, w: &ScoreWeights) -> i64 {
+fn host_term(drone: &DroneState, free_vcpu: u32, class: Class, w: &ScoreWeights) -> i64 {
     let pressure = i64::from(drone.admission_pressure_pm().unwrap_or(0).min(1000));
     let idle = if class == Class::Light || drone.vcpu == 0 {
         0

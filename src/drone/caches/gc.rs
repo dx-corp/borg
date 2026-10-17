@@ -42,15 +42,15 @@ pub fn measure(path: &Path) -> (u64, SystemTime) {
 /// What [`measure_tree`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Measured {
-    pub size: u64,
-    pub newest: SystemTime,
+    pub(super) size: u64,
+    pub(super) newest: SystemTime,
     /// Directories that could not be listed (for example owned by the job
     /// user and closed to the drone's user): `size` is then a lower bound.
-    pub unreadable_dirs: u64,
+    pub(super) unreadable_dirs: u64,
 }
 
 /// [`measure`], also counting directories that could not be listed.
-pub fn measure_tree(path: &Path) -> Measured {
+pub(super) fn measure_tree(path: &Path) -> Measured {
     let mut size = 0;
     let mut newest = SystemTime::UNIX_EPOCH;
     let mut unreadable_dirs = 0;

@@ -159,10 +159,10 @@ pub struct CacheStat {
     pub misses: Option<u64>,
     /// Whether `size_bytes` covers the whole cache.
     #[serde(default)]
-    pub size_status: SizeStatus,
+    pub(crate) size_status: SizeStatus,
     /// Whether `hits` and `misses` are real counts.
     #[serde(default)]
-    pub counters: Counters,
+    pub(crate) counters: Counters,
 }
 
 /// How complete a cache's `size_bytes` is.
@@ -278,7 +278,7 @@ pub struct ResultRequest {
     /// Host load when the runner started and when it exited; see
     /// [`crate::hostdiag`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<LeaseHostReport>,
+    pub(crate) host: Option<LeaseHostReport>,
 }
 
 #[derive(Debug)]
@@ -736,12 +736,12 @@ pub struct DroneStatus {
     /// `alive` (heartbeat within `drone_stale_secs`) or `stale`. A stale
     /// drone holds no schedulable capacity whatever its `health` says;
     /// `health` is the historical failure evidence only.
-    pub availability: Availability,
+    availability: Availability,
     /// Seconds since the last heartbeat; `None` if it never sent one.
-    pub last_seen_age_secs: Option<i64>,
+    last_seen_age_secs: Option<i64>,
     /// Seconds until a stale drone is removed (`drone_expiry`); `None` while
     /// alive or when it is never removed.
-    pub expires_in_secs: Option<i64>,
+    expires_in_secs: Option<i64>,
     pub accepting: bool,
     /// Enforced independently of the optional environment contract.
     pub disk_admission: crate::envcontract::DiskAdmission,
@@ -790,18 +790,18 @@ pub enum Availability {
 #[derive(Debug, Serialize)]
 pub struct CapacityStatus {
     /// Slots the alive, accepting drones could hold if empty.
-    pub schedulable_slots: u32,
+    schedulable_slots: u32,
     /// Slots free right now on alive, accepting drones.
-    pub free_slots: u32,
+    free_slots: u32,
     /// Jobs borg could not place at the last pass (`unmet_placeable`).
-    pub unmet_main: u32,
-    pub unmet_pr: u32,
-    pub unmet_deploy: u32,
+    unmet_main: u32,
+    unmet_pr: u32,
+    unmet_deploy: u32,
     /// Since when main demand has been unmet with schedulable slots at or
     /// under `capacity_alarm.max_slots`.
-    pub starved_since: Option<i64>,
+    starved_since: Option<i64>,
     /// The `capacity_starved` health event is raised and not yet restored.
-    pub alarm: bool,
+    alarm: bool,
 }
 
 /// What CPU pressure currently lets this drone take.
@@ -811,7 +811,7 @@ pub struct DroneAdmissionView {
     pub cpu_psi_pm: Option<u16>,
     /// Pressure estimated from the load average; `state` uses it only when
     /// `cpu_psi_pm` is null.
-    pub cpu_load_pm: Option<u16>,
+    cpu_load_pm: Option<u16>,
 }
 
 /// One drone's build environment contract.
@@ -857,9 +857,9 @@ pub struct Status {
     pub queue: Vec<QueueEntry>,
     pub drones: Vec<DroneStatus>,
     /// Per class: schedulable slots on alive drones next to unmet demand.
-    pub capacity: BTreeMap<Class, CapacityStatus>,
+    capacity: BTreeMap<Class, CapacityStatus>,
     /// Names of drones whose heartbeat is older than `drone_stale_secs`.
-    pub stale_drones: Vec<String>,
+    stale_drones: Vec<String>,
     /// Demand the allocator could not place. Counts jobs that non-borg runners
     /// may serve; see `unmet_placeable`.
     pub unmet: Vec<Unmet>,
@@ -1362,8 +1362,8 @@ async fn job_host(
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RunHosts {
-    pub run_id: u64,
-    pub jobs: Vec<JobHostView>,
+    run_id: u64,
+    jobs: Vec<JobHostView>,
 }
 
 /// `GET /runs/{run_id}`: every job of a workflow run that ran on a borg

@@ -100,11 +100,11 @@ pub struct ScoreWeights {
     pub profile_reliability: i64,
     /// Applied to the drone's current CPU pressure (permille; PSI, or the
     /// load estimate without PSI): a loaded host scores lower.
-    pub host_pressure: i64,
+    pub(crate) host_pressure: i64,
     /// Applied to the share of the drone's vCPU budget still free (permille,
     /// divided by 1000) for medium and heavy work: an idle host scores higher
     /// than one already running builds.
-    pub idle_share: i64,
+    pub(crate) idle_share: i64,
 }
 
 impl Default for ScoreWeights {

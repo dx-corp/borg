@@ -96,12 +96,12 @@ pub struct Snapshot {
     /// `unmet` minus what idle non-borg runners with the label can take.
     pub unmet_placeable: Vec<Unmet>,
     /// Per class, slots the fresh accepting drones could hold if empty.
-    pub schedulable_slots: BTreeMap<Class, u32>,
+    pub(crate) schedulable_slots: BTreeMap<Class, u32>,
     /// Per class, since when main demand has been unmet with schedulable
     /// slots at or under `capacity_alarm.max_slots`.
-    pub starved_since: BTreeMap<Class, i64>,
+    pub(crate) starved_since: BTreeMap<Class, i64>,
     /// Classes whose `capacity_starved` event is raised and not yet restored.
-    pub starved: BTreeSet<Class>,
+    pub(crate) starved: BTreeSet<Class>,
 }
 
 /// What the fleet watch remembers between passes.
