@@ -96,7 +96,7 @@ pub struct Snapshot {
     /// `unmet` minus what idle non-borg runners with the label can take.
     pub unmet_placeable: Vec<Unmet>,
     /// Per class, slots the fresh accepting drones could hold if empty.
-    pub(crate) schedulable_slots: BTreeMap<Class, u32>,
+    schedulable_slots: BTreeMap<Class, u32>,
     /// Per class, since when main demand has been unmet with schedulable
     /// slots at or under `capacity_alarm.max_slots`.
     pub(crate) starved_since: BTreeMap<Class, i64>,
