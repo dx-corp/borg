@@ -678,8 +678,9 @@ repository and groups them by workflow, head commit, event and pull request
 number. In a group of more than one it keeps the in-progress run (the lowest id
 if several are running), or else the queued run with the lowest id, and cancels
 the others only if they are still queued; a running duplicate is never
-cancelled. `workflow_dispatch` and `merge_group` runs are never grouped,
-because publication waits on those exact runs. Each cancellation is logged with
+cancelled. `workflow_dispatch`, `repository_dispatch` and `merge_group` runs
+are never grouped. Dispatches at the same head can carry different rollout
+payloads, and publication waits on those exact runs. Each cancellation is logged with
 the id of the run that was kept. With `dry_run` the log and `would_cancel` show
 what would have been cancelled.
 

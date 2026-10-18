@@ -291,6 +291,8 @@ async fn dispatch_and_merge_group_duplicates_are_untouched() {
     for id in 4..=5 {
         h.add_run(id, "queued", "merge_group", "sha", None);
     }
+    h.add_run(6, "in_progress", "repository_dispatch", "sha", None);
+    h.add_run(7, "queued", "repository_dispatch", "sha", None);
     let r = h.janitor_pass().await;
     assert_eq!((r.duplicates, r.dedup_cancelled), (0, 0), "{r:?}");
     assert!(h.state().cancelled.is_empty());
