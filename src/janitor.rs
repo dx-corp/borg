@@ -519,14 +519,18 @@ fn tally(
 
 /// Runs to drop from each group of queued or running runs sharing workflow,
 /// head commit, event and pull requests, each with the id of the run kept: the
-/// lowest-id running run, else the lowest-id queued run. `workflow_dispatch`
-/// and `merge_group` runs are never grouped, and `skip` ids are left out.
+/// lowest-id running run, else the lowest-id queued run. Dispatch payloads
+/// are not represented by the head commit, so dispatch events and merge groups
+/// are never grouped. `skip` ids are left out.
 fn surplus<'a>(runs: &'a [Run], skip: &BTreeSet<u64>) -> Vec<(&'a Run, u64)> {
     type Key<'a> = (u64, &'a str, &'a str, Vec<u64>);
     let mut groups: BTreeMap<Key<'a>, Vec<&'a Run>> = BTreeMap::new();
     for run in runs {
         if skip.contains(&run.id)
-            || matches!(run.event.as_str(), "workflow_dispatch" | "merge_group")
+            || matches!(
+                run.event.as_str(),
+                "workflow_dispatch" | "repository_dispatch" | "merge_group"
+            )
             || !matches!(run.status.as_str(), "queued" | "in_progress")
         {
             continue;
@@ -678,6 +682,17 @@ mod tests {
             run(6, 1, "in_progress", "push", "a", &[]),
         ];
         assert_eq!(picked(&runs), [(1, 6), (8, 6)]);
+    }
+
+    #[test]
+    fn repository_dispatches_at_same_head_preserve_distinct_rollout_verification() {
+        // GitHub reports the default branch head, not the dispatched payload.
+        // These runs may verify different rollout revisions and service digests.
+        let runs = [
+            run(1, 1, "in_progress", "repository_dispatch", "a", &[]),
+            run(2, 1, "queued", "repository_dispatch", "a", &[]),
+        ];
+        assert!(picked(&runs).is_empty());
     }
 
     #[test]
