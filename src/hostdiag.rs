@@ -457,7 +457,11 @@ fn clean(s: &str) -> String {
         .to_owned()
 }
 
-const SELECT: &str = "SELECT lease_id, drone, class, scope, repo, run_id, job_id, job_name, leased_at, finished_at, exit_code, duration_secs, start_sample, end_sample FROM lease_hosts";
+macro_rules! select_sql {
+    () => {
+        "SELECT lease_id, drone, class, scope, repo, run_id, job_id, job_name, leased_at, finished_at, exit_code, duration_secs, start_sample, end_sample FROM lease_hosts"
+    };
+}
 
 impl Store {
     /// Record a drone's result and host samples for its lease.
@@ -539,8 +543,9 @@ impl Store {
         cpu_psi_pct: f64,
     ) -> Result<Option<JobHostView>, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
-        let row = sqlx::query(&format!(
-            "{SELECT} WHERE job_id = ? ORDER BY leased_at DESC LIMIT 1"
+        let row = sqlx::query(concat!(
+            select_sql!(),
+            " WHERE job_id = ? ORDER BY leased_at DESC LIMIT 1"
         ))
         .bind(to_i64(job_id))
         .fetch_optional(&self.pool)
@@ -555,7 +560,7 @@ impl Store {
         cpu_psi_pct: f64,
     ) -> Result<Option<JobHostView>, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
-        let row = sqlx::query(&format!("{SELECT} WHERE lease_id = ?"))
+        let row = sqlx::query(concat!(select_sql!(), " WHERE lease_id = ?"))
             .bind(lease_id)
             .fetch_optional(&self.pool)
             .await?;
@@ -569,8 +574,9 @@ impl Store {
         cpu_psi_pct: f64,
     ) -> Result<Vec<JobHostView>, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
-        let rows = sqlx::query(&format!(
-            "{SELECT} WHERE run_id = ? ORDER BY leased_at, lease_id LIMIT 1000"
+        let rows = sqlx::query(concat!(
+            select_sql!(),
+            " WHERE run_id = ? ORDER BY leased_at, lease_id LIMIT 1000"
         ))
         .bind(to_i64(run_id))
         .fetch_all(&self.pool)
