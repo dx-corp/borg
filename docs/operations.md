@@ -710,6 +710,9 @@ a newer push leaves behind:
   `push` run on one of them is cancelled when a newer queued or running run of
   the same workflow on the same branch is on another commit. Running push runs
   are never cancelled, so the branch always finishes its newest started run.
+  GitHub reports a run as `queued` while any of its jobs waits for a runner, so
+  the janitor also reads the run's jobs and keeps the run when one is running
+  (`started_push`).
 
 When the janitor is enabled, `GET /status` has a `janitor` object:
 
@@ -735,6 +738,7 @@ When the janitor is enabled, `GET /status` has a `janitor` object:
 | `dedup_cancelled` | Queued duplicates cancelled. |
 | `would_cancel` | Runs `dry_run` would have cancelled, of any kind. |
 | `deferred` | Runs left for a later pass by `max_cancels_per_pass`. |
+| `started_push` | Superseded push runs kept because one of their jobs was running. |
 | `raced` | Runs whose status, head or pull request changed between the listing and the re-read just before the cancel; left alone. |
 | `uncancellable` | Runs whose cancel GitHub answered with 409. Runs stuck in `queued` for days (for example `workflow_run` runs GitHub never started) answer 409 on every pass and are counted each time. |
 | `errors` | Failed GitHub calls: a run listing for a repository, a pulls API read, a run re-read or a cancel. Each is logged as a `janitor:` warning in the queen journal. |

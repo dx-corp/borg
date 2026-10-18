@@ -2099,6 +2099,11 @@ pub fn render_metrics(status: &Status) -> String {
                 t.deferred,
             ),
             (
+                "started_push",
+                "Superseded push runs kept because a job was running",
+                t.started_push,
+            ),
+            (
                 "raced",
                 "Runs that changed state before the janitor cancelled them",
                 t.raced,

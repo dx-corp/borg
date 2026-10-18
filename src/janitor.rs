@@ -75,6 +75,9 @@ pub struct PassReport {
     pub would_cancel: u32,
     /// Runs left for a later pass by the per-pass cap.
     pub deferred: u32,
+    /// Superseded push runs left alone because one of their jobs is running.
+    /// GitHub shows a run as `queued` while any job waits for a runner.
+    pub started_push: u32,
     /// Runs that changed state between the listing and the cancel and were
     /// left alone.
     pub raced: u32,
@@ -97,6 +100,7 @@ impl PassReport {
         self.dedup_cancelled += o.dedup_cancelled;
         self.would_cancel += o.would_cancel;
         self.deferred += o.deferred;
+        self.started_push += o.started_push;
         self.raced += o.raced;
         self.uncancellable += o.uncancellable;
         self.errors += o.errors;
@@ -280,7 +284,7 @@ impl Janitor {
             }
         }
         tracing::debug!(
-            "janitor pass: considered {} superseded {} closed_pr {} superseded_push {} cancelled {} cancelled_running {} duplicates {} dedup_cancelled {} would_cancel {} deferred {} raced {} uncancellable {} errors {}",
+            "janitor pass: considered {} superseded {} closed_pr {} superseded_push {} cancelled {} cancelled_running {} duplicates {} dedup_cancelled {} would_cancel {} deferred {} started_push {} raced {} uncancellable {} errors {}",
             report.considered,
             report.superseded,
             report.closed_pr,
@@ -291,6 +295,7 @@ impl Janitor {
             report.dedup_cancelled,
             report.would_cancel,
             report.deferred,
+            report.started_push,
             report.raced,
             report.uncancellable,
             report.errors
@@ -376,6 +381,18 @@ impl Janitor {
                 report.deferred += 1;
                 continue;
             }
+            match self.has_running_job(repo, run.id).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    report.started_push += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("janitor: {repo} run {}: {e}", run.id);
+                    report.errors += 1;
+                    continue;
+                }
+            }
             let why = format!(
                 "on {}: superseded by run {newer}",
                 run.head_branch.as_deref().unwrap_or("?")
@@ -447,6 +464,33 @@ impl Janitor {
     }
 
     /// Cancel `run` unless a fresh read shows its status or head changed.
+    /// Whether any job of `run` is running. A run reads `queued` while one job
+    /// waits for a runner, even when others have started.
+    async fn has_running_job(&self, repo: &str, run: u64) -> Result<bool, GithubError> {
+        #[derive(Deserialize)]
+        struct Jobs {
+            jobs: Vec<Job>,
+        }
+        #[derive(Deserialize)]
+        struct Job {
+            status: String,
+        }
+        for page in 1..=MAX_PAGES {
+            let jobs: Jobs = self
+                .get(&format!(
+                    "/repos/{repo}/actions/runs/{run}/jobs?filter=latest&per_page=100&page={page}"
+                ))
+                .await?;
+            if jobs.jobs.iter().any(|j| j.status == "in_progress") {
+                return Ok(true);
+            }
+            if jobs.jobs.len() < 100 {
+                break;
+            }
+        }
+        Ok(false)
+    }
+
     async fn cancel_if_unchanged(
         &self,
         repo: &str,

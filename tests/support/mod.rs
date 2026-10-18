@@ -206,14 +206,19 @@ async fn runs(
 async fn jobs(
     State(s): State<Shared>,
     h: HeaderMap,
-    Path(_p): Path<(String, String, u64)>,
+    Path((_o, _r, run)): Path<(String, String, u64)>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_token(&h)?;
+    // The janitor reads a run's jobs with its own token; queen jobs carry no run_id.
+    let janitor = check_janitor(&h).is_ok();
+    if !janitor {
+        check_token(&h)?;
+    }
     let state = lock(&s);
     let jobs: Vec<_> = state
         .jobs
         .iter()
         .filter(|job| !state.hide_completed_jobs || job["status"] != "completed")
+        .filter(|job| !janitor || job["run_id"] == run)
         .cloned()
         .collect();
     Ok(Json(json!({"jobs": jobs})))

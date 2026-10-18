@@ -171,6 +171,33 @@ async fn older_queued_main_pushes_are_cancelled_and_running_ones_kept() {
 }
 
 #[tokio::test]
+async fn a_superseded_main_push_with_a_running_job_is_kept() {
+    // GitHub shows a run as queued while any job waits for a runner, so a
+    // publish run building one image while its siblings wait reads `queued`.
+    let h = Harness::start(with(json!({"superseded_push_branches": ["main"]}))).await;
+    let push = |id: u64, sha: &str| {
+        json!({"id": id, "workflow_id": 1, "status": "queued", "event": "push",
+            "head_sha": sha, "head_branch": "main", "pull_requests": []})
+    };
+    {
+        let mut st = h.state();
+        st.pr_runs.push(push(1, "a"));
+        st.pr_runs.push(push(2, "b"));
+        st.jobs
+            .push(json!({"id": 10, "run_id": 1, "status": "in_progress"}));
+        st.jobs
+            .push(json!({"id": 11, "run_id": 1, "status": "queued"}));
+    }
+    let r = h.janitor_pass().await;
+    assert_eq!(
+        (r.superseded_push, r.started_push, r.cancelled),
+        (1, 1, 0),
+        "{r:?}"
+    );
+    assert!(h.state().cancelled.is_empty());
+}
+
+#[tokio::test]
 async fn the_per_pass_cap_defers_the_rest_to_later_passes() {
     let h = Harness::start(enabled(false, 2)).await;
     for id in 1..=5 {
