@@ -646,6 +646,13 @@ alarm is on by default for heavy and medium, with `max_slots` 2 and
 "capacity_alarm": {"enabled": true, "classes": ["heavy", "medium"], "max_slots": 2, "after_secs": 600}
 ```
 
+`/status` `static_runners_offline` lists the organization's non-borg runners
+that GitHub reports offline (a static runner whose service stopped, was
+OOM-killed or lost its host), each with its custom labels and the time this
+queen first saw it offline (the time resets when the queen restarts). The
+metric `borg_static_runners_offline{runner}` is 1 for each. Borg's own runners
+are never listed; they are ephemeral and expire with their lease.
+
 All of these events go to the same audit trail as quarantines: `health_log`,
 shown as `health_events` in `/status`, and a `WARN` line in the queen journal.
 
@@ -813,6 +820,39 @@ The VM keeps its ephemeral external IP by default; do not pass `--no-address`
 unless a NAT gateway exists, which this setup avoids. If the cloud reclaims a
 spot VM mid-job, GitHub fails that job when its runner stops responding; rerun
 it. Queued jobs are unaffected and go to other drones.
+
+#### Burst rule (`burst`, dry-run)
+
+The `burst` block decides when the queen would add or remove burst drones.
+This build only simulates it: config validation rejects `dry_run: false`, and
+no VM is created or deleted. Each pass it:
+
+- weighs the unmet jobs borg must place in `scale_up.classes` (`main` and `pr`
+  weights; deploy jobs never count, because burst drones have shared trust),
+  ignoring a class with more than `max_free_slots` free slots;
+- would create one drone (`step`) once that weight stays at or above
+  `min_weighted_unmet` for `sustained_secs`, unless a drone is still
+  provisioning, `max_drones` is reached (drones made by hand with the burst
+  prefix count), or the day or month drone-hour budget lacks `reserve_hours`
+  of headroom for every live drone plus the new one;
+- would drain a drone idle for `idle_secs`, near its maximum run time
+  (`retire_margin_secs`) or once a budget is spent, and delete it on a later
+  pass only when it holds no lease.
+
+What it would do is logged as `burst_would_create`, `burst_would_drain`,
+`burst_would_undrain` and `burst_would_delete` health events under the drone
+name `burst`. `/status` `burst` shows the demand weight, the outcome of the
+last pass (`no_demand`, `sustaining`, `provisioning`, `at_max_drones`,
+`no_headroom`, `over_budget` or `create`) with a count per outcome since the
+queen started, simulated spend in drone-hours and dollars, and the simulated
+VMs. Metrics: `borg_burst_dry_run`, `borg_burst_drones{kind}`,
+`borg_burst_drone_hours{window}`, `borg_burst_budget_drone_hours{window}`,
+`borg_burst_weighted_unmet`, `borg_burst_demand_holds`,
+`borg_burst_passes{outcome}`.
+
+Simulated drones enroll 12 minutes after creation and never take a job, so
+while demand lasts, dry-run spend is the most the rule would allow, not what
+real drones would cost. The simulation is in memory: a queen restart forgets it.
 
 ### Deploy-trust drone
 

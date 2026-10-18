@@ -8,6 +8,7 @@
 mod support;
 
 mod admin_cli;
+mod burst;
 mod capacity;
 mod contract;
 mod drone;

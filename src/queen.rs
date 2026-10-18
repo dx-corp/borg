@@ -30,6 +30,7 @@ use crate::allocator::{
     max_slots,
 };
 use crate::bid::{ClassPressure, ScoreWeights};
+use crate::burst::{BurstState, BurstView, BurstVm, ObservedDrone};
 use crate::classes::{Class, Scope};
 use crate::config::{QueenConfig, StandbySettings};
 use crate::envcontract::{CheckKind, CheckState, Mode, Need, blocked_classes, capability_states};
@@ -90,6 +91,9 @@ pub struct Snapshot {
     pub wake: WakeView,
     /// Non-borg online runners by label, from the last pass.
     pub static_runners: BTreeMap<String, StaticRunners>,
+    /// Non-borg runners GitHub reports offline, with how long this queen has
+    /// seen them offline: a static runner that stopped heartbeating.
+    pub static_offline: Vec<OfflineRunner>,
     /// Standby leases the drones are told to start now (deploy demand is queued
     /// for them); read by the heartbeat.
     pub start_standby: BTreeSet<String>,
@@ -102,6 +106,15 @@ pub struct Snapshot {
     pub(crate) starved_since: BTreeMap<Class, i64>,
     /// Classes whose `capacity_starved` event is raised and not yet restored.
     pub(crate) starved: BTreeSet<Class>,
+    /// The burst rule after the last pass; `None` when burst is off.
+    pub burst: Option<BurstView>,
+}
+
+/// The burst rule's memory and, in dry-run, the fleet it would have made.
+#[derive(Debug, Default)]
+struct BurstSim {
+    state: BurstState,
+    vms: Vec<BurstVm>,
 }
 
 /// What the fleet watch remembers between passes.
@@ -111,6 +124,8 @@ struct FleetWatch {
     prev_fresh: Option<BTreeSet<String>>,
     starved_since: BTreeMap<Class, i64>,
     raised: BTreeSet<Class>,
+    /// Non-borg runner name to the pass time it was first seen offline.
+    offline_since: BTreeMap<String, i64>,
 }
 
 /// Runners in the organization that borg did not mint, for one label.
@@ -136,6 +151,50 @@ fn static_runners(runners: &[Runner], borg_prefix: &str) -> BTreeMap<String, Sta
             }
         }
     }
+    out
+}
+
+/// A non-borg runner that GitHub lists as offline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OfflineRunner {
+    pub name: String,
+    /// Custom labels only (`self-hosted`, `Linux` and the like are dropped).
+    pub labels: Vec<String>,
+    /// Unix time this queen first saw it offline (resets on a queen restart).
+    pub offline_since: i64,
+}
+
+/// Labels GitHub assigns to every self-hosted runner.
+const BUILTIN_LABELS: [&str; 6] = ["self-hosted", "Linux", "macOS", "Windows", "X64", "ARM64"];
+
+/// The organization's non-borg runners that are offline, oldest first.
+/// `seen` carries first-seen times between passes and forgets runners that
+/// came back or were deleted.
+fn offline_static_runners(
+    runners: &[Runner],
+    borg_prefix: &str,
+    now: i64,
+    seen: &mut BTreeMap<String, i64>,
+) -> Vec<OfflineRunner> {
+    let offline: Vec<&Runner> = runners
+        .iter()
+        .filter(|r| !r.name.starts_with(borg_prefix) && r.status == "offline")
+        .collect();
+    seen.retain(|name, _| offline.iter().any(|r| &r.name == name));
+    let mut out: Vec<OfflineRunner> = offline
+        .into_iter()
+        .map(|r| OfflineRunner {
+            name: r.name.clone(),
+            labels: r
+                .labels
+                .iter()
+                .map(|l| l.name.clone())
+                .filter(|l| !BUILTIN_LABELS.contains(&l.as_str()))
+                .collect(),
+            offline_since: *seen.entry(r.name.clone()).or_insert(now),
+        })
+        .collect();
+    out.sort_by(|a, b| (a.offline_since, &a.name).cmp(&(b.offline_since, &b.name)));
     out
 }
 
@@ -229,6 +288,7 @@ pub struct Queen {
     wake_sender: Arc<dyn WakeSender>,
     tick_lock: tokio::sync::Mutex<()>,
     watch: std::sync::Mutex<FleetWatch>,
+    burst: std::sync::Mutex<BurstSim>,
 }
 
 /// The full label set a JIT runner is registered with: the labels GitHub
@@ -411,6 +471,7 @@ impl Queen {
             wake_sender: Arc::new(UdpWakeSender),
             tick_lock: tokio::sync::Mutex::new(()),
             watch: std::sync::Mutex::new(FleetWatch::default()),
+            burst: std::sync::Mutex::new(BurstSim::default()),
         }
     }
 
@@ -536,6 +597,10 @@ impl Queen {
             .collect();
 
         let statics = static_runners(&runners, &prefix);
+        let static_offline = {
+            let mut w = self.watch.lock().expect("fleet watch lock");
+            offline_static_runners(&runners, &prefix, now_ts, &mut w.offline_since)
+        };
         let active = self.reconcile(&ours, now_ts).await?;
         self.reap(&ours, &active).await;
 
@@ -764,6 +829,15 @@ impl Queen {
                 &unmet_placeable,
             )
             .await;
+        let burst = self
+            .burst_pass(
+                now_ts,
+                &drone_rows,
+                &placement_leases,
+                &unmet_placeable,
+                &allocation.idle,
+            )
+            .await;
         let mut mint_error = None;
         let mut lease_error = None;
         let mut persisted = BTreeSet::new();
@@ -949,11 +1023,13 @@ impl Queen {
             s.profiles = profiles;
             s.wake = wake;
             s.static_runners = statics;
+            s.static_offline = static_offline;
             s.start_standby = start_standby;
             s.unmet_placeable = unmet_placeable;
             s.schedulable_slots = schedulable_slots;
             s.starved_since = starved_since;
             s.starved = starved;
+            s.burst = burst;
         });
         if let Err(e) = self
             .store
@@ -2096,6 +2172,94 @@ impl Queen {
         state
     }
 
+    /// Run the burst rule on this pass and log what it would do as
+    /// `burst_would_<action>` health events. Dry-run only: actions change the
+    /// simulated fleet, never a cloud VM.
+    async fn burst_pass(
+        &self,
+        now: i64,
+        rows: &[DroneRow],
+        leases: &[ActiveLease],
+        unmet: &[Unmet],
+        idle: &[ClassIdle],
+    ) -> Option<BurstView> {
+        let cfg = self.cfg.burst.as_ref().filter(|b| b.enabled)?;
+        let max_run = cfg.gce.max_run_secs;
+        let mut drones: Vec<ObservedDrone> = rows
+            .iter()
+            .filter(|d| d.name.starts_with(&cfg.drone_prefix))
+            .map(|d| ObservedDrone {
+                name: d.name.clone(),
+                alive: d
+                    .last_heartbeat
+                    .is_some_and(|t| now - t <= self.cfg.drone_stale_secs),
+                leases: u32::try_from(leases.iter().filter(|l| l.drone_id == d.name).count())
+                    .unwrap_or(u32::MAX),
+            })
+            .collect();
+        let (view, decisions) = {
+            // The state is plain data; a panic mid-pass leaves it usable.
+            let mut sim = self
+                .burst
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let BurstSim { state, vms } = &mut *sim;
+            crate::burst::prune(vms, max_run, now);
+            // Simulated drones enroll after a typical provisioning time and
+            // never hold a lease: they serve no demand, so dry-run spend is
+            // the most the rule would allow, not what real drones would cost.
+            drones.extend(
+                vms.iter()
+                    .filter(|v| v.ended_at.is_none() && !rows.iter().any(|r| r.name == v.drone))
+                    .map(|v| ObservedDrone {
+                        name: v.drone.clone(),
+                        alive: now - v.created_at >= crate::burst::SIMULATED_PROVISION_SECS,
+                        leases: 0,
+                    }),
+            );
+            let plan = crate::burst::plan(
+                cfg,
+                state,
+                &crate::burst::Observed {
+                    now,
+                    unmet,
+                    idle,
+                    drones: &drones,
+                    vms,
+                },
+            );
+            let decisions = crate::burst::apply_simulated(cfg, vms, &plan.actions, now);
+            state.count(now, plan.outcome);
+            for d in &decisions {
+                state.record(d.clone());
+            }
+            (crate::burst::view(cfg, state, vms, &plan, now), decisions)
+        };
+        for d in decisions {
+            let event = format!("burst_would_{}", d.action);
+            let reason = format!(
+                "{} {}: {} (dry-run; weighted unmet {}, {:.1}/{} drone-hours today, {:.1}/{} this month)",
+                d.action,
+                d.drone.as_deref().unwrap_or("-"),
+                d.detail,
+                view.demand.weighted_unmet,
+                view.spend.day_hours,
+                view.budget.drone_hours_per_day,
+                view.spend.month_hours,
+                view.budget.drone_hours_per_month,
+            );
+            tracing::info!("{event}: {reason}");
+            if let Err(e) = self
+                .store
+                .record_health_event(now, "burst", &event, &reason)
+                .await
+            {
+                tracing::warn!("record {event} failed: {e}");
+            }
+        }
+        Some(view)
+    }
+
     pub(crate) fn class_slots(&self, drones: &[DroneState]) -> BTreeMap<Class, u32> {
         Class::ALL
             .into_iter()
@@ -2165,6 +2329,58 @@ mod tests {
             "started_at": "2026-01-01T00:10:00Z", "runner_name": runner,
         }))
         .unwrap()
+    }
+
+    fn runner(name: &str, status: &str, labels: &[&str]) -> Runner {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "name": name, "status": status, "busy": false,
+            "labels": labels.iter().map(|l| serde_json::json!({"name": l})).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn offline_static_runners_are_tracked_until_they_return() {
+        let mut seen = BTreeMap::new();
+        let mut fleet = vec![
+            runner(
+                "gha-heavy-pve60-1",
+                "offline",
+                &["self-hosted", "Linux", "ci-heavy"],
+            ),
+            runner("gha-heavy-pve60-2", "online", &["ci-heavy"]),
+            runner("borg-host-a-l1", "offline", &["ci-heavy"]),
+        ];
+        let first = offline_static_runners(&fleet, "borg-", 100, &mut seen);
+        assert_eq!(
+            first,
+            [OfflineRunner {
+                name: "gha-heavy-pve60-1".to_owned(),
+                labels: vec!["ci-heavy".to_owned()],
+                offline_since: 100,
+            }]
+        );
+        fleet.push(runner("wsl-a", "offline", &[]));
+        let second = offline_static_runners(&fleet, "borg-", 160, &mut seen);
+        let since: Vec<_> = second
+            .iter()
+            .map(|o| (o.name.as_str(), o.offline_since))
+            .collect();
+        assert_eq!(since, [("gha-heavy-pve60-1", 100), ("wsl-a", 160)]);
+        fleet.remove(0);
+        fleet.push(runner("gha-heavy-pve60-1", "online", &[]));
+        let third = offline_static_runners(&fleet, "borg-", 200, &mut seen);
+        assert_eq!(third.len(), 1);
+        fleet[3] = runner("gha-heavy-pve60-1", "offline", &[]);
+        let again = offline_static_runners(&fleet, "borg-", 300, &mut seen);
+        let back = again
+            .iter()
+            .find(|o| o.name == "gha-heavy-pve60-1")
+            .unwrap();
+        assert_eq!(
+            back.offline_since, 300,
+            "a runner that came back starts over"
+        );
     }
 
     #[test]

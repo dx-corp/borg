@@ -12,6 +12,7 @@ pub mod admin;
 pub mod allocator;
 pub mod api;
 pub mod bid;
+pub mod burst;
 pub mod classes;
 pub mod config;
 pub mod configfile;

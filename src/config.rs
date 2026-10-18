@@ -334,6 +334,10 @@ pub struct QueenConfig {
     /// [`crate::mirror_auth`].
     #[serde(default)]
     pub mirror_auth: Option<MirrorAuthSettings>,
+    /// Absent disables burst capacity; see [`crate::burst`]. This build only
+    /// simulates it (`dry_run` must stay true).
+    #[serde(default)]
+    pub burst: Option<crate::burst::BurstSettings>,
 }
 
 /// A second GitHub App, held by the queen only, whose short-lived read-only
@@ -521,6 +525,17 @@ impl QueenConfig {
         }
         if let Some(p) = &self.preemption {
             p.validate().map_err(ConfigError::Invalid)?;
+        }
+        if let Some(b) = &self.burst {
+            b.validate().map_err(ConfigError::Invalid)?;
+            if !self
+                .drone_expiry
+                .burst_prefixes
+                .iter()
+                .any(|p| b.drone_prefix.starts_with(p.as_str()))
+            {
+                return bad("burst.drone_prefix must be covered by drone_expiry.burst_prefixes");
+            }
         }
         Ok(())
     }
@@ -746,6 +761,34 @@ mod tests {
         ] {
             assert!(with(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn burst_is_off_by_default_dry_run_only_and_needs_drone_expiry() {
+        assert!(QueenConfig::from_json(MIN).unwrap().burst.is_none());
+        let block = |extra: &str| {
+            format!(
+                r#"{{"enabled":true,{extra}"max_drones":3,
+                "budget":{{"drone_hours_per_day":24,"drone_hours_per_month":150}},
+                "scale_up":{{"classes":["heavy"],"weights":{{"main":3,"pr":1}},"min_weighted_unmet":6,"sustained_secs":600}},
+                "scale_down":{{"idle_secs":900}},
+                "gce":{{"project":"p","network":"n","subnet":"s","zones":["us-west1-b"],"machine_type":"c2d-highcpu-56"}}}}"#
+            )
+        };
+        let with = |expiry: &str, extra: &str| {
+            QueenConfig::from_json(&MIN.replace(
+                "\"repos\"",
+                &format!("{expiry}\"burst\":{},\"repos\"", block(extra)),
+            ))
+        };
+        let expiry = r#""drone_expiry":{"burst_prefixes":["gcp-burst-"]},"#;
+        let ok = with(expiry, "").unwrap().burst.unwrap();
+        assert!(ok.enabled && ok.dry_run);
+        let err = |r: Result<QueenConfig, ConfigError>| {
+            r.err().map(|e| e.to_string()).unwrap_or_default()
+        };
+        assert!(err(with("", "")).contains("drone_expiry.burst_prefixes"));
+        assert!(err(with(expiry, r#""dry_run":false,"#)).contains("only simulates"));
     }
 
     #[test]
