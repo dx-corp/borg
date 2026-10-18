@@ -93,7 +93,7 @@ pub struct Snapshot {
     pub static_runners: BTreeMap<String, StaticRunners>,
     /// Non-borg runners GitHub reports offline, with how long this queen has
     /// seen them offline: a static runner that stopped heartbeating.
-    pub static_offline: Vec<OfflineRunner>,
+    pub(super) static_offline: Vec<OfflineRunner>,
     /// Standby leases the drones are told to start now (deploy demand is queued
     /// for them); read by the heartbeat.
     pub start_standby: BTreeSet<String>,
@@ -107,7 +107,7 @@ pub struct Snapshot {
     /// Classes whose `capacity_starved` event is raised and not yet restored.
     pub(crate) starved: BTreeSet<Class>,
     /// The burst rule after the last pass; `None` when burst is off.
-    pub burst: Option<BurstView>,
+    pub(super) burst: Option<BurstView>,
 }
 
 /// The burst rule's memory and, in dry-run, the fleet it would have made.
@@ -157,11 +157,11 @@ fn static_runners(runners: &[Runner], borg_prefix: &str) -> BTreeMap<String, Sta
 /// A non-borg runner that GitHub lists as offline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OfflineRunner {
-    pub name: String,
+    pub(super) name: String,
     /// Custom labels only (`self-hosted`, `Linux` and the like are dropped).
-    pub labels: Vec<String>,
+    labels: Vec<String>,
     /// Unix time this queen first saw it offline (resets on a queen restart).
-    pub offline_since: i64,
+    offline_since: i64,
 }
 
 /// Labels GitHub assigns to every self-hosted runner.

@@ -1,8 +1,8 @@
 //! Burst capacity: the rule that decides when the queen should add or remove
 //! short-lived cloud drones, and what they have cost.
 //!
-//! Nothing here touches the network or the clock. [`plan`] reads what the
-//! queen saw this pass ([`Observed`]) and the remembered timers
+//! Nothing here touches the network or the clock. `plan` reads what the
+//! queen saw this pass (`Observed`) and the remembered timers
 //! ([`BurstState`]) and returns [`Action`]s. The queen carries them out
 //! (dry-run: it only logs them and applies them to a simulated fleet).
 //!
@@ -36,7 +36,7 @@
 //! the queen deletes its record. Drones created by hand are counted toward
 //! `max_drones` but are never drained, deleted or billed here.
 //!
-//! This build only simulates: [`BurstSettings::validate`] rejects
+//! This build only simulates: `BurstSettings::validate` rejects
 //! `dry_run = false`, and the queen keeps the simulated fleet in memory, so a
 //! restart forgets simulated drones and their spend.
 
@@ -53,7 +53,7 @@ const HOUR: f64 = 3600.0;
 /// Decisions kept for `/status`.
 const RECENT_DECISIONS: usize = 20;
 /// A simulated drone counts as enrolled this long after its simulated creation.
-pub const SIMULATED_PROVISION_SECS: i64 = 720;
+pub(super) const SIMULATED_PROVISION_SECS: i64 = 720;
 
 fn yes() -> bool {
     true
@@ -107,20 +107,20 @@ pub struct BurstSettings {
     pub enabled: bool,
     /// Decide and log, but create and delete nothing.
     #[serde(default = "yes")]
-    pub dry_run: bool,
+    pub(super) dry_run: bool,
     /// Most burst drones at once, counting ones created by hand.
     pub max_drones: u32,
     /// Name prefix of burst drones in the queen. Must be in
     /// `drone_expiry.burst_prefixes` so a dead drone's record goes away.
     #[serde(default = "default_drone_prefix")]
-    pub drone_prefix: String,
+    pub(super) drone_prefix: String,
     /// Used only to show spend in dollars.
     #[serde(default = "default_hourly_cost")]
-    pub hourly_cost_usd: f64,
+    hourly_cost_usd: f64,
     pub budget: BudgetSettings,
-    pub scale_up: ScaleUpSettings,
-    pub scale_down: ScaleDownSettings,
-    pub gce: GceSettings,
+    scale_up: ScaleUpSettings,
+    scale_down: ScaleDownSettings,
+    pub(super) gce: GceSettings,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -130,7 +130,7 @@ pub struct BudgetSettings {
     pub drone_hours_per_month: f64,
     /// Headroom required per drone, old and new, before creating one.
     #[serde(default = "default_reserve")]
-    pub reserve_hours: f64,
+    reserve_hours: f64,
 }
 
 /// Weight of one unmet job by scope. Deploy has none: burst drones enroll
@@ -138,8 +138,8 @@ pub struct BudgetSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeWeights {
-    pub main: u32,
-    pub pr: u32,
+    main: u32,
+    pr: u32,
 }
 
 impl ScopeWeights {
@@ -156,58 +156,66 @@ impl ScopeWeights {
 #[serde(deny_unknown_fields)]
 pub struct ScaleUpSettings {
     /// Classes whose unmet jobs count.
-    pub classes: Vec<Class>,
-    pub weights: ScopeWeights,
-    pub min_weighted_unmet: u32,
-    pub sustained_secs: i64,
+    classes: Vec<Class>,
+    weights: ScopeWeights,
+    min_weighted_unmet: u32,
+    sustained_secs: i64,
     /// A class with more free slots than this has no unmet demand to serve.
     #[serde(default)]
-    pub max_free_slots: u32,
+    max_free_slots: u32,
     /// Most drones created in one pass.
     #[serde(default = "default_step")]
-    pub step: u32,
+    step: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScaleDownSettings {
-    pub idle_secs: i64,
+    idle_secs: i64,
     /// Drain a drone this long before its maximum run time.
     #[serde(default = "default_retire_margin")]
-    pub retire_margin_secs: i64,
+    retire_margin_secs: i64,
     /// A created drone that has not enrolled by then is deleted.
     #[serde(default = "default_provision_grace")]
-    pub provision_grace_secs: i64,
+    provision_grace_secs: i64,
 }
 
-/// Where and what to create. Only names, shapes and limits; no credentials.
+/// Configuration for simulated VM placement and lifetime.
+/// Provisioning-only inputs remain accepted for configuration compatibility;
+/// this dry-run-only build neither provisions VMs nor reads credential files.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GceSettings {
-    pub project: String,
-    pub network: String,
-    pub subnet: String,
-    pub zones: Vec<String>,
-    pub machine_type: String,
+    project: String,
+    network: String,
+    subnet: String,
+    zones: Vec<String>,
+    machine_type: String,
     /// Instance names; the queen's service account is allowed only these.
     #[serde(default = "default_vm_prefix")]
-    pub vm_prefix: String,
+    vm_prefix: String,
     #[serde(default = "default_true_spot")]
-    pub spot: bool,
+    #[serde(rename = "spot")]
+    _spot: bool,
     /// Hard lifetime; the cloud deletes the VM then.
     #[serde(default = "default_max_run")]
-    pub max_run_secs: i64,
+    pub(super) max_run_secs: i64,
     #[serde(default = "default_disk_gb")]
-    pub boot_disk_gb: u32,
+    #[serde(rename = "boot_disk_gb")]
+    _boot_disk_gb: u32,
     #[serde(default = "default_disk_type")]
-    pub boot_disk_type: String,
+    #[serde(rename = "boot_disk_type")]
+    _boot_disk_type: String,
     #[serde(default = "default_image_family")]
-    pub image_family: String,
+    #[serde(rename = "image_family")]
+    _image_family: String,
     #[serde(default = "default_image_project")]
-    pub image_project: String,
-    /// Service-account key file (live mode).
+    #[serde(rename = "image_project")]
+    _image_project: String,
+    /// Accepted credential-path input; this build does not open the file.
     #[serde(default)]
-    pub credentials_path: Option<PathBuf>,
+    #[serde(rename = "credentials_path")]
+    _credentials_path: Option<PathBuf>,
 }
 
 fn dns_label(s: &str) -> bool {
@@ -217,7 +225,7 @@ fn dns_label(s: &str) -> bool {
 }
 
 impl BurstSettings {
-    pub fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), String> {
         let bad = |m: &str| Err(format!("burst: {m}"));
         let (b, up, down, gce) = (&self.budget, &self.scale_up, &self.scale_down, &self.gce);
         if !(1..=10).contains(&self.max_drones) {
@@ -287,30 +295,30 @@ impl BurstSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BurstVm {
     /// The drone's name in the queen.
-    pub drone: String,
-    pub vm: String,
-    pub zone: String,
-    pub created_at: i64,
-    pub draining_at: Option<i64>,
-    pub ended_at: Option<i64>,
+    pub(super) drone: String,
+    vm: String,
+    zone: String,
+    pub(super) created_at: i64,
+    draining_at: Option<i64>,
+    pub(super) ended_at: Option<i64>,
 }
 
 /// A burst-prefixed drone as the queen sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedDrone {
-    pub name: String,
+    pub(super) name: String,
     /// Heartbeating within `drone_stale_secs`.
-    pub alive: bool,
+    pub(super) alive: bool,
     /// Pending and running leases.
-    pub leases: u32,
+    pub(super) leases: u32,
 }
 
-pub struct Observed<'a> {
-    pub now: i64,
-    pub unmet: &'a [Unmet],
-    pub idle: &'a [ClassIdle],
-    pub drones: &'a [ObservedDrone],
-    pub vms: &'a [BurstVm],
+pub(super) struct Observed<'a> {
+    pub(super) now: i64,
+    pub(super) unmet: &'a [Unmet],
+    pub(super) idle: &'a [ClassIdle],
+    pub(super) drones: &'a [ObservedDrone],
+    pub(super) vms: &'a [BurstVm],
 }
 
 /// Timers the rule remembers between passes, and what it decided.
@@ -325,7 +333,7 @@ pub struct BurstState {
 }
 
 impl BurstState {
-    pub fn record(&mut self, d: Decision) {
+    pub(super) fn record(&mut self, d: Decision) {
         if self.recent.len() == RECENT_DECISIONS {
             self.recent.pop_front();
         }
@@ -333,7 +341,7 @@ impl BurstState {
     }
 
     /// Count one pass's outcome.
-    pub fn count(&mut self, now: i64, outcome: &'static str) {
+    pub(super) fn count(&mut self, now: i64, outcome: &'static str) {
         self.counting_since.get_or_insert(now);
         *self.outcomes.entry(outcome).or_insert(0) += 1;
     }
@@ -341,11 +349,11 @@ impl BurstState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Decision {
-    pub at: i64,
-    pub dry_run: bool,
-    pub action: String,
-    pub drone: Option<String>,
-    pub detail: String,
+    at: i64,
+    dry_run: bool,
+    pub(super) action: String,
+    pub(super) drone: Option<String>,
+    pub(super) detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,7 +365,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub fn kind(&self) -> &'static str {
+    fn kind(&self) -> &'static str {
         match self {
             Action::Create { .. } => "create",
             Action::Drain { .. } => "drain",
@@ -369,42 +377,42 @@ impl Action {
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Spend {
-    pub day_hours: f64,
-    pub month_hours: f64,
+    pub(super) day_hours: f64,
+    pub(super) month_hours: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DemandView {
-    pub weighted_unmet: u32,
+    pub(super) weighted_unmet: u32,
     /// The scale-up condition holds right now.
-    pub holds: bool,
-    pub since: Option<i64>,
+    pub(super) holds: bool,
+    since: Option<i64>,
 }
 
 /// Burst drones the rule counted this pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct DroneCounts {
     /// Live VMs this queen created (simulated in dry-run).
-    pub managed: u32,
+    pub(super) managed: u32,
     /// Of those, created and not yet enrolled.
-    pub provisioning: u32,
+    pub(super) provisioning: u32,
     /// Alive drones with the burst prefix that this queen did not create.
-    pub unmanaged: u32,
+    pub(super) unmanaged: u32,
 }
 
 #[derive(Debug)]
 pub struct Plan {
-    pub actions: Vec<Action>,
-    pub demand: DemandView,
-    pub spend: Spend,
-    pub over_budget: bool,
-    pub drones: DroneCounts,
+    pub(super) actions: Vec<Action>,
+    demand: DemandView,
+    spend: Spend,
+    over_budget: bool,
+    drones: DroneCounts,
     /// Stable key for why a drone is or is not being created: `no_demand`,
     /// `over_budget`, `provisioning`, `at_max_drones`, `sustaining`,
     /// `no_headroom` or `create`.
-    pub outcome: &'static str,
+    pub(super) outcome: &'static str,
     /// The same, with numbers.
-    pub reason: String,
+    reason: String,
 }
 
 fn live(vm: &BurstVm, max_run: i64, now: i64) -> bool {
@@ -443,7 +451,7 @@ fn windows(now: i64) -> (i64, i64) {
     (day, month)
 }
 
-pub fn spend(vms: &[BurstVm], max_run: i64, now: i64) -> Spend {
+fn spend(vms: &[BurstVm], max_run: i64, now: i64) -> Spend {
     let (day, month) = windows(now);
     Spend {
         day_hours: hours_in(vms, max_run, now, day, i64::MAX),
@@ -487,7 +495,7 @@ fn pick_zone(zones: &[String], live_vms: &[&BurstVm], planned: &[String]) -> Str
     clippy::too_many_lines,
     reason = "one linear rule, easier to audit whole"
 )]
-pub fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>) -> Plan {
+pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>) -> Plan {
     let now = obs.now;
     let max_run = cfg.gce.max_run_secs;
     let up = &cfg.scale_up;
@@ -666,7 +674,7 @@ pub fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>) -> Pla
 
 /// Forget VMs that ended (or hit their maximum run time) before the current
 /// UTC month: they no longer count toward any budget window.
-pub fn prune(vms: &mut Vec<BurstVm>, max_run: i64, now: i64) {
+pub(super) fn prune(vms: &mut Vec<BurstVm>, max_run: i64, now: i64) {
     let (_, month) = windows(now);
     vms.retain(|v| v.ended_at.unwrap_or(i64::MAX).min(v.created_at + max_run) >= month);
 }
@@ -674,44 +682,44 @@ pub fn prune(vms: &mut Vec<BurstVm>, max_run: i64, now: i64) {
 /// `/status` view of the burst rule after a pass.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BurstView {
-    pub dry_run: bool,
-    pub max_drones: u32,
-    pub budget: BudgetView,
+    pub(super) dry_run: bool,
+    max_drones: u32,
+    pub(super) budget: BudgetView,
     /// Drone-hours this UTC day and month (simulated in dry-run).
-    pub spend: Spend,
-    pub spend_usd: SpendUsd,
-    pub over_budget: bool,
-    pub demand: DemandView,
-    pub drones: DroneCounts,
-    pub outcome: &'static str,
-    pub reason: String,
+    pub(super) spend: Spend,
+    spend_usd: SpendUsd,
+    over_budget: bool,
+    pub(super) demand: DemandView,
+    pub(super) drones: DroneCounts,
+    outcome: &'static str,
+    reason: String,
     /// Live VMs this queen created (simulated in dry-run).
-    pub vms: Vec<BurstVm>,
+    vms: Vec<BurstVm>,
     /// Passes by outcome since `counting_since` (the queen's start).
-    pub outcomes: BTreeMap<&'static str, u64>,
-    pub counting_since: Option<i64>,
+    pub(super) outcomes: BTreeMap<&'static str, u64>,
+    counting_since: Option<i64>,
     /// Newest last.
-    pub recent: Vec<Decision>,
+    recent: Vec<Decision>,
 }
 
 /// [`Spend`] in dollars at `hourly_cost_usd`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct SpendUsd {
-    pub day: f64,
-    pub month: f64,
+    day: f64,
+    month: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct BudgetView {
-    pub drone_hours_per_day: f64,
-    pub drone_hours_per_month: f64,
-    pub reserve_hours: f64,
-    pub hourly_cost_usd: f64,
+    pub(super) drone_hours_per_day: f64,
+    pub(super) drone_hours_per_month: f64,
+    reserve_hours: f64,
+    hourly_cost_usd: f64,
 }
 
 /// The view after `p`'s actions were applied to `vms`: drone counts include
 /// this pass's creates and exclude its deletes.
-pub fn view(
+pub(super) fn view(
     cfg: &BurstSettings,
     st: &BurstState,
     vms: &[BurstVm],
@@ -763,7 +771,7 @@ pub fn view(
 
 /// `<prefix>q<minute in hex>[-<n>]`, with the first `n` that `taken` does not
 /// already hold.
-pub fn new_name(prefix: &str, now: i64, taken: impl Fn(&str) -> bool) -> String {
+fn new_name(prefix: &str, now: i64, taken: impl Fn(&str) -> bool) -> String {
     let minute = now / 60;
     let mut name = format!("{prefix}q{minute:x}");
     let mut n = 1u32;
@@ -776,7 +784,7 @@ pub fn new_name(prefix: &str, now: i64, taken: impl Fn(&str) -> bool) -> String 
 
 /// Carry `actions` out on a simulated fleet (dry-run). Returns what was done,
 /// as decisions to log.
-pub fn apply_simulated(
+pub(super) fn apply_simulated(
     cfg: &BurstSettings,
     vms: &mut Vec<BurstVm>,
     actions: &[Action],
@@ -929,6 +937,59 @@ mod tests {
                 "{to}"
             );
         }
+    }
+
+    #[test]
+    fn provisioning_inputs_remain_typed_accepted_configuration_only() {
+        let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
+        let gce = block["gce"].as_object_mut().unwrap();
+        gce.extend([
+            ("spot".to_owned(), serde_json::json!(false)),
+            ("boot_disk_gb".to_owned(), serde_json::json!(250)),
+            ("boot_disk_type".to_owned(), serde_json::json!("pd-ssd")),
+            (
+                "image_family".to_owned(),
+                serde_json::json!("custom-family"),
+            ),
+            (
+                "image_project".to_owned(),
+                serde_json::json!("custom-project"),
+            ),
+            (
+                "credentials_path".to_owned(),
+                serde_json::json!("/nonexistent/borg/credentials.json"),
+            ),
+        ]);
+        let parsed: BurstSettings = serde_json::from_value(block.clone()).unwrap();
+        parsed.validate().unwrap();
+        assert!(!parsed.gce._spot);
+        assert_eq!(parsed.gce._boot_disk_gb, 250);
+        assert_eq!(parsed.gce._boot_disk_type, "pd-ssd");
+        assert_eq!(parsed.gce._image_family, "custom-family");
+        assert_eq!(parsed.gce._image_project, "custom-project");
+        assert_eq!(
+            parsed.gce._credentials_path,
+            Some(PathBuf::from("/nonexistent/borg/credentials.json"))
+        );
+
+        let defaults = cfg();
+        assert!(defaults.gce._spot);
+        assert_eq!(defaults.gce._boot_disk_gb, 1000);
+        assert_eq!(defaults.gce._boot_disk_type, "pd-balanced");
+        assert_eq!(defaults.gce._image_family, "ubuntu-2204-lts");
+        assert_eq!(defaults.gce._image_project, "ubuntu-os-cloud");
+        assert_eq!(defaults.gce._credentials_path, None);
+
+        block["gce"]["unknown_provisioning_input"] = serde_json::json!(true);
+        let error = serde_json::from_value::<BurstSettings>(block.clone()).unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+        block["gce"]
+            .as_object_mut()
+            .unwrap()
+            .remove("unknown_provisioning_input");
+        block["dry_run"] = serde_json::json!(false);
+        let live: BurstSettings = serde_json::from_value(block).unwrap();
+        assert!(live.validate().unwrap_err().contains("only simulates"));
     }
 
     #[test]
