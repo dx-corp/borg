@@ -869,10 +869,10 @@ pub struct Status {
     pub reserved_for: Vec<Reservation>,
     /// Static (non-borg) runners GitHub reports offline: they stopped
     /// heartbeating and take no jobs.
-    pub static_runners_offline: Vec<crate::queen::OfflineRunner>,
+    static_runners_offline: Vec<crate::queen::OfflineRunner>,
     /// The burst rule after the last pass (simulated in dry-run); absent when
     /// burst is off.
-    pub burst: Option<crate::burst::BurstView>,
+    burst: Option<crate::burst::BurstView>,
     pub rollout: RolloutStatus,
     pub warm_floors: Vec<crate::allocator::WarmFloor>,
     pub pressure: Vec<ClassPressure>,
