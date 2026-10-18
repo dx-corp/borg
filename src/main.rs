@@ -496,6 +496,15 @@ async fn run_queen(path: &Path) -> Result<()> {
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
     tracing::info!("queen listening on {}", cfg.listen);
+    // Config validation already refuses `burst.dry_run = false`.
+    if let Some(b) = cfg.burst.as_ref().filter(|b| b.enabled) {
+        tracing::info!(
+            "burst capacity enabled (dry-run: decisions are logged as burst_would_* health events; no VM is created), max {} drones, {} drone-hours/day, {} /month",
+            b.max_drones,
+            b.budget.drone_hours_per_day,
+            b.budget.drone_hours_per_month,
+        );
+    }
     let mut requeuer = None;
     let janitor = match &cfg.supersede_janitor {
         Some(settings) => {

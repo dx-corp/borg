@@ -867,6 +867,12 @@ pub struct Status {
     pub unmet_placeable: Vec<Unmet>,
     /// Drones held back for starving demand.
     pub reserved_for: Vec<Reservation>,
+    /// Static (non-borg) runners GitHub reports offline: they stopped
+    /// heartbeating and take no jobs.
+    pub static_runners_offline: Vec<crate::queen::OfflineRunner>,
+    /// The burst rule after the last pass (simulated in dry-run); absent when
+    /// burst is off.
+    pub burst: Option<crate::burst::BurstView>,
     pub rollout: RolloutStatus,
     pub warm_floors: Vec<crate::allocator::WarmFloor>,
     pub pressure: Vec<ClassPressure>,
@@ -1249,6 +1255,8 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         unmet: snap.unmet,
         unmet_placeable: snap.unmet_placeable,
         reserved_for: snap.reserved_for,
+        static_runners_offline: snap.static_offline,
+        burst: snap.burst,
         rollout,
         warm_floors: snap.warm_floors,
         pressure: snap.pressure,
@@ -1526,6 +1534,74 @@ pub fn render_metrics(status: &Status) -> String {
             .map(|(c, v)| (format!("class=\"{c}\""), f64::from(u8::from(v.alarm))))
             .collect(),
     );
+    gauge(
+        "borg_static_runners_offline",
+        "Non-borg runners GitHub reports offline, by name.",
+        status
+            .static_runners_offline
+            .iter()
+            .map(|r| (format!("runner=\"{}\"", label_value(&r.name)), 1.0))
+            .collect(),
+    );
+    if let Some(b) = &status.burst {
+        gauge(
+            "borg_burst_dry_run",
+            "1 while burst decisions are only simulated.",
+            vec![(String::new(), f64::from(u8::from(b.dry_run)))],
+        );
+        gauge(
+            "borg_burst_drones",
+            "Burst drones by kind: managed (created by this queen; simulated in dry-run), provisioning, unmanaged (made by hand).",
+            [
+                ("managed", b.drones.managed),
+                ("provisioning", b.drones.provisioning),
+                ("unmanaged", b.drones.unmanaged),
+            ]
+            .map(|(k, n)| (format!("kind=\"{k}\""), f64::from(n)))
+            .to_vec(),
+        );
+        gauge(
+            "borg_burst_drone_hours",
+            "Burst drone-hours spent this UTC day and month (simulated in dry-run).",
+            vec![
+                ("window=\"day\"".to_owned(), b.spend.day_hours),
+                ("window=\"month\"".to_owned(), b.spend.month_hours),
+            ],
+        );
+        gauge(
+            "borg_burst_budget_drone_hours",
+            "Burst drone-hour budget per UTC day and month.",
+            vec![
+                ("window=\"day\"".to_owned(), b.budget.drone_hours_per_day),
+                (
+                    "window=\"month\"".to_owned(),
+                    b.budget.drone_hours_per_month,
+                ),
+            ],
+        );
+        gauge(
+            "borg_burst_weighted_unmet",
+            "Weighted unmet jobs the burst rule counted at the last pass.",
+            vec![(String::new(), f64::from(b.demand.weighted_unmet))],
+        );
+        gauge(
+            "borg_burst_demand_holds",
+            "1 while the burst scale-up condition holds.",
+            vec![(String::new(), f64::from(u8::from(b.demand.holds)))],
+        );
+        gauge(
+            "borg_burst_passes",
+            "Burst passes by outcome since the queen started.",
+            b.outcomes
+                .iter()
+                .map(|(o, n)| {
+                    #[allow(clippy::cast_precision_loss, reason = "pass counts far below 2^52")]
+                    let v = *n as f64;
+                    (format!("outcome=\"{o}\""), v)
+                })
+                .collect(),
+        );
+    }
     gauge(
         "borg_drone_free_mem_mib",
         "Memory budget left on a drone after its active leases.",
