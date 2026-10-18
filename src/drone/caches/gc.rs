@@ -39,7 +39,7 @@ pub fn measure(path: &Path) -> (u64, SystemTime) {
     (m.size, m.newest)
 }
 
-/// What [`measure_tree`] found.
+/// Size, recency, and unreadable-directory counts found by `measure_tree`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Measured {
     pub(super) size: u64,
