@@ -52,7 +52,7 @@ async fn dry_run_logs_what_it_would_create_drain_and_delete_and_creates_nothing(
     // Two main heavy jobs and no drone: weighted unmet 6.
     h.queue_job(1, "borg-ci-heavy", 5);
     h.queue_job(2, "borg-ci-heavy", 5);
-    let t0 = OffsetDateTime::now_utc();
+    let t0 = OffsetDateTime::now_utc().replace_time(time::Time::from_hms(12, 0, 0).unwrap());
     let at = |s: i64| t0 + time::Duration::seconds(s);
 
     h.queen.tick(at(0)).await.unwrap();
