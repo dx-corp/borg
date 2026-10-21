@@ -825,6 +825,32 @@ unless a NAT gateway exists, which this setup avoids. If the cloud reclaims a
 spot VM mid-job, GitHub fails that job when its runner stops responding; rerun
 it. Queued jobs are unaffected and go to other drones.
 
+#### Additional estimated dollar ceilings
+
+The `budget` block can also set **both**
+`max_estimated_usd_per_day` and `max_estimated_usd_per_month`.
+When present they are enforced *in addition to* the VM-hour caps:
+both already-accrued VM time and the configured `reserve_hours` for
+existing and prospective drones must fit under each dollar ceiling.
+A crossed cap drains owned VMs and prevents new creation, preserving
+running leases until they complete.
+
+Dollar limits use `burst.hourly_cost_usd`, an **operator estimate**
+that must be conservative enough to include the expected Spot compute,
+boot disk, public IP and traffic overhead. Unlike cloud billing budgets,
+the estimated ceiling **cannot guarantee a maximum invoice**: real prices
+vary, network egress is workload-dependent and the simulator forgets its
+created VMs on queen restart. Live cloud provisioning remains unsupported
+in this build; implement persisted accounting and provider-side spend
+controls before enabling it.
+
+If only one dollar limit is configured, or a value is nonfinite, zero,
+negative, or the daily limit exceeds the monthly limit, config
+validation fails. With neither limit configured, old VM-hour-only
+behavior is preserved. The status `burst.budget` object and
+`borg_burst_budget_estimated_usd{window="day|month"}` metric expose
+these configured dollar estimates without credentials.
+
 #### Burst rule (`burst`, dry-run)
 
 The `burst` block decides when the queen would add or remove burst drones.

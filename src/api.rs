@@ -1579,6 +1579,22 @@ pub fn render_metrics(status: &Status) -> String {
                 ),
             ],
         );
+        let usd_budgets: Vec<(String, f64)> = [
+            ("day", b.budget.max_estimated_usd_per_day),
+            ("month", b.budget.max_estimated_usd_per_month),
+        ]
+        .into_iter()
+        .filter_map(|(window, amount)| {
+            amount.map(|amount| (format!("window=\"{window}\""), amount))
+        })
+        .collect();
+        if !usd_budgets.is_empty() {
+            gauge(
+                "borg_burst_budget_estimated_usd",
+                "Optional estimated burst spend ceilings in USD; not cloud billing quotas.",
+                usd_budgets,
+            );
+        }
         gauge(
             "borg_burst_weighted_unmet",
             "Weighted unmet jobs the burst rule counted at the last pass.",
