@@ -1187,7 +1187,10 @@ mod tests {
         run(&c, &mut st, T0, &heavy, &[], &[]);
         let p = run(&c, &mut st, T0 + 600, &heavy, &[], &[]);
         assert_eq!(p.outcome, "no_headroom");
-        assert!(p.actions.is_empty(), "two reserved hours cost $4, exceeding $3/day");
+        assert!(
+            p.actions.is_empty(),
+            "two reserved hours cost $4, exceeding $3/day"
+        );
 
         // Even when the hour budget permits work, a reached dollar cap
         // drains an already-running drone without deleting its live lease.
