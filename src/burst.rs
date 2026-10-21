@@ -128,6 +128,12 @@ pub struct BurstSettings {
 pub struct BudgetSettings {
     pub drone_hours_per_day: f64,
     pub drone_hours_per_month: f64,
+    /// Optional additional ceilings on estimated all-in dollar spend.
+    /// These are estimates, not cloud billing quotas; both must be supplied together.
+    #[serde(default)]
+    pub(super) max_estimated_usd_per_day: Option<f64>,
+    #[serde(default)]
+    pub(super) max_estimated_usd_per_month: Option<f64>,
     /// Headroom required per drone, old and new, before creating one.
     #[serde(default = "default_reserve")]
     reserve_hours: f64,
@@ -252,6 +258,15 @@ impl BurstSettings {
             return bad(
                 "budget needs 0 < drone_hours_per_day <= drone_hours_per_month and reserve_hours >= 0",
             );
+        }
+        match (b.max_estimated_usd_per_day, b.max_estimated_usd_per_month) {
+            (None, None) => {}
+            (Some(day), Some(month)) if positive(day) && positive(month) && day <= month => {}
+            _ => {
+                return bad(
+                    "budget needs both positive estimated USD limits, day <= month, or neither",
+                );
+            }
         }
         if up.classes.is_empty()
             || up.min_weighted_unmet == 0
@@ -511,7 +526,15 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
 
     let spent = spend(obs.vms, max_run, now);
     let over_budget = spent.day_hours >= cfg.budget.drone_hours_per_day
-        || spent.month_hours >= cfg.budget.drone_hours_per_month;
+        || spent.month_hours >= cfg.budget.drone_hours_per_month
+        || cfg
+            .budget
+            .max_estimated_usd_per_day
+            .is_some_and(|cap| spent.day_hours * cfg.hourly_cost_usd >= cap)
+        || cfg
+            .budget
+            .max_estimated_usd_per_month
+            .is_some_and(|cap| spent.month_hours * cfg.hourly_cost_usd >= cap);
 
     let drone = |name: &str| obs.drones.iter().find(|d| d.name == name);
     let live_vms: Vec<&BurstVm> = obs.vms.iter().filter(|v| live(v, max_run, now)).collect();
@@ -630,7 +653,20 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
         while n > 0 {
             #[allow(clippy::cast_precision_loss, reason = "a handful of drones")]
             let reserved = (live_vms.len() + n) as f64 * cfg.budget.reserve_hours;
-            if spent.day_hours + reserved <= day && spent.month_hours + reserved <= month {
+            let estimated_day_usd = (spent.day_hours + reserved) * cfg.hourly_cost_usd;
+            let estimated_month_usd = (spent.month_hours + reserved) * cfg.hourly_cost_usd;
+            let within_usd = cfg
+                .budget
+                .max_estimated_usd_per_day
+                .is_none_or(|cap| estimated_day_usd <= cap)
+                && cfg
+                    .budget
+                    .max_estimated_usd_per_month
+                    .is_none_or(|cap| estimated_month_usd <= cap);
+            if spent.day_hours + reserved <= day
+                && spent.month_hours + reserved <= month
+                && within_usd
+            {
                 break;
             }
             n -= 1;
@@ -715,6 +751,8 @@ pub struct BudgetView {
     pub(super) drone_hours_per_month: f64,
     reserve_hours: f64,
     hourly_cost_usd: f64,
+    pub(super) max_estimated_usd_per_day: Option<f64>,
+    pub(super) max_estimated_usd_per_month: Option<f64>,
 }
 
 /// The view after `p`'s actions were applied to `vms`: drone counts include
@@ -747,6 +785,8 @@ pub(super) fn view(
             drone_hours_per_month: cfg.budget.drone_hours_per_month,
             reserve_hours: cfg.budget.reserve_hours,
             hourly_cost_usd: cfg.hourly_cost_usd,
+            max_estimated_usd_per_day: cfg.budget.max_estimated_usd_per_day,
+            max_estimated_usd_per_month: cfg.budget.max_estimated_usd_per_month,
         },
         spend: p.spend,
         spend_usd: SpendUsd {
@@ -1132,6 +1172,53 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn estimated_usd_budget_is_additional_to_vm_hour_limits() {
+        let mut c = cfg();
+        c.hourly_cost_usd = 2.0;
+        c.budget.max_estimated_usd_per_day = Some(3.0);
+        c.budget.max_estimated_usd_per_month = Some(8.0);
+        assert!(c.validate().is_ok());
+
+        let heavy = [unmet(Class::Heavy, Scope::Main, 2)];
+        let mut st = BurstState::default();
+        run(&c, &mut st, T0, &heavy, &[], &[]);
+        let p = run(&c, &mut st, T0 + 600, &heavy, &[], &[]);
+        assert_eq!(p.outcome, "no_headroom");
+        assert!(p.actions.is_empty(), "two reserved hours cost $4, exceeding $3/day");
+
+        // Even when the hour budget permits work, a reached dollar cap
+        // drains an already-running drone without deleting its live lease.
+        let running = [vm("gcp-burst-qc", "us-west1-b", T0)];
+        let busy = [drone("gcp-burst-qc", true, 1)];
+        let mut st = BurstState::default();
+        let p = run(&c, &mut st, T0 + 5400, &heavy, &busy, &running);
+        assert!(p.over_budget);
+        assert_eq!(
+            p.actions,
+            [Action::Drain {
+                drone: "gcp-burst-qc".to_owned(),
+                why: "budget spent"
+            }]
+        );
+        let v = view(&c, &st, &running, &p, T0 + 5400);
+        assert_eq!(v.budget.max_estimated_usd_per_day, Some(3.0));
+        assert_eq!(v.budget.max_estimated_usd_per_month, Some(8.0));
+    }
+
+    #[test]
+    fn estimated_usd_budget_rejects_partial_nonfinite_or_reversed_limits() {
+        let mut c = cfg();
+        c.budget.max_estimated_usd_per_day = Some(5.0);
+        assert!(c.validate().is_err(), "one limit is not sufficient");
+        c.budget.max_estimated_usd_per_month = Some(4.0);
+        assert!(c.validate().is_err(), "day cannot exceed month");
+        c.budget.max_estimated_usd_per_month = Some(20.0);
+        assert!(c.validate().is_ok());
+        c.budget.max_estimated_usd_per_day = Some(f64::NAN);
+        assert!(c.validate().is_err(), "NaN cannot bypass a limit");
     }
 
     #[test]
