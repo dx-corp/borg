@@ -569,6 +569,33 @@ impl Free<'_> {
         self.evaluate_bid(class, scope, pressure, weights).score
     }
 
+    /// Backfill may share a reserved host only when its sole existing lease
+    /// can finish and leave room for the reserved job alongside every new
+    /// grant. With several existing leases, preserve the full drain instead
+    /// of guessing their completion order.
+    fn preserves_reservation(&self, classes: &Classes, reserved: Class, class: Class) -> bool {
+        if self.in_flight != 1 {
+            return false;
+        }
+        let reserved = classes.spec(reserved);
+        let candidate = classes.spec(class);
+        let mut mem = u128::from(reserved.mem_mib) + u128::from(candidate.mem_mib);
+        let mut cpu = u128::from(reserved.vcpu) + u128::from(candidate.vcpu);
+        let mut leases = 2_u128;
+        for (&(granted_class, _), &count) in &self.granted {
+            let spec = classes.spec(granted_class);
+            mem += u128::from(count) * u128::from(spec.mem_mib);
+            cpu += u128::from(count) * u128::from(spec.vcpu);
+            leases += u128::from(count);
+        }
+        mem <= u128::from(self.drone.mem_mib)
+            && cpu <= u128::from(self.drone.vcpu)
+            && self
+                .drone
+                .max_leases
+                .is_none_or(|cap| leases <= u128::from(cap))
+    }
+
     /// Eligibility and scores are evaluated once, for both selection and its
     /// explanation. Keeping this next to `offer` prevents a second scheduler.
     fn candidate(
@@ -612,7 +639,9 @@ impl Free<'_> {
         if self.leases_left == Some(0) {
             reasons.push(Rejection::LeaseCap);
         }
-        if reserved_for.is_some_and(|key| key != (class, scope)) {
+        if reserved_for.is_some_and(|key| {
+            key != (class, scope) && !self.preserves_reservation(&input.classes, key.0, class)
+        }) {
             reasons.push(Rejection::Reserved);
         }
         let evaluated = self.evaluate_bid(class, scope, pressure, &input.weights);
@@ -1740,10 +1769,16 @@ mod tests {
                 scope: Scope::Pr
             }]
         );
-        assert!(
-            a.grants.iter().all(|g| g.drone_id != "b"),
-            "reserved drone got a new lease"
+        assert_eq!(a.grants.iter().filter(|g| g.drone_id == "b").count(), 1);
+        let mut next = i.clone();
+        next.leases.retain(|l| l.drone_id != "b");
+        next.leases.extend(
+            a.grants
+                .iter()
+                .map(|g| lease(&g.drone_id, g.class, g.scope, LeaseState::Running)),
         );
+        next.demand.retain(|d| d.class == Class::Heavy);
+        assert_eq!(count(&allocate(&next), Class::Heavy, Scope::Pr), 1);
         assert!(
             count(&a, Class::Light, Scope::Main) > 0,
             "other drone keeps working"
@@ -1754,6 +1789,91 @@ mod tests {
             count: 1
         }));
         assert_within_budget(&i, &a);
+    }
+
+    /// A running heavy lease leaves 12 GiB idle on a 26 GiB host. Six
+    /// 2 GiB backfills can finish independently: the next 14 GiB heavy
+    /// still fits as soon as the original lease ends.
+    fn backfill_input() -> AllocatorInput {
+        let mut i = input(
+            &[
+                (Class::Heavy, Scope::Main, 1),
+                (Class::Light, Scope::Pr, 10),
+            ],
+            vec![DroneState {
+                mem_mib: 26 * 1024,
+                vcpu: 11,
+                ..host("a")
+            }],
+        );
+        i.classes.light = ClassSpec {
+            mem_mib: 2048,
+            vcpu: 1,
+            docker: false,
+        };
+        i.classes.medium = ClassSpec {
+            mem_mib: 8192,
+            vcpu: 2,
+            docker: true,
+        };
+        i.classes.heavy = ClassSpec {
+            mem_mib: 14336,
+            vcpu: 4,
+            docker: true,
+        };
+        i.leases = vec![lease("a", Class::Heavy, Scope::Main, LeaseState::Running)];
+        aged(&mut i, Class::Heavy, Scope::Main, 300);
+        i
+    }
+
+    #[test]
+    fn reservation_backfills_without_delaying_the_reserved_job() {
+        let mut i = backfill_input();
+        let a = allocate(&i);
+        assert_eq!(a.reserved_for.len(), 1);
+        assert_eq!(count(&a, Class::Light, Scope::Pr), 6);
+        assert_within_budget(&i, &a);
+        // The original heavy finishes while every backfill keeps running.
+        i.leases = a
+            .grants
+            .iter()
+            .map(|g| lease(&g.drone_id, g.class, g.scope, LeaseState::Running))
+            .collect();
+        i.demand.retain(|d| d.class == Class::Heavy);
+        let next = allocate(&i);
+        assert_eq!(count(&next, Class::Heavy, Scope::Main), 1);
+        assert_within_budget(&i, &next);
+    }
+
+    #[test]
+    fn reservation_backfill_preserves_cpu_and_lease_limits() {
+        for (vcpu, cap, expected) in [
+            (11, None, 6),
+            (5, None, 1),
+            (11, Some(2), 1),
+            (11, Some(1), 0),
+        ] {
+            let mut i = backfill_input();
+            i.drones[0].vcpu = vcpu;
+            i.drones[0].max_leases = cap;
+            let a = allocate(&i);
+            assert_eq!(
+                count(&a, Class::Light, Scope::Pr),
+                expected,
+                "vcpu={vcpu} cap={cap:?}"
+            );
+            assert_within_budget(&i, &a);
+        }
+    }
+
+    #[test]
+    fn reservation_with_multiple_existing_leases_does_not_backfill() {
+        let mut i = backfill_input();
+        i.leases
+            .push(lease("a", Class::Light, Scope::Main, LeaseState::Running));
+        let a = allocate(&i);
+        assert_eq!(a.reserved_for.len(), 1);
+        assert!(a.grants.is_empty());
     }
 
     #[test]

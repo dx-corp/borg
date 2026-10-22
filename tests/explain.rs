@@ -124,44 +124,54 @@ fn traces_owner_net_capacity_blocked_environment_and_nonaccepting_hosts() {
 }
 
 #[test]
-fn records_starvation_reservation_and_why_smaller_work_cannot_take_it() {
-    let mut drone = host("a");
-    drone.mem_mib = 28 * 1024;
-    drone.vcpu = 16;
-    let mut i = input(vec![drone], 1);
-    i.demand.push(Demand {
-        class: Class::Heavy,
-        scope: Scope::Main,
-        count: 1,
-    });
-    i.leases.push(ActiveLease {
-        drone_id: "a".into(),
-        class: Class::Medium,
-        scope: Scope::Main,
-        state: LeaseState::Running,
-    });
-    i.queue_ages.push(QueueAge {
-        class: Class::Heavy,
-        scope: Scope::Main,
-        oldest_age_secs: 60,
-    });
-    i.starvation_after_secs = Some(30);
-    let result = allocate(&i);
-    assert_eq!(result.decisions[0].reservation.as_deref(), Some("a"));
-    let light = result
-        .decisions
-        .iter()
-        .find(|d| d.class == Class::Light)
-        .unwrap();
-    assert!(
-        light.candidates[0]
-            .rejection_reasons
-            .contains(&Rejection::Reserved)
-    );
-    assert_eq!(
-        light.candidates[0].reserved_for,
-        Some((Class::Heavy, Scope::Main))
-    );
+fn records_reservation_and_whether_backfill_preserves_the_reserved_job() {
+    // Heavy needs 24 GiB, medium uses 12 GiB, light needs 2.5 GiB.
+    // Current room admits light in both cases; future heavy room decides.
+    for (mem_gib, backfill) in [(24, false), (28, true)] {
+        let mut drone = host("a");
+        drone.mem_mib = mem_gib * 1024;
+        drone.vcpu = 16;
+        let mut i = input(vec![drone], 1);
+        i.demand.push(Demand {
+            class: Class::Heavy,
+            scope: Scope::Main,
+            count: 1,
+        });
+        i.leases.push(ActiveLease {
+            drone_id: "a".into(),
+            class: Class::Medium,
+            scope: Scope::Main,
+            state: LeaseState::Running,
+        });
+        i.queue_ages.push(QueueAge {
+            class: Class::Heavy,
+            scope: Scope::Main,
+            oldest_age_secs: 60,
+        });
+        i.starvation_after_secs = Some(30);
+        let result = allocate(&i);
+        assert_eq!(result.decisions[0].reservation.as_deref(), Some("a"));
+        let light = result
+            .decisions
+            .iter()
+            .find(|d| d.class == Class::Light)
+            .unwrap();
+        if backfill {
+            assert_eq!(light.winner.as_deref(), Some("a"));
+            assert!(light.candidates[0].rejection_reasons.is_empty());
+        } else {
+            assert!(light.winner.is_none());
+            assert!(
+                light.candidates[0]
+                    .rejection_reasons
+                    .contains(&Rejection::Reserved)
+            );
+        }
+        assert_eq!(
+            light.candidates[0].reserved_for,
+            Some((Class::Heavy, Scope::Main))
+        );
+    }
 }
 
 #[test]
