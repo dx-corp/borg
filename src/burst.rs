@@ -131,9 +131,9 @@ pub struct BudgetSettings {
     /// Optional additional ceilings on estimated all-in dollar spend.
     /// These are estimates, not cloud billing quotas; both must be supplied together.
     #[serde(default)]
-    pub(super) max_estimated_usd_per_day: Option<f64>,
+    max_estimated_usd_per_day: Option<f64>,
     #[serde(default)]
-    pub(super) max_estimated_usd_per_month: Option<f64>,
+    max_estimated_usd_per_month: Option<f64>,
     /// Headroom required per drone, old and new, before creating one.
     #[serde(default = "default_reserve")]
     reserve_hours: f64,
