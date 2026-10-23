@@ -2134,6 +2134,41 @@ pub fn render_metrics(status: &Status) -> String {
                 "Janitor per-run or per-pull-request failures",
                 t.errors,
             ),
+            (
+                "promotion_considered",
+                "Promotion workflow runs the janitor examined",
+                t.promotion_considered,
+            ),
+            (
+                "promotion_superseded",
+                "Pending promotion runs a newer started or successful run supersedes",
+                t.promotion_superseded,
+            ),
+            (
+                "promotion_stale",
+                "Old promotion runs a newer successful run supersedes",
+                t.promotion_stale,
+            ),
+            (
+                "promotion_ghost",
+                "Queued promotion runs with no jobs past the ghost age",
+                t.promotion_ghost,
+            ),
+            (
+                "promotion_cancelled",
+                "Superseded, stale or ghost promotion runs the janitor cancelled",
+                t.promotion_cancelled,
+            ),
+            (
+                "promotion_unprovable",
+                "Superseded promotion runs kept because no source repository proves ancestry",
+                t.promotion_unprovable,
+            ),
+            (
+                "force_cancelled",
+                "Janitor-cancelled runs still unfinished that were force-cancelled",
+                t.force_cancelled,
+            ),
         ] {
             gauge(
                 &format!("borg_janitor_{field}_total"),

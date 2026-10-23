@@ -802,12 +802,14 @@ impl Installer<'_> {
     fn drone_config(&self) -> Result<String, InstallError> {
         let o = self.opts;
         // A host's reclaim policy is edited in place; reinstalling must not
-        // reset it.
+        // reset it. The block older installs wrote verbatim (off, dry run, no
+        // roots) was never an operator choice, so it takes today's default.
         let reclaim = std::fs::read_to_string(self.on_disk(&self.layout.config()))
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
             .and_then(|v| v.get("reclaim").cloned())
-            .and_then(|r| serde_json::from_value(r).ok())
+            .and_then(|r| serde_json::from_value::<crate::reclaim::ReclaimSettings>(r).ok())
+            .filter(|r| !r.is_legacy_default())
             .unwrap_or_default();
         let cfg = DroneConfig {
             queen_url: o.queen_url.clone(),
@@ -1205,6 +1207,20 @@ mod tests {
         let kept = DroneConfig::from_json(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(kept.reclaim.enabled && !kept.reclaim.dry_run, "{again:?}");
         assert_eq!(kept.reclaim.roots.len(), 1);
+
+        // The off/dry-run block older installs wrote takes today's default.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        v["reclaim"] = serde_json::to_value(crate::reclaim::ReclaimSettings {
+            enabled: false,
+            dry_run: true,
+            ..Default::default()
+        })
+        .unwrap();
+        fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+        install(&opts(&e), &with_downloads(exec())).unwrap();
+        let upgraded = DroneConfig::from_json(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(upgraded.reclaim, crate::reclaim::ReclaimSettings::default());
 
         // Second run on the now-configured host.
         let y = exec();

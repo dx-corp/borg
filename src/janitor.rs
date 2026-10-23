@@ -34,6 +34,16 @@
 //! * a cancel that GitHub refuses with 409 is a no-op, counted as
 //!   `uncancellable`;
 //! * every cancellation (or, in dry-run, every would-be cancellation) is logged.
+//!
+//! `superseded_promotions` blocks thin one promotion workflow each (see
+//! `promotions`): a pending run whose apply never ran yields to a newer
+//! started or successful run covering its services, a run older than
+//! `stale_after_hours` yields to a newer successful one, a nameless queued run
+//! with no jobs is dropped after `ghost_after_hours`, and a run the janitor
+//! cancelled that is still unfinished `force_cancel_after_mins` later is
+//! force-cancelled. A newer run must be proven the same as or ahead of the
+//! older one in its source repository, and no run is touched while a mutation
+//! job of it runs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -44,6 +54,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::config::JanitorSettings;
+
+#[path = "janitor_promotions.rs"]
+mod promotions;
 use crate::github::{GithubError, TokenSource};
 use crate::secret::Secret;
 
@@ -86,6 +99,21 @@ pub struct PassReport {
     pub uncancellable: u32,
     /// Per-run or per-pull-request failures (logged, not fatal).
     pub errors: u32,
+    /// Runs of `superseded_promotions` workflows examined.
+    pub promotion_considered: u32,
+    /// Pending promotion runs a newer started or successful run supersedes.
+    pub promotion_superseded: u32,
+    /// Promotion runs past `stale_after_hours` a newer successful run supersedes.
+    pub promotion_stale: u32,
+    /// Queued promotion runs with no jobs past `ghost_after_hours`.
+    pub promotion_ghost: u32,
+    /// Promotion runs cancelled for any of the three reasons above.
+    pub promotion_cancelled: u32,
+    /// Promotion runs whose superseding sha could not be proven (no source
+    /// repository configured for the event).
+    pub promotion_unprovable: u32,
+    /// Janitor-cancelled runs still unfinished that were force-cancelled.
+    pub force_cancelled: u32,
 }
 
 impl PassReport {
@@ -104,6 +132,13 @@ impl PassReport {
         self.raced += o.raced;
         self.uncancellable += o.uncancellable;
         self.errors += o.errors;
+        self.promotion_considered += o.promotion_considered;
+        self.promotion_superseded += o.promotion_superseded;
+        self.promotion_stale += o.promotion_stale;
+        self.promotion_ghost += o.promotion_ghost;
+        self.promotion_cancelled += o.promotion_cancelled;
+        self.promotion_unprovable += o.promotion_unprovable;
+        self.force_cancelled += o.force_cancelled;
     }
 }
 
@@ -141,6 +176,10 @@ struct Run {
     head_repository: Option<RepoRef>,
     #[serde(default)]
     pull_requests: Vec<PullRef>,
+    #[serde(default)]
+    display_title: String,
+    #[serde(default)]
+    created_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +210,7 @@ pub struct Janitor {
     token: TokenSource,
     settings: JanitorSettings,
     view: Mutex<JanitorView>,
+    promotion: Mutex<promotions::State>,
 }
 
 impl Janitor {
@@ -201,6 +241,7 @@ impl Janitor {
                 since: now(),
                 ..JanitorView::default()
             }),
+            promotion: Mutex::new(promotions::State::default()),
         })
     }
 
@@ -283,6 +324,7 @@ impl Janitor {
                 report.errors += 1;
             }
         }
+        self.promotion_passes(&mut budget, &mut report).await;
         tracing::debug!(
             "janitor pass: considered {} superseded {} closed_pr {} superseded_push {} cancelled {} cancelled_running {} duplicates {} dedup_cancelled {} would_cancel {} deferred {} started_push {} raced {} uncancellable {} errors {}",
             report.considered,
@@ -371,7 +413,9 @@ impl Janitor {
                 continue;
             }
             let kind = if running { Kind::Running } else { Kind::Stale };
-            let outcome = self.cancel_if_unchanged(repo, run, &why).await;
+            let outcome = self
+                .cancel_if_unchanged(repo, run, &why, self.settings.dry_run)
+                .await;
             tally(report, budget, repo, run.id, kind, outcome);
         }
         for (run, newer) in superseded_pushes(&runs, &st.superseded_push_branches) {
@@ -397,7 +441,9 @@ impl Janitor {
                 "on {}: superseded by run {newer}",
                 run.head_branch.as_deref().unwrap_or("?")
             );
-            let outcome = self.cancel_if_unchanged(repo, run, &why).await;
+            let outcome = self
+                .cancel_if_unchanged(repo, run, &why, self.settings.dry_run)
+                .await;
             tally(report, budget, repo, run.id, Kind::Stale, outcome);
         }
         if st.dedupe_same_sha {
@@ -414,7 +460,9 @@ impl Janitor {
                     "duplicate of run {kept} (workflow {}, head {})",
                     run.workflow_id, run.head_sha
                 );
-                let outcome = self.cancel_if_unchanged(repo, run, &why).await;
+                let outcome = self
+                    .cancel_if_unchanged(repo, run, &why, self.settings.dry_run)
+                    .await;
                 tally(report, budget, repo, run.id, Kind::Duplicate, outcome);
             }
         }
@@ -496,6 +544,7 @@ impl Janitor {
         repo: &str,
         run: &Run,
         why: &str,
+        dry_run: bool,
     ) -> Result<Outcome, GithubError> {
         let fresh: Run = self
             .get(&format!("/repos/{repo}/actions/runs/{}", run.id))
@@ -507,7 +556,7 @@ impl Janitor {
             return Ok(Outcome::Raced);
         }
         let state = &run.status;
-        if self.settings.dry_run {
+        if dry_run {
             tracing::info!(
                 "janitor (dry-run): would cancel {state} {repo} run {} {why}",
                 run.id
@@ -529,6 +578,7 @@ enum Kind {
     Stale,
     Running,
     Duplicate,
+    Promotion,
 }
 
 fn tally(
@@ -546,6 +596,7 @@ fn tally(
                 Kind::Stale => report.cancelled += 1,
                 Kind::Running => report.cancelled_running += 1,
                 Kind::Duplicate => report.dedup_cancelled += 1,
+                Kind::Promotion => report.promotion_cancelled += 1,
             }
         }
         Ok(Outcome::DryRun) => {
@@ -675,6 +726,8 @@ mod tests {
                 .iter()
                 .map(|&number| PullRef { number, head: None })
                 .collect(),
+            display_title: String::new(),
+            created_at: String::new(),
         }
     }
 

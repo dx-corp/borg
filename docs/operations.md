@@ -532,24 +532,42 @@ pressure (see [Admission by CPU pressure](#admission-by-cpu-pressure)).
 
 ### Build-box reclaim
 
-A drone on a shared build host can reclaim abandoned git worktrees and cargo
-`target/` and `incremental/` directories by disk pressure (`reclaim` block of the
-drone config; off by default, dry-run by default). `reclaim::run_cycle` is the
-policy; the drone implements `ReclaimHost` and reports `ReclaimStats` in its
-heartbeat (`reclaim`), which the queen audits (`/status` `reclaim`).
+Every drone reclaims abandoned git worktrees and cargo `target/` and
+`incremental/` directories by disk pressure and idle age (`reclaim` block of the
+drone config; **on and deleting by default**, `"enabled": false` opts a host
+out, `"dry_run": true` only logs). `reclaim::run_cycle` is the policy;
+`drone::reclaim` implements `ReclaimHost` (Linux) and reports `ReclaimStats` in
+the heartbeat (`reclaim`), which the queen audits (`/status` `reclaim`) and
+exports as `borg_reclaim_*` metrics.
 
-What a `ReclaimHost` implementation must guarantee, because the policy relies on
-it: `probe` reports **busy** if any process has its working directory or an open
-file inside the path (check `/proc/*/cwd` and `fd`, or `lsof +D` on macOS);
-**dirty** if `git status --porcelain` is non-empty, untracked files included;
-**unpushed** if `git rev-list HEAD --not --remotes` is non-empty (or HEAD is
-detached on such commits); **protected** for the main checkout (first entry of
-`git worktree list`), a locked worktree, or a repository with stashes; **not_git**
-when the path is not a work tree; and **unknown** whenever any step failed or
-timed out. `delete` removes the directory (for a worktree, `git worktree remove`
-or removal followed by `git worktree prune`) and returns the bytes freed. `scan`
-lists each child of a root, and for `cargo_target` roots also each
-`incremental/` directory inside (with `within` set to its target directory).
+Roots: with `roots` empty the drone uses the standard build locations that exist
+under every `/home/*` directory and the job user's home (`worktrees`,
+`agent-worktrees`, `claude-worktrees`, `agent-work`, `.codex-worktrees`,
+`.grok/worktrees` as worktree roots; `slot-targets`, `cargo-targets`,
+`.cargo-targets`, `.cache`, `t` as cargo-target roots) and on the shared data
+volume (`/srv/devdata/worktrees`, `/srv/devdata/agent-runs`,
+`/srv/devdata/cargo-target`, `/srv/devdata/slots`). A worktree candidate is a
+directory one or two levels below a worktree root that holds `.git`; a cargo
+candidate is a directory one or two levels below a cargo root that holds
+`.rustc_info.json`, plus each `incremental/` inside it. Roots on different
+filesystems are reclaimed in separate cycles, each against its own usage.
+`borg drone install` writes the default block and keeps an operator-edited one;
+the off/dry-run block older installs wrote is replaced by the default.
+
+What `drone::reclaim` guarantees, because the policy relies on it. Every probe
+and deletion runs as the directory's owner (`setpriv`) under `timeout`, with
+global git config ignored and no optional git locks, so a probe never rewrites
+an index or leaves files owned by someone else. `probe` reports **busy** if a
+process of that owner has its working directory or an open file inside the
+path (`/proc/*/cwd` and `fd`); **dirty** if `git status --porcelain` is
+non-empty, untracked files included; **unpushed** if `git rev-list HEAD --not
+--remotes` is non-empty; **protected** for a main checkout (git dir equals the
+common dir) or a locked worktree; **not_git** when the path is not the top of a
+work tree; and **unknown** whenever any step failed or timed out. Stashes live
+in the repository, so removing a linked worktree never loses one. `delete` runs
+`rm -rf` as the owner and, for a worktree, `git worktree prune` in its
+repository. Audit sequence numbers start from the clock so they keep growing
+across drone restarts.
 
 ### Quorum rollout
 
@@ -719,6 +737,48 @@ a newer push leaves behind:
   treats `workflow_run` runs of one workflow on one commit as duplicates, which
   would cancel audit records there.
 
+`superseded_promotions` thins promotion workflows whose runs are
+`repository_dispatch` runs named `Promote runtime images sha-<sha>
+services=<a,b> ... source-event=<event>`. It is independent of `repos` and of
+the rules above: each block names one repository and one workflow file, and
+only runs of that workflow are read or cancelled. Example for dx-corp/k8s:
+
+```toml
+[[supersede_janitor.superseded_promotions]]
+repo = "dx-corp/k8s"
+workflow = ".github/workflows/promote-runtime-images.yml"
+source_repos = { platform_runtime_images_published = "dx-corp/mono" }
+dry_run = true
+```
+
+Every `sweep_secs` (default 300) the janitor lists the workflow's unfinished
+runs and its successful ones, and cancels:
+
+* a pending run whose `apply_job` (default `apply-platform-production`) never
+  ran, when a newer run covering all of its services for the same
+  `source-event` has started or succeeded (`promotion_superseded`). A newer
+  run that has not started does not count, so a cohort is never pushed to the
+  back of the runner queue by its own successors;
+* a run older than `stale_after_hours` (default 6) in any unfinished state,
+  when a newer covering run has succeeded (`promotion_stale`). This covers a
+  run that applied long ago and still waits on, or holds a runner for,
+  verification of a revision production no longer runs;
+* a queued run with no job records older than `ghost_after_hours` (default
+  24), whatever its name (`promotion_ghost`).
+
+The newer run's sha must be the same as, or ahead of, the older run's in the
+`source_repos` repository for the event; an event without an entry is never
+cancelled (`promotion_unprovable`), and a failed compare keeps the run. No run
+is touched while one of its `mutation_jobs` (default apply and
+`rollback-verified-bad`) is in progress. A run the janitor cancelled that is
+still unfinished `force_cancel_after_mins` (default 10) later is
+force-cancelled (`force_cancelled`), which ends runs a runner never released.
+Each block has its own `dry_run`, default true, so a new block only logs
+what it would cancel (`would_cancel`) while the janitor's other rules stay
+live; set it to false after reading the log. The janitor's own `dry_run` and
+`max_cancels_per_pass` apply as well. The App needs
+Contents: read on each `source_repos` repository for the compare.
+
 When the janitor is enabled, `GET /status` has a `janitor` object:
 
 * `since`: unix time the queen started; `total` counts from here.
@@ -747,6 +807,13 @@ When the janitor is enabled, `GET /status` has a `janitor` object:
 | `raced` | Runs whose status, head or pull request changed between the listing and the re-read just before the cancel; left alone. |
 | `uncancellable` | Runs whose cancel GitHub answered with 409. Runs stuck in `queued` for days (for example `workflow_run` runs GitHub never started) answer 409 on every pass and are counted each time. |
 | `errors` | Failed GitHub calls: a run listing for a repository, a pulls API read, a run re-read or a cancel. Each is logged as a `janitor:` warning in the queen journal. |
+| `promotion_considered` | Runs of `superseded_promotions` workflows examined (pending ones, stale ones, and nameless queued ones past the ghost age). |
+| `promotion_superseded` | Pending promotion runs a newer started or successful run supersedes. |
+| `promotion_stale` | Promotion runs past `stale_after_hours` a newer successful run supersedes. |
+| `promotion_ghost` | Nameless queued promotion runs with no jobs past `ghost_after_hours`. |
+| `promotion_cancelled` | Promotion runs cancelled for any of the three reasons above. |
+| `promotion_unprovable` | Superseded promotion runs kept because their event has no `source_repos` entry. |
+| `force_cancelled` | Runs the janitor cancelled that were still unfinished after `force_cancel_after_mins` and were force-cancelled. |
 
 `GET /metrics` has `borg_janitor_<counter>_total` for each counter, summed over
 passes since the queen started.

@@ -2,6 +2,7 @@
 //! [`crate::configfile`]). Nothing org-specific is baked in: the organization,
 //! repositories, label prefix and class sizes all come from here.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -102,6 +103,79 @@ pub struct JanitorSettings {
     /// rules, for example a deploy repository's audit or apply runs.
     #[serde(default)]
     pub repos: Option<Vec<String>>,
+    /// Promotion workflows whose superseded and stale runs are cancelled (see
+    /// [`PromotionSupersede`]). Each block names its own repository and
+    /// workflow; nothing else in that repository is touched.
+    #[serde(default)]
+    pub superseded_promotions: Vec<PromotionSupersede>,
+}
+
+/// One promotion workflow the janitor thins (see `crate::janitor`). Runs are
+/// matched by the workflow's run name, `Promote runtime images sha-<sha>
+/// services=<a,b> ... source-event=<event>`, so one service set's runs are
+/// only ever compared with runs that cover the same services.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromotionSupersede {
+    /// Repository holding the workflow, `owner/name`.
+    pub repo: String,
+    /// Log what this block would cancel without cancelling. Defaults to true
+    /// even when the janitor itself is live; the janitor's own `dry_run` also
+    /// applies.
+    #[serde(default = "yes")]
+    pub dry_run: bool,
+    /// Workflow file path, for example `.github/workflows/promote-runtime-images.yml`.
+    pub workflow: String,
+    /// Source repository per `source-event`, used to prove that a newer run's
+    /// sha is the same as or ahead of an older run's. An event with no entry
+    /// is never cancelled.
+    #[serde(default)]
+    pub source_repos: BTreeMap<String, String>,
+    /// A run older than this is cancelled once a newer run covering its
+    /// services has succeeded, unless a mutation job of it is running.
+    #[serde(default = "default_promotion_stale_hours")]
+    pub stale_after_hours: u64,
+    /// A run cancelled by the janitor that is still not finished this long
+    /// afterwards is force-cancelled.
+    #[serde(default = "default_promotion_force_mins")]
+    pub force_cancel_after_mins: u64,
+    /// A queued run with no job records this old is cancelled whatever its
+    /// name says.
+    #[serde(default = "default_promotion_ghost_hours")]
+    pub ghost_after_hours: u64,
+    /// Seconds between sweeps of this workflow (each costs a few API reads per
+    /// queued run).
+    #[serde(default = "default_promotion_sweep_secs")]
+    pub sweep_secs: u64,
+    /// The job that mutates production. A pending run whose apply job ran is
+    /// only cancelled by the stale rule.
+    #[serde(default = "default_promotion_apply_job")]
+    pub apply_job: String,
+    /// Jobs a run is never cancelled during.
+    #[serde(default = "default_promotion_mutation_jobs")]
+    pub mutation_jobs: Vec<String>,
+}
+
+fn default_promotion_stale_hours() -> u64 {
+    6
+}
+fn default_promotion_force_mins() -> u64 {
+    10
+}
+fn default_promotion_ghost_hours() -> u64 {
+    24
+}
+fn default_promotion_sweep_secs() -> u64 {
+    300
+}
+fn default_promotion_apply_job() -> String {
+    "apply-platform-production".into()
+}
+fn default_promotion_mutation_jobs() -> Vec<String> {
+    vec![
+        "apply-platform-production".into(),
+        "rollback-verified-bad".into(),
+    ]
 }
 
 impl JanitorSettings {
@@ -634,6 +708,35 @@ mod tests {
         ] {
             assert!(QueenConfig::from_json(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn superseded_promotions_take_defaults_and_reject_unknown_keys() {
+        let block = |extra: &str| {
+            MIN.replace(
+                "\"repos\"",
+                &format!(
+                    "\"supersede_janitor\":{{\"superseded_promotions\":[{{\"repo\":\"o/k8s\",\"workflow\":\"w.yml\"{extra}}}]}},\"repos\""
+                ),
+            )
+        };
+        let c = QueenConfig::from_json(&block("")).unwrap();
+        let j = c.supersede_janitor.unwrap();
+        assert!(j.dry_run);
+        let p = &j.superseded_promotions[0];
+        assert_eq!(
+            (
+                p.stale_after_hours,
+                p.force_cancel_after_mins,
+                p.ghost_after_hours,
+                p.sweep_secs
+            ),
+            (6, 10, 24, 300)
+        );
+        assert_eq!(p.apply_job, "apply-platform-production");
+        assert!(p.dry_run, "a new block starts in dry-run");
+        assert!(p.source_repos.is_empty());
+        assert!(QueenConfig::from_json(&block(",\"nope\":1")).is_err());
     }
 
     #[test]
