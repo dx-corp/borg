@@ -211,6 +211,8 @@ pub struct Janitor {
     settings: JanitorSettings,
     view: Mutex<JanitorView>,
     promotion: Mutex<promotions::State>,
+    /// Contents-read credential for compares; `None` uses `token`.
+    compare_auth: Option<crate::mirror_auth::MirrorAuth>,
 }
 
 impl Janitor {
@@ -242,7 +244,15 @@ impl Janitor {
                 ..JanitorView::default()
             }),
             promotion: Mutex::new(promotions::State::default()),
+            compare_auth: None,
         })
+    }
+
+    /// Read source repositories (compares) with this credential instead of
+    /// the janitor's own token.
+    pub fn with_compare_auth(mut self, auth: crate::mirror_auth::MirrorAuth) -> Self {
+        self.compare_auth = Some(auth);
+        self
     }
 
     pub fn view(&self) -> JanitorView {
@@ -261,6 +271,28 @@ impl Janitor {
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .bearer_auth(token.expose()))
+    }
+
+    /// GET with the compare credential when one is configured.
+    async fn get_contents<T: DeserializeOwned>(&self, path: &str) -> Result<T, GithubError> {
+        let Some(auth) = &self.compare_auth else {
+            return self.get(path).await;
+        };
+        let token = auth.credential().await?.token;
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.api_base))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .bearer_auth(token.expose())
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(status_error("GET", path, status.as_u16(), resp).await);
+        }
+        let bytes = resp.bytes().await?;
+        serde_json::from_slice(&bytes).map_err(|e| GithubError::Decode(format!("{path}: {e}")))
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, GithubError> {

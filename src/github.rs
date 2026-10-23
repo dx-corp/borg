@@ -5,6 +5,7 @@
 //! else. Drones only ever receive single-use JIT runner configs.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -394,24 +395,55 @@ impl GithubClient {
                 }
             }
         }
-        let mut out = Vec::new();
-        for run in run_ids {
-            for page in 1..=MAX_PAGES {
-                let jobs: Jobs = self
-                    .get(&format!("/repos/{repo}/actions/runs/{run}/jobs?filter=latest&per_page=100&page={page}"))
-                    .await?;
-                let n = jobs.jobs.len();
-                out.extend(jobs.jobs.into_iter().map(|mut job| {
-                    // The enclosing run is authoritative even if an older API omits run_id.
-                    job.run_id = run;
-                    job
-                }));
-                if n < 100 {
-                    break;
+        // One jobs listing per run dominates a tick (hundreds of runs across
+        // the watched repositories), so list several runs at once. Workers
+        // borrow the client and pull run ids from a shared index; results are
+        // put back in run-id order so the output does not depend on timing.
+        let run_ids: Vec<u64> = run_ids.into_iter().collect();
+        let next = AtomicUsize::new(0);
+        let worker = || async {
+            let mut got: Vec<(usize, Vec<WorkflowJob>)> = Vec::new();
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&run) = run_ids.get(i) else {
+                    return Ok::<_, GithubError>(got);
+                };
+                let mut jobs_of_run = Vec::new();
+                for page in 1..=MAX_PAGES {
+                    let jobs: Jobs = self
+                        .get(&format!("/repos/{repo}/actions/runs/{run}/jobs?filter=latest&per_page=100&page={page}"))
+                        .await?;
+                    let n = jobs.jobs.len();
+                    jobs_of_run.extend(jobs.jobs.into_iter().map(|mut job| {
+                        // The enclosing run is authoritative even if an older API omits run_id.
+                        job.run_id = run;
+                        job
+                    }));
+                    if n < 100 {
+                        break;
+                    }
                 }
+                got.push((i, jobs_of_run));
             }
+        };
+        // Eight concurrent listings: enough to cut a ~330-run tick several-fold
+        // while staying far below the installation rate limit per tick.
+        let (a, b, c, d, e, f, g, h) = tokio::join!(
+            worker(),
+            worker(),
+            worker(),
+            worker(),
+            worker(),
+            worker(),
+            worker(),
+            worker()
+        );
+        let mut parts = Vec::with_capacity(run_ids.len());
+        for w in [a, b, c, d, e, f, g, h] {
+            parts.extend(w?);
         }
-        Ok(out)
+        parts.sort_unstable_by_key(|(i, _)| *i);
+        Ok(parts.into_iter().flat_map(|(_, jobs)| jobs).collect())
     }
 
     /// Compatibility surface for consumers that only need queued demand.

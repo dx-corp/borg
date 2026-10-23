@@ -1487,3 +1487,38 @@ async fn the_mirror_token_is_cached_until_ten_minutes_of_life_remain() {
     short.heartbeat_with(&token, json!({})).await;
     assert_eq!(short.state().scoped_requests.len(), 2);
 }
+
+#[tokio::test]
+async fn job_listing_reads_runs_concurrently_and_keeps_run_order() {
+    let h = Harness::start(json!({})).await;
+    let created = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    {
+        let mut st = h.state();
+        st.jobs_by_run = true;
+        st.jobs_delay_ms = 40;
+        st.queued_runs = (1..=16).rev().collect();
+        st.jobs = (1..=16u64)
+            .map(|run| {
+                json!({"id": 100 + run, "run_id": run, "status": "queued",
+                       "labels": ["borg-ci-light"], "created_at": created})
+            })
+            .collect();
+    }
+    let client =
+        borg::github::GithubClient::new(&h.gh_url, support::ORG, "12345", h.private_pem.as_bytes())
+            .unwrap();
+    let jobs = client
+        .workflow_jobs(&format!("{}/app", support::ORG))
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs.iter().map(|j| (j.run_id, j.id)).collect::<Vec<_>>(),
+        (1..=16u64).map(|run| (run, 100 + run)).collect::<Vec<_>>(),
+        "every run's jobs, in run-id order"
+    );
+    let peak = h.state().jobs_max_inflight;
+    assert!(peak > 1, "jobs listings overlap (peak {peak})");
+    assert!(peak <= 8, "at most eight listings at once (peak {peak})");
+}

@@ -526,11 +526,26 @@ async fn run_queen(path: &Path) -> Result<()> {
                     settings,
                 )?);
             }
-            Some(Janitor::with_token_source(
-                &cfg.github.api_base,
-                token,
-                settings.clone(),
-            )?)
+            let janitor =
+                Janitor::with_token_source(&cfg.github.api_base, token, settings.clone())?;
+            Some(match &settings.compare_auth {
+                Some(c) => {
+                    let pem = c.private_key(std::env::var("BORG_MIRROR_APP_PRIVATE_KEY").ok())?;
+                    let client =
+                        GithubClient::new(&cfg.github.api_base, &cfg.github.org, &c.app_id, &pem)?;
+                    tracing::info!(
+                        "janitor compares read {} repositories with app {}",
+                        c.repositories.len(),
+                        c.app_id
+                    );
+                    janitor.with_compare_auth(MirrorAuth::new(
+                        client,
+                        &cfg.github.org,
+                        &c.repositories,
+                    ))
+                }
+                None => janitor,
+            })
         }
         None => None,
     };

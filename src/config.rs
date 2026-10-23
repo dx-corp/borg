@@ -108,6 +108,13 @@ pub struct JanitorSettings {
     /// workflow; nothing else in that repository is touched.
     #[serde(default)]
     pub superseded_promotions: Vec<PromotionSupersede>,
+    /// App credential for reading source repositories' contents (the
+    /// promotion rules' ancestry compare). The janitor's own token usually
+    /// has `actions` only, and GitHub answers 403 to a compare without
+    /// `contents: read`. Tokens are down-scoped to `contents: read` on the
+    /// listed repositories.
+    #[serde(default)]
+    pub compare_auth: Option<MirrorAuthSettings>,
 }
 
 /// One promotion workflow the janitor thins (see `crate::janitor`). Runs are
@@ -615,6 +622,13 @@ impl QueenConfig {
             && repos.iter().any(|r| !self.repos.contains(r))
         {
             return bad("supersede_janitor repos must be a subset of the queen's repos");
+        }
+        if let Some(m) = self
+            .supersede_janitor
+            .as_ref()
+            .and_then(|j| j.compare_auth.as_ref())
+        {
+            m.validate()?;
         }
         if let Some(p) = &self.preemption {
             p.validate().map_err(ConfigError::Invalid)?;

@@ -784,7 +784,8 @@ mod disk_tests {
 
     #[tokio::test]
     async fn fail_open_retains_standby_and_active_lease_below_learned_queen_floor() {
-        let cfg = DroneConfig::from_json(r#"{"queen_url":"http://127.0.0.1:1","allow_insecure":true,"runner_dir":"/runner","work_root":"/work","cache_root":"/cache"}"#).unwrap();
+        // This fixture tests disk admission, not reclaim's startup probes.
+        let cfg = DroneConfig::from_json(r#"{"queen_url":"http://127.0.0.1:1","allow_insecure":true,"runner_dir":"/runner","work_root":"/work","cache_root":"/cache","reclaim":{"enabled":false}}"#).unwrap();
         let client = QueenClient::new(&cfg, Secret::new("test".to_owned())).unwrap();
         let drone = Drone::new(cfg, client, Arc::new(DiskHost), Arc::new(NoExec));
         drone.disk_floor.store(32 << 30, Ordering::Relaxed);

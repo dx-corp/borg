@@ -33,6 +33,17 @@ pub const ORG: &str = "example-org";
 #[derive(Default)]
 pub struct MockState {
     public_pem: String,
+    /// Compares answer 403 unless called with the contents-read mirror token.
+    pub compare_needs_contents: bool,
+    /// Bearer of every compare request.
+    pub compare_tokens: Vec<String>,
+    /// Queen job listings return only the jobs whose `run_id` matches the run.
+    pub jobs_by_run: bool,
+    /// Delay each jobs listing, so concurrent listings overlap.
+    pub jobs_delay_ms: u64,
+    pub jobs_inflight: u32,
+    /// Most jobs listings that were in flight at once.
+    pub jobs_max_inflight: u32,
     pub queued_runs: Vec<u64>,
     pub jobs: Vec<Value>,
     pub runners: Vec<Value>,
@@ -227,12 +238,23 @@ async fn jobs(
     if !janitor {
         check_token(&h)?;
     }
-    let state = lock(&s);
+    let delay = {
+        let mut state = lock(&s);
+        state.jobs_inflight += 1;
+        state.jobs_max_inflight = state.jobs_max_inflight.max(state.jobs_inflight);
+        state.jobs_delay_ms
+    };
+    if delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
+    let mut state = lock(&s);
+    state.jobs_inflight -= 1;
+    let by_run = janitor || state.jobs_by_run;
     let jobs: Vec<_> = state
         .jobs
         .iter()
         .filter(|job| !state.hide_completed_jobs || job["status"] != "completed")
-        .filter(|job| !janitor || job["run_id"] == run)
+        .filter(|job| !by_run || job["run_id"] == run)
         .cloned()
         .collect();
     Ok(Json(json!({"jobs": jobs})))
@@ -320,9 +342,18 @@ async fn compare(
     h: HeaderMap,
     Path((_o, _r, range)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_janitor(&h)?;
-    lock(&s)
-        .compares
+    let token = bearer(&h).map(str::to_owned);
+    let mut st = lock(&s);
+    if st.compare_needs_contents {
+        // Like GitHub for a token without `contents: read`.
+        if token.as_deref() != Some(MIRROR_TOKEN) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    } else {
+        check_janitor(&h)?;
+    }
+    st.compare_tokens.push(token.unwrap_or_default());
+    st.compares
         .get(&range)
         .map(|status| Json(json!({"status": status})))
         .ok_or(StatusCode::NOT_FOUND)
@@ -522,8 +553,21 @@ impl Harness {
         let cfg = QueenConfig::from_json(&cfg.to_string()).unwrap();
         let github = GithubClient::new(&gh_url, ORG, "12345", private_pem.as_bytes()).unwrap();
         let janitor = cfg.supersede_janitor.clone().map(|settings| {
-            borg::janitor::Janitor::new(&gh_url, borg::secret::Secret::new(JANITOR_TOKEN), settings)
-                .unwrap()
+            let compare = settings.compare_auth.clone();
+            let j = borg::janitor::Janitor::new(
+                &gh_url,
+                borg::secret::Secret::new(JANITOR_TOKEN),
+                settings,
+            )
+            .unwrap();
+            match compare {
+                Some(c) => j.with_compare_auth(borg::mirror_auth::MirrorAuth::new(
+                    GithubClient::new(&gh_url, ORG, &c.app_id, private_pem.as_bytes()).unwrap(),
+                    ORG,
+                    &c.repositories,
+                )),
+                None => j,
+            }
         });
         let requeuer = cfg
             .supersede_janitor
