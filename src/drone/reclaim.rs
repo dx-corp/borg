@@ -794,20 +794,23 @@ mod tests {
     #[test]
     fn live_host_keeps_dirty_and_unpushed_worktrees_and_deletes_a_clean_pushed_one() {
         use crate::drone::exec::SystemExec;
-        use std::process::Command;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        #[allow(clippy::disallowed_methods, reason = "test fixture git setup")]
         let git = |dir: &Path, args: &[&str]| {
-            let ok = Command::new("git")
-                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
-                .arg(dir)
-                .args(args)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "git {args:?}");
+            let dir = dir.to_string_lossy();
+            let mut command = vec![
+                "GIT_CONFIG_GLOBAL=/dev/null",
+                "git",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-C",
+                dir.as_ref(),
+            ];
+            command.extend_from_slice(args);
+            let output = SystemExec.run("env", &command).unwrap();
+            assert!(output.success, "git {args:?}: {}", output.stdout);
         };
         let origin = root.join("origin.git");
         std::fs::create_dir(&origin).unwrap();
