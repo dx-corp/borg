@@ -96,6 +96,19 @@ pub struct JanitorSettings {
     /// are never cancelled.
     #[serde(default)]
     pub(crate) superseded_push_branches: Vec<String>,
+    /// Repositories the janitor passes over. Default: every queen `repos`
+    /// entry. Set it when the queen watches repositories (for alias lanes)
+    /// whose runs must not be deduplicated or superseded by these generic
+    /// rules, for example a deploy repository's audit or apply runs.
+    #[serde(default)]
+    pub repos: Option<Vec<String>>,
+}
+
+impl JanitorSettings {
+    /// The repositories one pass covers, given the queen's own list.
+    pub fn pass_repos<'a>(&'a self, queen_repos: &'a [String]) -> &'a [String] {
+        self.repos.as_deref().unwrap_or(queen_repos)
+    }
 }
 
 fn yes() -> bool {
@@ -523,6 +536,12 @@ impl QueenConfig {
                 "supersede_janitor interval_secs and max_cancels_per_pass must be positive",
             );
         }
+        if let Some(j) = &self.supersede_janitor
+            && let Some(repos) = &j.repos
+            && repos.iter().any(|r| !self.repos.contains(r))
+        {
+            return bad("supersede_janitor repos must be a subset of the queen's repos");
+        }
         if let Some(p) = &self.preemption {
             p.validate().map_err(ConfigError::Invalid)?;
         }
@@ -632,10 +651,27 @@ mod tests {
         assert!(j.dry_run);
         assert!(!j.cancel_running && !j.dedupe_same_sha);
         assert_eq!((j.interval_secs, j.max_cancels_per_pass), (60, 20));
+        let all = vec!["a/b".to_owned(), "a/deploy".to_owned()];
+        assert_eq!(
+            j.pass_repos(&all),
+            all.as_slice(),
+            "default: every queen repo"
+        );
+        let scoped = QueenConfig::from_json(&MIN.replace(
+            "\"repos\"",
+            &format!(
+                "\"supersede_janitor\":{{\"repos\":[{:?}]}},\"repos\"",
+                c.repos[0]
+            ),
+        ))
+        .unwrap();
+        let sj = scoped.supersede_janitor.as_ref().unwrap();
+        assert_eq!(sj.pass_repos(&all), &c.repos[..1], "explicit list wins");
         for bad in [
             "{\"interval_secs\":0}",
             "{\"max_cancels_per_pass\":0}",
             "{\"nope\":1}",
+            "{\"repos\":[\"not/watched\"]}",
         ] {
             let json = MIN.replace(
                 "\"repos\"",

@@ -687,9 +687,57 @@ async fn with_a_job_user_the_runner_and_its_file_operations_go_through_setpriv()
     );
     assert_eq!(
         fs::read_to_string(rig.path("out/who.txt")).unwrap().trim(),
-        format!("{}|borg-job", rig.path("job-home").display()),
-        "the job sees the job user's home"
+        format!("{}|borg-job", rig.path("work/slot-0/_home").display()),
+        "the job gets a private HOME inside its lease directory"
     );
+    assert!(!rig.path("work/slot-0").exists());
+}
+
+#[tokio::test]
+async fn files_a_job_writes_to_home_never_reach_the_next_job() {
+    let rig = Rig::new().await;
+    let log = rig.path("setpriv.log");
+    let setpriv = fake_setpriv(rig.dir.path(), &log);
+    let job_home = rig.path("job-home");
+    fs::create_dir_all(&job_home).unwrap();
+    fs::write(job_home.join(".bazelrc"), "build --disk_cache=/c\n").unwrap();
+    // The first job writes credentials into HOME; every job records what it found.
+    rig.install_runner(
+        "ls -A \"$HOME\" | tr '\\n' ' ' > $OUT/home-$BORG_LEASE_ID.txt\n\
+         mkdir -p \"$HOME/.docker\" \"$HOME/.kube\" \"$HOME/.config/gh\"\n\
+         echo secret > \"$HOME/.netrc\"\n\
+         echo '{}' > \"$HOME/.docker/config.json\"\n\
+         echo k > \"$HOME/.kube/config\"\n\
+         echo t > \"$HOME/.config/gh/hosts.yml\"",
+    );
+    let drone = rig.drone_with(
+        json!({"job_user": {"name": "borg-job", "home": job_home, "priv_bin": setpriv}}),
+        Arc::new(AllButDocker(RecordingExec::default())),
+    );
+    let mut tasks = JoinSet::new();
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    for run in 1..=2 {
+        rig.h.queue_job(run, "borg-ci-light", 1);
+        rig.h.tick().await;
+        assert_eq!(drone.heartbeat_once(true, &mut tasks).await.unwrap(), 1);
+        drain(&mut tasks).await;
+        rig.h.state().jobs.clear();
+    }
+    let seen = read_dir_prefixed(&rig.path("out"), "home-");
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    for listing in &seen {
+        assert_eq!(
+            listing.trim(),
+            ".bazelrc",
+            "each job starts with only the seeded rc: {seen:?}"
+        );
+    }
+    for leaked in [".netrc", ".docker", ".kube", ".config"] {
+        assert!(
+            !job_home.join(leaked).exists(),
+            "{leaked} must not land in the shared home"
+        );
+    }
     assert!(!rig.path("work/slot-0").exists());
 }
 
@@ -998,4 +1046,21 @@ async fn draining_drones_do_not_start_capability_refreshes() {
             .iter()
             .any(|c| c.contains("--kill-after=2s"))
     );
+}
+
+/// Contents of every file in `dir` whose name starts with `prefix`, sorted by name.
+fn read_dir_prefixed(dir: &Path, prefix: &str) -> Vec<String> {
+    let mut v: Vec<(String, String)> = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+        .map(|e| {
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                fs::read_to_string(e.path()).unwrap(),
+            )
+        })
+        .collect();
+    v.sort();
+    v.into_iter().map(|(_, s)| s).collect()
 }

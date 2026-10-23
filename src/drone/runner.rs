@@ -26,6 +26,25 @@ use crate::secret::Secret;
 
 const RSS_SAMPLE_EVERY: Duration = Duration::from_secs(2);
 
+/// The lease's private HOME, a child of the lease directory (removed with it).
+pub const LEASE_HOME: &str = "_home";
+
+/// Files from the job user's own home that every lease HOME starts with. Only
+/// drone-written configuration belongs here (the Bazel cache rc), never
+/// anything a job could have written.
+const SEEDED_HOME_FILES: [&str; 1] = [".bazelrc"];
+
+/// Create a lease HOME and copy the drone-managed seed files into it.
+fn seed_lease_home(fs_ops: &dyn FsOps, user_home: &Path, lease_home: &Path) -> io::Result<()> {
+    fs_ops.mkdir_p(lease_home)?;
+    for name in SEEDED_HOME_FILES {
+        if let Ok(content) = fs::read_to_string(user_home.join(name)) {
+            fs_ops.write_file(&lease_home.join(name), &content)?;
+        }
+    }
+    Ok(())
+}
+
 pub struct RunSpec<'a> {
     pub lease_id: &'a str,
     pub jit_config: &'a Secret,
@@ -163,13 +182,19 @@ pub async fn run_lease(
         ));
     }
     let lease_dir: PathBuf = spec.lease_dir.to_owned();
+    let lease_home = lease_dir.join(LEASE_HOME);
     let (src, dst) = (spec.runner_dir.to_owned(), lease_dir.clone());
+    let (home_dst, user_home) = (lease_home.clone(), spec.job_user.map(|u| u.home.clone()));
     tokio::task::spawn_blocking(move || {
         // A slot is reused, so make sure nothing of an earlier lease remains.
         if dst.symlink_metadata().is_ok() {
             fs_ops.remove_all(&dst)?;
         }
-        fs_ops.clone_tree(&src, &dst)
+        fs_ops.clone_tree(&src, &dst)?;
+        if let Some(user_home) = user_home {
+            seed_lease_home(fs_ops.as_ref(), &user_home, &home_dst)?;
+        }
+        Ok::<(), io::Error>(())
     })
     .await
     .map_err(io::Error::other)??;
@@ -193,8 +218,12 @@ pub async fn run_lease(
     let mut command = Command::new(&program);
     command.args(&leading);
     if let Some(user) = spec.job_user {
+        // Each lease gets its own HOME inside the lease directory, so files a
+        // job writes there (`~/.netrc`, `~/.docker/config.json`, `~/.kube`,
+        // `~/.config/gh`, gcloud and git credentials) are deleted with the
+        // lease and never reach the next job.
         command
-            .env("HOME", &user.home)
+            .env("HOME", &lease_home)
             .env("USER", &user.name)
             .env("LOGNAME", &user.name);
     }

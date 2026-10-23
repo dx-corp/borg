@@ -2335,7 +2335,7 @@ pub async fn serve(
                 // Cancel-safe for the same reason as the ticker above.
                 tokio::select! {
                     _ = every.tick() => {
-                        janitor.pass(&queen.config().repos).await;
+                        janitor.pass(janitor.settings().pass_repos(&queen.config().repos)).await;
                         if let Some(requeuer) = queen.requeuer() {
                             let now = OffsetDateTime::now_utc().unix_timestamp();
                             if let Err(e) = requeuer.pass(queen.store(), now).await {
