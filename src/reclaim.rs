@@ -28,12 +28,14 @@
 //!   open file inside it;
 //! * a worktree with uncommitted changes, **including untracked files**;
 //! * a worktree with commits that are on no remote-tracking branch;
-//! * a worktree that is the main checkout, locked, or whose repository has
-//!   stashes;
+//! * a worktree that is the main checkout or locked (stashes live in the
+//!   repository, not the linked worktree, so removing one never loses them);
 //! * a worktree that is not a git checkout.
 //!
-//! It is **dry-run by default** and enabled per host. Every deletion, real or
-//! would-be, becomes a [`DeletionRecord`] (path, size, reason, outcome) that
+//! It is **on by default** on every drone: with no `roots` configured the
+//! drone reclaims the standard worktree and cargo-target locations it finds
+//! (see `drone::reclaim::default_roots`). Every deletion, real or would-be,
+//! becomes a [`DeletionRecord`] (path, size, reason, outcome) that
 //! the drone logs and reports to the queen in its heartbeat.
 
 use std::collections::BTreeMap;
@@ -77,10 +79,11 @@ pub struct Root {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReclaimSettings {
-    /// Off unless a host opts in.
+    /// On by default; a host may opt out.
     pub enabled: bool,
     /// Log and report what would be deleted without deleting anything.
     pub dry_run: bool,
+    /// Empty: the drone's default roots.
     pub roots: Vec<Root>,
     /// Start reclaiming at this disk usage (percent).
     pub high_water_pct: u8,
@@ -102,8 +105,8 @@ pub struct ReclaimSettings {
 impl Default for ReclaimSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
-            dry_run: true,
+            enabled: true,
+            dry_run: false,
             roots: Vec::new(),
             high_water_pct: 85,
             low_water_pct: 70,
@@ -118,6 +121,17 @@ impl Default for ReclaimSettings {
 }
 
 impl ReclaimSettings {
+    /// The block installs wrote before reclaim was on by default: off, dry
+    /// run, no roots, default thresholds.
+    pub fn is_legacy_default(&self) -> bool {
+        *self
+            == Self {
+                enabled: false,
+                dry_run: true,
+                ..Self::default()
+            }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !(self.low_water_pct < self.high_water_pct
             && self.high_water_pct <= self.critical_pct
@@ -135,9 +149,6 @@ impl ReclaimSettings {
             return Err(
                 "reclaim max_deletions_per_cycle and interval_secs must be positive".into(),
             );
-        }
-        if self.enabled && self.roots.is_empty() {
-            return Err("reclaim is enabled but has no roots".into());
         }
         for r in &self.roots {
             if !r.path.is_absolute() {
@@ -175,7 +186,7 @@ pub struct Safety {
     pub unpushed: bool,
     /// Worktree: not a git checkout.
     pub not_git: bool,
-    /// Worktree: main checkout, locked, or stashes exist.
+    /// Worktree: main checkout or locked.
     pub protected: Option<String>,
     /// The probe failed or could not tell.
     pub unknown: Option<String>,
@@ -808,8 +819,10 @@ mod tests {
             "{}",
             c.records[0].reason
         );
-        // Defaults are dry-run and disabled.
-        assert!(ReclaimSettings::default().dry_run && !ReclaimSettings::default().enabled);
+        // Defaults are on and deleting, with the drone's default roots.
+        let d = ReclaimSettings::default();
+        assert!(d.enabled && !d.dry_run && d.roots.is_empty());
+        assert!(d.validate().is_ok());
     }
 
     #[test]
@@ -893,10 +906,6 @@ mod tests {
             },
             ReclaimSettings {
                 critical_min_age_secs: u64::MAX,
-                ..ReclaimSettings::default()
-            },
-            ReclaimSettings {
-                enabled: true,
                 ..ReclaimSettings::default()
             },
             ReclaimSettings {

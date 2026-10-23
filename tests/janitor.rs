@@ -374,3 +374,214 @@ async fn totals_reach_status_and_metrics() {
         "{metrics}"
     );
 }
+
+const PROMOTE: &str = ".github/workflows/promote-runtime-images.yml";
+const EVENT: &str = "platform_runtime_images_published";
+
+fn sha(c: char) -> String {
+    c.to_string().repeat(40)
+}
+
+fn ago(secs: i64) -> String {
+    (time::OffsetDateTime::now_utc() - time::Duration::seconds(secs))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
+fn promo(
+    id: u64,
+    status: &str,
+    conclusion: Option<&str>,
+    c: char,
+    services: &str,
+    age: i64,
+) -> serde_json::Value {
+    json!({
+        "id": id, "workflow_id": 7, "path": PROMOTE, "status": status,
+        "conclusion": conclusion, "event": "repository_dispatch",
+        "head_sha": "main", "pull_requests": [],
+        "created_at": ago(age),
+        "display_title": format!(
+            "Promote runtime images sha-{} services={services} dex-governance=false source-event={EVENT} source-run=1",
+            sha(c)
+        ),
+    })
+}
+
+fn promotions(dry_run: bool, extra: serde_json::Value) -> serde_json::Value {
+    let mut block = json!({
+        "repo": "o/k8s", "workflow": PROMOTE, "dry_run": dry_run,
+        "source_repos": {EVENT: "o/mono"}, "sweep_secs": 0,
+    });
+    block
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    json!({"supersede_janitor": {"dry_run": false, "superseded_promotions": [block]}})
+}
+
+fn ahead(h: &Harness, base: char, head: char) {
+    h.state()
+        .compares
+        .insert(format!("{}...{}", sha(base), sha(head)), "ahead".into());
+}
+
+#[tokio::test]
+async fn a_pending_promotion_yields_to_a_started_newer_run_of_its_services() {
+    let h = Harness::start(promotions(false, json!({}))).await;
+    h.add_promotion_run(promo(1, "queued", None, 'a', "memory", 3600));
+    h.add_promotion_run(promo(2, "in_progress", None, 'b', "memory,ingest", 600));
+    // Other service set, and a newer run that has not started: both kept.
+    h.add_promotion_run(promo(3, "queued", None, 'c', "grid", 3600));
+    h.add_promotion_run(promo(4, "queued", None, 'd', "grid", 60));
+    // Same services but not a promotion: never examined.
+    h.add_run(5, "queued", "workflow_run", "main", None);
+    ahead(&h, 'a', 'b');
+    ahead(&h, 'c', 'd');
+
+    let r = h.janitor_pass().await;
+    assert_eq!(
+        (r.promotion_superseded, r.promotion_cancelled, r.errors),
+        (1, 1, 0),
+        "{r:?}"
+    );
+    assert_eq!(h.state().cancelled, [1]);
+}
+
+#[tokio::test]
+async fn an_unproven_successor_never_cancels() {
+    let h = Harness::start(promotions(false, json!({}))).await;
+    // The compare answers 404: ancestry is unproven, the run is kept.
+    h.add_promotion_run(promo(1, "queued", None, 'a', "memory", 3600));
+    h.add_promotion_run(promo(2, "in_progress", None, 'b', "memory", 600));
+    let r = h.janitor_pass().await;
+    assert_eq!((r.promotion_cancelled, r.errors), (0, 1), "{r:?}");
+
+    // A newer run behind the older one is not a successor either.
+    let h = Harness::start(promotions(false, json!({}))).await;
+    h.add_promotion_run(promo(1, "queued", None, 'a', "memory", 3600));
+    h.add_promotion_run(promo(2, "in_progress", None, 'b', "memory", 600));
+    h.state()
+        .compares
+        .insert(format!("{}...{}", sha('a'), sha('b')), "behind".into());
+    let r = h.janitor_pass().await;
+    assert_eq!((r.promotion_cancelled, r.errors), (0, 0), "{r:?}");
+    assert!(h.state().cancelled.is_empty());
+}
+
+#[tokio::test]
+async fn an_event_without_a_source_repository_is_kept() {
+    let h = Harness::start(promotions(false, json!({"source_repos": {}}))).await;
+    h.add_promotion_run(promo(1, "queued", None, 'a', "memory", 3600));
+    h.add_promotion_run(promo(2, "in_progress", None, 'b', "memory", 600));
+    let r = h.janitor_pass().await;
+    assert_eq!(
+        (r.promotion_unprovable, r.promotion_cancelled),
+        (1, 0),
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_applied_run_is_only_cancelled_when_stale_and_then_forced() {
+    let week = 7 * 24 * 3600;
+    let h = Harness::start(promotions(false, json!({"force_cancel_after_mins": 0}))).await;
+    // Applied, waiting on verification for a week; a newer run succeeded.
+    h.add_promotion_run(promo(1, "in_progress", None, 'a', "memory", week));
+    h.add_run_job(
+        1,
+        "apply-platform-production",
+        "completed",
+        Some("promotion-gce-01-1"),
+    );
+    h.add_run_job(
+        1,
+        "verify-direct-promotion",
+        "in_progress",
+        Some("gha-runner-pve50-e"),
+    );
+    // Applied but young: the pending rule never covers an applied run.
+    h.add_promotion_run(promo(2, "queued", None, 'a', "ingest", 600));
+    h.add_run_job(
+        2,
+        "apply-platform-production",
+        "completed",
+        Some("promotion-gce-01-2"),
+    );
+    h.add_promotion_run(promo(
+        3,
+        "completed",
+        Some("success"),
+        'b',
+        "memory,ingest",
+        300,
+    ));
+    h.add_promotion_run(promo(4, "in_progress", None, 'c', "ingest", 60));
+    ahead(&h, 'a', 'b');
+    ahead(&h, 'a', 'c');
+    h.state().stuck_on_cancel.push(1);
+
+    let r = h.janitor_pass().await;
+    assert_eq!(
+        (
+            r.promotion_stale,
+            r.promotion_superseded,
+            r.promotion_cancelled
+        ),
+        (1, 0, 1),
+        "{r:?}"
+    );
+    assert_eq!(h.state().cancelled, [1]);
+
+    // The cancel did not take: the next pass force-cancels and does not
+    // cancel it again.
+    let r = h.janitor_pass().await;
+    assert_eq!((r.force_cancelled, r.promotion_cancelled), (1, 0), "{r:?}");
+    assert_eq!(h.state().force_cancelled, [1]);
+    assert_eq!(h.state().cancelled, [1]);
+}
+
+#[tokio::test]
+async fn a_running_mutation_job_is_never_interrupted() {
+    let h = Harness::start(promotions(false, json!({}))).await;
+    h.add_promotion_run(promo(1, "in_progress", None, 'a', "memory", 7 * 24 * 3600));
+    h.add_run_job(
+        1,
+        "rollback-verified-bad",
+        "in_progress",
+        Some("promotion-gce-01-1"),
+    );
+    h.add_promotion_run(promo(2, "completed", Some("success"), 'b', "memory", 300));
+    ahead(&h, 'a', 'b');
+    let r = h.janitor_pass().await;
+    assert_eq!((r.promotion_cancelled, r.promotion_stale), (0, 0), "{r:?}");
+}
+
+#[tokio::test]
+async fn a_nameless_queued_run_without_jobs_is_dropped_after_the_ghost_age() {
+    let h = Harness::start(promotions(false, json!({}))).await;
+    let mut old = promo(1, "queued", None, 'a', "memory", 15 * 24 * 3600);
+    old["display_title"] = json!(EVENT);
+    h.add_promotion_run(old);
+    let mut with_jobs = promo(2, "queued", None, 'a', "memory", 15 * 24 * 3600);
+    with_jobs["display_title"] = json!(EVENT);
+    h.add_promotion_run(with_jobs);
+    h.add_run_job(2, "resolve-lane-contract", "queued", None);
+    let mut young = promo(3, "queued", None, 'a', "memory", 3600);
+    young["display_title"] = json!(EVENT);
+    h.add_promotion_run(young);
+    let r = h.janitor_pass().await;
+    assert_eq!((r.promotion_ghost, r.promotion_cancelled), (1, 1), "{r:?}");
+    assert_eq!(h.state().cancelled, [1]);
+}
+
+#[tokio::test]
+async fn dry_run_promotion_rules_cancel_nothing() {
+    let h = Harness::start(promotions(true, json!({}))).await;
+    h.add_promotion_run(promo(1, "queued", None, 'a', "memory", 3600));
+    h.add_promotion_run(promo(2, "in_progress", None, 'b', "memory", 600));
+    ahead(&h, 'a', 'b');
+    let r = h.janitor_pass().await;
+    assert_eq!((r.would_cancel, r.promotion_cancelled), (1, 0), "{r:?}");
+    assert!(h.state().cancelled.is_empty());
+}

@@ -128,6 +128,10 @@ impl Rig {
             cfg["caches"]["bazel"] = json!({});
         }
         cfg["caches"]["bazel"]["bazelrc"] = json!(self.path("bazelrc"));
+        // Never let a test reclaim the real host's build directories.
+        if cfg["reclaim"].is_null() {
+            cfg["reclaim"] = json!({"enabled": false});
+        }
         let cfg = DroneConfig::from_json(&cfg.to_string()).unwrap();
         let client = QueenClient::new(&cfg, Secret::new(self.token.clone())).unwrap();
         Drone::new(cfg, client, Arc::new(FixedHost), exec)

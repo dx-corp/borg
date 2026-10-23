@@ -15,6 +15,7 @@ pub mod fsops;
 pub mod install;
 pub mod jobuser;
 pub mod pins;
+pub mod reclaim;
 pub mod runner;
 pub mod selfupdate;
 pub mod slots;
@@ -98,6 +99,8 @@ pub struct Drone {
     capability_cache: capabilities::CapabilityCache,
     /// Busy-cores rate of the host, fed by heartbeats and lease samples.
     cpu_meter: Arc<crate::hostdiag::CpuMeter>,
+    /// Build-box reclaim; `None` when off or unsupported here.
+    reclaimer: Option<Arc<reclaim::Reclaimer>>,
 }
 
 impl Drone {
@@ -131,6 +134,7 @@ impl Drone {
             Arc::clone(&host),
         ));
         let selfupdate = cfg.state_dir.clone().map(SelfUpdate::new);
+        let reclaimer = reclaim::Reclaimer::new(&cfg, Arc::clone(&exec));
         let standbys = Standbys::load(cfg.state_dir.clone());
         Self {
             cfg,
@@ -140,6 +144,7 @@ impl Drone {
             disk_floor: AtomicU64::new(crate::envcontract::DEFAULT_MIN_DISK_FREE_BYTES),
             capability_cache: capabilities::CapabilityCache::default(),
             cpu_meter: Arc::default(),
+            reclaimer,
             client: Arc::new(client),
             host,
             exec,
@@ -278,7 +283,7 @@ impl Drone {
             trust: self.cfg.trust,
             held_standby: self.standbys.ids(),
             bids: Vec::new(),
-            reclaim: None,
+            reclaim: self.reclaimer.as_ref().and_then(|r| r.heartbeat_stats()),
             update_report: self
                 .selfupdate
                 .as_ref()
@@ -509,6 +514,7 @@ impl Drone {
         self.startup_sweep().await;
         let mut tasks = JoinSet::new();
         let cache_background = self.caches.spawn_background();
+        let reclaim_background = self.reclaimer.as_ref().map(reclaim::Reclaimer::spawn);
         let mut every = tokio::time::interval(Duration::from_secs(self.cfg.heartbeat_secs));
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tokio::pin!(shutdown);
@@ -569,6 +575,9 @@ impl Drone {
             }
         }
         cache_background.abort();
+        if let Some(r) = reclaim_background {
+            r.abort();
+        }
     }
 }
 

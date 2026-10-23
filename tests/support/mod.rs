@@ -59,6 +59,13 @@ pub struct MockState {
     pub cancelled: Vec<u64>,
     /// Runs whose cancel answers 409.
     pub uncancellable: Vec<u64>,
+    /// Runs whose cancel is accepted but which stay listed (a runner that
+    /// never acknowledges the cancel).
+    pub stuck_on_cancel: Vec<u64>,
+    /// Runs the janitor force-cancelled.
+    pub force_cancelled: Vec<u64>,
+    /// Compare status per `base...head`; missing pairs answer 404.
+    pub compares: HashMap<String, String>,
     /// Jobs the requeuer re-ran.
     pub reruns: Vec<u64>,
     /// Status code a job's rerun answers instead of 201.
@@ -182,9 +189,16 @@ async fn runs(
             .pr_runs
             .iter()
             .filter(|r| {
-                ["status", "event"]
-                    .iter()
-                    .all(|k| q.get(*k).is_none_or(|v| r[*k].as_str() == Some(v)))
+                ["status", "event"].iter().all(|k| {
+                    q.get(*k).is_none_or(|v| {
+                        // GitHub's `status=success` filters on the conclusion.
+                        if *k == "status" && v == "success" {
+                            r["conclusion"].as_str() == Some("success")
+                        } else {
+                            r[*k].as_str() == Some(v)
+                        }
+                    })
+                })
             })
             .cloned()
             .collect();
@@ -281,8 +295,37 @@ async fn cancel_run(
         return StatusCode::CONFLICT;
     }
     st.cancelled.push(id);
+    if !st.stuck_on_cancel.contains(&id) {
+        st.pr_runs.retain(|r| r["id"].as_u64() != Some(id));
+    }
+    StatusCode::ACCEPTED
+}
+
+async fn force_cancel_run(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_o, _r, id)): Path<(String, String, u64)>,
+) -> StatusCode {
+    if check_janitor(&h).is_err() {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let mut st = lock(&s);
+    st.force_cancelled.push(id);
     st.pr_runs.retain(|r| r["id"].as_u64() != Some(id));
     StatusCode::ACCEPTED
+}
+
+async fn compare(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_o, _r, range)): Path<(String, String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    check_janitor(&h)?;
+    lock(&s)
+        .compares
+        .get(&range)
+        .map(|status| Json(json!({"status": status})))
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn rerun_job(
@@ -446,6 +489,11 @@ impl Harness {
                 "/repos/{owner}/{repo}/actions/runs/{run}/cancel",
                 post(cancel_run),
             )
+            .route(
+                "/repos/{owner}/{repo}/actions/runs/{run}/force-cancel",
+                post(force_cancel_run),
+            )
+            .route("/repos/{owner}/{repo}/compare/{range}", get(compare))
             .route(
                 "/repos/{owner}/{repo}/actions/jobs/{id}/rerun",
                 post(rerun_job),
@@ -633,6 +681,20 @@ impl Harness {
         self.state().pr_runs.push(json!({
             "id": id, "workflow_id": 1, "status": status, "event": event,
             "head_sha": sha, "pull_requests": prs
+        }));
+    }
+
+    /// Add a promotion run as the janitor lists it.
+    pub fn add_promotion_run(&self, run: Value) {
+        self.state().pr_runs.push(run);
+    }
+
+    /// Add a job record of `run` as the janitor reads it.
+    pub fn add_run_job(&self, run: u64, name: &str, status: &str, runner: Option<&str>) {
+        let id = 9_000_000 + self.state().jobs.len() as u64;
+        self.state().jobs.push(json!({
+            "id": id, "run_id": run, "name": name, "status": status,
+            "runner_name": runner, "steps": [], "labels": []
         }));
     }
 
