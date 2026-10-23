@@ -713,6 +713,11 @@ a newer push leaves behind:
   GitHub reports a run as `queued` while any of its jobs waits for a runner, so
   the janitor also reads the run's jobs and keeps the run when one is running
   (`started_push`).
+* `repos`: the repositories a pass covers, a subset of the queen's `repos`.
+  Default: all of them. Set it when the queen also watches repositories only to
+  serve their alias lanes (for example a deploy repository): `dedupe_same_sha`
+  treats `workflow_run` runs of one workflow on one commit as duplicates, which
+  would cancel audit records there.
 
 When the janitor is enabled, `GET /status` has a `janitor` object:
 
@@ -1205,6 +1210,11 @@ budget, so an owner can say "this PC gives at most 8 vCPUs and 24 GiB".
    containers should name them with `$BORG_DOCKER_PREFIX` (docker compose does
    this through `COMPOSE_PROJECT_NAME`).
 4. Per-job cleanup leaves tool caches under `cache_root` intact.
+   With a job user, each lease runs with `HOME` set to `<lease dir>/_home`,
+   which starts with only the drone-managed `.bazelrc`. Anything a job writes
+   to its home (`~/.netrc`, `~/.docker/config.json`, `~/.kube`, `~/.config/gh`,
+   gcloud or git credential files) is deleted with the lease directory, so it
+   never reaches a later job or a concurrent lease's `HOME`.
 5. The exit code, duration and peak RSS of the runner's process group (Linux)
    are reported to the queen.
 
