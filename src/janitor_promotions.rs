@@ -169,7 +169,7 @@ impl Janitor {
             status: String,
         }
         let c: Compare = self
-            .get(&format!("/repos/{repo}/compare/{base}...{head}?per_page=1"))
+            .get_contents(&format!("/repos/{repo}/compare/{base}...{head}?per_page=1"))
             .await?;
         let ok = matches!(c.status.as_str(), "ahead" | "identical");
         cache.insert((base.to_owned(), head.to_owned()), ok);

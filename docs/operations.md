@@ -551,6 +551,11 @@ directory one or two levels below a worktree root that holds `.git`; a cargo
 candidate is a directory one or two levels below a cargo root that holds
 `.rustc_info.json`, plus each `incremental/` inside it. Roots on different
 filesystems are reclaimed in separate cycles, each against its own usage.
+The filesystems of `work_root` and `cache_root` are always measured, so every
+drone reports usage and a recent cycle even with no build roots. Commands run as
+the owner of the path or, when the drone cannot stat it (a private `750` home),
+of its nearest ancestor the drone can stat; default roots are discovered the same
+way.
 `borg drone install` writes the default block and keeps an operator-edited one;
 the off/dry-run block older installs wrote is replaced by the default.
 
@@ -750,6 +755,13 @@ workflow = ".github/workflows/promote-runtime-images.yml"
 source_repos = { platform_runtime_images_published = "dx-corp/mono" }
 dry_run = true
 ```
+
+The ancestry compare needs `contents: read` on each source repository. If the
+janitor's token lacks it (the runner App has `actions` only; GitHub answers
+403 and every run stays unproven), set `supersede_janitor.compare_auth` to an
+App that can read contents, in the same shape as `mirror_auth`:
+`{"app_id": "...", "private_key_path": "...", "repositories": ["mono"]}`.
+Compare tokens are down-scoped to `contents: read` on those repositories.
 
 Every `sweep_secs` (default 300) the janitor lists the workflow's unfinished
 runs and its successful ones, and cancels:

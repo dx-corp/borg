@@ -585,3 +585,32 @@ async fn dry_run_promotion_rules_cancel_nothing() {
     assert_eq!((r.would_cancel, r.promotion_cancelled), (1, 0), "{r:?}");
     assert!(h.state().cancelled.is_empty());
 }
+
+#[tokio::test]
+async fn compares_use_the_contents_credential_when_the_janitor_token_cannot_read() {
+    // Without compare_auth the 403 keeps the run (unproven) and counts an error.
+    let h = Harness::start(promotions(false, json!({}))).await;
+    h.state().compare_needs_contents = true;
+    h.add_promotion_run(promo(1, "queued", None, 'a', "memory", 3600));
+    h.add_promotion_run(promo(2, "in_progress", None, 'b', "memory", 600));
+    ahead(&h, 'a', 'b');
+    let r = h.janitor_pass().await;
+    assert_eq!((r.promotion_cancelled, r.errors), (0, 1), "{r:?}");
+
+    let mut cfg = promotions(false, json!({}));
+    cfg["supersede_janitor"]["compare_auth"] = json!({"app_id": "12345", "repositories": ["mono"]});
+    let h = Harness::start(cfg).await;
+    h.state().compare_needs_contents = true;
+    h.add_promotion_run(promo(1, "queued", None, 'a', "memory", 3600));
+    h.add_promotion_run(promo(2, "in_progress", None, 'b', "memory", 600));
+    ahead(&h, 'a', 'b');
+    let r = h.janitor_pass().await;
+    assert_eq!((r.promotion_cancelled, r.errors), (1, 0), "{r:?}");
+    let st = h.state();
+    assert_eq!(st.compare_tokens, [support::MIRROR_TOKEN]);
+    assert_eq!(
+        st.scoped_requests[0]["permissions"],
+        json!({"contents": "read"})
+    );
+    assert_eq!(st.scoped_requests[0]["repositories"], json!(["mono"]));
+}

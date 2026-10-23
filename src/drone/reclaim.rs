@@ -127,8 +127,22 @@ impl Commands {
         }
     }
 
-    /// `uid:gid` of `path`.
+    /// `uid:gid` of `path`, or of its nearest ancestor the drone may stat: a
+    /// private home (mode 750) hides everything below it from the drone, and
+    /// its owner is the one who can see inside. A wrong guess only makes the
+    /// owner's commands fail, which keeps the directory.
     fn owner(&self, path: &Path) -> Result<(String, String), String> {
+        let mut at = Some(path);
+        while let Some(p) = at {
+            if let Ok(o) = self.stat_owner(p) {
+                return Ok(o);
+            }
+            at = p.parent();
+        }
+        Err(format!("stat {}: no readable ancestor", path.display()))
+    }
+
+    fn stat_owner(&self, path: &Path) -> Result<(String, String), String> {
         let p = path.to_string_lossy();
         let out = self
             .exec
@@ -522,6 +536,9 @@ fn merge(into: &mut Option<Cycle>, c: Cycle) {
 pub struct Reclaimer {
     settings: ReclaimSettings,
     roots: Vec<Root>,
+    /// The drone's own job filesystems: always measured, so every drone
+    /// reports usage and a recent cycle even with no build roots.
+    anchors: Vec<PathBuf>,
     cmd: Commands,
     stats: Mutex<ReclaimStats>,
     seq: Mutex<u64>,
@@ -539,15 +556,20 @@ impl Reclaimer {
             tracing::info!("reclaim: not supported on this OS; off");
             return None;
         }
-        let roots = if settings.roots.is_empty() {
-            default_roots(&host_homes(cfg), Path::is_dir)
-        } else {
-            settings.roots.clone()
-        };
         let setpriv = cfg
             .job_user
             .as_ref()
             .map_or_else(|| "setpriv".to_owned(), |u| u.priv_bin.clone());
+        let cmd = Commands::new(exec, setpriv);
+        let roots = if settings.roots.is_empty() {
+            // Checked as the directory's owner: a private home hides its
+            // build directories from the drone itself.
+            default_roots(&host_homes(cfg), |p| {
+                cmd.sh(p, PROBE_SECS, r#"test -d "$1""#).is_ok()
+            })
+        } else {
+            settings.roots.clone()
+        };
         // Audit sequence numbers must grow across drone restarts, because the
         // queen ignores a (drone, seq) it already has.
         let seq = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp())
@@ -570,7 +592,8 @@ impl Reclaimer {
             }),
             settings,
             roots,
-            cmd: Commands::new(exec, setpriv),
+            anchors: vec![cfg.work_root.clone(), cfg.cache_root.clone()],
+            cmd,
             seq: Mutex::new(seq),
             sizes: Mutex::new(HashMap::new()),
         }))
@@ -596,6 +619,13 @@ impl Reclaimer {
                     .1
                     .push(r.clone()),
                 Err(e) => tracing::warn!("reclaim: {}: {e}", r.path.display()),
+            }
+        }
+        for a in &self.anchors {
+            if let Ok((_, mount)) = self.cmd.disk(a) {
+                groups
+                    .entry(mount)
+                    .or_insert_with(|| (a.clone(), Vec::new()));
             }
         }
         let mut combined: Option<Cycle> = None;
@@ -700,6 +730,31 @@ mod tests {
                 ("/srv/devdata/slots".to_owned(), "cargo_target"),
                 ("/srv/devdata/worktrees".to_owned(), "cargo_target"),
             ]
+        );
+    }
+
+    #[test]
+    fn owner_falls_back_to_the_nearest_ancestor_the_drone_may_stat() {
+        use crate::drone::exec::Output;
+        struct PrivateHome;
+        impl Exec for PrivateHome {
+            fn run(&self, program: &str, args: &[&str]) -> std::io::Result<Output> {
+                assert_eq!(program, "stat");
+                let visible = args.last() == Some(&"/home/u");
+                Ok(Output {
+                    success: visible,
+                    stdout: if visible {
+                        "1000:1000".into()
+                    } else {
+                        String::new()
+                    },
+                })
+            }
+        }
+        let cmd = Commands::new(Arc::new(PrivateHome), "setpriv".into());
+        assert_eq!(
+            cmd.owner(Path::new("/home/u/worktrees/x")).unwrap(),
+            ("1000".to_owned(), "1000".to_owned())
         );
     }
 
