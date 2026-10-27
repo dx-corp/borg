@@ -25,16 +25,20 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::allocator::{
     ActiveLease, AdmissionState, AllocatorInput, ClassIdle, Demand, DroneAdmission, DroneState,
-    LeaseState, PlacementDecision, Promotion, QueueAge, Reservation, Unmet, WarmFloor,
+    LeaseState, PlacementDecision, PrTurn, Promotion, QueueAge, Reservation, Unmet, WarmFloor,
     allocate_reserved, allocate_reserved_with_backlog, allocate_scope, free_room, free_slots,
     max_slots,
 };
 use crate::bid::{ClassPressure, ScoreWeights};
-use crate::burst::{BurstState, BurstView, BurstVm, ObservedDrone};
+use crate::burst::{
+    Action as BurstAction, BurstSettings, BurstState, BurstView, BurstVm,
+    Decision as BurstDecision, ObservedDrone, ZONE_COOLDOWN_SECS,
+};
 use crate::classes::{Class, Scope};
 use crate::config::{QueenConfig, StandbySettings};
 use crate::envcontract::{CheckKind, CheckState, Mode, Need, blocked_classes, capability_states};
 use crate::explain::{MAX_HISTORY, PlacementKind, PlacementOutcome, PlacementRecord};
+use crate::gce::{GceClient, GceError, SECRET_METADATA_KEYS, VmSpec};
 use crate::github::{GithubClient, GithubError, QueuedJob, Runner, WorkflowJob};
 use crate::health::{DroneHealth, DroneInfo, Outcome, OutcomeKind, evaluate};
 use crate::homeostasis::{Controller, KeyInput, KeyReport};
@@ -78,7 +82,7 @@ pub struct Snapshot {
     pub health: BTreeMap<String, DroneHealth>,
     /// Host failures look fleet-wide, so automatic quarantine is paused.
     pub health_systemic: bool,
-    /// Slots each class could still be granted, from the last pass.
+    /// Slots each class could still be granted after the last pass's grants.
     pub idle: Vec<ClassIdle>,
     /// CPU-pressure admission per fresh drone from the last pass.
     pub admission: Vec<DroneAdmission>,
@@ -110,11 +114,13 @@ pub struct Snapshot {
     pub(super) burst: Option<BurstView>,
 }
 
-/// The burst rule's memory and, in dry-run, the fleet it would have made.
+/// The burst rule's memory and the fleet it made (simulated in dry-run,
+/// loaded from the store once when live).
 #[derive(Debug, Default)]
 struct BurstSim {
     state: BurstState,
     vms: Vec<BurstVm>,
+    loaded: bool,
 }
 
 /// What the fleet watch remembers between passes.
@@ -126,6 +132,44 @@ struct FleetWatch {
     raised: BTreeSet<Class>,
     /// Non-borg runner name to the pass time it was first seen offline.
     offline_since: BTreeMap<String, i64>,
+    /// Main grants per class since that class last granted a pull request,
+    /// capped at `pr_fairness.main_grants_between`.
+    main_grants_since_pr: BTreeMap<Class, u32>,
+}
+
+/// Classes whose next grant goes to starving pull-request demand: main has
+/// taken `between` grants in a row.
+fn pr_turn_classes(main_grants_since_pr: &BTreeMap<Class, u32>, between: u32) -> Vec<Class> {
+    Class::ALL
+        .into_iter()
+        .filter(|c| main_grants_since_pr.get(c).copied().unwrap_or(0) >= between)
+        .collect()
+}
+
+/// Account this pass's grants: a pull-request grant resets its class, main
+/// grants count up to `between`. Deploy grants are neither.
+fn advance_pr_turns(
+    main_grants_since_pr: &mut BTreeMap<Class, u32>,
+    grants: &[crate::allocator::Grant],
+    between: u32,
+) {
+    for class in Class::ALL {
+        let of = |scope| {
+            u32::try_from(
+                grants
+                    .iter()
+                    .filter(|g| g.class == class && g.scope == scope)
+                    .count(),
+            )
+            .unwrap_or(u32::MAX)
+        };
+        let count = main_grants_since_pr.entry(class).or_default();
+        *count = if of(Scope::Pr) > 0 {
+            0
+        } else {
+            count.saturating_add(of(Scope::Main)).min(between)
+        };
+    }
 }
 
 /// Runners in the organization that borg did not mint, for one label.
@@ -289,6 +333,32 @@ pub struct Queen {
     tick_lock: tokio::sync::Mutex<()>,
     watch: std::sync::Mutex<FleetWatch>,
     burst: std::sync::Mutex<BurstSim>,
+    /// Creates and deletes burst VMs; present only when burst is live.
+    gce: Option<GceClient>,
+    /// Per drone, the CPU pressure samples (`observed_at`, `some avg10`
+    /// permille) from recent heartbeats; admission reads their mean over
+    /// `admission.facts_max_age_secs`. See [`pressure_window_mean`].
+    cpu_pressure: std::sync::Mutex<BTreeMap<String, VecDeque<(i64, u16)>>>,
+}
+
+/// Samples kept per drone: 10 s heartbeats over a 180 s window need 18.
+const CPU_PRESSURE_SAMPLES: usize = 64;
+
+/// The mean of the samples observed within `max_age_secs` of `now`, rounded
+/// to permille, or `None` without one. A drone reports `some avg10`, a 10 s
+/// window that a reclaim scan, container teardown or a git fetch pushes past
+/// the thresholds for one or two heartbeats; the queen samples it once a
+/// tick, so a drone with nothing running could flip to `light_only` or
+/// `closed` on a burst (10/23 explain history: gha-heavy-pve50-1 changed
+/// state at nearly every 300 s tick). Admission answers whether the host is
+/// oversubscribed for minutes, so it reads the window mean.
+fn pressure_window_mean(samples: &[(i64, u16)], now: i64, max_age_secs: i64) -> Option<u16> {
+    let fresh = samples
+        .iter()
+        .filter(|(at, _)| (0..=max_age_secs).contains(&(now - at)))
+        .map(|&(_, pm)| u64::from(pm.min(1000)));
+    let (sum, n) = fresh.fold((0u64, 0u64), |(s, n), pm| (s + pm, n + 1));
+    (n > 0).then(|| u16::try_from((sum + n / 2) / n).unwrap_or(1000))
 }
 
 /// The full label set a JIT runner is registered with: the labels GitHub
@@ -471,8 +541,19 @@ impl Queen {
             wake_sender: Arc::new(UdpWakeSender),
             tick_lock: tokio::sync::Mutex::new(()),
             watch: std::sync::Mutex::new(FleetWatch::default()),
+            cpu_pressure: std::sync::Mutex::new(BTreeMap::new()),
             burst: std::sync::Mutex::new(BurstSim::default()),
+            gce: None,
         }
+    }
+
+    /// Attach the Compute Engine client burst capacity creates VMs with.
+    /// Required when `burst.dry_run` is false; a live config without it
+    /// logs `burst_skipped` instead of acting.
+    #[must_use]
+    pub fn with_gce(mut self, gce: GceClient) -> Self {
+        self.gce = Some(gce);
+        self
     }
 
     /// Attach the preemption requeuer; `api::serve` runs it after each
@@ -558,8 +639,48 @@ impl Queen {
         &self.cfg
     }
 
+    /// Record a heartbeat's CPU pressure reading for the admission window.
+    /// Without a reading nothing is recorded: the window then empties and
+    /// admission falls back to the load estimate.
+    pub(crate) fn note_cpu_pressure(&self, drone: &str, observed_at: i64, psi_pm: Option<u16>) {
+        let Some(pm) = psi_pm else { return };
+        let mut all = self.cpu_pressure.lock().expect("cpu pressure lock");
+        let samples = all.entry(drone.to_owned()).or_default();
+        if samples.back().is_some_and(|&(at, _)| at >= observed_at) {
+            return;
+        }
+        samples.push_back((observed_at, pm));
+        while samples.len() > CPU_PRESSURE_SAMPLES {
+            samples.pop_front();
+        }
+    }
+
+    /// The drone's admission pressure: the mean of its readings within
+    /// `max_age_secs`, see [`pressure_window_mean`].
+    fn cpu_pressure_mean(&self, drone: &str, now: i64, max_age_secs: i64) -> Option<u16> {
+        let all = self.cpu_pressure.lock().expect("cpu pressure lock");
+        let samples: Vec<(i64, u16)> = all.get(drone)?.iter().copied().collect();
+        pressure_window_mean(&samples, now, max_age_secs)
+    }
+
+    /// The pull-request turns this pass; see [`PrTurn`].
+    fn pr_turn(&self) -> PrTurn {
+        let Some(f) = &self.cfg.pr_fairness else {
+            return PrTurn::default();
+        };
+        let w = self.watch.lock().expect("fleet watch lock");
+        PrTurn {
+            after_secs: Some(f.after_secs),
+            classes: pr_turn_classes(&w.main_grants_since_pr, f.main_grants_between),
+        }
+    }
+
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub(crate) fn github_rate_limit(&self) -> crate::github::RateLimitView {
+        self.github.rate_limit().view()
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -666,7 +787,9 @@ impl Queen {
                         .as_ref()
                         .filter(|f| now_ts - f.observed_at <= a.facts_max_age_secs)
                 {
-                    state.cpu_psi_pm = f.cpu_psi_some_avg10_pm;
+                    state.cpu_psi_pm = self
+                        .cpu_pressure_mean(&d.name, now_ts, a.facts_max_age_secs)
+                        .or(f.cpu_psi_some_avg10_pm);
                     state.cpu_load_pm =
                         crate::allocator::load_pressure_pm(f.load_per_cpu_pm, f.cpu_busy_pm);
                 }
@@ -714,6 +837,7 @@ impl Queen {
             starvation_after_secs: self.cfg.starvation_after_secs,
             weights: ScoreWeights::default(),
             admission: self.cfg.admission.as_ref().map(|a| a.thresholds()),
+            pr_turn: self.pr_turn(),
         };
         let mut unit_reserved = Vec::new();
         let mut deploy_grants = Vec::new();
@@ -771,6 +895,14 @@ impl Queen {
             spend_bids(&mut runner_input.drones, &spent_bids);
         }
         let mut allocation = allocate_reserved(&runner_input, &unit_reserved);
+        if let Some(f) = &self.cfg.pr_fairness {
+            let mut w = self.watch.lock().expect("fleet watch lock");
+            advance_pr_turns(
+                &mut w.main_grants_since_pr,
+                &allocation.grants,
+                f.main_grants_between,
+            );
+        }
         deploy_grants.append(&mut allocation.grants);
         allocation.grants = deploy_grants;
         deploy_decisions.append(&mut allocation.decisions);
@@ -820,12 +952,30 @@ impl Queen {
         // hosts for.
         let unmet_placeable = placeable_unmet(&allocation.unmet, &statics, &self.cfg.classes);
         let wake = self.wake_pass(now_ts, &unmet_placeable, &fresh_names).await;
+        // `allocation.idle` is the room before this pass's grants. The jobs
+        // still unmet compete only for what those grants left, so the capacity
+        // alarm and burst judge room after placement; otherwise a pass that
+        // fills the last free slots reads as idle capacity and no demand.
+        let mut held_after = placement_leases;
+        held_after.extend(allocation.grants.iter().map(|g| ActiveLease {
+            drone_id: g.drone_id.clone(),
+            class: g.class,
+            scope: g.scope,
+            state: LeaseState::Pending,
+        }));
+        let idle_after = crate::allocator::idle_after(
+            &runner_input.drones,
+            &held_after,
+            &runner_input.classes,
+            runner_input.admission,
+        );
         let (starved_since, starved) = self
             .watch_fleet(
                 now_ts,
                 &drone_rows,
                 &fresh_names,
-                &schedulable_slots,
+                &idle_after,
+                &preempt_ages,
                 &unmet_placeable,
             )
             .await;
@@ -833,9 +983,9 @@ impl Queen {
             .burst_pass(
                 now_ts,
                 &drone_rows,
-                &placement_leases,
+                &held_after,
                 &unmet_placeable,
-                &allocation.idle,
+                &idle_after,
             )
             .await;
         let mut mint_error = None;
@@ -936,13 +1086,7 @@ impl Queen {
         if mint_error.is_none()
             && let Some(st) = &self.cfg.standby
         {
-            let mut held = placement_leases.clone();
-            held.extend(allocation.grants.iter().map(|g| ActiveLease {
-                drone_id: g.drone_id.clone(),
-                class: g.class,
-                scope: g.scope,
-                state: LeaseState::Pending,
-            }));
+            let held = held_after;
             mint_error = self
                 .top_up_standby(
                     st,
@@ -1017,7 +1161,7 @@ impl Queen {
             s.unmet = allocation.unmet.clone();
             s.warm_floors = warm_floors;
             s.pressure = allocation.pressure.clone();
-            s.idle = allocation.idle.clone();
+            s.idle = idle_after;
             s.admission = allocation.admission.clone();
             s.homeostasis = homeostasis;
             s.profiles = profiles;
@@ -1589,6 +1733,7 @@ impl Queen {
                     starvation_after_secs: self.cfg.starvation_after_secs,
                     weights: ScoreWeights::default(),
                     admission,
+                    pr_turn: PrTurn::default(),
                 },
                 &reservations,
                 &backlog,
@@ -2096,7 +2241,8 @@ impl Queen {
         now: i64,
         rows: &[DroneRow],
         fresh: &BTreeSet<String>,
-        slots: &BTreeMap<Class, u32>,
+        idle: &[ClassIdle],
+        queue_ages: &[QueueAge],
         unmet: &[Unmet],
     ) -> (BTreeMap<Class, i64>, BTreeSet<Class>) {
         let alarm = &self.cfg.capacity_alarm;
@@ -2128,19 +2274,34 @@ impl Queen {
                     .filter(|u| u.class == class && u.scope == Scope::Main)
                     .map(|u| u.count)
                     .sum();
-                let have = slots.get(&class).copied().unwrap_or(0);
+                // Effective capacity: free slots on drones that admit every
+                // scope of the class, not what the fleet could hold if empty.
+                let have = idle
+                    .iter()
+                    .find(|i| i.class == class)
+                    .map_or(0, |i| i.idle_slots);
+                // The oldest queued main job of the class says how long the
+                // starvation has really lasted, whatever this queen has seen.
+                let oldest = queue_ages
+                    .iter()
+                    .filter(|a| a.class == class && a.scope == Scope::Main)
+                    .map(|a| i64::try_from(a.oldest_age_secs).unwrap_or(i64::MAX))
+                    .max()
+                    .unwrap_or(0);
                 if alarm.enabled
                     && alarm.classes.contains(&class)
                     && main > 0
                     && have <= alarm.max_slots
                 {
-                    let since = *w.starved_since.entry(class).or_insert(now);
+                    let since = w.starved_since.entry(class).or_insert(now);
+                    *since = (*since).min(now.saturating_sub(oldest));
+                    let since = *since;
                     if now - since >= alarm.after_secs && w.raised.insert(class) {
                         events.push((
                             "fleet".to_owned(),
                             "capacity_starved",
                             format!(
-                                "{class}: {main} main jobs unmet for {}s with {have} schedulable slots; stale drones: [{}]",
+                                "{class}: {main} main jobs unmet for {}s with {have} free admitting slots; stale drones: [{}]",
                                 now - since,
                                 stale.join(", ")
                             ),
@@ -2152,7 +2313,7 @@ impl Queen {
                         events.push((
                             "fleet".to_owned(),
                             "capacity_restored",
-                            format!("{class}: {have} schedulable slots, {main} main jobs unmet"),
+                            format!("{class}: {have} free admitting slots, {main} main jobs unmet"),
                         ));
                     }
                 }
@@ -2172,9 +2333,14 @@ impl Queen {
         state
     }
 
-    /// Run the burst rule on this pass and log what it would do as
-    /// `burst_would_<action>` health events. Dry-run only: actions change the
-    /// simulated fleet, never a cloud VM.
+    /// Run the burst rule on this pass. Dry-run: log what it would do as
+    /// `burst_would_<action>` health events and apply it to the simulated
+    /// fleet. Live: carry the actions out on Compute Engine and the store,
+    /// log `burst_<action>` events, and persist the VM list.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one pass: load, plan, apply, persist, log; easier to audit whole"
+    )]
     async fn burst_pass(
         &self,
         now: i64,
@@ -2185,6 +2351,24 @@ impl Queen {
     ) -> Option<BurstView> {
         let cfg = self.cfg.burst.as_ref().filter(|b| b.enabled)?;
         let max_run = cfg.gce.max_run_secs;
+        let live = cfg.live();
+        if live && !self.lock_burst().loaded {
+            match self.store.burst_vms().await {
+                Ok(vms) => {
+                    let mut sim = self.lock_burst();
+                    sim.vms = vms;
+                    sim.loaded = true;
+                }
+                Err(e) => {
+                    tracing::warn!("burst: load VM records failed: {e}");
+                    return None;
+                }
+            }
+        }
+        let discovered = match (live, self.gce.as_ref()) {
+            (true, Some(gce)) => self.discover_burst_vms(cfg, gce, rows, now).await,
+            _ => Vec::new(),
+        };
         let mut drones: Vec<ObservedDrone> = rows
             .iter()
             .filter(|d| d.name.starts_with(&cfg.drone_prefix))
@@ -2197,26 +2381,25 @@ impl Queen {
                     .unwrap_or(u32::MAX),
             })
             .collect();
-        let (view, decisions) = {
-            // The state is plain data; a panic mid-pass leaves it usable.
-            let mut sim = self
-                .burst
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let BurstSim { state, vms } = &mut *sim;
+        let (plan, mut vms) = {
+            let mut sim = self.lock_burst();
+            let BurstSim { state, vms, .. } = &mut *sim;
             crate::burst::prune(vms, max_run, now);
-            // Simulated drones enroll after a typical provisioning time and
-            // never hold a lease: they serve no demand, so dry-run spend is
-            // the most the rule would allow, not what real drones would cost.
-            drones.extend(
-                vms.iter()
-                    .filter(|v| v.ended_at.is_none() && !rows.iter().any(|r| r.name == v.drone))
-                    .map(|v| ObservedDrone {
-                        name: v.drone.clone(),
-                        alive: now - v.created_at >= crate::burst::SIMULATED_PROVISION_SECS,
-                        leases: 0,
-                    }),
-            );
+            if !live {
+                // Simulated drones enroll after a typical provisioning time
+                // and never hold a lease: they serve no demand, so dry-run
+                // spend is the most the rule would allow, not what real
+                // drones would cost.
+                drones.extend(
+                    vms.iter()
+                        .filter(|v| v.ended_at.is_none() && !rows.iter().any(|r| r.name == v.drone))
+                        .map(|v| ObservedDrone {
+                            name: v.drone.clone(),
+                            alive: now - v.created_at >= crate::burst::SIMULATED_PROVISION_SECS,
+                            leases: 0,
+                        }),
+                );
+            }
             let plan = crate::burst::plan(
                 cfg,
                 state,
@@ -2228,17 +2411,43 @@ impl Queen {
                     vms,
                 },
             );
-            let decisions = crate::burst::apply_simulated(cfg, vms, &plan.actions, now);
-            state.count(now, plan.outcome);
-            for d in &decisions {
-                state.record(d.clone());
+            (plan, vms.clone())
+        };
+        let (decisions, failed_zones) = if live {
+            let (applied, failed) = self
+                .apply_burst_live(cfg, &mut vms, &plan.actions, rows, now)
+                .await;
+            (discovered.into_iter().chain(applied).collect(), failed)
+        } else {
+            (
+                crate::burst::apply_simulated(cfg, &mut vms, &plan.actions, now),
+                Vec::new(),
+            )
+        };
+        let view = {
+            let mut sim = self.lock_burst();
+            for zone in &failed_zones {
+                sim.state.cool_zone(zone, now + ZONE_COOLDOWN_SECS);
             }
-            (crate::burst::view(cfg, state, vms, &plan, now), decisions)
+            sim.state.count(now, plan.outcome);
+            for d in &decisions {
+                sim.state.record(d.clone());
+            }
+            sim.vms.clone_from(&vms);
+            crate::burst::view(cfg, &sim.state, &vms, &plan, now)
+        };
+        if live && let Err(e) = self.store.save_burst_vms(&vms).await {
+            tracing::warn!("burst: persist VM records failed: {e}");
+        }
+        let (prefix, mode) = if live {
+            ("burst_", "live")
+        } else {
+            ("burst_would_", "dry-run")
         };
         for d in decisions {
-            let event = format!("burst_would_{}", d.action);
+            let event = format!("{prefix}{}", d.action);
             let reason = format!(
-                "{} {}: {} (dry-run; weighted unmet {}, {:.1}/{} drone-hours today, {:.1}/{} this month)",
+                "{} {}: {} ({mode}; weighted unmet {}, {:.1}/{} drone-hours today, {:.1}/{} this month)",
                 d.action,
                 d.drone.as_deref().unwrap_or("-"),
                 d.detail,
@@ -2248,7 +2457,11 @@ impl Queen {
                 view.spend.month_hours,
                 view.budget.drone_hours_per_month,
             );
-            tracing::info!("{event}: {reason}");
+            if d.action.ends_with("_failed") {
+                tracing::warn!("{event}: {reason}");
+            } else {
+                tracing::info!("{event}: {reason}");
+            }
             if let Err(e) = self
                 .store
                 .record_health_event(now, "burst", &event, &reason)
@@ -2258,6 +2471,288 @@ impl Queen {
             }
         }
         Some(view)
+    }
+
+    fn lock_burst(&self) -> std::sync::MutexGuard<'_, BurstSim> {
+        // The state is plain data; a panic mid-pass leaves it usable.
+        self.burst
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Carry burst actions out for real. Each action becomes one decision,
+    /// `<kind>` on success or `<kind>_failed` with the error; a failed action
+    /// leaves the VM record as it was, so the next pass retries it. Returns
+    /// the decisions and the zones whose create failed.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per action; splitting hides the shared decision shape"
+    )]
+    async fn apply_burst_live(
+        &self,
+        cfg: &BurstSettings,
+        vms: &mut Vec<BurstVm>,
+        actions: &[BurstAction],
+        rows: &[DroneRow],
+        now: i64,
+    ) -> (Vec<BurstDecision>, Vec<String>) {
+        let short = |e: &dyn std::fmt::Display| e.to_string().chars().take(300).collect::<String>();
+        let Some(gce) = self.gce.as_ref() else {
+            let d = BurstDecision::new(
+                now,
+                false,
+                "skipped",
+                None,
+                "no compute client attached".to_owned(),
+            );
+            return (vec![d], Vec::new());
+        };
+        let mut out = Vec::new();
+        let mut failed_zones = Vec::new();
+        for a in actions {
+            let (action, drone, detail) = match a {
+                BurstAction::Create { zone } => {
+                    let (drone, vm) = crate::burst::new_vm_names(cfg, now, |n| {
+                        vms.iter().any(|v| v.drone == n) || rows.iter().any(|r| r.name == n)
+                    });
+                    match self
+                        .create_burst_vm(cfg, gce, vms, (&drone, &vm, zone), now)
+                        .await
+                    {
+                        Ok(None) => ("create", Some(drone), format!("{vm} in {zone}")),
+                        Ok(Some(unconfirmed)) => (
+                            "create",
+                            Some(drone),
+                            format!("{vm} in {zone}; create not confirmed: {unconfirmed}"),
+                        ),
+                        Err(e) => {
+                            failed_zones.push(zone.clone());
+                            ("create_failed", Some(drone), format!("{zone}: {e}"))
+                        }
+                    }
+                }
+                BurstAction::Drain { drone, why } => {
+                    let reason = format!("burst: {why}");
+                    match self.store.set_quarantine(drone, Some(&reason)).await {
+                        Ok(_) => {
+                            crate::burst::set(vms, drone, |v| v.draining_at = Some(now));
+                            ("drain", Some(drone.clone()), (*why).to_owned())
+                        }
+                        Err(e) => ("drain_failed", Some(drone.clone()), short(&e)),
+                    }
+                }
+                BurstAction::Undrain { drone } => {
+                    match self.store.set_quarantine(drone, None).await {
+                        Ok(_) => {
+                            crate::burst::set(vms, drone, |v| v.draining_at = None);
+                            ("undrain", Some(drone.clone()), "demand returned".to_owned())
+                        }
+                        Err(e) => ("undrain_failed", Some(drone.clone()), short(&e)),
+                    }
+                }
+                BurstAction::Scrub { drone } => {
+                    let Some((zone, vm)) = vms
+                        .iter()
+                        .find(|v| &v.drone == drone)
+                        .map(|v| (v.zone.clone(), v.vm.clone()))
+                    else {
+                        continue;
+                    };
+                    match gce.scrub_metadata(&zone, &vm, &SECRET_METADATA_KEYS).await {
+                        Ok(_) => {
+                            crate::burst::set(vms, drone, |v| v.scrubbed_at = Some(now));
+                            (
+                                "scrub",
+                                Some(drone.clone()),
+                                "bootstrap secrets removed from metadata".to_owned(),
+                            )
+                        }
+                        Err(e) => ("scrub_failed", Some(drone.clone()), short(&e)),
+                    }
+                }
+                BurstAction::Delete { drone, why } => {
+                    let Some((zone, vm)) = vms
+                        .iter()
+                        .find(|v| &v.drone == drone)
+                        .map(|v| (v.zone.clone(), v.vm.clone()))
+                    else {
+                        continue;
+                    };
+                    match gce.delete_instance(&zone, &vm).await {
+                        Ok(existed) => {
+                            crate::burst::set(vms, drone, |v| v.ended_at = Some(now));
+                            if let Err(e) = self.store.remove_drone(drone).await {
+                                tracing::warn!("burst: remove drone {drone}: {e}");
+                            }
+                            let gone = if existed { "" } else { " (VM already gone)" };
+                            ("delete", Some(drone.clone()), format!("{why}{gone}"))
+                        }
+                        Err(e) => ("delete_failed", Some(drone.clone()), short(&e)),
+                    }
+                }
+            };
+            out.push(BurstDecision::new(now, false, action, drone, detail));
+        }
+        (out, failed_zones)
+    }
+
+    /// Enroll `drone` and create its VM. Once the insert is accepted the VM
+    /// may exist, so it is recorded and persisted before the wait: a wait that
+    /// fails for any reason but a failed operation leaves the record and the
+    /// enrollment in place (`Ok(Some(why))`), and the VM is then served,
+    /// or deleted after the provisioning grace, like any other. When GCE
+    /// says the create failed, no VM exists: the enrollment is undone so the
+    /// name is free and no silent record lingers.
+    async fn create_burst_vm(
+        &self,
+        cfg: &BurstSettings,
+        gce: &GceClient,
+        vms: &mut Vec<BurstVm>,
+        (drone, vm, zone): (&str, &str, &str),
+        now: i64,
+    ) -> Result<Option<String>, String> {
+        let short = |e: &dyn std::fmt::Display| e.to_string().chars().take(300).collect::<String>();
+        let g = cfg.gce();
+        let key_path = g
+            .tailscale_authkey_path
+            .as_ref()
+            .ok_or("gce.tailscale_authkey_path is not set")?;
+        let authkey = tokio::fs::read_to_string(key_path)
+            .await
+            .map_err(|e| format!("read {}: {e}", key_path.display()))?;
+        let token = crate::admin::enroll_drone(&self.store, drone, now)
+            .await
+            .map_err(|e| format!("enroll {drone}: {e}"))?;
+        let body = crate::gce::instance_body(
+            g,
+            &VmSpec {
+                zone,
+                vm,
+                drone,
+                tailscale_authkey: authkey.trim(),
+                enroll_token: &token,
+            },
+        );
+        let undo = || async {
+            if let Err(e) = self.store.remove_drone(drone).await {
+                tracing::warn!("burst: undo enrollment of {drone}: {e}");
+            }
+        };
+        let op = match gce.insert_instance(zone, &body).await {
+            Ok(op) => op,
+            Err(e) => {
+                undo().await;
+                return Err(short(&e));
+            }
+        };
+        vms.push(crate::burst::new_vm(
+            drone.to_owned(),
+            vm.to_owned(),
+            zone.to_owned(),
+            now,
+        ));
+        if let Err(e) = self.store.save_burst_vms(vms).await {
+            tracing::warn!("burst: persist VM record of {vm}: {e}");
+        }
+        let Some(op) = op else {
+            return Ok(None);
+        };
+        match gce.wait_operation(zone, &op).await {
+            Ok(()) => Ok(None),
+            Err(e @ GceError::Operation(_)) => {
+                crate::burst::set(vms, drone, |v| v.ended_at = Some(now));
+                undo().await;
+                Err(short(&e))
+            }
+            Err(e) => {
+                tracing::warn!("burst: create {zone}/{vm} not confirmed: {e}");
+                Ok(Some(short(&e)))
+            }
+        }
+    }
+
+    /// Reconcile the VM records with the burst VMs Compute Engine actually
+    /// runs (by label), so a VM the queen lost track of still counts toward
+    /// `max_drones` and is cleaned up. A VM whose drone is enrolled but has
+    /// no live record is adopted and then handled like any other. A VM whose
+    /// drone is not enrolled can never serve (its token is gone or never
+    /// existed) and is deleted now; it stays recorded, and counted, until a
+    /// delete succeeds, and a failed delete is retried on the next pass.
+    async fn discover_burst_vms(
+        &self,
+        cfg: &BurstSettings,
+        gce: &GceClient,
+        rows: &[DroneRow],
+        now: i64,
+    ) -> Vec<BurstDecision> {
+        let listed = match gce.list_burst_instances().await {
+            Ok(listed) => listed,
+            Err(e) => {
+                tracing::warn!("burst: list burst VMs failed: {e}");
+                return vec![BurstDecision::new(
+                    now,
+                    false,
+                    "discover_failed",
+                    None,
+                    e.to_string().chars().take(300).collect(),
+                )];
+            }
+        };
+        let mut doomed: Vec<(String, crate::gce::ListedVm)> = Vec::new();
+        {
+            let mut sim = self.lock_burst();
+            for l in listed {
+                let tracked = sim.vms.iter().any(|v| v.vm == l.vm && v.ended_at.is_none());
+                let ours = !l.drone.is_empty() && l.drone.starts_with(&cfg.drone_prefix);
+                let enrolled = ours && rows.iter().any(|r| r.name == l.drone);
+                let drone = if ours { l.drone.clone() } else { l.vm.clone() };
+                if !tracked {
+                    let created = l.created_at.map_or(now, |t| t.min(now));
+                    let mut vm =
+                        crate::burst::new_vm(drone.clone(), l.vm.clone(), l.zone.clone(), created);
+                    if !enrolled {
+                        // Not provisioning: it never will. Draining also
+                        // makes the rule delete it if the delete below fails.
+                        vm.draining_at = Some(now);
+                    }
+                    sim.vms.push(vm);
+                    tracing::warn!(
+                        "burst: found unrecorded VM {} in {} ({drone})",
+                        l.vm,
+                        l.zone
+                    );
+                }
+                if !enrolled {
+                    doomed.push((drone, l));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (drone, l) in doomed {
+            let (action, detail) = match gce.delete_instance(&l.zone, &l.vm).await {
+                Ok(_) => {
+                    let mut sim = self.lock_burst();
+                    for v in sim.vms.iter_mut().filter(|v| v.vm == l.vm) {
+                        v.ended_at.get_or_insert(now);
+                    }
+                    (
+                        "delete",
+                        format!("orphan {} in {}: drone not enrolled", l.vm, l.zone),
+                    )
+                }
+                Err(e) => (
+                    "delete_failed",
+                    format!(
+                        "orphan {} in {}: {}",
+                        l.vm,
+                        l.zone,
+                        e.to_string().chars().take(300).collect::<String>()
+                    ),
+                ),
+            };
+            out.push(BurstDecision::new(now, false, action, Some(drone), detail));
+        }
+        out
     }
 
     pub(crate) fn class_slots(&self, drones: &[DroneState]) -> BTreeMap<Class, u32> {
@@ -2281,6 +2776,68 @@ impl Queen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_pressure_is_the_mean_of_the_fresh_window() {
+        assert_eq!(pressure_window_mean(&[], 1000, 180), None);
+        // One burst among quiet samples does not cross a threshold.
+        let samples = [
+            (900, 50),
+            (910, 60),
+            (920, 559),
+            (930, 40),
+            (940, 50),
+            (950, 41),
+        ];
+        assert_eq!(pressure_window_mean(&samples, 1000, 180), Some(133));
+        // Sustained pressure does.
+        let busy = [(900, 540), (910, 560), (920, 559), (930, 530)];
+        assert_eq!(pressure_window_mean(&busy, 1000, 180), Some(547));
+        // Only samples within the window count; future ones never do.
+        let aged = [(700, 1000), (900, 100), (1200, 1000)];
+        assert_eq!(pressure_window_mean(&aged, 1000, 180), Some(100));
+        assert_eq!(pressure_window_mean(&aged, 1000, 300), Some(550));
+        // Readings are clamped to permille.
+        assert_eq!(pressure_window_mean(&[(1000, 5000)], 1000, 180), Some(1000));
+    }
+
+    #[test]
+    fn pr_turns_come_after_consecutive_main_grants() {
+        let grant = |class, scope| crate::allocator::Grant {
+            drone_id: "a".into(),
+            class,
+            scope,
+            labels: vec![],
+            mem_mib: 0,
+            vcpu: 0,
+        };
+        let mut counts = BTreeMap::new();
+        assert!(pr_turn_classes(&counts, 2).is_empty());
+        advance_pr_turns(&mut counts, &[grant(Class::Heavy, Scope::Main)], 2);
+        assert!(pr_turn_classes(&counts, 2).is_empty());
+        advance_pr_turns(
+            &mut counts,
+            &[
+                grant(Class::Heavy, Scope::Main),
+                grant(Class::Heavy, Scope::Deploy),
+            ],
+            2,
+        );
+        assert_eq!(pr_turn_classes(&counts, 2), [Class::Heavy]);
+        // Due until a pull-request grant of the class, which resets it.
+        advance_pr_turns(&mut counts, &[grant(Class::Heavy, Scope::Main)], 2);
+        assert_eq!(pr_turn_classes(&counts, 2), [Class::Heavy]);
+        advance_pr_turns(
+            &mut counts,
+            &[
+                grant(Class::Heavy, Scope::Pr),
+                grant(Class::Heavy, Scope::Main),
+            ],
+            2,
+        );
+        assert!(pr_turn_classes(&counts, 2).is_empty());
+        assert_eq!(pr_turn_classes(&counts, 0), Class::ALL);
+    }
 
     #[test]
     fn jit_labels_list_platform_labels_first_then_class_labels() {

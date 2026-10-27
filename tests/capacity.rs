@@ -242,3 +242,60 @@ async fn unmet_main_demand_without_capacity_raises_and_clears_the_alarm() {
     assert_eq!(s["capacity"]["heavy"]["alarm"], false);
     assert!(events(&s).contains(&("fleet".into(), "capacity_restored".into())));
 }
+
+#[tokio::test]
+async fn a_drone_shedding_under_pressure_has_no_free_slot_for_the_alarm() {
+    let h = Harness::start(json!({
+        "capacity_alarm": {"after_secs": 60, "max_slots": 0},
+        "admission": {"psi_soft_pm": 300, "psi_light_only_pm": 500, "psi_hard_pm": 600,
+                      "facts_max_age_secs": 100_000}
+    }))
+    .await;
+    let t0 = OffsetDateTime::now_utc();
+    let token = h.enroll("hot").await;
+    // PSI 540: light-only. The drone has room for a heavy lease it will not take.
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": {"observed_at": t0.unix_timestamp(), "cpu_psi_some_avg10_pm": 540}}),
+    )
+    .await;
+    h.queue_job(1, "borg-ci-heavy", 5);
+    h.queue_job(2, "borg-ci-heavy", 5);
+    // The queue fixture and tick must use the same clock: wall time after
+    // t0 would make these jobs less than five whole seconds old at the tick.
+    let created = (t0 - time::Duration::seconds(5))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    for job in &mut h.state().jobs {
+        job["created_at"] = json!(created);
+    }
+    h.queen.tick(t0).await.unwrap();
+    let s = status_at(&h, t0).await;
+    assert_eq!(s["drones"][0]["admission"]["state"], "light_only");
+    assert_eq!(s["capacity"]["heavy"]["schedulable_slots"], 1, "nominal");
+    assert_eq!(s["capacity"]["heavy"]["unmet_main"], 2);
+    assert_eq!(s["capacity"]["heavy"]["alarm"], false, "not for 60s yet");
+    // The clock starts at the oldest queued job, not at this pass.
+    let since = s["capacity"]["heavy"]["starved_since"].as_i64().unwrap();
+    assert!(since <= t0.unix_timestamp() - 5, "{since}");
+    assert!(h.state().mints.is_empty());
+
+    let t1 = t0 + time::Duration::seconds(61);
+    h.queen.tick(t1).await.unwrap();
+    let s = status_at(&h, t1).await;
+    assert_eq!(s["capacity"]["heavy"]["alarm"], true, "{}", s["capacity"]);
+    assert!(events(&s).contains(&("fleet".into(), "capacity_starved".into())));
+    assert!(
+        h.metrics()
+            .await
+            .contains("borg_capacity_starved{class=\"heavy\"} 1")
+    );
+
+    // The queue drains: the alarm clears.
+    h.state().jobs.clear();
+    let t2 = t1 + time::Duration::seconds(10);
+    h.queen.tick(t2).await.unwrap();
+    let s = status_at(&h, t2).await;
+    assert_eq!(s["capacity"]["heavy"]["alarm"], false);
+    assert!(events(&s).contains(&("fleet".into(), "capacity_restored".into())));
+}

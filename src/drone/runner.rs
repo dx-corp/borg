@@ -27,7 +27,7 @@ use crate::secret::Secret;
 const RSS_SAMPLE_EVERY: Duration = Duration::from_secs(2);
 
 /// The lease's private HOME, a child of the lease directory (removed with it).
-pub const LEASE_HOME: &str = "_home";
+const LEASE_HOME: &str = "_home";
 
 /// Files from the job user's own home that every lease HOME starts with. Only
 /// drone-written configuration belongs here (the Bazel cache rc), never

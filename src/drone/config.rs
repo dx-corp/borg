@@ -209,7 +209,9 @@ pub struct DroneConfig {
     /// Parent of the per-lease work directories. Wiped on start and after
     /// every job.
     pub work_root: PathBuf,
-    /// Tool caches (sccache, mise, cargo). Never touched by cleanup.
+    /// Tool caches (sccache, mise, cargo). Never touched by between-job
+    /// cleanup; reclaim may remove stale cargo target directories under
+    /// `<cache_root>/*/slots` (regenerable build output, never while busy).
     pub cache_root: PathBuf,
     #[serde(default = "default_docker")]
     pub docker_bin: String,

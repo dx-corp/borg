@@ -1,8 +1,9 @@
 //! The supersede janitor: cancels queued pull-request workflow runs whose head
-//! commit is no longer the pull request's head, runs of listed workflows for
-//! pull requests that were closed or merged (`closed_pr_workflows`), and queued
-//! push runs on listed branches that a newer run of the same workflow
-//! supersedes (`superseded_push_branches`).
+//! commit is no longer the pull request's head, runs for pull requests that
+//! were closed or merged (any workflow once a pull-request read credential is
+//! configured; `closed_pr_workflows` without one), and queued push runs on
+//! listed branches that a newer run of the same workflow supersedes
+//! (`superseded_push_branches`).
 //!
 //! A push to a pull request branch makes every run of the older commit
 //! pointless, but GitHub keeps them queued and they occupy runner demand. Two
@@ -27,8 +28,13 @@
 //!   head matches, and from the pulls API only when that entry has no head;
 //! * a `pull_request` run with no open pull request is treated as belonging
 //!   to a closed one only when its head repository is the repository itself
-//!   (forks never) and its workflow is listed in `closed_pr_workflows`, and a
-//!   fresh read must still show no pull request;
+//!   (forks never) and either its workflow is listed in `closed_pr_workflows`
+//!   or the pulls API shows the branch's pull request closed *after* the run
+//!   was created (a run created after the close is the `closed` event's own
+//!   handler and is kept), and a fresh read must still show no pull request;
+//! * the pulls API is read with `compare_auth` when configured (tokens carry
+//!   `contents: read` and `pull_requests: read`), else with the janitor's own
+//!   token; a refused read is counted once per pass and keeps every run;
 //! * at most `max_cancels_per_pass` cancellations per pass, one pass per
 //!   `interval_secs`;
 //! * a cancel that GitHub refuses with 409 is a no-op, counted as
@@ -57,7 +63,7 @@ use crate::config::JanitorSettings;
 
 #[path = "janitor_promotions.rs"]
 mod promotions;
-use crate::github::{GithubError, TokenSource};
+use crate::github::{GithubError, RateLimit, TokenSource};
 use crate::secret::Secret;
 
 /// Upper bound on pages of queued runs read per repository (100 per page).
@@ -204,7 +210,65 @@ struct PullHead {
     sha: String,
 }
 
+/// A pull request as `GET /pulls?head=owner:branch&state=all` lists it.
+#[derive(Debug, Deserialize)]
+struct PullByHead {
+    number: u64,
+    state: String,
+    head: PullHead,
+    #[serde(default)]
+    closed_at: Option<String>,
+}
+
+/// What a run of a branch with no open pull request in its listing deserves.
+#[derive(Debug, PartialEq, Eq)]
+enum BranchVerdict {
+    /// The branch's pull request is open at another head.
+    Superseded {
+        number: u64,
+        current: String,
+    },
+    /// The branch's newest pull request closed after the run was created.
+    Closed {
+        number: u64,
+        closed_at: String,
+    },
+    Keep,
+}
+
+/// Decide for a run created at `created_at` (unix) from its branch's pull
+/// requests, newest first.
+fn branch_verdict(run_head: &str, created_at: Option<i64>, pulls: &[PullByHead]) -> BranchVerdict {
+    if let Some(open) = pulls.iter().find(|p| p.state == "open") {
+        return if open.head.sha == run_head {
+            BranchVerdict::Keep
+        } else {
+            BranchVerdict::Superseded {
+                number: open.number,
+                current: open.head.sha.clone(),
+            }
+        };
+    }
+    let (Some(newest), Some(created)) = (pulls.first(), created_at) else {
+        return BranchVerdict::Keep;
+    };
+    match newest.closed_at.as_deref().and_then(unix) {
+        Some(closed) if closed > created => BranchVerdict::Closed {
+            number: newest.number,
+            closed_at: newest.closed_at.clone().unwrap_or_default(),
+        },
+        _ => BranchVerdict::Keep,
+    }
+}
+
+fn unix(rfc3339: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(rfc3339, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(time::OffsetDateTime::unix_timestamp)
+}
+
 pub struct Janitor {
+    rate_limit: RateLimit,
     http: reqwest::Client,
     api_base: String,
     token: TokenSource,
@@ -216,6 +280,11 @@ pub struct Janitor {
 }
 
 impl Janitor {
+    pub fn with_rate_limit(mut self, rate_limit: RateLimit) -> Self {
+        self.rate_limit = rate_limit;
+        self
+    }
+
     /// A janitor with a fixed token.
     pub fn new(
         api_base: &str,
@@ -235,6 +304,7 @@ impl Janitor {
             .timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self {
+            rate_limit: token.rate_limit(),
             http,
             api_base: api_base.trim_end_matches('/').to_owned(),
             token,
@@ -279,27 +349,32 @@ impl Janitor {
             return self.get(path).await;
         };
         let token = auth.credential().await?.token;
-        let resp = self
-            .http
-            .get(format!("{}{path}", self.api_base))
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .bearer_auth(token.expose())
-            .send()
+        let rate_limit = auth.rate_limit();
+        let resp = rate_limit
+            .send(
+                self.http
+                    .get(format!("{}{path}", self.api_base))
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .bearer_auth(token.expose()),
+            )
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(status_error("GET", path, status.as_u16(), resp).await);
+            return Err(status_error(&rate_limit, "GET", path, status.as_u16(), resp).await);
         }
         let bytes = resp.bytes().await?;
         serde_json::from_slice(&bytes).map_err(|e| GithubError::Decode(format!("{path}: {e}")))
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, GithubError> {
-        let resp = self.request(Method::GET, path).await?.send().await?;
+        let resp = self
+            .rate_limit
+            .send(self.request(Method::GET, path).await?)
+            .await?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(status_error("GET", path, status.as_u16(), resp).await);
+            return Err(status_error(&self.rate_limit, "GET", path, status.as_u16(), resp).await);
         }
         let bytes = resp.bytes().await?;
         serde_json::from_slice(&bytes).map_err(|e| GithubError::Decode(format!("{path}: {e}")))
@@ -309,12 +384,15 @@ impl Janitor {
     /// cancelled (already finished), which is fine.
     async fn cancel(&self, repo: &str, run: u64) -> Result<bool, GithubError> {
         let path = format!("/repos/{repo}/actions/runs/{run}/cancel");
-        let resp = self.request(Method::POST, &path).await?.send().await?;
+        let resp = self
+            .rate_limit
+            .send(self.request(Method::POST, &path).await?)
+            .await?;
         let status = resp.status();
         match status.as_u16() {
             200..=299 => Ok(true),
             409 => Ok(false),
-            code => Err(status_error("POST", &path, code, resp).await),
+            code => Err(status_error(&self.rate_limit, "POST", &path, code, resp).await),
         }
     }
 
@@ -403,6 +481,7 @@ impl Janitor {
         }
         let mut stale = BTreeSet::new();
         let mut heads: BTreeMap<u64, Option<String>> = BTreeMap::new();
+        let mut branches = BranchPulls::default();
         for run in &runs {
             let running = run.status == "in_progress";
             if run.event != "pull_request"
@@ -412,14 +491,45 @@ impl Janitor {
             }
             let why = match run.pull_requests.as_slice() {
                 // No open pull request matches this same-repository run: its
-                // pull request was closed or merged.
-                [] if self.closed_pr_workflow(repo, run) => {
-                    report.considered += 1;
-                    report.closed_pr += 1;
-                    format!(
-                        "for branch {}: no open pull request",
-                        run.head_branch.as_deref().unwrap_or("?")
-                    )
+                // pull request was closed or merged, or moved to another head.
+                // A fork's run never names a pull request either; forks are
+                // left alone.
+                [] if self.same_repository(repo, run) => {
+                    if self.closed_pr_workflow(run) {
+                        report.considered += 1;
+                        report.closed_pr += 1;
+                        format!(
+                            "for branch {}: no open pull request",
+                            run.head_branch.as_deref().unwrap_or("?")
+                        )
+                    } else {
+                        let Some(branch) = run.head_branch.as_deref() else {
+                            continue;
+                        };
+                        let Some(pulls) =
+                            self.branch_pulls(repo, branch, &mut branches, report).await
+                        else {
+                            continue;
+                        };
+                        report.considered += 1;
+                        match branch_verdict(&run.head_sha, unix(&run.created_at), &pulls) {
+                            BranchVerdict::Superseded { number, current } => {
+                                report.superseded += 1;
+                                format!(
+                                    "for #{number}: head {} superseded by {current}",
+                                    run.head_sha
+                                )
+                            }
+                            BranchVerdict::Closed { number, closed_at } => {
+                                report.closed_pr += 1;
+                                format!(
+                                    "for branch {branch}: #{number} closed {closed_at}, run created {}",
+                                    run.created_at
+                                )
+                            }
+                            BranchVerdict::Keep => continue,
+                        }
+                    }
                 }
                 [pr] => {
                     report.considered += 1;
@@ -435,8 +545,7 @@ impl Janitor {
                         pr.number, run.head_sha
                     )
                 }
-                // A fork's run carries no pull request; with more than one
-                // the answer is ambiguous. Leave both alone.
+                // With more than one pull request the answer is ambiguous.
                 _ => continue,
             };
             stale.insert(run.id);
@@ -501,16 +610,57 @@ impl Janitor {
         Ok(())
     }
 
-    /// Whether `run` is a same-repository run of a `closed_pr_workflows` entry.
-    fn closed_pr_workflow(&self, repo: &str, run: &Run) -> bool {
+    /// Whether `run`'s head is in `repo` itself (not a fork).
+    fn same_repository(&self, repo: &str, run: &Run) -> bool {
         run.head_repository
             .as_ref()
             .is_some_and(|r| r.full_name.eq_ignore_ascii_case(repo))
-            && self
-                .settings
-                .closed_pr_workflows
-                .iter()
-                .any(|w| *w == run.path || *w == run.name)
+    }
+
+    /// Whether `run` is a run of a `closed_pr_workflows` entry.
+    fn closed_pr_workflow(&self, run: &Run) -> bool {
+        self.settings
+            .closed_pr_workflows
+            .iter()
+            .any(|w| *w == run.path || *w == run.name)
+    }
+
+    /// The pull requests of `branch` in `repo`, newest first, read once per
+    /// branch per pass. `None` after a refused or failed read, which is
+    /// logged and counted once per pass: every run of the repository is then
+    /// kept.
+    async fn branch_pulls(
+        &self,
+        repo: &str,
+        branch: &str,
+        cache: &mut BranchPulls,
+        report: &mut PassReport,
+    ) -> Option<std::sync::Arc<[PullByHead]>> {
+        if cache.unreadable {
+            return None;
+        }
+        if let Some(pulls) = cache.by_branch.get(branch) {
+            return Some(pulls.clone());
+        }
+        let owner = repo.split('/').next().unwrap_or_default();
+        let path = format!(
+            "/repos/{repo}/pulls?state=all&head={owner}:{branch}&sort=updated&direction=desc&per_page=10"
+        );
+        match self.get_contents::<Vec<PullByHead>>(&path).await {
+            Ok(pulls) => {
+                let pulls: std::sync::Arc<[PullByHead]> = pulls.into();
+                cache.by_branch.insert(branch.to_owned(), pulls.clone());
+                Some(pulls)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "janitor: {repo} pulls for {branch}: {e}; runs of closed pull requests are kept this pass (set supersede_janitor.compare_auth to an App with pull_requests: read, or list the workflow in closed_pr_workflows)"
+                );
+                report.errors += 1;
+                cache.unreadable = true;
+                None
+            }
+        }
     }
 
     /// The pull request's current head: the run's own entry when GitHub filled
@@ -529,7 +679,7 @@ impl Janitor {
             return cached.clone();
         }
         let fetched = match self
-            .get::<Pull>(&format!("/repos/{repo}/pulls/{}", pr.number))
+            .get_contents::<Pull>(&format!("/repos/{repo}/pulls/{}", pr.number))
             .await
         {
             Ok(p) => Some(p.head.sha),
@@ -685,6 +835,14 @@ enum Outcome {
     Uncancellable,
 }
 
+/// Pull requests read per branch during one pass of one repository.
+#[derive(Default)]
+struct BranchPulls {
+    by_branch: BTreeMap<String, std::sync::Arc<[PullByHead]>>,
+    /// The pulls API refused or failed once this pass: read no more.
+    unreadable: bool,
+}
+
 fn now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
@@ -720,23 +878,23 @@ fn superseded_pushes<'a>(runs: &'a [Run], branches: &[String]) -> Vec<(&'a Run, 
 }
 
 pub(crate) async fn status_error(
+    rate_limit: &RateLimit,
     method: &'static str,
     path: &str,
     status: u16,
     resp: reqwest::Response,
 ) -> GithubError {
-    GithubError::Status {
-        method,
-        path: path.to_owned(),
-        status,
-        body: resp
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(200)
-            .collect(),
-    }
+    // GitHub pretty-prints JSON errors over several lines; the journal shows
+    // one line per record, so collapse the body to keep the message readable
+    // in `journalctl | grep`.
+    let body = resp
+        .text()
+        .await
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    rate_limit.error(method, path, status, &body)
 }
 
 #[cfg(test)]

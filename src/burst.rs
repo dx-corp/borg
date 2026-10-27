@@ -36,9 +36,14 @@
 //! the queen deletes its record. Drones created by hand are counted toward
 //! `max_drones` but are never drained, deleted or billed here.
 //!
-//! This build only simulates: `BurstSettings::validate` rejects
-//! `dry_run = false`, and the queen keeps the simulated fleet in memory, so a
-//! restart forgets simulated drones and their spend.
+//! With `dry_run` (the default) the queen only logs the actions and applies
+//! them to a simulated fleet kept in memory. Live (`dry_run = false`, which
+//! needs the `gce` credentials and bootstrap inputs), the queen enrolls the
+//! drone, creates the VM through [`crate::gce`], drains by quarantining,
+//! scrubs the bootstrap secrets from instance metadata once the drone
+//! heartbeats, deletes the VM and its record, and persists the VM list in the
+//! store so spend survives a restart. A zone whose create failed is skipped
+//! for `ZONE_COOLDOWN_SECS` while another zone is available.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -54,6 +59,8 @@ const HOUR: f64 = 3600.0;
 const RECENT_DECISIONS: usize = 20;
 /// A simulated drone counts as enrolled this long after its simulated creation.
 pub(super) const SIMULATED_PROVISION_SECS: i64 = 720;
+/// After a failed create, prefer other zones for this long.
+pub(crate) const ZONE_COOLDOWN_SECS: i64 = 900;
 
 fn yes() -> bool {
     true
@@ -96,6 +103,19 @@ fn default_image_family() -> String {
 }
 fn default_image_project() -> String {
     "ubuntu-os-cloud".to_owned()
+}
+fn default_api_base() -> String {
+    "https://compute.googleapis.com/compute/v1".to_owned()
+}
+fn default_tailscale_tag() -> String {
+    "tag:borg-drone".to_owned()
+}
+/// Owner caps a burst drone lends, sized for c2d-highcpu-56 (56 vCPU, 112 GiB).
+fn default_drone_max_vcpu() -> u32 {
+    52
+}
+fn default_drone_max_mem_mib() -> u64 {
+    104_448
 }
 
 /// The `burst` block of the queen config. Off unless `enabled`; dry-run unless
@@ -186,42 +206,59 @@ pub struct ScaleDownSettings {
     provision_grace_secs: i64,
 }
 
-/// Configuration for simulated VM placement and lifetime.
-/// Provisioning-only inputs remain accepted for configuration compatibility;
-/// this dry-run-only build neither provisions VMs nor reads credential files.
+/// Where and how burst VMs are made. The placement and lifetime fields apply
+/// to the simulation too; the credential and bootstrap fields are required
+/// only when `dry_run` is false.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GceSettings {
-    project: String,
-    network: String,
-    subnet: String,
-    zones: Vec<String>,
-    machine_type: String,
+    pub project: String,
+    pub(crate) network: String,
+    pub(crate) subnet: String,
+    pub zones: Vec<String>,
+    pub machine_type: String,
     /// Instance names; the queen's service account is allowed only these.
     #[serde(default = "default_vm_prefix")]
     vm_prefix: String,
     #[serde(default = "default_true_spot")]
-    #[serde(rename = "spot")]
-    _spot: bool,
+    pub(crate) spot: bool,
     /// Hard lifetime; the cloud deletes the VM then.
     #[serde(default = "default_max_run")]
-    pub(super) max_run_secs: i64,
+    pub(crate) max_run_secs: i64,
     #[serde(default = "default_disk_gb")]
-    #[serde(rename = "boot_disk_gb")]
-    _boot_disk_gb: u32,
+    pub(crate) boot_disk_gb: u32,
     #[serde(default = "default_disk_type")]
-    #[serde(rename = "boot_disk_type")]
-    _boot_disk_type: String,
+    pub(crate) boot_disk_type: String,
     #[serde(default = "default_image_family")]
-    #[serde(rename = "image_family")]
-    _image_family: String,
+    pub(crate) image_family: String,
     #[serde(default = "default_image_project")]
-    #[serde(rename = "image_project")]
-    _image_project: String,
-    /// Accepted credential-path input; this build does not open the file.
+    pub(crate) image_project: String,
+    /// Service-account key file (JSON) the queen creates and deletes VMs
+    /// with. Required unless `dry_run`.
     #[serde(default)]
-    #[serde(rename = "credentials_path")]
-    _credentials_path: Option<PathBuf>,
+    pub credentials_path: Option<PathBuf>,
+    /// Compute API base; tests point it at a fake.
+    #[serde(default = "default_api_base")]
+    pub api_base: String,
+    /// The URL drones reach this queen at (over the tailnet). The bootstrap
+    /// script fetches the drone binary from it. Required unless `dry_run`.
+    #[serde(default)]
+    pub(crate) queen_url: Option<String>,
+    /// File on the queen holding a reusable, ephemeral, pre-authorized
+    /// tailnet auth key for `tailscale_tag`. Required unless `dry_run`.
+    #[serde(default)]
+    pub tailscale_authkey_path: Option<PathBuf>,
+    #[serde(default = "default_tailscale_tag")]
+    pub(crate) tailscale_tag: String,
+    /// File on the queen served to drones as their toolchain installer
+    /// (iac `install-owned-runner-toolchain.sh`). Required unless `dry_run`.
+    #[serde(default)]
+    pub toolchain_script_path: Option<PathBuf>,
+    /// Owner caps passed to `borg drone install` on the VM.
+    #[serde(default = "default_drone_max_vcpu")]
+    pub(crate) drone_max_vcpu: u32,
+    #[serde(default = "default_drone_max_mem_mib")]
+    pub(crate) drone_max_mem_mib: u64,
 }
 
 fn dns_label(s: &str) -> bool {
@@ -297,12 +334,44 @@ impl BurstSettings {
         if gce.max_run_secs <= down.retire_margin_secs + down.idle_secs {
             return bad("gce.max_run_secs must exceed retire_margin_secs plus idle_secs");
         }
+        if !gce.tailscale_tag.starts_with("tag:") {
+            return bad("gce.tailscale_tag looks like tag:name");
+        }
+        if gce.drone_max_vcpu == 0 || gce.drone_max_mem_mib == 0 {
+            return bad("gce.drone_max_vcpu and gce.drone_max_mem_mib must be positive");
+        }
         if !self.dry_run {
-            return bad(
-                "dry_run = false is not supported by this build: it only simulates burst decisions",
-            );
+            for (name, present) in [
+                ("credentials_path", gce.credentials_path.is_some()),
+                ("queen_url", gce.queen_url.is_some()),
+                (
+                    "tailscale_authkey_path",
+                    gce.tailscale_authkey_path.is_some(),
+                ),
+                ("toolchain_script_path", gce.toolchain_script_path.is_some()),
+            ] {
+                if !present {
+                    return bad(&format!("gce.{name} is required when dry_run is false"));
+                }
+            }
+            if !gce
+                .queen_url
+                .as_deref()
+                .is_some_and(|u| u.starts_with("https://") || u.starts_with("http://"))
+            {
+                return bad("gce.queen_url must be an http(s) URL");
+            }
         }
         Ok(())
+    }
+
+    /// Enabled and not dry-run: the queen creates and deletes real VMs.
+    pub fn live(&self) -> bool {
+        self.enabled && !self.dry_run
+    }
+
+    pub fn gce(&self) -> &GceSettings {
+        &self.gce
     }
 }
 
@@ -310,12 +379,14 @@ impl BurstSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BurstVm {
     /// The drone's name in the queen.
-    pub(super) drone: String,
-    vm: String,
-    zone: String,
-    pub(super) created_at: i64,
-    draining_at: Option<i64>,
-    pub(super) ended_at: Option<i64>,
+    pub(crate) drone: String,
+    pub(crate) vm: String,
+    pub(crate) zone: String,
+    pub(crate) created_at: i64,
+    pub(crate) draining_at: Option<i64>,
+    pub(crate) ended_at: Option<i64>,
+    /// When the bootstrap secrets were removed from instance metadata.
+    pub(crate) scrubbed_at: Option<i64>,
 }
 
 /// A burst-prefixed drone as the queen sees it.
@@ -345,6 +416,8 @@ pub struct BurstState {
     /// Passes by [`Plan::outcome`] since `counting_since`.
     outcomes: BTreeMap<&'static str, u64>,
     counting_since: Option<i64>,
+    /// Zones to avoid until the given time, after a failed create.
+    zone_cooldown: BTreeMap<String, i64>,
 }
 
 impl BurstState {
@@ -360,6 +433,11 @@ impl BurstState {
         self.counting_since.get_or_insert(now);
         *self.outcomes.entry(outcome).or_insert(0) += 1;
     }
+
+    /// Prefer other zones over `zone` until `until`.
+    pub(super) fn cool_zone(&mut self, zone: &str, until: i64) {
+        self.zone_cooldown.insert(zone.to_owned(), until);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -371,12 +449,44 @@ pub struct Decision {
     pub(super) detail: String,
 }
 
+impl Decision {
+    pub(super) fn new(
+        at: i64,
+        dry_run: bool,
+        action: &str,
+        drone: Option<String>,
+        detail: String,
+    ) -> Self {
+        Self {
+            at,
+            dry_run,
+            action: action.to_owned(),
+            drone,
+            detail,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    Create { zone: String },
-    Drain { drone: String, why: &'static str },
-    Undrain { drone: String },
-    Delete { drone: String, why: &'static str },
+    Create {
+        zone: String,
+    },
+    Drain {
+        drone: String,
+        why: &'static str,
+    },
+    Undrain {
+        drone: String,
+    },
+    Delete {
+        drone: String,
+        why: &'static str,
+    },
+    /// Remove the bootstrap secrets from the VM's metadata (live only).
+    Scrub {
+        drone: String,
+    },
 }
 
 impl Action {
@@ -386,6 +496,7 @@ impl Action {
             Action::Drain { .. } => "drain",
             Action::Undrain { .. } => "undrain",
             Action::Delete { .. } => "delete",
+            Action::Scrub { .. } => "scrub",
         }
     }
 }
@@ -493,13 +604,27 @@ fn weighted_unmet(cfg: &ScaleUpSettings, unmet: &[Unmet], idle: &[ClassIdle]) ->
         .fold(0u32, u32::saturating_add)
 }
 
-/// The zone with the fewest live burst VMs; ties go to the first listed.
-fn pick_zone(zones: &[String], live_vms: &[&BurstVm], planned: &[String]) -> String {
-    zones
-        .iter()
+/// The zone with the fewest live burst VMs; ties go to the first listed. A
+/// zone cooling down after a failed create is skipped while another is open.
+fn pick_zone(
+    zones: &[String],
+    live_vms: &[&BurstVm],
+    planned: &[String],
+    cooldown: &BTreeMap<String, i64>,
+    now: i64,
+) -> String {
+    let cooling = |z: &String| cooldown.get(z).is_some_and(|until| now < *until);
+    let open: Vec<&String> = zones.iter().filter(|z| !cooling(z)).collect();
+    let candidates: Vec<&String> = if open.is_empty() {
+        zones.iter().collect()
+    } else {
+        open
+    };
+    candidates
+        .into_iter()
         .min_by_key(|z| {
             live_vms.iter().filter(|v| &v.zone == *z).count()
-                + planned.iter().filter(|p| p == z).count()
+                + planned.iter().filter(|p| *p == *z).count()
         })
         .cloned()
         .unwrap_or_default()
@@ -551,6 +676,11 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
         let retiring = age >= max_run - down.retire_margin_secs;
         if !alive && age < down.provision_grace_secs && vm.draining_at.is_none() {
             provisioning += 1;
+        }
+        if !cfg.dry_run && alive && vm.scrubbed_at.is_none() {
+            actions.push(Action::Scrub {
+                drone: vm.drone.clone(),
+            });
         }
         if holds || leases > 0 || !alive || vm.draining_at.is_some() {
             st.idle_since.remove(&vm.drone);
@@ -672,7 +802,7 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
             n -= 1;
         }
         for _ in 0..n {
-            let zone = pick_zone(&cfg.gce.zones, &live_vms, &zones);
+            let zone = pick_zone(&cfg.gce.zones, &live_vms, &zones, &st.zone_cooldown, now);
             zones.push(zone);
         }
         if zones.is_empty() {
@@ -822,6 +952,30 @@ fn new_name(prefix: &str, now: i64, taken: impl Fn(&str) -> bool) -> String {
     name
 }
 
+/// The drone and VM names for a new burst VM, avoiding names `taken` holds.
+pub(super) fn new_vm_names(
+    cfg: &BurstSettings,
+    now: i64,
+    taken: impl Fn(&str) -> bool,
+) -> (String, String) {
+    let drone = new_name(&cfg.drone_prefix, now, taken);
+    let vm = drone.replacen(&cfg.drone_prefix, &cfg.gce.vm_prefix, 1);
+    (drone, vm)
+}
+
+/// A fresh record for a VM created now.
+pub(super) fn new_vm(drone: String, vm: String, zone: String, now: i64) -> BurstVm {
+    BurstVm {
+        drone,
+        vm,
+        zone,
+        created_at: now,
+        draining_at: None,
+        ended_at: None,
+        scrubbed_at: None,
+    }
+}
+
 /// Carry `actions` out on a simulated fleet (dry-run). Returns what was done,
 /// as decisions to log.
 pub(super) fn apply_simulated(
@@ -834,16 +988,8 @@ pub(super) fn apply_simulated(
     for a in actions {
         let (drone, detail) = match a {
             Action::Create { zone } => {
-                let drone = new_name(&cfg.drone_prefix, now, |n| vms.iter().any(|v| v.drone == n));
-                let vm = drone.replacen(&cfg.drone_prefix, &cfg.gce.vm_prefix, 1);
-                vms.push(BurstVm {
-                    drone: drone.clone(),
-                    vm,
-                    zone: zone.clone(),
-                    created_at: now,
-                    draining_at: None,
-                    ended_at: None,
-                });
+                let (drone, vm) = new_vm_names(cfg, now, |n| vms.iter().any(|v| v.drone == n));
+                vms.push(new_vm(drone.clone(), vm, zone.clone(), now));
                 (Some(drone), format!("zone {zone}"))
             }
             Action::Drain { drone, why } => {
@@ -858,19 +1004,17 @@ pub(super) fn apply_simulated(
                 set(vms, drone, |v| v.ended_at = Some(now));
                 (Some(drone.clone()), (*why).to_owned())
             }
+            Action::Scrub { drone } => {
+                set(vms, drone, |v| v.scrubbed_at = Some(now));
+                (Some(drone.clone()), "secrets removed".to_owned())
+            }
         };
-        out.push(Decision {
-            at: now,
-            dry_run: true,
-            action: a.kind().to_owned(),
-            drone,
-            detail,
-        });
+        out.push(Decision::new(now, true, a.kind(), drone, detail));
     }
     out
 }
 
-fn set(vms: &mut [BurstVm], drone: &str, f: impl FnOnce(&mut BurstVm)) {
+pub(super) fn set(vms: &mut [BurstVm], drone: &str, f: impl FnOnce(&mut BurstVm)) {
     if let Some(v) = vms.iter_mut().find(|v| v.drone == drone) {
         f(v);
     }
@@ -910,7 +1054,19 @@ mod tests {
             created_at,
             draining_at: None,
             ended_at: None,
+            scrubbed_at: None,
         }
+    }
+
+    /// A live configuration: dry-run off with every provisioning input.
+    fn live_cfg() -> BurstSettings {
+        let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
+        block["dry_run"] = serde_json::json!(false);
+        block["gce"]["credentials_path"] = serde_json::json!("/etc/borg/gce-sa.json");
+        block["gce"]["queen_url"] = serde_json::json!("https://queen.example.test");
+        block["gce"]["tailscale_authkey_path"] = serde_json::json!("/etc/borg/drone-ts.key");
+        block["gce"]["toolchain_script_path"] = serde_json::json!("/etc/borg/toolchain.sh");
+        serde_json::from_value(block).unwrap()
     }
 
     fn drone(name: &str, alive: bool, leases: u32) -> ObservedDrone {
@@ -964,10 +1120,6 @@ mod tests {
                 "\"zones\": [\"us-west1-b\", \"us-west1-a\"]",
                 "\"zones\": []",
             ),
-            (
-                "\"enabled\": true,",
-                "\"enabled\": true, \"dry_run\": false,",
-            ),
             ("\"pr\": 1", "\"pr\": 0, \"extra\": 1"),
             ("\"main\": 3", "\"deploy\": 3, \"main\": 3"),
         ] {
@@ -980,7 +1132,42 @@ mod tests {
     }
 
     #[test]
-    fn provisioning_inputs_remain_typed_accepted_configuration_only() {
+    fn live_mode_needs_every_provisioning_input() {
+        let live = live_cfg();
+        assert!(live.validate().is_ok() && live.live());
+        assert!(!cfg().live(), "dry-run is never live");
+        for missing in [
+            "credentials_path",
+            "queen_url",
+            "tailscale_authkey_path",
+            "toolchain_script_path",
+        ] {
+            let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
+            block["dry_run"] = serde_json::json!(false);
+            for (k, v) in [
+                ("credentials_path", "/k.json"),
+                ("queen_url", "https://q"),
+                ("tailscale_authkey_path", "/ts.key"),
+                ("toolchain_script_path", "/t.sh"),
+            ] {
+                if k != missing {
+                    block["gce"][k] = serde_json::json!(v);
+                }
+            }
+            let parsed: BurstSettings = serde_json::from_value(block).unwrap();
+            let err = parsed.validate().unwrap_err();
+            assert!(err.contains(missing), "{missing}: {err}");
+        }
+        let mut bad_url = live_cfg();
+        bad_url.gce.queen_url = Some("queen.example.test".to_owned());
+        assert!(bad_url.validate().unwrap_err().contains("queen_url"));
+        let mut bad_tag = live_cfg();
+        bad_tag.gce.tailscale_tag = "borg-drone".to_owned();
+        assert!(bad_tag.validate().unwrap_err().contains("tailscale_tag"));
+    }
+
+    #[test]
+    fn provisioning_inputs_parse_with_defaults_and_reject_unknown_keys() {
         let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
         let gce = block["gce"].as_object_mut().unwrap();
         gce.extend([
@@ -1002,34 +1189,117 @@ mod tests {
         ]);
         let parsed: BurstSettings = serde_json::from_value(block.clone()).unwrap();
         parsed.validate().unwrap();
-        assert!(!parsed.gce._spot);
-        assert_eq!(parsed.gce._boot_disk_gb, 250);
-        assert_eq!(parsed.gce._boot_disk_type, "pd-ssd");
-        assert_eq!(parsed.gce._image_family, "custom-family");
-        assert_eq!(parsed.gce._image_project, "custom-project");
+        assert!(!parsed.gce.spot);
+        assert_eq!(parsed.gce.boot_disk_gb, 250);
+        assert_eq!(parsed.gce.boot_disk_type, "pd-ssd");
+        assert_eq!(parsed.gce.image_family, "custom-family");
+        assert_eq!(parsed.gce.image_project, "custom-project");
         assert_eq!(
-            parsed.gce._credentials_path,
+            parsed.gce.credentials_path,
             Some(PathBuf::from("/nonexistent/borg/credentials.json"))
         );
 
         let defaults = cfg();
-        assert!(defaults.gce._spot);
-        assert_eq!(defaults.gce._boot_disk_gb, 1000);
-        assert_eq!(defaults.gce._boot_disk_type, "pd-balanced");
-        assert_eq!(defaults.gce._image_family, "ubuntu-2204-lts");
-        assert_eq!(defaults.gce._image_project, "ubuntu-os-cloud");
-        assert_eq!(defaults.gce._credentials_path, None);
+        assert!(defaults.gce.spot);
+        assert_eq!(defaults.gce.boot_disk_gb, 1000);
+        assert_eq!(defaults.gce.boot_disk_type, "pd-balanced");
+        assert_eq!(defaults.gce.image_family, "ubuntu-2204-lts");
+        assert_eq!(defaults.gce.image_project, "ubuntu-os-cloud");
+        assert_eq!(defaults.gce.credentials_path, None);
+        assert_eq!(defaults.gce.tailscale_tag, "tag:borg-drone");
+        assert_eq!(
+            (defaults.gce.drone_max_vcpu, defaults.gce.drone_max_mem_mib),
+            (52, 104_448)
+        );
+        assert!(
+            defaults
+                .gce
+                .api_base
+                .starts_with("https://compute.googleapis.com/")
+        );
 
         block["gce"]["unknown_provisioning_input"] = serde_json::json!(true);
         let error = serde_json::from_value::<BurstSettings>(block.clone()).unwrap_err();
         assert!(error.to_string().contains("unknown field"), "{error}");
-        block["gce"]
-            .as_object_mut()
-            .unwrap()
-            .remove("unknown_provisioning_input");
-        block["dry_run"] = serde_json::json!(false);
-        let live: BurstSettings = serde_json::from_value(block).unwrap();
-        assert!(live.validate().unwrap_err().contains("only simulates"));
+    }
+
+    #[test]
+    fn live_drones_are_scrubbed_once_after_they_enroll_and_never_in_dry_run() {
+        let live = live_cfg();
+        let vms = [vm("gcp-burst-qa", "us-west1-b", T0 - 600)];
+        let mut st = BurstState::default();
+        assert!(
+            run(
+                &live,
+                &mut st,
+                T0,
+                &[],
+                &[drone("gcp-burst-qa", false, 0)],
+                &vms
+            )
+            .actions
+            .is_empty(),
+            "not until it heartbeats"
+        );
+        let up = [drone("gcp-burst-qa", true, 0)];
+        let p = run(&live, &mut st, T0, &[], &up, &vms);
+        assert_eq!(
+            p.actions,
+            [Action::Scrub {
+                drone: "gcp-burst-qa".to_owned()
+            }]
+        );
+        let scrubbed = [BurstVm {
+            scrubbed_at: Some(T0),
+            ..vm("gcp-burst-qa", "us-west1-b", T0 - 600)
+        }];
+        assert!(
+            run(&live, &mut st, T0 + 60, &[], &up, &scrubbed)
+                .actions
+                .is_empty()
+        );
+        let mut st = BurstState::default();
+        assert!(
+            run(&cfg(), &mut st, T0, &[], &up, &vms).actions.is_empty(),
+            "simulated drones carry no secrets"
+        );
+    }
+
+    #[test]
+    fn a_zone_whose_create_failed_is_skipped_while_another_is_open() {
+        let c = cfg();
+        let heavy = [unmet(Class::Heavy, Scope::Main, 2)];
+        let mut st = BurstState::default();
+        st.cool_zone("us-west1-b", T0 + ZONE_COOLDOWN_SECS);
+        run(&c, &mut st, T0, &heavy, &[], &[]);
+        let p = run(&c, &mut st, T0 + 600, &heavy, &[], &[]);
+        assert_eq!(
+            p.actions,
+            [Action::Create {
+                zone: "us-west1-a".to_owned()
+            }]
+        );
+        // Every zone cooling down: the least loaded one is still tried.
+        st.cool_zone("us-west1-a", T0 + ZONE_COOLDOWN_SECS);
+        run(&c, &mut st, T0 + 700, &heavy, &[], &[]);
+        let p = run(&c, &mut st, T0 + 1300, &heavy, &[], &[]);
+        assert_eq!(
+            p.actions,
+            [Action::Create {
+                zone: "us-west1-b".to_owned()
+            }]
+        );
+        // Cooled off: back to the first listed zone.
+        let mut st = BurstState::default();
+        st.cool_zone("us-west1-b", T0 - 1);
+        run(&c, &mut st, T0, &heavy, &[], &[]);
+        let p = run(&c, &mut st, T0 + 600, &heavy, &[], &[]);
+        assert_eq!(
+            p.actions,
+            [Action::Create {
+                zone: "us-west1-b".to_owned()
+            }]
+        );
     }
 
     #[test]

@@ -117,6 +117,8 @@ const TOKEN_SLACK_SECS: i64 = 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GithubError {
+    #[error("GitHub API quota cooldown until {retry_at} (UTC epoch seconds)")]
+    RateLimited { retry_at: i64 },
     #[error("request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("{method} {path} returned {status}: {body}")]
@@ -132,6 +134,19 @@ pub enum GithubError {
     Key(String),
     #[error("unexpected response: {0}")]
     Decode(String),
+}
+
+impl GithubError {
+    /// A failure of this one request that the next poll may not repeat: a
+    /// GitHub 5xx, or a timeout or broken connection. Auth, permission, quota,
+    /// and decode failures are not transient; they say the whole view is off.
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::Status { status, .. } => (500..600).contains(status),
+            Self::Http(e) => e.is_timeout() || e.is_connect() || e.is_request() || e.is_body(),
+            Self::RateLimited { .. } | Self::Jwt(_) | Self::Key(_) | Self::Decode(_) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +190,11 @@ struct AuthState {
     token: Option<CachedToken>,
 }
 
+mod rate_limit;
+pub use rate_limit::{RateLimit, RateLimitView};
+
 pub struct GithubClient {
+    rate_limit: RateLimit,
     http: reqwest::Client,
     api_base: String,
     org: String,
@@ -206,6 +225,13 @@ pub enum TokenSource {
 }
 
 impl TokenSource {
+    pub fn rate_limit(&self) -> RateLimit {
+        match self {
+            Self::Static(_) => RateLimit::default(),
+            Self::App(client) => client.rate_limit(),
+        }
+    }
+
     pub async fn bearer(&self) -> Result<Secret, GithubError> {
         match self {
             TokenSource::Static(s) => Ok(s.clone()),
@@ -215,6 +241,15 @@ impl TokenSource {
 }
 
 impl GithubClient {
+    pub fn rate_limit(&self) -> RateLimit {
+        self.rate_limit.clone()
+    }
+
+    pub fn with_rate_limit(mut self, rate_limit: RateLimit) -> Self {
+        self.rate_limit = rate_limit;
+        self
+    }
+
     pub fn new(
         api_base: &str,
         org: &str,
@@ -228,6 +263,7 @@ impl GithubClient {
             .timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self {
+            rate_limit: RateLimit::default(),
             http,
             api_base: api_base.trim_end_matches('/').to_owned(),
             org: org.to_owned(),
@@ -265,16 +301,16 @@ impl GithubClient {
         path: &str,
         rb: RequestBuilder,
     ) -> Result<T, GithubError> {
-        let resp = rb.send().await?;
+        let resp = self.rate_limit.send(rb).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(GithubError::Status {
-                method: static_method(&method),
-                path: path.to_owned(),
-                status: status.as_u16(),
-                body: body.chars().take(200).collect(),
-            });
+            return Err(self.rate_limit.error(
+                static_method(&method),
+                path,
+                status.as_u16(),
+                &body,
+            ));
         }
         let bytes = resp.bytes().await?;
         serde_json::from_slice(&bytes).map_err(|e| GithubError::Decode(format!("{path}: {e}")))
@@ -410,9 +446,21 @@ impl GithubClient {
                 };
                 let mut jobs_of_run = Vec::new();
                 for page in 1..=MAX_PAGES {
-                    let jobs: Jobs = self
+                    let jobs: Jobs = match self
                         .get(&format!("/repos/{repo}/actions/runs/{run}/jobs?filter=latest&per_page=100&page={page}"))
-                        .await?;
+                        .await
+                    {
+                        Ok(jobs) => jobs,
+                        // One run's listing failing transiently must not fail
+                        // the whole poll: skip the run this time (its jobs are
+                        // read again next poll) and keep the rest of the view.
+                        Err(e) if e.is_transient() => {
+                            tracing::warn!("skipping run {repo}#{run} this poll: {e}");
+                            jobs_of_run.clear();
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     let n = jobs.jobs.len();
                     jobs_of_run.extend(jobs.jobs.into_iter().map(|mut job| {
                         // The enclosing run is authoritative even if an older API omits run_id.
@@ -518,23 +566,18 @@ impl GithubClient {
     /// Delete a runner registration. A runner that is already gone is fine.
     pub async fn delete_runner(&self, runner_id: u64) -> Result<(), GithubError> {
         let path = format!("/orgs/{}/actions/runners/{runner_id}", self.org);
-        let resp = self.authed(Method::DELETE, &path).await?.send().await?;
+        let resp = self
+            .rate_limit
+            .send(self.authed(Method::DELETE, &path).await?)
+            .await?;
         let status = resp.status();
         if status.is_success() || status.as_u16() == 404 {
             return Ok(());
         }
-        Err(GithubError::Status {
-            method: "DELETE",
-            path,
-            status: status.as_u16(),
-            body: resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect(),
-        })
+        let body = resp.text().await.unwrap_or_default();
+        Err(self
+            .rate_limit
+            .error("DELETE", &path, status.as_u16(), &body))
     }
 }
 

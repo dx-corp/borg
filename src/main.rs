@@ -11,6 +11,7 @@ use borg::drone::exec::SystemExec;
 use borg::drone::install::{self, InstallOptions, Platform};
 use borg::drone::{Drone, pins};
 use borg::enroll;
+use borg::gce::GceClient;
 use borg::github::{GithubClient, TokenSource};
 use borg::janitor::Janitor;
 use borg::mirror_auth::MirrorAuth;
@@ -435,9 +436,18 @@ fn private_key(cfg: &QueenConfig) -> Result<Vec<u8>> {
     }
 }
 
+/// What the janitor's read credential (`compare_auth`) may do: ancestry
+/// compares and pull-request lookups by branch.
+static JANITOR_READ_PERMISSIONS: std::sync::LazyLock<serde_json::Value> =
+    std::sync::LazyLock::new(|| serde_json::json!({"contents": "read", "pull_requests": "read"}));
+
 /// The janitor's token: `token_path`, else `BORG_JANITOR_TOKEN`, else the
 /// queen's own App installation token (the App then needs Actions: write).
-fn janitor_token(settings: &JanitorSettings, cfg: &QueenConfig) -> Result<TokenSource> {
+fn janitor_token(
+    settings: &JanitorSettings,
+    cfg: &QueenConfig,
+    rate_limit: borg::github::RateLimit,
+) -> Result<TokenSource> {
     let raw = match &settings.token_path {
         Some(path) => Some(
             std::fs::read_to_string(path)
@@ -453,12 +463,15 @@ fn janitor_token(settings: &JanitorSettings, cfg: &QueenConfig) -> Result<TokenS
             }
             Ok(TokenSource::Static(borg::secret::Secret::new(token)))
         }
-        None => Ok(TokenSource::App(Arc::new(GithubClient::new(
-            &cfg.github.api_base,
-            &cfg.github.org,
-            &cfg.github.app_id,
-            &private_key(cfg)?,
-        )?))),
+        None => Ok(TokenSource::App(Arc::new(
+            GithubClient::new(
+                &cfg.github.api_base,
+                &cfg.github.org,
+                &cfg.github.app_id,
+                &private_key(cfg)?,
+            )?
+            .with_rate_limit(rate_limit),
+        ))),
     }
 }
 
@@ -496,19 +509,48 @@ async fn run_queen(path: &Path) -> Result<()> {
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
     tracing::info!("queen listening on {}", cfg.listen);
-    // Config validation already refuses `burst.dry_run = false`.
+    let mut gce = None;
     if let Some(b) = cfg.burst.as_ref().filter(|b| b.enabled) {
-        tracing::info!(
-            "burst capacity enabled (dry-run: decisions are logged as burst_would_* health events; no VM is created), max {} drones, {} drone-hours/day, {} /month",
-            b.max_drones,
-            b.budget.drone_hours_per_day,
-            b.budget.drone_hours_per_month,
-        );
+        if b.live() {
+            // Validation guarantees the paths are set; they must also be
+            // readable now, so a misconfigured queen fails at start and not
+            // at the first create.
+            let g = b.gce();
+            for (name, path) in [
+                ("tailscale_authkey_path", g.tailscale_authkey_path.as_ref()),
+                ("toolchain_script_path", g.toolchain_script_path.as_ref()),
+            ] {
+                let path = path.context("burst live path missing")?;
+                std::fs::metadata(path)
+                    .with_context(|| format!("burst.gce.{name}: {}", path.display()))?;
+            }
+            let key = g.credentials_path.as_ref().context("credentials_path")?;
+            let client = GceClient::from_key_file(key, &g.project, &g.api_base)
+                .with_context(|| format!("burst.gce.credentials_path: {}", key.display()))?;
+            tracing::info!(
+                "burst capacity LIVE: creating up to {} {} spot VMs in {} ({}), {} drone-hours/day, {} /month",
+                b.max_drones,
+                g.machine_type,
+                g.project,
+                g.zones.join(","),
+                b.budget.drone_hours_per_day,
+                b.budget.drone_hours_per_month,
+            );
+            gce = Some(client);
+        } else {
+            tracing::info!(
+                "burst capacity enabled (dry-run: decisions are logged as burst_would_* health events; no VM is created), max {} drones, {} drone-hours/day, {} /month",
+                b.max_drones,
+                b.budget.drone_hours_per_day,
+                b.budget.drone_hours_per_month,
+            );
+        }
     }
     let mut requeuer = None;
     let janitor = match &cfg.supersede_janitor {
         Some(settings) => {
-            let token = janitor_token(settings, &cfg)?;
+            let token = janitor_token(settings, &cfg, github.rate_limit())?;
+            let rate_limit = token.rate_limit();
             let mode = if settings.dry_run {
                 "dry-run"
             } else {
@@ -520,14 +562,14 @@ async fn run_queen(path: &Path) -> Result<()> {
             };
             tracing::info!("supersede janitor enabled ({mode}, {credential_kind} credential)");
             if cfg.preemption.is_some() {
-                requeuer = Some(Requeuer::with_token_source(
-                    &cfg.github.api_base,
-                    token.clone(),
-                    settings,
-                )?);
+                requeuer = Some(
+                    Requeuer::with_token_source(&cfg.github.api_base, token.clone(), settings)?
+                        .with_rate_limit(rate_limit.clone()),
+                );
             }
             let janitor =
-                Janitor::with_token_source(&cfg.github.api_base, token, settings.clone())?;
+                Janitor::with_token_source(&cfg.github.api_base, token, settings.clone())?
+                    .with_rate_limit(rate_limit);
             Some(match &settings.compare_auth {
                 Some(c) => {
                     let pem = c.private_key(std::env::var("BORG_MIRROR_APP_PRIVATE_KEY").ok())?;
@@ -538,11 +580,10 @@ async fn run_queen(path: &Path) -> Result<()> {
                         c.repositories.len(),
                         c.app_id
                     );
-                    janitor.with_compare_auth(MirrorAuth::new(
-                        client,
-                        &cfg.github.org,
-                        &c.repositories,
-                    ))
+                    janitor.with_compare_auth(
+                        MirrorAuth::new(client, &cfg.github.org, &c.repositories)
+                            .with_permissions(JANITOR_READ_PERMISSIONS.clone()),
+                    )
                 }
                 None => janitor,
             })
@@ -560,6 +601,9 @@ async fn run_queen(path: &Path) -> Result<()> {
         }
     });
     let mut queen = Queen::new(cfg, store, github);
+    if let Some(client) = gce {
+        queen = queen.with_gce(client);
+    }
     if let Some(t) = tailnet {
         queen = queen.with_tailnet_enroll(t);
     }

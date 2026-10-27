@@ -378,6 +378,201 @@ async fn totals_reach_status_and_metrics() {
 const PROMOTE: &str = ".github/workflows/promote-runtime-images.yml";
 const EVENT: &str = "platform_runtime_images_published";
 
+fn branch_run(
+    id: u64,
+    status: &str,
+    path: &str,
+    branch: &str,
+    sha: &str,
+    created: &str,
+) -> serde_json::Value {
+    json!({"id": id, "status": status, "event": "pull_request", "head_sha": sha,
+        "head_branch": branch, "path": path, "name": path,
+        "head_repository": {"full_name": "example-org/app"}, "pull_requests": [],
+        "created_at": created})
+}
+
+fn pull(number: u64, state: &str, sha: &str, closed_at: Option<&str>) -> serde_json::Value {
+    json!({"number": number, "state": state, "head": {"sha": sha}, "closed_at": closed_at})
+}
+
+#[tokio::test]
+async fn runs_of_closed_or_moved_pull_requests_are_cancelled_for_any_workflow() {
+    // No closed_pr_workflows: the verdict comes from the branch's pull requests.
+    let h = Harness::start(with(json!({"cancel_running": true}))).await;
+    {
+        let mut st = h.state();
+        // Merged after the review run was created: the run is waste.
+        st.pr_runs.push(branch_run(
+            1,
+            "queued",
+            "review.yml",
+            "feat/a",
+            "a1",
+            "2026-10-23T10:00:00Z",
+        ));
+        st.pulls_by_head.insert(
+            "feat/a".into(),
+            vec![pull(10, "closed", "a1", Some("2026-10-23T10:00:05Z"))],
+        );
+        // The `closed` event's own handler: created after the close, kept.
+        st.pr_runs.push(branch_run(
+            2,
+            "queued",
+            "teardown.yml",
+            "feat/a",
+            "a1",
+            "2026-10-23T10:00:06Z",
+        ));
+        // Same second as the close: ambiguous, kept.
+        st.pr_runs.push(branch_run(
+            3,
+            "queued",
+            "review.yml",
+            "feat/a",
+            "a1",
+            "2026-10-23T10:00:05Z",
+        ));
+        // Open at another head: superseded, even though GitHub listed no pull request.
+        st.pr_runs.push(branch_run(
+            4,
+            "in_progress",
+            "review.yml",
+            "feat/b",
+            "b1",
+            "2026-10-23T10:00:00Z",
+        ));
+        st.pulls_by_head
+            .insert("feat/b".into(), vec![pull(11, "open", "b2", None)]);
+        // Reopened: an open pull request at this head keeps the run.
+        st.pr_runs.push(branch_run(
+            5,
+            "queued",
+            "review.yml",
+            "feat/c",
+            "c1",
+            "2026-10-23T10:00:00Z",
+        ));
+        st.pulls_by_head.insert(
+            "feat/c".into(),
+            vec![
+                pull(12, "open", "c1", None),
+                pull(9, "closed", "c0", Some("2026-10-22T10:00:00Z")),
+            ],
+        );
+        // No pull request on the branch at all, and a run without a creation time: kept.
+        st.pr_runs.push(branch_run(
+            6,
+            "queued",
+            "review.yml",
+            "feat/d",
+            "d1",
+            "2026-10-23T10:00:00Z",
+        ));
+        st.pr_runs
+            .push(branch_run(7, "queued", "review.yml", "feat/a", "a1", ""));
+        // A fork's run is never looked up.
+        let mut fork = branch_run(
+            8,
+            "queued",
+            "review.yml",
+            "feat/a",
+            "a1",
+            "2026-10-23T10:00:00Z",
+        );
+        fork["head_repository"] = json!({"full_name": "fork/app"});
+        st.pr_runs.push(fork);
+    }
+    let r = h.janitor_pass().await;
+    assert_eq!(
+        (
+            r.considered,
+            r.closed_pr,
+            r.superseded,
+            r.cancelled,
+            r.cancelled_running,
+            r.errors
+        ),
+        (7, 1, 1, 1, 1, 0),
+        "{r:?}"
+    );
+    let mut cancelled = h.state().cancelled.clone();
+    cancelled.sort_unstable();
+    assert_eq!(cancelled, [1, 4]);
+}
+
+#[tokio::test]
+async fn a_refused_pull_request_read_is_one_error_and_keeps_every_run() {
+    let h = Harness::start(with(json!({}))).await;
+    h.require_mirror_for_pulls();
+    {
+        let mut st = h.state();
+        for id in 1..=3 {
+            st.pr_runs.push(branch_run(
+                id,
+                "queued",
+                "review.yml",
+                &format!("feat/{id}"),
+                "a1",
+                "2026-10-23T10:00:00Z",
+            ));
+            st.pulls_by_head.insert(
+                format!("feat/{id}"),
+                vec![pull(id, "closed", "a1", Some("2026-10-23T10:00:05Z"))],
+            );
+        }
+    }
+    let r = h.janitor_pass().await;
+    assert_eq!((r.considered, r.cancelled, r.errors), (0, 0, 1), "{r:?}");
+    assert!(h.state().cancelled.is_empty());
+
+    // With compare_auth the same reads go through with the mirror token.
+    let mut cfg = with(json!({}));
+    cfg["supersede_janitor"]["compare_auth"] = json!({"app_id": "12345", "repositories": ["app"]});
+    let h = Harness::start(cfg).await;
+    h.require_mirror_for_pulls();
+    {
+        let mut st = h.state();
+        for id in 1..=3 {
+            st.pr_runs.push(branch_run(
+                id,
+                "queued",
+                "review.yml",
+                &format!("feat/{id}"),
+                "a1",
+                "2026-10-23T10:00:00Z",
+            ));
+            st.pulls_by_head.insert(
+                format!("feat/{id}"),
+                vec![pull(id, "closed", "a1", Some("2026-10-23T10:00:05Z"))],
+            );
+        }
+    }
+    let r = h.janitor_pass().await;
+    assert_eq!(
+        (r.considered, r.closed_pr, r.cancelled, r.errors),
+        (3, 3, 3, 0),
+        "{r:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_compare_is_one_error_per_pass() {
+    let h = Harness::start(promotions(false, json!({}))).await;
+    h.state().compare_needs_contents = true;
+    for (id, sha) in [(1, 'a'), (2, 'b'), (3, 'c')] {
+        h.add_promotion_run(promo(id, "queued", None, sha, "memory", 3600));
+        ahead(&h, sha, 'f');
+    }
+    h.add_promotion_run(promo(9, "in_progress", None, 'f', "memory", 600));
+    let r = h.janitor_pass().await;
+    assert_eq!(
+        (r.promotion_considered, r.promotion_cancelled, r.errors),
+        (3, 0, 1),
+        "{r:?}"
+    );
+}
+
 fn sha(c: char) -> String {
     c.to_string().repeat(40)
 }
@@ -610,7 +805,7 @@ async fn compares_use_the_contents_credential_when_the_janitor_token_cannot_read
     assert_eq!(st.compare_tokens, [support::MIRROR_TOKEN]);
     assert_eq!(
         st.scoped_requests[0]["permissions"],
-        json!({"contents": "read"})
+        json!({"contents": "read", "pull_requests": "read"})
     );
     assert_eq!(st.scoped_requests[0]["repositories"], json!(["mono"]));
 }

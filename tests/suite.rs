@@ -14,6 +14,8 @@ mod contract;
 mod drone;
 mod explain;
 mod explain_cli;
+mod github_quota;
+mod github_quota_cli;
 mod health;
 mod hostdiag_wire;
 mod janitor;

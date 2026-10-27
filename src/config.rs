@@ -102,12 +102,12 @@ pub struct JanitorSettings {
     /// whose runs must not be deduplicated or superseded by these generic
     /// rules, for example a deploy repository's audit or apply runs.
     #[serde(default)]
-    pub repos: Option<Vec<String>>,
+    repos: Option<Vec<String>>,
     /// Promotion workflows whose superseded and stale runs are cancelled (see
     /// [`PromotionSupersede`]). Each block names its own repository and
     /// workflow; nothing else in that repository is touched.
     #[serde(default)]
-    pub superseded_promotions: Vec<PromotionSupersede>,
+    pub(crate) superseded_promotions: Vec<PromotionSupersede>,
     /// App credential for reading source repositories' contents (the
     /// promotion rules' ancestry compare). The janitor's own token usually
     /// has `actions` only, and GitHub answers 403 to a compare without
@@ -125,42 +125,42 @@ pub struct JanitorSettings {
 #[serde(deny_unknown_fields)]
 pub struct PromotionSupersede {
     /// Repository holding the workflow, `owner/name`.
-    pub repo: String,
+    pub(crate) repo: String,
     /// Log what this block would cancel without cancelling. Defaults to true
     /// even when the janitor itself is live; the janitor's own `dry_run` also
     /// applies.
     #[serde(default = "yes")]
-    pub dry_run: bool,
+    pub(crate) dry_run: bool,
     /// Workflow file path, for example `.github/workflows/promote-runtime-images.yml`.
-    pub workflow: String,
+    pub(crate) workflow: String,
     /// Source repository per `source-event`, used to prove that a newer run's
     /// sha is the same as or ahead of an older run's. An event with no entry
     /// is never cancelled.
     #[serde(default)]
-    pub source_repos: BTreeMap<String, String>,
+    pub(crate) source_repos: BTreeMap<String, String>,
     /// A run older than this is cancelled once a newer run covering its
     /// services has succeeded, unless a mutation job of it is running.
     #[serde(default = "default_promotion_stale_hours")]
-    pub stale_after_hours: u64,
+    pub(crate) stale_after_hours: u64,
     /// A run cancelled by the janitor that is still not finished this long
     /// afterwards is force-cancelled.
     #[serde(default = "default_promotion_force_mins")]
-    pub force_cancel_after_mins: u64,
+    pub(crate) force_cancel_after_mins: u64,
     /// A queued run with no job records this old is cancelled whatever its
     /// name says.
     #[serde(default = "default_promotion_ghost_hours")]
-    pub ghost_after_hours: u64,
+    pub(crate) ghost_after_hours: u64,
     /// Seconds between sweeps of this workflow (each costs a few API reads per
     /// queued run).
     #[serde(default = "default_promotion_sweep_secs")]
-    pub sweep_secs: u64,
+    pub(crate) sweep_secs: u64,
     /// The job that mutates production. A pending run whose apply job ran is
     /// only cancelled by the stale rule.
     #[serde(default = "default_promotion_apply_job")]
-    pub apply_job: String,
+    pub(crate) apply_job: String,
     /// Jobs a run is never cancelled during.
     #[serde(default = "default_promotion_mutation_jobs")]
-    pub mutation_jobs: Vec<String>,
+    pub(crate) mutation_jobs: Vec<String>,
 }
 
 fn default_promotion_stale_hours() -> u64 {
@@ -187,7 +187,7 @@ fn default_promotion_mutation_jobs() -> Vec<String> {
 
 impl JanitorSettings {
     /// The repositories one pass covers, given the queen's own list.
-    pub fn pass_repos<'a>(&'a self, queen_repos: &'a [String]) -> &'a [String] {
+    pub(crate) fn pass_repos<'a>(&'a self, queen_repos: &'a [String]) -> &'a [String] {
         self.repos.as_deref().unwrap_or(queen_repos)
     }
 }
@@ -335,6 +335,62 @@ impl AdmissionSettings {
     }
 }
 
+/// Pull-request fairness; present means on. Main demand is served before
+/// pull-request demand, so a main queue that never empties starves pull
+/// requests forever. With this block, once main has taken
+/// `main_grants_between` grants of a class in a row, the next grant of that
+/// class goes to pull-request demand that has waited `after_secs`; main
+/// keeps every other grant. See [`crate::allocator::PrTurn`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrFairnessSettings {
+    /// Pull-request demand that has waited this long is starving.
+    pub(crate) after_secs: u64,
+    /// Consecutive main grants of a class before its starving pull-request
+    /// demand gets one. 0 gives pull requests one grant every pass.
+    #[serde(default = "default_main_grants_between")]
+    pub(crate) main_grants_between: u32,
+}
+
+fn default_main_grants_between() -> u32 {
+    2
+}
+
+fn default_pr_fairness() -> Option<PrFairnessSettings> {
+    Some(PrFairnessSettings {
+        after_secs: 900,
+        main_grants_between: default_main_grants_between(),
+    })
+}
+
+/// `false`/`null` turns a settings block off; `true` is an error.
+fn settings_or_off<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SettingsOrOff<T> {
+        Settings(T),
+        Off(bool),
+    }
+    match Option::<SettingsOrOff<T>>::deserialize(d)? {
+        None | Some(SettingsOrOff::Off(false)) => Ok(None),
+        Some(SettingsOrOff::Settings(s)) => Ok(Some(s)),
+        Some(SettingsOrOff::Off(true)) => Err(serde::de::Error::custom(
+            "expected a settings block, or false to disable",
+        )),
+    }
+}
+
+impl PrFairnessSettings {
+    fn validate(&self) -> Result<(), String> {
+        if self.after_secs == 0 {
+            return Err("pr_fairness.after_secs must be positive".to_owned());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueenConfig {
@@ -369,6 +425,10 @@ pub struct QueenConfig {
     /// `null`) disables it; TOML has no null.
     #[serde(default = "default_starvation", deserialize_with = "secs_or_off")]
     pub starvation_after_secs: Option<u64>,
+    /// Pull-request turns while main demand never runs dry; on by default
+    /// (900 s, 2 main grants between). `false` (or JSON `null`) disables it.
+    #[serde(default = "default_pr_fairness", deserialize_with = "settings_or_off")]
+    pub(crate) pr_fairness: Option<PrFairnessSettings>,
     #[serde(default)]
     pub classes: Classes,
     #[serde(default = "default_warm_floors")]
@@ -428,8 +488,9 @@ pub struct QueenConfig {
     /// [`crate::mirror_auth`].
     #[serde(default)]
     pub mirror_auth: Option<MirrorAuthSettings>,
-    /// Absent disables burst capacity; see [`crate::burst`]. This build only
-    /// simulates it (`dry_run` must stay true).
+    /// Absent disables burst capacity; see [`crate::burst`]. Dry-run by
+    /// default; `dry_run: false` needs the `gce` credential and bootstrap
+    /// inputs and makes the queen create and delete real VMs.
     #[serde(default)]
     pub burst: Option<crate::burst::BurstSettings>,
 }
@@ -600,6 +661,9 @@ impl QueenConfig {
         self.health.validate().map_err(ConfigError::Invalid)?;
         if let Some(a) = &self.admission {
             a.validate().map_err(ConfigError::Invalid)?;
+        }
+        if let Some(f) = &self.pr_fairness {
+            f.validate().map_err(ConfigError::Invalid)?;
         }
         if let Some(st) = &self.standby {
             st.validate().map_err(ConfigError::Invalid)?;
@@ -868,6 +932,34 @@ mod tests {
     }
 
     #[test]
+    fn pr_fairness_is_on_by_default_and_turns_off() {
+        let f = QueenConfig::from_json(MIN).unwrap().pr_fairness.unwrap();
+        assert_eq!((f.after_secs, f.main_grants_between), (900, 2));
+        let with = |a: &str| {
+            QueenConfig::from_json(
+                &MIN.replace("\"repos\"", &format!("\"pr_fairness\":{a},\"repos\"")),
+            )
+        };
+        assert!(with("false").unwrap().pr_fairness.is_none());
+        assert!(with("null").unwrap().pr_fairness.is_none());
+        let f = with(r#"{"after_secs":600}"#).unwrap().pr_fairness.unwrap();
+        assert_eq!((f.after_secs, f.main_grants_between), (600, 2));
+        let f = with(r#"{"after_secs":600,"main_grants_between":0}"#)
+            .unwrap()
+            .pr_fairness
+            .unwrap();
+        assert_eq!(f.main_grants_between, 0);
+        for bad in [
+            "true",
+            r#"{"after_secs":0}"#,
+            r#"{"main_grants_between":1}"#,
+            r#"{"after_secs":600,"nope":1}"#,
+        ] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn zero_telemetry_retention_is_rejected() {
         let json = MIN.replace("\"repos\"", "\"telemetry_retention_days\":0,\"repos\"");
         assert!(QueenConfig::from_json(&json).is_err());
@@ -941,7 +1033,7 @@ mod tests {
             r.err().map(|e| e.to_string()).unwrap_or_default()
         };
         assert!(err(with("", "")).contains("drone_expiry.burst_prefixes"));
-        assert!(err(with(expiry, r#""dry_run":false,"#)).contains("only simulates"));
+        assert!(err(with(expiry, r#""dry_run":false,"#)).contains("credentials_path"));
     }
 
     #[test]

@@ -101,6 +101,38 @@ async fn other_rerun_errors_are_retried_next_pass() {
 }
 
 #[tokio::test]
+async fn quota_refusal_keeps_preempted_job_eligible_without_repeated_requests() {
+    let h = harness(false, 20).await;
+    h.add_run(7, "completed", "pull_request", "sha", None);
+    h.preempted("l1", 7, 70, now()).await;
+    let path = format!("/repos/{}/app/actions/jobs/70/rerun", support::ORG);
+    h.state().http_replies.insert(
+        path.clone(),
+        (
+            403,
+            vec![
+                ("x-ratelimit-remaining".into(), "0".into()),
+                ("x-ratelimit-reset".into(), (now() + 3600).to_string()),
+            ],
+            "{\"message\":\"API rate limit exceeded\"}".into(),
+        ),
+    );
+
+    let report = h.requeue_pass().await;
+    assert_eq!((report.errors, report.terminal, report.rerun), (1, 0, 0));
+    assert!(requeued_at(&h, "l1").await.is_none());
+    let requests = h.state().http_requests.clone();
+    tokio::time::timeout(std::time::Duration::from_millis(200), h.requeue_pass())
+        .await
+        .expect("quota cooldown must return promptly");
+    assert_eq!(
+        h.state().http_requests,
+        requests,
+        "cooldown must suppress all HTTP requests"
+    );
+}
+
+#[tokio::test]
 async fn dry_run_makes_no_calls_and_marks_nothing() {
     let h = harness(true, 20).await;
     h.add_run(7, "completed", "pull_request", "sha", None);

@@ -391,6 +391,57 @@ async fn github_failure_before_minting_aborts_the_tick() {
     assert!(h.state().mints.is_empty());
 }
 
+fn job_in_run(run: u64, id: u64, label: &str) -> Value {
+    let created = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    json!({"id": id, "run_id": run, "status": "queued", "labels": [label], "created_at": created})
+}
+
+#[tokio::test]
+async fn a_5xx_on_one_runs_jobs_skips_that_run_and_the_tick_goes_on() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    {
+        let mut st = h.state();
+        st.jobs_by_run = true;
+        st.queued_runs = vec![1, 2];
+        st.jobs = vec![
+            job_in_run(1, 11, "borg-ci-light"),
+            job_in_run(2, 21, "borg-ci-light"),
+        ];
+        st.jobs_fail_runs.insert(2, 502);
+    }
+    h.queen.tick(OffsetDateTime::now_utc()).await.unwrap();
+    let s = h.status().await;
+    assert!(s["last_error"].is_null(), "{}", s["last_error"]);
+    // Run 1's job is still seen and placed; run 2 is read again next poll.
+    assert_eq!(h.state().mints.len(), 1, "{}", s["queue"]);
+    h.state().jobs_fail_runs.clear();
+    h.tick().await;
+    assert_eq!(h.state().mints.len(), 2);
+}
+
+#[tokio::test]
+async fn an_auth_failure_on_one_runs_jobs_still_aborts_the_tick() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    {
+        let mut st = h.state();
+        st.jobs_by_run = true;
+        st.queued_runs = vec![1, 2];
+        st.jobs = vec![
+            job_in_run(1, 11, "borg-ci-light"),
+            job_in_run(2, 21, "borg-ci-light"),
+        ];
+        st.jobs_fail_runs.insert(2, 401);
+    }
+    assert!(h.queen.tick(OffsetDateTime::now_utc()).await.is_err());
+    assert!(h.state().mints.is_empty());
+}
+
 #[tokio::test]
 async fn warm_schedule_raises_the_floor_only_inside_its_window() {
     use time::macros::datetime;
@@ -945,6 +996,55 @@ async fn admission_falls_back_to_load_without_psi_and_light_only_sheds_main_heav
         .collect();
     assert_eq!(minted.len(), 1, "{minted:?}");
     assert!(minted[0].contains("borg-ci-light"), "{minted:?}");
+}
+
+#[tokio::test]
+async fn admission_reads_the_window_mean_so_one_burst_does_not_close_a_drone() {
+    let h = Harness::start(json!({"admission": {
+        "psi_soft_pm": 300, "psi_light_only_pm": 500, "psi_hard_pm": 600, "facts_max_age_secs": 300}}))
+    .await;
+    let token = h.enroll("d1").await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    // Three quiet heartbeats, then one burst at 700: the window mean is 213.
+    for (i, pm) in [50, 60, 40, 700].into_iter().enumerate() {
+        let at = now - 170 + i64::try_from(i).unwrap() * 10;
+        h.heartbeat_with(
+            &token,
+            json!({"env_facts": {"observed_at": at, "cpu_psi_some_avg10_pm": pm}}),
+        )
+        .await;
+    }
+    h.queue_job(1, "borg-ci-heavy", 5);
+    h.tick().await;
+    let a = h.status().await["drones"][0]["admission"].clone();
+    assert_eq!(a["state"], "open", "{a}");
+    assert_eq!(a["cpu_psi_pm"], 213, "{a}");
+    assert_eq!(h.state().mints.len(), 1, "the heavy job is placed");
+    assert!(
+        h.metrics()
+            .await
+            .contains("borg_drone_cpu_psi_pm{drone=\"d1\"} 213")
+    );
+
+    // Sustained pressure closes it; a repeated reading counts once.
+    for i in 0..6 {
+        h.heartbeat_with(
+            &token,
+            json!({"env_facts": {"observed_at": now - 50 + i * 10, "cpu_psi_some_avg10_pm": 1000}}),
+        )
+        .await;
+    }
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": {"observed_at": now, "cpu_psi_some_avg10_pm": 1000}}),
+    )
+    .await;
+    h.queue_job(2, "borg-ci-heavy", 5);
+    h.tick().await;
+    let a = h.status().await["drones"][0]["admission"].clone();
+    assert_eq!(a["state"], "closed", "{a}");
+    assert_eq!(a["cpu_psi_pm"], 685, "{a}");
+    assert_eq!(h.state().mints.len(), 1, "no new grant on a closed drone");
 }
 
 #[tokio::test]

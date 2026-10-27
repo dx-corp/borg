@@ -25,6 +25,7 @@ Configuration, scheduling, drone administration, and protocol details for
   - [Cloud burst drones](#cloud-burst-drones)
   - [Deploy-trust drone](#deploy-trust-drone)
   - [Starvation guard](#starvation-guard)
+  - [Pull-request turns](#pull-request-turns)
   - [Preemption](#preemption)
   - [Admission by CPU pressure](#admission-by-cpu-pressure)
   - [Standby runners and deploy fail-open](#standby-runners-and-deploy-fail-open)
@@ -657,8 +658,15 @@ accepting drones could hold if empty) and `free_slots` next to `unmet_main`,
 `unmet_pr` and `unmet_deploy`. The unmet counts are the last pass's
 `unmet_placeable`. When main demand of a class in `capacity_alarm.classes`
 stays unmet for `capacity_alarm.after_secs` while that class has at most
-`capacity_alarm.max_slots` schedulable slots, the queen logs a
+`capacity_alarm.max_slots` *free admitting* slots, the queen logs a
 `capacity_starved` event (drone `fleet`; the reason names the stale drones).
+A free admitting slot is room left after placement on a drone that admits
+every scope of the class (not shedding under CPU pressure, class not blocked
+by its environment); `schedulable_slots` is the nominal total and does not
+gate the alarm. The starvation clock starts at the oldest queued main job of
+the class, so a queen restart does not reset it. The same effective idle
+count feeds `pressure` and the burst rule's `scale_up.max_free_slots`, so a
+drone shedding work under pressure never masks unmet demand.
 When the condition clears, it logs `capacity_restored`. `capacity.<class>.alarm`
 and the metric `borg_capacity_starved{class}` show whether the alarm is
 raised, and `borg_unmet_jobs{class,scope}` exports the unmet counts. The
@@ -717,18 +725,32 @@ what would have been cancelled.
 The pull request's current head comes from the run's own `pull_requests`
 entry, which GitHub fills at read time with the open pull requests whose head
 branch matches. The janitor reads the pulls API only when that entry carries no
-head, so the App does not need pull-request read access.
+head, or is empty (below).
 
-Two more lists, both empty by default, cover the runs a closed pull request or
-a newer push leaves behind:
+A `pull_request` run whose head repository is the repository itself and which
+names no open pull request belongs to a pull request that was closed or merged
+(mono merges most pull requests within seconds of opening, so every review run
+of such a pull request queues forever), or to one that moved to another head.
+The janitor reads the branch's pull requests (`GET /pulls?head=owner:branch`,
+once per branch per pass, with `compare_auth` when configured) and cancels the
+run when the branch's pull request is open at another head (`superseded`), or
+when its newest pull request closed *after* the run was created (`closed_pr`).
+A run created at or after the close is the `closed` event's own handler
+(teardown, cleanup) and is kept, so no workflow list is needed. A refused or
+failed read (the janitor's own token lacks `pull_requests: read`: the runner
+App has `actions` only) is logged with the remedy, counted once per pass in
+`errors`, and keeps every run of the repository that pass. A fresh read must
+still show no pull request before the cancel.
+
+Two more lists, both empty by default, cover runs the branch lookup cannot
+reach:
 
 * `closed_pr_workflows`: workflow file paths (`.github/workflows/ci.yml`) or
   names. A queued `pull_request` run of one of them (a running one too with
-  `cancel_running`) whose head repository is the repository itself and which
-  names no open pull request belongs to a pull request that was closed or
-  merged, and is cancelled. A fresh read must still show no pull request. Do
-  not list a workflow that runs on the `closed` event (teardown, cleanup): its
-  runs look the same.
+  `cancel_running`) that names no open pull request is cancelled without
+  reading the pulls API. Keep it for the workflows that matter most when the
+  read credential is missing; do not list a workflow that runs on the `closed`
+  event (teardown, cleanup): its runs look the same.
 * `superseded_push_branches`: branch names, for example `["main"]`. A queued
   `push` run on one of them is cancelled when a newer queued or running run of
   the same workflow on the same branch is on another commit. Running push runs
@@ -759,9 +781,13 @@ dry_run = true
 The ancestry compare needs `contents: read` on each source repository. If the
 janitor's token lacks it (the runner App has `actions` only; GitHub answers
 403 and every run stays unproven), set `supersede_janitor.compare_auth` to an
-App that can read contents, in the same shape as `mirror_auth`:
-`{"app_id": "...", "private_key_path": "...", "repositories": ["mono"]}`.
-Compare tokens are down-scoped to `contents: read` on those repositories.
+App that can read contents and pull requests, in the same shape as
+`mirror_auth`: `{"app_id": "...", "private_key_path": "...", "repositories":
+["mono"]}`. Its tokens are down-scoped to `contents: read` and `pull_requests:
+read` on those repositories, and the same credential serves the pull-request
+lookups above, so list every repository the janitor passes over as well as
+every source repository. A refused compare is counted once per pass; the
+remaining runs of that pass are kept unproven without further reads.
 
 Every `sweep_secs` (default 300) the janitor lists the workflow's unfinished
 runs and its successful ones, and cancels:
@@ -923,10 +949,10 @@ Dollar limits use `burst.hourly_cost_usd`, an **operator estimate**
 that must be conservative enough to include the expected Spot compute,
 boot disk, public IP and traffic overhead. Unlike cloud billing budgets,
 the estimated ceiling **cannot guarantee a maximum invoice**: real prices
-vary, network egress is workload-dependent and the simulator forgets its
-created VMs on queen restart. Live cloud provisioning remains unsupported
-in this build; implement persisted accounting and provider-side spend
-controls before enabling it.
+vary and network egress is workload-dependent. Live mode persists the VM
+records in the queen's store (`burst_vms`), so the drone-hour and dollar
+accounting survives a queen restart; a cloud billing budget on the project
+is still the backstop.
 
 If only one dollar limit is configured, or a value is nonfinite, zero,
 negative, or the daily limit exceeds the monthly limit, config
@@ -935,11 +961,11 @@ behavior is preserved. The status `burst.budget` object and
 `borg_burst_budget_estimated_usd{window="day|month"}` metric expose
 these configured dollar estimates without credentials.
 
-#### Burst rule (`burst`, dry-run)
+#### Burst rule (`burst`)
 
-The `burst` block decides when the queen would add or remove burst drones.
-This build only simulates it: config validation rejects `dry_run: false`, and
-no VM is created or deleted. Each pass it:
+The `burst` block decides when the queen adds or removes burst drones. With
+`dry_run` (the default) it only logs and simulates; with `dry_run: false` it
+creates and deletes VMs (see "Live burst drones" below). Each pass it:
 
 - weighs the unmet jobs borg must place in `scale_up.classes` (`main` and `pr`
   weights; deploy jobs never count, because burst drones have shared trust),
@@ -967,6 +993,77 @@ VMs. Metrics: `borg_burst_dry_run`, `borg_burst_drones{kind}`,
 Simulated drones enroll 12 minutes after creation and never take a job, so
 while demand lasts, dry-run spend is the most the rule would allow, not what
 real drones would cost. The simulation is in memory: a queen restart forgets it.
+
+#### Live burst drones (`dry_run: false`)
+
+Live, every action is carried out and logged as `burst_create`,
+`burst_drain`, `burst_undrain`, `burst_scrub` and `burst_delete` (or
+`<action>_failed` with the error; a failed action is retried next pass, and a
+zone whose create failed is avoided for 15 minutes while another is open).
+The queen needs, under `burst.gce`:
+
+- `credentials_path`: a service-account key file (JSON). The account needs
+  only `compute.instances.{create,get,list,delete,setMetadata,setLabels}`,
+  `compute.disks.create`, `compute.subnetworks.{use,useExternalIp}`,
+  `compute.images.useReadOnly`, `compute.zones.get` and
+  `compute.zoneOperations.get` in the project (a custom role; no
+  `iam.serviceAccounts.actAs`, since the VMs carry no account). The queen
+  signs a JWT with it and calls the Compute API directly; no `gcloud` on
+  the queen.
+- `queen_url`: where drones reach this queen over the tailnet: the
+  queen's `https://` MagicDNS name.
+- `tailscale_authkey_path`: a reusable, ephemeral, pre-authorized key for
+  `tailscale_tag` (default `tag:borg-drone`), the one Secret Manager holds
+  for hand-made drones.
+- `toolchain_script_path`: the iac `install-owned-runner-toolchain.sh`. The
+  queen serves it at `GET /bootstrap/toolchain.sh`, and its own executable at
+  `GET /bootstrap/borg`, so every burst drone runs the queen's build. Build
+  the queen on the lowest glibc the drone image has (CT 153, glibc 2.35, for
+  Ubuntu 22.04 drones).
+- `drone_max_vcpu` / `drone_max_mem_mib`: the owner caps passed to
+  `borg drone install` (defaults fit c2d-highcpu-56; raise the memory cap
+  for c2d-standard-56).
+
+Create: the queen enrolls `gcp-burst-q<minute>` itself (one-time token), then
+inserts `borg-burst-q<minute>` with the spot, 12-hour delete-on-termination,
+no-service-account shape documented above and three metadata items: the
+rendered `startup-script`, `borg-ts-authkey` and `borg-enroll-token`. The
+startup script joins the tailnet, fetches the binary and toolchain script
+from the queen, runs `borg drone install --trust shared`, and shreds both
+secrets. Once the drone heartbeats, the queen removes the two secret items
+from the instance metadata (`burst_scrub`); until then they are readable on
+the VM, which runs no job before it enrolls. The enrollment token is single
+use. A VM that never heartbeats within `provision_grace_secs` is deleted
+with its enrollment; read its serial console
+(`gcloud compute instances get-serial-port-output borg-burst-...`) for the
+`borg-burst:` lines. `borg-burst: toolchain ok (rc=1)` is the expected
+`runner` sudo self-check; `toolchain FAILED` is followed by the tail of
+`/var/log/borg-toolchain.log`.
+
+The VM record is written as soon as the insert is accepted, before the
+queen waits on the create operation. A wait that fails for any reason other
+than a failed operation keeps the record and the enrollment (`burst_create`
+with `create not confirmed`); only a failed operation (stockout, quota) is
+`burst_create_failed`, which undoes the enrollment. Every live pass also
+lists the project's VMs labeled `borg-burst=queen` (`instances.aggregatedList`,
+so `compute.instances.list`): a VM with no record is recorded, so it counts
+toward `max_drones`. If its drone is enrolled it is adopted; if not, it can
+never serve and is deleted at once (`burst_delete`, `orphan ...`), with a
+failed delete retried each pass. A failed listing is `burst_discover_failed`
+and changes nothing else.
+
+Drain quarantines the drone (`manual_quarantine`, reason `burst: idle`,
+`burst: budget spent` or `burst: near its maximum run time`); undrain
+releases it. Delete removes the VM (a 404 counts as done: spot VMs delete
+themselves) and then the drone record, so `drone_expiry` is not needed for
+managed drones.
+
+Turning it on: roll the binary and config together (the old binary rejects
+the new keys), with the four files above in place. Confirm with
+`/status` `burst.dry_run == false`, a `burst_create` health event when
+demand holds, the VM in `gcloud compute instances list`, the drone appearing
+in `/status` `drones` within about 12 minutes, then `burst_scrub`. The
+metric `borg_burst_dry_run` reads 0.
 
 ### Deploy-trust drone
 
@@ -1046,6 +1143,30 @@ that can free up soonest (fewest in-flight leases, ties by name) and grants no
 smaller lease there until the starving lease fits. Held drones are listed in
 `/status` under `reserved_for`.
 
+### Pull-request turns
+
+Main demand is placed before pull-request demand, and the starvation guard
+keeps that order. When every merge refills the main queue, a freed heavy or
+medium slot always goes to main and pull requests wait for hours (measured
+10/23: oldest heavy pull-request job 11.7 h, oldest main job 47 min, with 48
+heavy main jobs queued against 4 heavy slots). On by default:
+
+```json
+"pr_fairness": { "after_secs": 900, "main_grants_between": 2 }
+```
+
+The queen counts, per class, the main grants since the class last granted a
+pull request. Once that reaches `main_grants_between`, the next grant of the
+class goes to pull-request demand that has waited `after_secs`, before main's
+demand of that class; main takes every other grant of the pass, and deploy
+demand is unaffected (deploy drones never take pull-request work). A turn is
+one grant, is skipped on a `pr_blocked` drone, and resets the count only when a
+pull-request grant is actually made. With the defaults pull requests get at
+least one of every three grants of a class while they starve. `false` (or JSON
+`null`) turns turns off; `after_secs` must be positive;
+`main_grants_between: 0` gives pull requests a grant every pass. The count is
+in queen memory and starts at zero after a restart.
+
 ### Preemption
 
 Off unless the queen config has a `preemption` block:
@@ -1109,7 +1230,13 @@ config has an `admission` block:
 
 Each drone reports Linux PSI `cpu some avg10` in permille on every heartbeat
 (the higher of `/proc/pressure/cpu` and the cgroup file
-`/sys/fs/cgroup/cpu.pressure`). The queen compares it with three thresholds:
+`/sys/fs/cgroup/cpu.pressure`). The queen keeps the readings of the last
+`facts_max_age_secs` per drone and admits on their mean, so the state answers
+whether the host has been loaded for minutes, not whether a 10 s window caught
+a reclaim scan, a container teardown or a git fetch (10/23: with one reading
+per 300 s tick, `gha-heavy-pve50-1` changed state at nearly every tick and
+showed `light_only` at 559 permille with no lease running). The mean is the
+`cpu_psi_pm` in `/status` and the metric. It compares with three thresholds:
 
 | Pressure | State | New grants |
 | --- | --- | --- |

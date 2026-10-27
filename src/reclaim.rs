@@ -123,7 +123,7 @@ impl Default for ReclaimSettings {
 impl ReclaimSettings {
     /// The block installs wrote before reclaim was on by default: off, dry
     /// run, no roots, default thresholds.
-    pub fn is_legacy_default(&self) -> bool {
+    pub(crate) fn is_legacy_default(&self) -> bool {
         *self
             == Self {
                 enabled: false,
