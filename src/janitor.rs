@@ -11,7 +11,8 @@
 //! superseded runs that already started, and `dedupe_same_sha` cancels queued
 //! duplicates of a run of the same workflow, commit, event and pull request.
 //! Duplicate groups never include `workflow_dispatch` or `merge_group` runs,
-//! and a running duplicate is never cancelled. The
+//! and a running duplicate is never cancelled, even when its workflow still
+//! reads `queued`. An unreadable jobs response also preserves the run. The
 //! janitor is opt-in (`supersede_janitor` in the queen config). Cancelling
 //! runs needs `actions: write`: the janitor uses the queen's App installation
 //! token (minted and refreshed on demand) unless the config names a static
@@ -97,8 +98,8 @@ pub struct PassReport {
     /// Superseded push runs left alone because one of their jobs is running.
     /// GitHub shows a run as `queued` while any job waits for a runner.
     pub started_push: u32,
-    /// Runs that changed state between the listing and the cancel and were
-    /// left alone.
+    /// Runs left alone when a fresh status, head or active child job
+    /// contradicted the listing used to select them.
     pub raced: u32,
     /// Runs whose cancel GitHub answered with 409 (already finished, or stuck
     /// in a state GitHub will not cancel).
@@ -596,6 +597,19 @@ impl Janitor {
                 if *budget == 0 {
                     report.deferred += 1;
                     continue;
+                }
+                // A waiting sibling can keep the workflow queued after jobs start.
+                match self.has_running_job(repo, run.id).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        report.raced += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("janitor: {repo} run {}: {e}", run.id);
+                        report.errors += 1;
+                        continue;
+                    }
                 }
                 let why = format!(
                     "duplicate of run {kept} (workflow {}, head {})",
