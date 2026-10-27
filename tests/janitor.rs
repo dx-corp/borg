@@ -295,6 +295,64 @@ async fn queued_duplicates_keep_the_lowest_id() {
 }
 
 #[tokio::test]
+async fn a_queued_duplicate_with_a_running_job_is_kept() {
+    // GitHub's workflow stays queued while a sibling job waits for a runner.
+    // cancel_running must never opt same-head duplicate cleanup into killing it.
+    for cancel_running in [false, true] {
+        let h = Harness::start(with(json!({
+            "dedupe_same_sha": true, "cancel_running": cancel_running
+        })))
+        .await;
+        h.state().pulls.insert(10, "sha".into());
+        h.add_run(4, "queued", "pull_request", "sha", Some(10));
+        h.add_run(9, "queued", "pull_request", "sha", Some(10));
+        h.add_run_job(9, "active", "in_progress", Some("runner-1"));
+        h.add_run_job(9, "waiting", "queued", None);
+
+        let r = h.janitor_pass().await;
+        assert_eq!(
+            (r.duplicates, r.dedup_cancelled, r.errors, r.raced),
+            (1, 0, 0, 1),
+            "{r:?}"
+        );
+        assert!(h.state().cancelled.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_duplicate_job_response_preserves_the_run() {
+    let h = Harness::start(with(json!({"dedupe_same_sha": true}))).await;
+    h.state().pulls.insert(10, "sha".into());
+    h.add_run(4, "queued", "pull_request", "sha", Some(10));
+    h.add_run(9, "queued", "pull_request", "sha", Some(10));
+    // An invalid provider response cannot establish that no job is running.
+    h.state()
+        .jobs
+        .push(json!({"id": 90, "run_id": 9, "status": false}));
+
+    let r = h.janitor_pass().await;
+    assert_eq!((r.dedup_cancelled, r.errors), (0, 1), "{r:?}");
+    assert!(h.state().cancelled.is_empty());
+}
+
+#[tokio::test]
+async fn keeping_an_active_duplicate_leaves_the_cancel_budget_for_an_idle_one() {
+    let h = Harness::start(with(json!({
+        "dedupe_same_sha": true, "max_cancels_per_pass": 1
+    })))
+    .await;
+    h.state().pulls.insert(10, "sha".into());
+    for id in [4, 6, 9] {
+        h.add_run(id, "queued", "pull_request", "sha", Some(10));
+    }
+    h.add_run_job(6, "active", "in_progress", Some("runner-1"));
+
+    let r = h.janitor_pass().await;
+    assert_eq!((r.dedup_cancelled, r.deferred, r.raced), (1, 0, 1), "{r:?}");
+    assert_eq!(h.state().cancelled, [9]);
+}
+
+#[tokio::test]
 async fn a_running_duplicate_is_kept_and_never_cancelled() {
     let h = Harness::start(with(json!({"dedupe_same_sha": true}))).await;
     h.state().pulls.insert(10, "sha".into());
