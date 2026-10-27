@@ -1,6 +1,8 @@
 use crate::support;
 
-use borg::allocator::{AllocatorInput, Demand, DroneState, HostCaps, PlacementDecision, allocate};
+use borg::allocator::{
+    AllocatorInput, Demand, DroneState, HostCaps, PlacementDecision, PrTurn, allocate,
+};
 use borg::bid::ScoreWeights;
 use borg::classes::{Class, Classes, Scope};
 use borg::explain::{
@@ -28,6 +30,7 @@ fn decision() -> PlacementDecision {
         starvation_after_secs: None,
         weights: ScoreWeights::default(),
         admission: None,
+        pr_turn: PrTurn::default(),
     })
     .decisions
     .remove(0)

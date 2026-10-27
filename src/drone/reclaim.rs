@@ -59,7 +59,11 @@ const SHARED_TARGET_DIRS: &[&str] = &[
 /// The roots a drone reclaims when its config lists none: the worktree and
 /// cargo-target locations under every home directory and the shared data
 /// volume, as far as they exist. `exists` is the filesystem check.
-pub fn default_roots(homes: &[PathBuf], exists: impl Fn(&Path) -> bool) -> Vec<Root> {
+fn default_roots(
+    homes: &[PathBuf],
+    ci_slots: &[PathBuf],
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<Root> {
     let mut out = Vec::new();
     let mut push = |path: PathBuf, kind: Kind| {
         if exists(&path) && !out.iter().any(|r: &Root| r.path == path && r.kind == kind) {
@@ -80,6 +84,27 @@ pub fn default_roots(homes: &[PathBuf], exists: impl Fn(&Path) -> bool) -> Vec<R
     for d in SHARED_TARGET_DIRS {
         push(PathBuf::from(d), Kind::CargoTarget);
     }
+    // CI jobs keep weekly cargo targets per cache slot; they are regenerable
+    // and were never reclaimed, so drones filled their disks with them.
+    for d in ci_slots {
+        push(d.clone(), Kind::CargoTarget);
+    }
+    out
+}
+
+/// `<cache_root>/<namespace>/slots` directories: the per-job CI cache slots
+/// whose `cargo-target/<week>` directories reclaim may remove. Namespaces are
+/// stable, so new slots under them are found on every scan.
+fn ci_slot_roots(cfg: &DroneConfig) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(&cfg.cache_root)
+        .map(|it| {
+            it.filter_map(Result::ok)
+                .map(|e| e.path().join("slots"))
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
     out
 }
 
@@ -110,7 +135,7 @@ pub struct Commands {
 }
 
 impl Commands {
-    pub fn new(exec: Arc<dyn Exec>, setpriv: String) -> Self {
+    fn new(exec: Arc<dyn Exec>, setpriv: String) -> Self {
         // Real uid of this process (`Uid:` line of /proc/self/status).
         let self_uid = std::fs::read_to_string("/proc/self/status")
             .ok()
@@ -243,7 +268,9 @@ const LIST_WORKTREES: &str =
     r#"find "$1" -mindepth 2 -maxdepth 3 -name .git -printf '%h\n' 2>/dev/null; echo .done"#;
 /// Cargo target directories (cargo writes `.rustc_info.json` at the root of
 /// every target directory) one or two levels below the root.
-const LIST_TARGETS: &str = r#"find "$1" -mindepth 2 -maxdepth 3 -name .rustc_info.json -printf '%h\n' 2>/dev/null; echo .done"#;
+/// Target directories (those holding `.rustc_info.json`) up to three levels
+/// below a root; CI slot caches keep them at `<slots>/<slot>/cargo-target/<week>`.
+const LIST_TARGETS: &str = r#"find "$1" -mindepth 2 -maxdepth 4 -name .rustc_info.json -printf '%h\n' 2>/dev/null; echo .done"#;
 /// `incremental/` directories of a target directory (host and per-triple).
 const LIST_INCREMENTAL: &str = r#"find "$1" -mindepth 2 -maxdepth 3 -type d -name incremental -prune -printf '%p\n' 2>/dev/null; echo .done"#;
 /// Every cwd and open file of the processes the caller may inspect.
@@ -532,6 +559,46 @@ fn merge(into: &mut Option<Cycle>, c: Cycle) {
     acc.errors += c.errors;
 }
 
+/// Where the container runtime keeps images (the root filesystem on the
+/// drones); `df` here measures the filesystem image pulls fill.
+const DOCKER_ROOT: &str = "/var/lib/docker";
+/// `docker image ls` rows: repository, full image id, creation time.
+const IMAGE_FORMAT: &str = "{{.Repository}}\t{{.ID}}\t{{.CreatedAt}}";
+
+/// Image ids superseded by a newer image of the same repository, from
+/// `IMAGE_FORMAT` rows. CI pulls a new platform image per commit, so old
+/// ones pile up; the newest image of every repository is kept, which keeps
+/// deliberately pre-pulled CI tool images. Images with no repository are
+/// dangling layers and always superseded. `CreatedAt` is
+/// `YYYY-MM-DD HH:MM:SS +0000 UTC` on the drones, so it sorts as text.
+fn superseded_images(listing: &str) -> Vec<String> {
+    let mut by_repo: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
+    let mut out = Vec::new();
+    for line in listing.lines() {
+        let mut f = line.split('\t');
+        let (Some(repo), Some(id), Some(created)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        if repo == "<none>" {
+            out.push(id.to_owned());
+        } else {
+            by_repo.entry(repo).or_default().push((created, id));
+        }
+    }
+    for images in by_repo.values_mut() {
+        images.sort_unstable();
+        images.dedup_by(|a, b| a.1 == b.1);
+        images.pop();
+        out.extend(images.iter().map(|(_, id)| (*id).to_owned()));
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// The drone's reclaim loop and the stats its heartbeat reports.
 pub struct Reclaimer {
     settings: ReclaimSettings,
@@ -540,6 +607,7 @@ pub struct Reclaimer {
     /// reports usage and a recent cycle even with no build roots.
     anchors: Vec<PathBuf>,
     cmd: Commands,
+    docker_bin: String,
     stats: Mutex<ReclaimStats>,
     seq: Mutex<u64>,
     sizes: Mutex<HashMap<PathBuf, (i64, u64)>>,
@@ -547,7 +615,7 @@ pub struct Reclaimer {
 
 impl Reclaimer {
     /// `None` when reclaim is off or the host is not Linux.
-    pub fn new(cfg: &DroneConfig, exec: Arc<dyn Exec>) -> Option<Arc<Self>> {
+    pub(super) fn new(cfg: &DroneConfig, exec: Arc<dyn Exec>) -> Option<Arc<Self>> {
         let settings = cfg.reclaim.clone();
         if !settings.enabled {
             return None;
@@ -564,7 +632,7 @@ impl Reclaimer {
         let roots = if settings.roots.is_empty() {
             // Checked as the directory's owner: a private home hides its
             // build directories from the drone itself.
-            default_roots(&host_homes(cfg), |p| {
+            default_roots(&host_homes(cfg), &ci_slot_roots(cfg), |p| {
                 cmd.sh(p, PROBE_SECS, r#"test -d "$1""#).is_ok()
             })
         } else {
@@ -594,13 +662,14 @@ impl Reclaimer {
             roots,
             anchors: vec![cfg.work_root.clone(), cfg.cache_root.clone()],
             cmd,
+            docker_bin: cfg.docker_bin.clone(),
             seq: Mutex::new(seq),
             sizes: Mutex::new(HashMap::new()),
         }))
     }
 
     /// Stats for the next heartbeat, with the audit entries not yet sent.
-    pub fn heartbeat_stats(&self) -> Option<ReclaimStats> {
+    pub(super) fn heartbeat_stats(&self) -> Option<ReclaimStats> {
         let mut s = self.stats.lock().ok()?;
         let mut out = s.clone();
         out.recent = s.drain_recent(RECENT_PER_HEARTBEAT);
@@ -608,7 +677,7 @@ impl Reclaimer {
     }
 
     /// One reclaim run over every filesystem the roots live on.
-    pub fn run_once(&self) {
+    fn run_once(&self) {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let mut groups: BTreeMap<String, (PathBuf, Vec<Root>)> = BTreeMap::new();
         for r in &self.roots {
@@ -678,10 +747,55 @@ impl Reclaimer {
         if let (Some(c), Ok(mut stats)) = (combined, self.stats.lock()) {
             stats.absorb(&self.settings, now, &c);
         }
+        self.prune_superseded_images();
+    }
+
+    /// Above the high-water mark on the image filesystem, removes images a
+    /// newer image of the same repository superseded (pve50-vm240 failed
+    /// disk admission on 2026-10-25 holding 7 GiB of them). `docker image rm`
+    /// without `-f` refuses an image a container still uses, so a running
+    /// job's image stays.
+    fn prune_superseded_images(&self) {
+        let Ok((disk, mount)) = self.cmd.disk(Path::new(DOCKER_ROOT)) else {
+            return;
+        };
+        let usage = disk.usage_pct();
+        if usage < self.settings.high_water_pct {
+            return;
+        }
+        let listing = match self.cmd.exec.run(
+            &self.docker_bin,
+            &["image", "ls", "--no-trunc", "--format", IMAGE_FORMAT],
+        ) {
+            Ok(out) if out.success => out.stdout,
+            _ => return,
+        };
+        let ids = superseded_images(&listing);
+        if ids.is_empty() {
+            return;
+        }
+        if self.settings.dry_run {
+            tracing::info!(
+                "reclaim images {mount}: usage {usage}%, would remove {} superseded image(s)",
+                ids.len()
+            );
+            return;
+        }
+        let mut removed = 0usize;
+        for id in &ids {
+            match self.cmd.exec.run(&self.docker_bin, &["image", "rm", id]) {
+                Ok(out) if out.success => removed += 1,
+                _ => tracing::info!("reclaim images: kept {id} (in use or referenced elsewhere)"),
+            }
+        }
+        tracing::info!(
+            "reclaim images {mount}: usage {usage}%, removed {removed} of {} superseded image(s)",
+            ids.len()
+        );
     }
 
     /// Run a cycle shortly after start and then every `interval_secs`.
-    pub fn spawn(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+    pub(super) fn spawn(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(60)).await;
@@ -711,11 +825,16 @@ mod tests {
             "/home/dev/slot-targets",
             "/srv/devdata/worktrees",
             "/srv/devdata/slots",
+            "/var/lib/borg-job/cache/mono-ci/slots",
         ]
         .into_iter()
         .map(PathBuf::from)
         .collect();
-        let roots = default_roots(&[PathBuf::from("/home/dev")], |p| present.contains(p));
+        let roots = default_roots(
+            &[PathBuf::from("/home/dev")],
+            &[PathBuf::from("/var/lib/borg-job/cache/mono-ci/slots")],
+            |p| present.contains(p),
+        );
         let got: Vec<(String, &str)> = roots
             .iter()
             .map(|r| (r.path.display().to_string(), r.kind.as_str()))
@@ -729,8 +848,27 @@ mod tests {
                 ("/srv/devdata/worktrees".to_owned(), "worktree"),
                 ("/srv/devdata/slots".to_owned(), "cargo_target"),
                 ("/srv/devdata/worktrees".to_owned(), "cargo_target"),
+                (
+                    "/var/lib/borg-job/cache/mono-ci/slots".to_owned(),
+                    "cargo_target"
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn target_listing_finds_ci_slot_weekly_targets() {
+        let root = std::env::temp_dir().join(format!("borg-reclaim-slots-{}", std::process::id()));
+        let week = root.join("slot-a/cargo-target/2026-W43");
+        std::fs::create_dir_all(week.join("debug")).unwrap();
+        std::fs::write(week.join(".rustc_info.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join("slot-a/mise-home/x")).unwrap();
+        // The production path: Commands::sh through the reviewed SystemExec.
+        let cmd = Commands::new(Arc::new(crate::drone::exec::SystemExec), "setpriv".into());
+        let out = cmd.sh(&root, 30, LIST_TARGETS).unwrap();
+        let found = listed(&out).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(found, vec![week]);
     }
 
     #[test]
@@ -766,6 +904,33 @@ mod tests {
             [PathBuf::from("/a/x"), PathBuf::from("/a/y")]
         );
         assert!(listed(".done").unwrap().is_empty());
+    }
+
+    #[test]
+    fn superseded_images_keep_the_newest_of_each_repository() {
+        let listing = "\
+ghcr.io/dx-corp/platform/platform-worker\tsha256:w3\t2026-10-25 18:00:00 +0000 UTC
+ghcr.io/dx-corp/platform/platform-worker\tsha256:w1\t2026-10-25 08:00:00 +0000 UTC
+ghcr.io/dx-corp/platform/platform-api\tsha256:a2\t2026-10-25 12:00:00 +0000 UTC
+ghcr.io/dx-corp/platform/platform-worker\tsha256:w2\t2026-10-25 10:00:00 +0000 UTC
+ghcr.io/dx-corp/deploy-feature-flag-ci-tools\tsha256:tools\t2026-08-20 09:00:00 +0000 UTC
+ghcr.io/dx-corp/platform/platform-api\tsha256:a1\t2026-10-24 12:00:00 +0000 UTC
+<none>\tsha256:dangling\t2026-10-01 00:00:00 +0000 UTC
+malformed line
+";
+        assert_eq!(
+            superseded_images(listing),
+            vec!["sha256:a1", "sha256:dangling", "sha256:w1", "sha256:w2"]
+        );
+    }
+
+    #[test]
+    fn one_image_per_repository_is_never_superseded() {
+        let listing = "repo-a\tsha256:x\t2026-01-01 00:00:00 +0000 UTC\nrepo-b\tsha256:y\t2026-01-01 00:00:00 +0000 UTC\n";
+        assert!(superseded_images(listing).is_empty());
+        // The same id listed twice for one repository is one image.
+        let twice = "repo-a\tsha256:x\t2026-01-01 00:00:00 +0000 UTC\nrepo-a\tsha256:x\t2026-01-01 00:00:00 +0000 UTC\n";
+        assert!(superseded_images(twice).is_empty());
     }
 
     #[test]

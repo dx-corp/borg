@@ -211,6 +211,15 @@ CREATE TABLE IF NOT EXISTS preemptions (
     at           INTEGER NOT NULL,
     requeued_at  INTEGER
 );
+CREATE TABLE IF NOT EXISTS burst_vms (
+    drone        TEXT PRIMARY KEY,
+    vm           TEXT NOT NULL,
+    zone         TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    draining_at  INTEGER,
+    ended_at     INTEGER,
+    scrubbed_at  INTEGER
+);
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -773,6 +782,58 @@ impl Store {
                 })
             })
             .collect()
+    }
+
+    /// The burst VMs the queen created and still accounts for (live mode).
+    pub(crate) async fn burst_vms(&self) -> Result<Vec<crate::burst::BurstVm>, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let rows = sqlx::query(
+            "SELECT drone, vm, zone, created_at, draining_at, ended_at, scrubbed_at FROM burst_vms ORDER BY created_at, drone",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::burst::BurstVm {
+                drone: r.get("drone"),
+                vm: r.get("vm"),
+                zone: r.get("zone"),
+                created_at: r.get("created_at"),
+                draining_at: r.get("draining_at"),
+                ended_at: r.get("ended_at"),
+                scrubbed_at: r.get("scrubbed_at"),
+            })
+            .collect())
+    }
+
+    /// Replace the burst VM list with `vms` (a handful of rows, written
+    /// whole after every live pass so a restart keeps the spend record).
+    pub(crate) async fn save_burst_vms(
+        &self,
+        vms: &[crate::burst::BurstVm],
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query("DELETE FROM burst_vms")
+            .execute(&mut *tx)
+            .await?;
+        for v in vms {
+            // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+            sqlx::query(
+                "INSERT INTO burst_vms (drone, vm, zone, created_at, draining_at, ended_at, scrubbed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&v.drone)
+            .bind(&v.vm)
+            .bind(&v.zone)
+            .bind(v.created_at)
+            .bind(v.draining_at)
+            .bind(v.ended_at)
+            .bind(v.scrubbed_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Quarantine (`Some(reason)`) or release (`None`) a drone on an

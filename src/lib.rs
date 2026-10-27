@@ -20,6 +20,7 @@ pub mod drone;
 pub mod enroll;
 pub mod envcontract;
 pub mod explain;
+pub mod gce;
 pub mod github;
 pub mod health;
 pub mod homeostasis;

@@ -9,7 +9,7 @@
 //! the janitor's `dry_run` and `max_cancels_per_pass` settings.
 //!
 //! * a run that is not `completed` is left for a later pass;
-//! * a rerun answered 403, 404 or 409 (job gone, retention expired, or already
+//! * a rerun answered a permission 403, 404 or 409 (job gone, retention expired, or already
 //!   re-run) is terminal: the row is marked and a warning is logged;
 //! * any other error is logged and retried on the next pass;
 //! * a row older than 24 hours is marked without a call, so a backlog never
@@ -23,7 +23,7 @@ use reqwest::{Method, RequestBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::config::JanitorSettings;
-use crate::github::{GithubError, TokenSource};
+use crate::github::{GithubError, RateLimit, TokenSource};
 use crate::janitor::status_error;
 use crate::secret::Secret;
 use crate::store::{Store, StoreError};
@@ -44,7 +44,7 @@ pub struct PassReport {
     pub waiting: u32,
     /// Rows older than 24 hours, marked without a call.
     pub stale: u32,
-    /// Rows whose rerun answered 403, 404 or 409.
+    /// Rows whose rerun answered a permission 403, 404 or 409.
     pub terminal: u32,
     /// Failures that will be retried next pass.
     pub errors: u32,
@@ -76,6 +76,7 @@ struct Run {
 }
 
 pub struct Requeuer {
+    rate_limit: RateLimit,
     http: reqwest::Client,
     api_base: String,
     token: TokenSource,
@@ -85,6 +86,11 @@ pub struct Requeuer {
 }
 
 impl Requeuer {
+    pub fn with_rate_limit(mut self, rate_limit: RateLimit) -> Self {
+        self.rate_limit = rate_limit;
+        self
+    }
+
     /// Built from the janitor's token and settings.
     pub fn new(
         api_base: &str,
@@ -104,6 +110,7 @@ impl Requeuer {
             .timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self {
+            rate_limit: token.rate_limit(),
             http,
             api_base: api_base.trim_end_matches('/').to_owned(),
             token,
@@ -129,10 +136,13 @@ impl Requeuer {
 
     async fn run_status(&self, repo: &str, run: u64) -> Result<String, GithubError> {
         let path = format!("/repos/{repo}/actions/runs/{run}");
-        let resp = self.request(Method::GET, &path).await?.send().await?;
+        let resp = self
+            .rate_limit
+            .send(self.request(Method::GET, &path).await?)
+            .await?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(status_error("GET", &path, status.as_u16(), resp).await);
+            return Err(status_error(&self.rate_limit, "GET", &path, status.as_u16(), resp).await);
         }
         let bytes = resp.bytes().await?;
         serde_json::from_slice::<Run>(&bytes)
@@ -140,14 +150,25 @@ impl Requeuer {
             .map_err(|e| GithubError::Decode(format!("{path}: {e}")))
     }
 
-    /// Re-run a job. `Ok(Some(code))` is a terminal refusal (403, 404, 409).
+    /// Re-run a job. `Ok(Some(code))` is a terminal refusal (permission 403, 404, 409).
     async fn rerun(&self, repo: &str, job: u64) -> Result<Option<u16>, GithubError> {
         let path = format!("/repos/{repo}/actions/jobs/{job}/rerun");
-        let resp = self.request(Method::POST, &path).await?.send().await?;
+        let resp = self
+            .rate_limit
+            .send(self.request(Method::POST, &path).await?)
+            .await?;
         match resp.status().as_u16() {
             200..=299 => Ok(None),
-            code @ (403 | 404 | 409) => Ok(Some(code)),
-            code => Err(status_error("POST", &path, code, resp).await),
+            403 => {
+                let error = status_error(&self.rate_limit, "POST", &path, 403, resp).await;
+                if matches!(error, GithubError::RateLimited { .. }) {
+                    Err(error)
+                } else {
+                    Ok(Some(403))
+                }
+            }
+            code @ (404 | 409) => Ok(Some(code)),
+            code => Err(status_error(&self.rate_limit, "POST", &path, code, resp).await),
         }
     }
 

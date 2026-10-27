@@ -332,6 +332,8 @@ pub fn router(queen: Arc<Queen>) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/metrics", get(metrics))
+        .route("/bootstrap/borg", get(bootstrap_borg))
+        .route("/bootstrap/toolchain.sh", get(bootstrap_toolchain))
         .route("/report", get(report))
         .route("/explain", get(explain))
         .route("/jobs/{job_id}", get(job_host))
@@ -341,6 +343,49 @@ pub fn router(queen: Arc<Queen>) -> Router {
         .route("/v1/leases/{id}/result", post(lease_result))
         .merge(crate::units_api::routes())
         .with_state(queen)
+}
+
+/// The toolchain installer a live burst config serves to new drones.
+fn bootstrap_toolchain_path(queen: &Queen) -> Option<std::path::PathBuf> {
+    queen
+        .config()
+        .burst
+        .as_ref()
+        .filter(|b| b.live())
+        .and_then(|b| b.gce().toolchain_script_path.clone())
+}
+
+/// `GET /bootstrap/borg`: this queen's own executable, which a burst VM's
+/// startup script installs as its drone. Served only while burst is live.
+/// The binary is already on every drone, so this is not a secret; it is
+/// reachable only by tailnet nodes the policy lets reach the queen.
+async fn bootstrap_borg(State(queen): State<Arc<Queen>>) -> Result<Response, ApiError> {
+    if bootstrap_toolchain_path(&queen).is_none() {
+        return Err(ApiError::NotFound);
+    }
+    let exe = std::env::current_exe().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let bytes = tokio::fs::read(&exe)
+        .await
+        .map_err(|e| ApiError::Internal(format!("read {}: {e}", exe.display())))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response())
+}
+
+/// `GET /bootstrap/toolchain.sh`: the toolchain installer from
+/// `burst.gce.toolchain_script_path`. Served only while burst is live.
+async fn bootstrap_toolchain(State(queen): State<Arc<Queen>>) -> Result<Response, ApiError> {
+    let path = bootstrap_toolchain_path(&queen).ok_or(ApiError::NotFound)?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| ApiError::Internal(format!("read {}: {e}", path.display())))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "text/x-shellscript")],
+        bytes,
+    )
+        .into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -495,9 +540,9 @@ async fn heartbeat(
     store.set_trust(&drone, req.trust).await?;
     store.set_bids(&drone, &sanitize_bids(&req.bids)).await?;
     if let Some(facts) = &req.env_facts {
-        store
-            .set_env_facts(&drone, &sanitize_facts(facts, now))
-            .await?;
+        let facts = sanitize_facts(facts, now);
+        queen.note_cpu_pressure(&drone, facts.observed_at, facts.cpu_psi_some_avg10_pm);
+        store.set_env_facts(&drone, &facts).await?;
     }
     if let Some(stats) = &req.reclaim {
         store.record_reclaim(&drone, stats).await?;
@@ -808,6 +853,8 @@ pub struct CapacityStatus {
 #[derive(Debug, Serialize)]
 pub struct DroneAdmissionView {
     pub state: AdmissionState,
+    /// The mean of the drone's `some avg10` readings over
+    /// `admission.facts_max_age_secs`, in permille.
     pub cpu_psi_pm: Option<u16>,
     /// Pressure estimated from the load average; `state` uses it only when
     /// `cpu_psi_pm` is null.
@@ -850,6 +897,7 @@ pub struct RolloutStatus {
 
 #[derive(Debug, Serialize)]
 pub struct Status {
+    github_rate_limit: crate::github::RateLimitView,
     pub now: i64,
     pub last_tick_at: Option<i64>,
     pub last_error: Option<String>,
@@ -1247,6 +1295,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         now,
         last_tick_at: snap.last_tick_at,
         last_error: snap.last_error,
+        github_rate_limit: queen.github_rate_limit(),
         classes,
         queue: snap.queue,
         drones,
@@ -1717,7 +1766,7 @@ pub fn render_metrics(status: &Status) -> String {
     );
     gauge(
         "borg_drone_cpu_psi_pm",
-        "Fresh CPU pressure (`some avg10`, permille) reported by the drone; absent when unknown or admission is off.",
+        "CPU pressure the drone is admitted on: the mean of its `some avg10` readings (permille) over `admission.facts_max_age_secs`; absent when unknown or admission is off.",
         status
             .drones
             .iter()
@@ -2274,6 +2323,27 @@ pub fn render_metrics(status: &Status) -> String {
             "Leases that ran without a git mirror.",
             cache_rows(&|c| c.misses.map(|v| v as f64)),
         );
+    }
+    for (name, help, value) in [
+        (
+            "borg_github_rate_limit_remaining",
+            "Last observed GitHub primary quota remaining.",
+            status.github_rate_limit.remaining.map(|v| v as f64),
+        ),
+        (
+            "borg_github_rate_limit_reset_at",
+            "Last observed GitHub primary quota reset UTC epoch seconds.",
+            status.github_rate_limit.reset_at.map(|v| v as f64),
+        ),
+        (
+            "borg_github_rate_limit_retry_at",
+            "GitHub API cooldown deadline UTC epoch seconds.",
+            status.github_rate_limit.retry_at.map(|v| v as f64),
+        ),
+    ] {
+        if let Some(value) = value {
+            gauge(name, help, vec![(String::new(), value)]);
+        }
     }
     gauge(
         "borg_last_tick_ok",

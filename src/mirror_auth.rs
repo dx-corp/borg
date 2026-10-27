@@ -37,6 +37,9 @@ pub struct MirrorAuth {
     org: String,
     /// Bare names, as GitHub's `repositories` parameter wants them.
     repositories: Vec<String>,
+    /// The permissions tokens are down-scoped to; `contents: read` unless
+    /// [`MirrorAuth::with_permissions`] widened them.
+    permissions: serde_json::Value,
     cached: tokio::sync::Mutex<Option<(Secret, i64)>>,
     expires_at: std::sync::atomic::AtomicI64,
 }
@@ -48,14 +51,26 @@ fn unix_now() -> i64 {
 }
 
 impl MirrorAuth {
+    pub(crate) fn rate_limit(&self) -> crate::github::RateLimit {
+        self.client.rate_limit()
+    }
+
     pub fn new(client: GithubClient, org: &str, repositories: &[String]) -> Self {
         Self {
             client,
             org: org.to_owned(),
             repositories: repositories.to_vec(),
+            permissions: serde_json::json!({"contents": "read"}),
             cached: tokio::sync::Mutex::new(None),
             expires_at: std::sync::atomic::AtomicI64::new(0),
         }
+    }
+
+    /// Mint tokens with these permissions instead of `contents: read` only
+    /// (the janitor's read credential also needs `pull_requests: read`).
+    pub fn with_permissions(mut self, permissions: serde_json::Value) -> Self {
+        self.permissions = permissions;
+        self
     }
 
     /// The current credential, minting a new token when under ten minutes of
@@ -70,10 +85,7 @@ impl MirrorAuth {
             None => {
                 let minted = self
                     .client
-                    .installation_token_scoped(
-                        &serde_json::json!({"contents": "read"}),
-                        &self.repositories,
-                    )
+                    .installation_token_scoped(&self.permissions, &self.repositories)
                     .await?;
                 *cached = Some(minted.clone());
                 self.expires_at

@@ -46,7 +46,7 @@ pub(super) struct Intent {
 }
 
 /// Parse `Promote runtime images sha-<40 hex> services=<a,b> ... source-event=<e>`.
-pub(super) fn parse_title(title: &str) -> Option<Intent> {
+fn parse_title(title: &str) -> Option<Intent> {
     let rest = title.strip_prefix("Promote runtime images sha-")?;
     let mut tokens = rest.split_whitespace();
     let sha = tokens.next()?;
@@ -97,12 +97,6 @@ fn executed(job: &Job) -> bool {
         || job.runner_name.as_deref().is_some_and(|r| !r.is_empty())
         || !job.steps.is_empty()
         || job.status == "completed" && job.conclusion.as_deref() != Some("skipped")
-}
-
-fn unix(rfc3339: &str) -> Option<i64> {
-    time::OffsetDateTime::parse(rfc3339, &time::format_description::well_known::Rfc3339)
-        .ok()
-        .map(time::OffsetDateTime::unix_timestamp)
 }
 
 impl Janitor {
@@ -182,11 +176,14 @@ impl Janitor {
             return Ok(false);
         }
         let path = format!("/repos/{repo}/actions/runs/{run}/force-cancel");
-        let resp = self.request(Method::POST, &path).await?.send().await?;
+        let resp = self
+            .rate_limit
+            .send(self.request(Method::POST, &path).await?)
+            .await?;
         match resp.status().as_u16() {
             200..=299 => Ok(true),
             409 => Ok(false),
-            code => Err(status_error("POST", &path, code, resp).await),
+            code => Err(status_error(&self.rate_limit, "POST", &path, code, resp).await),
         }
     }
 
@@ -254,6 +251,10 @@ impl Janitor {
             .filter_map(|r| parse_title(&r.display_title).map(|i| (r, i)))
             .collect();
         let mut compares = BTreeMap::new();
+        // One refused compare (the token lacks `contents: read` on the source
+        // repository) is counted once per pass; later runs are kept unproven
+        // without another read each.
+        let mut compare_failed = false;
         for run in &active {
             if self
                 .promotion
@@ -327,6 +328,9 @@ impl Janitor {
                 if !(success && stale || superseded_rule) {
                     continue;
                 }
+                if compare_failed {
+                    break;
+                }
                 match self
                     .same_or_ahead(source, &intent.sha, &i.sha, &mut compares)
                     .await
@@ -337,8 +341,13 @@ impl Janitor {
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        tracing::warn!("janitor: {source} compare {}...{}: {e}", intent.sha, i.sha);
+                        tracing::warn!(
+                            "janitor: {source} compare {}...{}: {e}; promotion runs are kept unproven this pass (set supersede_janitor.compare_auth to an App with contents: read on {source})",
+                            intent.sha,
+                            i.sha
+                        );
                         report.errors += 1;
+                        compare_failed = true;
                         break;
                     }
                 }

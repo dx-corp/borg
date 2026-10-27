@@ -81,8 +81,9 @@ pub struct DroneState {
     /// Which scopes the host may run; see [`Trust::admits`].
     #[serde(default)]
     pub trust: Trust,
-    /// Recent CPU pressure (`some avg10`, permille); `None` is not measured
-    /// or stale. Only read when [`AllocatorInput::admission`] is set.
+    /// Recent CPU pressure (the mean of `some avg10` readings over the
+    /// admission window, permille); `None` is not measured or stale. Only
+    /// read when [`AllocatorInput::admission`] is set.
     #[serde(default)]
     pub cpu_psi_pm: Option<u16>,
     /// CPU pressure estimated from the load average, for a drone without PSI
@@ -284,6 +285,22 @@ pub struct AllocatorInput {
     pub weights: ScoreWeights,
     /// CPU-pressure admission; `None` turns it off.
     pub admission: Option<AdmissionThresholds>,
+    /// Pull-request turns; the default keeps strict main-before-PR order.
+    pub pr_turn: PrTurn,
+}
+
+/// Main demand is served before pull-request demand, so a main queue that
+/// never empties starves pull requests forever. A class listed here gives one
+/// grant to its pull-request demand, if that has waited `after_secs`, before
+/// its main demand is placed. The queen lists a class once main has taken
+/// enough grants in a row; see `pr_fairness` in the queen config.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PrTurn {
+    /// Pull-request demand that has waited at least this long may take a
+    /// turn; `None` turns turns off.
+    pub(crate) after_secs: Option<u64>,
+    /// Classes whose next grant goes to starving pull-request demand.
+    pub(crate) classes: Vec<Class>,
 }
 
 /// An instruction to mint one runner and hand it to one drone.
@@ -711,6 +728,69 @@ impl Free<'_> {
     }
 }
 
+/// Remaining room per drone after `leases`. Duplicate drone ids collapse to
+/// the first entry; leases on unknown drones are ignored.
+fn free_by_drone<'a>(
+    drones: &'a [DroneState],
+    leases: &[ActiveLease],
+    classes: &Classes,
+    admission: Option<AdmissionThresholds>,
+) -> BTreeMap<&'a str, Free<'a>> {
+    let mut free: BTreeMap<&str, Free<'_>> = BTreeMap::new();
+    for drone in drones {
+        free.entry(drone.id.as_str()).or_insert(Free {
+            drone,
+            mem_mib: drone.mem_mib,
+            vcpu: drone.vcpu,
+            leases_left: drone.max_leases,
+            in_flight: 0,
+            admission: AdmissionState::of(drone.admission_pressure_pm(), admission),
+            granted: BTreeMap::new(),
+        });
+    }
+    for lease in leases {
+        if let Some(f) = free.get_mut(lease.drone_id.as_str()) {
+            f.take(classes.spec(lease.class));
+            f.in_flight += 1;
+        }
+    }
+    free
+}
+
+/// Idle slots of `class` across `free`. Spare room counts only where any
+/// queued job of the class could be placed: a drone shedding a scope under
+/// CPU pressure, or blocking the class by its environment, has no idle slot
+/// for this purpose.
+fn class_idle(free: &BTreeMap<&str, Free<'_>>, class: Class, spec: &ClassSpec) -> u32 {
+    free.values()
+        .filter(|f| {
+            f.fits(spec)
+                && !f.drone.blocked_classes.contains(&class)
+                && Scope::ALL.iter().all(|s| f.admission.admits(class, *s))
+        })
+        .map(|f| f.slots(spec))
+        .fold(0u32, u32::saturating_add)
+}
+
+/// Idle slots per class once `leases` hold their room, by the same rule the
+/// allocator uses for [`Allocation::idle`]. Pass the leases held after a
+/// pass's grants to learn what that pass left free.
+pub(crate) fn idle_after(
+    drones: &[DroneState],
+    leases: &[ActiveLease],
+    classes: &Classes,
+    admission: Option<AdmissionThresholds>,
+) -> Vec<ClassIdle> {
+    let free = free_by_drone(drones, leases, classes, admission);
+    Class::ALL
+        .into_iter()
+        .map(|class| ClassIdle {
+            class,
+            idle_slots: class_idle(&free, class, classes.spec(class)),
+        })
+        .collect()
+}
+
 type Counts = BTreeMap<(Class, Scope), u32>;
 
 fn sum_counts<I: IntoIterator<Item = (Class, Scope, u32)>>(items: I) -> Counts {
@@ -832,26 +912,12 @@ fn allocate_inner(
     backlog: Option<&[Demand]>,
     scope: Option<Scope>,
 ) -> Allocation {
-    // Remaining room per drone after leases already in flight. Duplicate
-    // drone ids collapse to the first entry.
-    let mut free: BTreeMap<&str, Free<'_>> = BTreeMap::new();
-    for drone in &input.drones {
-        free.entry(drone.id.as_str()).or_insert(Free {
-            drone,
-            mem_mib: drone.mem_mib,
-            vcpu: drone.vcpu,
-            leases_left: drone.max_leases,
-            in_flight: 0,
-            admission: AdmissionState::of(drone.admission_pressure_pm(), input.admission),
-            granted: BTreeMap::new(),
-        });
-    }
-    for lease in &input.leases {
-        if let Some(f) = free.get_mut(lease.drone_id.as_str()) {
-            f.take(input.classes.spec(lease.class));
-            f.in_flight += 1;
-        }
-    }
+    let mut free = free_by_drone(
+        &input.drones,
+        &input.leases,
+        &input.classes,
+        input.admission,
+    );
 
     let queued = sum_counts(input.demand.iter().map(|d| (d.class, d.scope, d.count)));
     let floors = sum_counts(
@@ -921,14 +987,15 @@ fn allocate_inner(
     let mut initial_need = need.clone();
     let pressure_backlog =
         backlog.map(|demand| sum_counts(demand.iter().map(|d| (d.class, d.scope, d.count))));
-    let aged = |class, scope| {
-        input.starvation_after_secs.is_some_and(|after| {
+    let waited = |class, scope, after: Option<u64>| {
+        after.is_some_and(|after| {
             input
                 .queue_ages
                 .iter()
                 .any(|a| a.class == class && a.scope == scope && a.oldest_age_secs >= after)
         })
     };
+    let aged = |class, scope| waited(class, scope, input.starvation_after_secs);
     let mut pressure: BTreeMap<Class, u16> = BTreeMap::new();
     let mut idle_by_class: Vec<ClassIdle> = Vec::new();
     for class in Class::ALL {
@@ -945,11 +1012,7 @@ fn allocate_inner(
             shortfall = shortfall.saturating_add(uncovered);
             starving |= queued_here > 0 && aged(class, scope);
         }
-        let idle = free
-            .values()
-            .filter(|f| f.fits(spec))
-            .map(|f| f.slots(spec))
-            .fold(0u32, u32::saturating_add);
+        let idle = class_idle(&free, class, spec);
         pressure.insert(class, demand_pressure(shortfall, idle, starving));
         idle_by_class.push(ClassIdle {
             class,
@@ -987,6 +1050,25 @@ fn allocate_inner(
         .map(|r| (r.drone_id.clone(), (r.class, r.scope)))
         .collect();
 
+    // Pull-request turn: one grant per listed class to pull-request demand
+    // that has waited long enough, ahead of main's demand for that class.
+    // Deploy demand is unaffected: it runs only on deploy-trust drones, which
+    // never take pull-request work.
+    for class in Class::ALL.into_iter().rev() {
+        let key = (Scope::Pr, class);
+        let wanted = need.get(&key).copied().unwrap_or(0);
+        if wanted == 0
+            || !input.pr_turn.classes.contains(&class)
+            || get(&queued, class, Scope::Pr) == 0
+            || !waited(class, Scope::Pr, input.pr_turn.after_secs)
+        {
+            continue;
+        }
+        let n = place(input, &mut free, &pressure, &reserved, key, 1, &mut out);
+        *placed.entry(key).or_default() += n;
+        need.insert(key, wanted - n);
+    }
+
     // Starvation guard. Demand that has waited too long is placed first; if it
     // still cannot fit, hold back the drone that will free up soonest so the
     // stream of smaller jobs cannot keep it full.
@@ -1006,7 +1088,7 @@ fn allocate_inner(
                     wanted,
                     &mut out,
                 );
-                placed.insert((scope, class), n);
+                *placed.entry((scope, class)).or_default() += n;
                 need.insert((scope, class), 0);
                 if n < wanted {
                     let spec = input.classes.spec(class);
@@ -1122,6 +1204,7 @@ mod tests {
             starvation_after_secs: None,
             weights: ScoreWeights::default(),
             admission: None,
+            pr_turn: PrTurn::default(),
         }
     }
 
@@ -2485,5 +2568,80 @@ mod tests {
         ];
         let a = allocate(&i);
         assert!(a.grants.is_empty() && a.promote.is_empty());
+    }
+
+    fn pr_turn(i: &mut AllocatorInput, class: Class) {
+        i.queue_ages.retain(|q| q.scope != Scope::Pr);
+        i.queue_ages.push(QueueAge {
+            class,
+            scope: Scope::Pr,
+            oldest_age_secs: 1000,
+        });
+        i.pr_turn = PrTurn {
+            after_secs: Some(900),
+            classes: vec![class],
+        };
+    }
+
+    #[test]
+    fn pr_turn_gives_starving_pr_demand_one_grant_ahead_of_main() {
+        let mut i = input(
+            &[(Class::Heavy, Scope::Main, 3), (Class::Heavy, Scope::Pr, 3)],
+            vec![host("a")],
+        );
+        pr_turn(&mut i, Class::Heavy);
+        let a = allocate(&i);
+        assert_eq!(count(&a, Class::Heavy, Scope::Pr), 1);
+        assert_eq!(count(&a, Class::Heavy, Scope::Main), 0);
+        assert_within_budget(&i, &a);
+        // Room for two: the turn is one grant, main takes the rest.
+        i.drones.push(host("b"));
+        let a = allocate(&i);
+        assert_eq!(count(&a, Class::Heavy, Scope::Pr), 1);
+        assert_eq!(count(&a, Class::Heavy, Scope::Main), 1);
+        assert_within_budget(&i, &a);
+    }
+
+    #[test]
+    fn pr_turn_needs_the_class_listed_and_its_demand_aged() {
+        let mut i = input(
+            &[(Class::Heavy, Scope::Main, 3), (Class::Heavy, Scope::Pr, 3)],
+            vec![host("a")],
+        );
+        pr_turn(&mut i, Class::Medium);
+        assert_eq!(count(&allocate(&i), Class::Heavy, Scope::Main), 1);
+        pr_turn(&mut i, Class::Heavy);
+        i.queue_ages
+            .iter_mut()
+            .for_each(|q| q.oldest_age_secs = 100);
+        assert_eq!(count(&allocate(&i), Class::Heavy, Scope::Main), 1);
+        i.queue_ages
+            .iter_mut()
+            .for_each(|q| q.oldest_age_secs = 5000);
+        i.pr_turn.after_secs = None;
+        assert_eq!(count(&allocate(&i), Class::Heavy, Scope::Main), 1);
+    }
+
+    #[test]
+    fn pr_turn_obeys_admission_and_the_scope_filter() {
+        let mut i = input(
+            &[(Class::Heavy, Scope::Main, 1), (Class::Heavy, Scope::Pr, 1)],
+            vec![host("a")],
+        );
+        pr_turn(&mut i, Class::Heavy);
+        i.drones[0].cpu_psi_pm = Some(400);
+        i.admission = Some(AdmissionThresholds {
+            psi_soft_pm: 300,
+            psi_light_only_pm: 500,
+            psi_hard_pm: 600,
+        });
+        let a = allocate(&i);
+        assert_eq!(count(&a, Class::Heavy, Scope::Pr), 0);
+        assert_eq!(count(&a, Class::Heavy, Scope::Main), 1);
+        i.admission = None;
+        i.drones[0].cpu_psi_pm = None;
+        let a = allocate_scope(&i, Scope::Main);
+        assert_eq!(count(&a, Class::Heavy, Scope::Pr), 0);
+        assert_eq!(count(&a, Class::Heavy, Scope::Main), 1);
     }
 }

@@ -30,8 +30,13 @@ pub const MIRROR_TOKEN: &str = "ghs_mirror_for_tests";
 pub const JANITOR_TOKEN: &str = "ghp_janitor_for_tests";
 pub const ORG: &str = "example-org";
 
+pub type HttpReply = (u16, Vec<(String, String)>, String);
+
 #[derive(Default)]
 pub struct MockState {
+    /// Scripted API replies and counts; keys include the request path only.
+    pub http_replies: HashMap<String, HttpReply>,
+    pub http_requests: HashMap<String, u64>,
     public_pem: String,
     /// Compares answer 403 unless called with the contents-read mirror token.
     pub compare_needs_contents: bool,
@@ -45,6 +50,8 @@ pub struct MockState {
     /// Most jobs listings that were in flight at once.
     pub jobs_max_inflight: u32,
     pub queued_runs: Vec<u64>,
+    /// Queen jobs listings of these runs answer with this status instead.
+    pub jobs_fail_runs: HashMap<u64, u16>,
     pub jobs: Vec<Value>,
     pub runners: Vec<Value>,
     pub mints: Vec<Value>,
@@ -64,6 +71,11 @@ pub struct MockState {
     pub pr_runs: Vec<Value>,
     /// Current head sha per pull request number.
     pub pulls: HashMap<u64, String>,
+    /// Pull requests per head branch as `GET /pulls?head=` lists them,
+    /// newest first; a branch without an entry lists none.
+    pub pulls_by_head: HashMap<String, Vec<Value>>,
+    /// Pull-request reads answer 403 unless called with the mirror token.
+    pulls_need_mirror: bool,
     /// Status the single-run endpoint reports instead of the listed one.
     pub fresh_status: HashMap<u64, String>,
     /// Runs the janitor cancelled.
@@ -84,6 +96,42 @@ pub struct MockState {
     /// Reads of a single run (janitor or requeuer).
     pub run_reads: u32,
     next_runner_id: u64,
+    /// Fake Compute Engine: live instances as `{name, zone, body}`.
+    pub gce_instances: Vec<Value>,
+    /// Instance names deleted, in order.
+    pub gce_deleted: Vec<String>,
+    /// `setMetadata` request bodies, in order.
+    pub gce_set_metadata: Vec<Value>,
+    /// The next instance insert fails with this operation error code.
+    pub gce_fail_create: Option<String>,
+    /// Operation waits answer with this HTTP status (the VM is still made).
+    pub gce_wait_status: Option<u16>,
+    /// Instance deletes answer 500 and keep the instance.
+    pub gce_fail_delete: bool,
+    /// Labeled instance listings served.
+    pub gce_lists: u32,
+    pub gce_token_requests: u32,
+}
+
+async fn scripted_reply(
+    State(state): State<Shared>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let reply = {
+        let mut state = lock(&state);
+        let path = request.uri().path().to_owned();
+        *state.http_requests.entry(path.clone()).or_default() += 1;
+        state.http_replies.get(&path).cloned()
+    };
+    if let Some((status, headers, body)) = reply {
+        let mut response = axum::http::Response::builder().status(status);
+        for (name, value) in headers {
+            response = response.header(name, value);
+        }
+        return response.body(axum::body::Body::from(body)).unwrap();
+    }
+    next.run(request).await
 }
 
 pub type Shared = Arc<Mutex<MockState>>;
@@ -249,6 +297,9 @@ async fn jobs(
     }
     let mut state = lock(&s);
     state.jobs_inflight -= 1;
+    if !janitor && let Some(&code) = state.jobs_fail_runs.get(&run) {
+        return Err(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+    }
     let by_run = janitor || state.jobs_by_run;
     let jobs: Vec<_> = state
         .jobs
@@ -375,12 +426,38 @@ async fn rerun_job(
     StatusCode::CREATED
 }
 
+fn check_pulls(st: &MockState, h: &HeaderMap) -> Result<(), StatusCode> {
+    match bearer(h) {
+        Some(MIRROR_TOKEN) => Ok(()),
+        Some(JANITOR_TOKEN) if !st.pulls_need_mirror => Ok(()),
+        Some(JANITOR_TOKEN) => Err(StatusCode::FORBIDDEN),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+async fn pulls_by_head(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, StatusCode> {
+    let st = lock(&s);
+    check_pulls(&st, &h)?;
+    let branch = q
+        .get("head")
+        .and_then(|v| v.split_once(':'))
+        .map(|(_, b)| b)
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    Ok(Json(Value::Array(
+        st.pulls_by_head.get(branch).cloned().unwrap_or_default(),
+    )))
+}
+
 async fn pull(
     State(s): State<Shared>,
     h: HeaderMap,
     Path((_o, _r, n)): Path<(String, String, u64)>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_janitor(&h)?;
+    check_pulls(&lock(&s), &h)?;
     let sha = lock(&s)
         .pulls
         .get(&n)
@@ -461,7 +538,15 @@ pub struct Harness {
     /// The fake GitHub API base and the App key it accepts.
     pub gh_url: String,
     pub private_pem: String,
+    /// The fake Compute Engine base (`/token` and `/compute/v1/...`).
+    pub gce_url: String,
+    /// Holds the live-burst input files for the harness's lifetime.
+    _bootstrap: Option<tempfile::TempDir>,
 }
+
+pub const GCE_TOKEN: &str = "gce-token-for-tests";
+pub const TS_AUTHKEY: &str = "tskey-auth-for-tests";
+pub const TOOLCHAIN_SCRIPT: &str = "#!/bin/bash\necho toolchain-for-tests\n";
 
 pub fn capacity() -> Capacity {
     Capacity {
@@ -529,6 +614,7 @@ impl Harness {
                 "/repos/{owner}/{repo}/actions/jobs/{id}/rerun",
                 post(rerun_job),
             )
+            .route("/repos/{owner}/{repo}/pulls", get(pulls_by_head))
             .route("/repos/{owner}/{repo}/pulls/{n}", get(pull))
             .route("/orgs/{org}/actions/runners", get(list_runners))
             .route(
@@ -536,10 +622,43 @@ impl Harness {
                 post(jitconfig),
             )
             .route("/orgs/{org}/actions/runners/{id}", delete(delete_runner))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&mock),
+                scripted_reply,
+            ))
             .with_state(Arc::clone(&mock));
         let gh_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gh_url = format!("http://{}", gh_listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(gh_listener, app).await });
+
+        // A fake Compute Engine for live burst configs: a token endpoint and
+        // the instance calls the queen makes.
+        let gce_app = Router::new()
+            .route("/token", post(gce_token))
+            .route(
+                "/compute/v1/projects/{project}/zones/{zone}/instances",
+                post(gce_insert),
+            )
+            .route(
+                "/compute/v1/projects/{project}/aggregated/instances",
+                get(gce_aggregated),
+            )
+            .route(
+                "/compute/v1/projects/{project}/zones/{zone}/operations/{op}/wait",
+                post(gce_wait),
+            )
+            .route(
+                "/compute/v1/projects/{project}/zones/{zone}/instances/{name}",
+                get(gce_get).delete(gce_delete),
+            )
+            .route(
+                "/compute/v1/projects/{project}/zones/{zone}/instances/{name}/setMetadata",
+                post(gce_set_metadata),
+            )
+            .with_state(Arc::clone(&mock));
+        let gce_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gce_url = format!("http://{}", gce_listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(gce_listener, gce_app).await });
 
         let mut cfg = json!({
             "github": {"org": ORG, "app_id": "12345", "api_base": gh_url},
@@ -547,6 +666,44 @@ impl Harness {
             "db_path": "unused.db",
             "warm_floors": []
         });
+        let mut extra = extra;
+        let mut bootstrap = None;
+        if extra["burst"]["dry_run"] == json!(false) {
+            // Live burst: point the queen at the fake API and give it the
+            // input files a real queen host would hold.
+            let dir = tempfile::tempdir().unwrap();
+            let key = dir.path().join("gce-sa.json");
+            std::fs::write(
+                &key,
+                json!({
+                    // The RSA key is generated per Harness and only authenticates to its local fake API.
+                    // nosemgrep: generic.secrets.security.detected-google-gcm-service-account.detected-google-gcm-service-account
+                    "type": "service_account",
+                    "client_email": "borg-queen@p.iam.gserviceaccount.com",
+                    "private_key": private_pem,
+                    "token_uri": format!("{gce_url}/token"),
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let ts = dir.path().join("drone-ts.key");
+            std::fs::write(&ts, format!("{TS_AUTHKEY}\n")).unwrap();
+            let toolchain = dir.path().join("toolchain.sh");
+            std::fs::write(&toolchain, TOOLCHAIN_SCRIPT).unwrap();
+            let gce = &mut extra["burst"]["gce"];
+            for (k, v) in [
+                ("api_base", json!(format!("{gce_url}/compute/v1"))),
+                ("credentials_path", json!(key)),
+                ("queen_url", json!("https://queen.example.test")),
+                ("tailscale_authkey_path", json!(ts)),
+                ("toolchain_script_path", json!(toolchain)),
+            ] {
+                if gce.get(k).is_none() {
+                    gce[k] = v;
+                }
+            }
+            bootstrap = Some(dir);
+        }
         for (k, v) in extra.as_object().cloned().unwrap_or_default() {
             cfg[k] = v;
         }
@@ -561,11 +718,14 @@ impl Harness {
             )
             .unwrap();
             match compare {
-                Some(c) => j.with_compare_auth(borg::mirror_auth::MirrorAuth::new(
-                    GithubClient::new(&gh_url, ORG, &c.app_id, private_pem.as_bytes()).unwrap(),
-                    ORG,
-                    &c.repositories,
-                )),
+                Some(c) => j.with_compare_auth(
+                    borg::mirror_auth::MirrorAuth::new(
+                        GithubClient::new(&gh_url, ORG, &c.app_id, private_pem.as_bytes()).unwrap(),
+                        ORG,
+                        &c.repositories,
+                    )
+                    .with_permissions(json!({"contents": "read", "pull_requests": "read"})),
+                ),
                 None => j,
             }
         });
@@ -604,6 +764,16 @@ impl Harness {
                 &settings.repositories,
             ));
         }
+        if let Some(b) = queen.config().burst.as_ref().filter(|b| b.live()) {
+            let g = b.gce();
+            let client = borg::gce::GceClient::from_key_file(
+                g.credentials_path.as_ref().unwrap(),
+                &g.project,
+                &g.api_base,
+            )
+            .unwrap();
+            queen = queen.with_gce(client);
+        }
         let queen = Arc::new(queen);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -624,6 +794,8 @@ impl Harness {
             http: reqwest::Client::new(),
             gh_url,
             private_pem,
+            gce_url,
+            _bootstrap: bootstrap,
         }
     }
 
@@ -706,6 +878,11 @@ impl Harness {
             .json()
             .await
             .unwrap()
+    }
+
+    /// Pull-request reads answer 403 to the janitor's own token from now on.
+    pub fn require_mirror_for_pulls(&self) {
+        self.state().pulls_need_mirror = true;
     }
 
     /// Add a queued pull-request run on `sha` for pull request `pr`; `head`
@@ -821,4 +998,165 @@ impl Harness {
             r["busy"] = json!(busy);
         }
     }
+}
+
+fn gce_check(h: &HeaderMap) -> Result<(), StatusCode> {
+    let auth = h
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if auth == format!("Bearer {GCE_TOKEN}") {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// The OAuth token exchange: any signed assertion is accepted.
+async fn gce_token(State(s): State<Shared>, body: String) -> Result<Json<Value>, StatusCode> {
+    if !body.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer")
+        || !body.contains("&assertion=ey")
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    lock(&s).gce_token_requests += 1;
+    Ok(Json(
+        json!({"access_token": GCE_TOKEN, "expires_in": 3600, "token_type": "Bearer"}),
+    ))
+}
+
+async fn gce_insert(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_project, zone)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    gce_check(&h)?;
+    let mut st = lock(&s);
+    let name = body["name"].as_str().unwrap_or_default().to_owned();
+    if let Some(code) = st.gce_fail_create.take() {
+        return Ok(Json(json!({"name": format!("op-{name}"), "status": "DONE",
+            "error": {"errors": [{"code": code, "message": "The zone does not have enough resources"}]}})));
+    }
+    if st.gce_instances.iter().any(|i| i["name"] == name) {
+        return Err(StatusCode::CONFLICT);
+    }
+    st.gce_instances
+        .push(json!({"name": name, "zone": zone, "body": body}));
+    Ok(Json(
+        json!({"name": format!("op-{name}"), "status": "RUNNING"}),
+    ))
+}
+
+async fn gce_wait(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_project, _zone, op)): Path<(String, String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    gce_check(&h)?;
+    if let Some(code) = lock(&s).gce_wait_status {
+        return Err(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+    Ok(Json(json!({"name": op, "status": "DONE"})))
+}
+
+/// `instances.aggregatedList` filtered on `labels.borg-burst=queen`, grouped
+/// by zone as GCE does.
+async fn gce_aggregated(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, StatusCode> {
+    gce_check(&h)?;
+    if q.get("filter").map(String::as_str) != Some("labels.borg-burst=queen") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut st = lock(&s);
+    st.gce_lists += 1;
+    let mut items = serde_json::Map::new();
+    for i in st
+        .gce_instances
+        .iter()
+        .filter(|i| i["body"]["labels"]["borg-burst"] == "queen")
+    {
+        let zone = i["zone"].as_str().unwrap_or_default();
+        let entry = items
+            .entry(format!("zones/{zone}"))
+            .or_insert_with(|| json!({"instances": []}));
+        entry["instances"].as_array_mut().unwrap().push(json!({
+            "name": i["name"],
+            "zone": format!("https://www.googleapis.com/compute/v1/projects/p/zones/{zone}"),
+            "status": "RUNNING",
+            "labels": i["body"]["labels"],
+        }));
+    }
+    items.insert(
+        "zones/us-east1-b".to_owned(),
+        json!({"warning": {"code": "NO_RESULTS_ON_PAGE"}}),
+    );
+    Ok(Json(json!({"items": items})))
+}
+
+async fn gce_get(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_project, _zone, name)): Path<(String, String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    gce_check(&h)?;
+    let st = lock(&s);
+    let inst = st
+        .gce_instances
+        .iter()
+        .find(|i| i["name"] == name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(json!({
+        "name": name,
+        "status": "RUNNING",
+        "metadata": {"fingerprint": "fp-for-tests", "items": inst["body"]["metadata"]["items"]},
+    })))
+}
+
+async fn gce_delete(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_project, _zone, name)): Path<(String, String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    gce_check(&h)?;
+    let mut st = lock(&s);
+    if st.gce_fail_delete {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let before = st.gce_instances.len();
+    st.gce_instances.retain(|i| i["name"] != name);
+    if st.gce_instances.len() == before {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    st.gce_deleted.push(name.clone());
+    Ok(Json(
+        json!({"name": format!("op-delete-{name}"), "status": "RUNNING"}),
+    ))
+}
+
+async fn gce_set_metadata(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_project, _zone, name)): Path<(String, String, String)>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    gce_check(&h)?;
+    let mut st = lock(&s);
+    if body["fingerprint"] != "fp-for-tests" {
+        return Err(StatusCode::PRECONDITION_FAILED);
+    }
+    let inst = st
+        .gce_instances
+        .iter_mut()
+        .find(|i| i["name"] == name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    inst["body"]["metadata"]["items"] = body["items"].clone();
+    st.gce_set_metadata
+        .push(json!({"name": name, "body": body}));
+    Ok(Json(
+        json!({"name": format!("op-meta-{name}"), "status": "DONE"}),
+    ))
 }
