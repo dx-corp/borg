@@ -138,6 +138,10 @@ pub struct BurstSettings {
     #[serde(default = "default_hourly_cost")]
     hourly_cost_usd: f64,
     pub budget: BudgetSettings,
+    /// The most the control API may set `max_drones` and the drone-hour
+    /// budgets to (see [`crate::control`]). Absent: the configured values.
+    #[serde(default)]
+    ceilings: Option<crate::control::Ceilings>,
     scale_up: ScaleUpSettings,
     scale_down: ScaleDownSettings,
     pub(super) gce: GceSettings,
@@ -305,6 +309,19 @@ impl BurstSettings {
                 );
             }
         }
+        if let Some(c) = &self.ceilings {
+            let ok = (self.max_drones..=10).contains(&c.max_drones)
+                && c.drone_hours_per_day.is_finite()
+                && c.drone_hours_per_day >= b.drone_hours_per_day
+                && c.drone_hours_per_month.is_finite()
+                && c.drone_hours_per_month >= b.drone_hours_per_month
+                && c.drone_hours_per_day <= c.drone_hours_per_month;
+            if !ok {
+                return bad(
+                    "ceilings must be at least the configured max_drones and budgets, max_drones at most 10, day <= month",
+                );
+            }
+        }
         if up.classes.is_empty()
             || up.min_weighted_unmet == 0
             || up.sustained_secs <= 0
@@ -368,6 +385,23 @@ impl BurstSettings {
     /// Enabled and not dry-run: the queen creates and deletes real VMs.
     pub fn live(&self) -> bool {
         self.enabled && !self.dry_run
+    }
+
+    /// Not dry-run: the queen acts on real VMs. Unlike [`Self::live`] this
+    /// ignores `enabled`, which the control API can change at runtime; the
+    /// Compute Engine client and bootstrap inputs are needed either way
+    /// (disabled burst still drains and deletes the drones it made).
+    pub fn provisions(&self) -> bool {
+        !self.dry_run
+    }
+
+    /// The control API's limits: `ceilings`, or the configured values.
+    pub fn ceilings(&self) -> crate::control::Ceilings {
+        self.ceilings.unwrap_or(crate::control::Ceilings {
+            max_drones: self.max_drones,
+            drone_hours_per_day: self.budget.drone_hours_per_day,
+            drone_hours_per_month: self.budget.drone_hours_per_month,
+        })
     }
 
     pub fn gce(&self) -> &GceSettings {
@@ -533,7 +567,7 @@ pub struct Plan {
     spend: Spend,
     over_budget: bool,
     drones: DroneCounts,
-    /// Stable key for why a drone is or is not being created: `no_demand`,
+    /// Stable key for why a drone is or is not being created: `disabled`, `no_demand`,
     /// `over_budget`, `provisioning`, `at_max_drones`, `sustaining`,
     /// `no_headroom` or `create`.
     pub(super) outcome: &'static str,
@@ -640,6 +674,9 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
     let max_run = cfg.gce.max_run_secs;
     let up = &cfg.scale_up;
     let down = &cfg.scale_down;
+    // Turned off (in the config or through the control API): create
+    // nothing; drain the drones this queen made and delete them once empty.
+    let disabled = !cfg.enabled;
 
     let weighted = weighted_unmet(up, obs.unmet, obs.idle);
     let holds = weighted >= up.min_weighted_unmet;
@@ -688,7 +725,7 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
             st.idle_since.entry(vm.drone.clone()).or_insert(now);
         }
         match vm.draining_at {
-            Some(_) if holds && !over_budget && !retiring && alive => {
+            Some(_) if holds && !disabled && !over_budget && !retiring && alive => {
                 actions.push(Action::Undrain {
                     drone: vm.drone.clone(),
                 });
@@ -704,6 +741,10 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
                     why: "never enrolled or gone silent",
                 });
             }
+            None if disabled => actions.push(Action::Drain {
+                drone: vm.drone.clone(),
+                why: "burst disabled",
+            }),
             None if over_budget => actions.push(Action::Drain {
                 drone: vm.drone.clone(),
                 why: "budget spent",
@@ -740,7 +781,9 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
         .unwrap_or(usize::MAX)
         .saturating_sub(counted);
 
-    let (outcome, reason) = if !holds {
+    let (outcome, reason) = if disabled {
+        ("disabled", "burst is disabled".to_owned())
+    } else if !holds {
         (
             "no_demand",
             format!("weighted unmet {weighted} below {}", up.min_weighted_unmet),
@@ -848,6 +891,9 @@ pub(super) fn prune(vms: &mut Vec<BurstVm>, max_run: i64, now: i64) {
 /// `/status` view of the burst rule after a pass.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BurstView {
+    /// Effective `enabled` (config or control override); see
+    /// [`crate::control`]. Disabled burst creates nothing and drains its drones.
+    pub(super) enabled: bool,
     pub(super) dry_run: bool,
     max_drones: u32,
     pub(super) budget: BudgetView,
@@ -908,6 +954,7 @@ pub(super) fn view(
             .count(),
     );
     BurstView {
+        enabled: cfg.enabled,
         dry_run: cfg.dry_run,
         max_drones: cfg.max_drones,
         budget: BudgetView {

@@ -1065,6 +1065,68 @@ demand holds, the VM in `gcloud compute instances list`, the drone appearing
 in `/status` `drones` within about 12 minutes, then `burst_scrub`. The
 metric `borg_burst_dry_run` reads 0.
 
+#### Burst control API (`control`)
+
+Operators and agents change burst at runtime through an authenticated API
+instead of editing the queen config. Configure it with:
+
+```json
+"control": {"token_path": "/etc/borg/control.token"},
+"burst": {"ceilings": {"max_drones": 5, "drone_hours_per_day": 48, "drone_hours_per_month": 300}, ...}
+```
+
+The token file holds one line of at least 32 characters, is owned by the
+queen's user and mode 0600 (the queen refuses to start otherwise); make one
+with `printf 'borg_%s\n' "$(openssl rand -hex 32)"`. `ceilings` bound what the
+API may set; without them the configured values are the ceilings, so the API
+can only lower `max_drones` and the budgets or restore them.
+
+- `GET /v1/control/burst`: capacity per class, the last burst pass (outcome,
+  drones, spend against budget) and, under `burst_control`, each of
+  `enabled`, `max_drones`, `drone_hours_per_day` and `drone_hours_per_month`
+  with its effective `value`, `source` (`config` or `override`), configured
+  value, ceiling, and who set the override, when and why.
+- `POST /v1/control/burst` with `{"actor", "reason", "enabled"?,
+  "max_drones"?, "drone_hours_per_day"?, "drone_hours_per_month"?,
+  "clear"?: [knob...]}`. `actor` and `reason` are required. A value above its
+  ceiling, a day budget above the month budget or an unknown field is
+  refused (400) and leaves nothing behind. Setting a value equal to the
+  current one is accepted and audited; it pins the value as an override.
+  `clear` drops overrides so the configured value applies again.
+- `GET /v1/control/audit?limit=N`: every write, newest first, with actor,
+  reason, key, and the old and new effective values with their sources.
+
+All three need `Authorization: Bearer <token>` (401 otherwise) and answer 404
+when `control` is not configured. Overrides and the audit log live in the
+queen's SQLite store (`control_overrides`, `control_audit`), so they survive
+a restart. An override beats the config, so editing `burst.enabled` in the
+config does not change a value an override holds; `/status` `burst_control`
+shows which one applies. The burst rule reads the overrides every pass, so a
+write applies at the next pass (`poll_interval_secs`).
+
+Turning burst off creates nothing more; the drones the queen made are drained
+(`burst: burst disabled`) and deleted once they hold no lease, and the pass
+outcome is `disabled`. The same applies when the config sets
+`enabled: false`. Metric: `borg_burst_enabled`.
+
+The CLI wraps the API:
+
+```sh
+borg queen-ctl status
+borg queen-ctl burst off --reason "GCP spend review"
+borg queen-ctl burst on --reason "heavy CI starving"
+borg queen-ctl burst set --max-drones 2 --drone-hours-per-day 24 --reason "..."
+borg queen-ctl burst clear max-drones --reason "back to config"
+borg queen-ctl audit --limit 20
+```
+
+On the queen host it reads the URL (`listen`) and `control.token_path` from
+`/etc/borg/queen.json`; elsewhere give `--queen <url>` (or `BORG_QUEEN`) and
+`--token-file` (or `BORG_CONTROL_TOKEN_FILE`, or the token in
+`BORG_CONTROL_TOKEN`). The actor defaults to `$USER@<hostname>`; set
+`--actor` (or `BORG_ACTOR`) to name an agent or a person. `--json` prints the
+raw response.
+
 ### Deploy-trust drone
 
 Deploy-scope jobs (labels ending `-deploy`) run only on a drone whose trust is

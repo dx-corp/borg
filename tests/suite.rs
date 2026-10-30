@@ -11,6 +11,7 @@ mod admin_cli;
 mod burst;
 mod capacity;
 mod contract;
+mod control;
 mod drone;
 mod explain;
 mod explain_cli;

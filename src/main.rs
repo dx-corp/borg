@@ -59,6 +59,9 @@ enum Command {
     /// Downloads and verifies the release, drains the service, swaps the binary
     /// (keeping borg.prev), restarts it, and rolls back if it does not come up.
     Update(UpdateArgs),
+    /// Read and change burst capacity on a running queen through its
+    /// authenticated control API. Every change needs a reason and is audited.
+    QueenCtl(QueenCtlArgs),
     /// Run or administer the queen (the coordinator).
     Queen {
         #[command(subcommand)]
@@ -216,6 +219,216 @@ struct ExplainArgs {
     /// Print the typed JSON history instead of text.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct QueenCtlArgs {
+    /// Queen base URL. Default: `http://<listen>` from --config.
+    #[arg(long, env = "BORG_QUEEN")]
+    queen: Option<String>,
+    /// The queen's config, for its URL and `control.token_path` when --queen
+    /// or --token-file are not given (on the queen host).
+    #[arg(
+        long,
+        env = "BORG_QUEEN_CONFIG",
+        default_value = "/etc/borg/queen.json"
+    )]
+    config: PathBuf,
+    /// File holding the control token. Default: BORG_CONTROL_TOKEN, else
+    /// `control.token_path` from --config.
+    #[arg(long, env = "BORG_CONTROL_TOKEN_FILE")]
+    token_file: Option<PathBuf>,
+    /// Who is making the change, recorded in the audit log. Default:
+    /// BORG_ACTOR, else `$USER@<hostname>`.
+    #[arg(long, env = "BORG_ACTOR")]
+    actor: Option<String>,
+    /// Print JSON instead of text.
+    #[arg(long)]
+    json: bool,
+    #[command(subcommand)]
+    command: QueenCtlCommand,
+}
+
+#[derive(Subcommand)]
+enum QueenCtlCommand {
+    /// Burst state, effective settings with their source, spend against the
+    /// budget, capacity per class, and the newest audit entries.
+    Status,
+    /// Change burst settings (within the ceilings in the queen config).
+    Burst {
+        #[command(subcommand)]
+        command: BurstCtlCommand,
+    },
+    /// Control writes, newest first.
+    Audit {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum BurstCtlCommand {
+    /// Let burst create drones.
+    On {
+        #[arg(long)]
+        reason: String,
+    },
+    /// Stop creating drones; the queen drains and deletes the ones it made
+    /// once they hold no lease.
+    Off {
+        #[arg(long)]
+        reason: String,
+    },
+    /// Set max_drones and/or the drone-hour budgets.
+    Set {
+        #[arg(long)]
+        max_drones: Option<u32>,
+        #[arg(long)]
+        drone_hours_per_day: Option<f64>,
+        #[arg(long)]
+        drone_hours_per_month: Option<f64>,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Drop overrides so the configured values apply again.
+    Clear {
+        /// enabled, max-drones, drone-hours-per-day, drone-hours-per-month.
+        #[arg(required = true, value_enum)]
+        knobs: Vec<KnobArg>,
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum KnobArg {
+    Enabled,
+    MaxDrones,
+    DroneHoursPerDay,
+    DroneHoursPerMonth,
+}
+
+impl From<KnobArg> for borg::control::Knob {
+    fn from(k: KnobArg) -> Self {
+        match k {
+            KnobArg::Enabled => Self::Enabled,
+            KnobArg::MaxDrones => Self::MaxDrones,
+            KnobArg::DroneHoursPerDay => Self::DroneHoursPerDay,
+            KnobArg::DroneHoursPerMonth => Self::DroneHoursPerMonth,
+        }
+    }
+}
+
+/// `borg queen-ctl`: resolve the URL, token and actor, then call the API.
+async fn queen_ctl(a: QueenCtlArgs) -> Result<()> {
+    let cfg = if a.queen.is_none()
+        || (a.token_file.is_none() && std::env::var_os("BORG_CONTROL_TOKEN").is_none())
+    {
+        Some(QueenConfig::load(&a.config).with_context(|| {
+            format!(
+                "read {} (or give --queen and --token-file)",
+                a.config.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    let base = match (&a.queen, &cfg) {
+        (Some(u), _) => u.trim_end_matches('/').to_owned(),
+        (None, Some(c)) => format!("http://{}", c.listen),
+        (None, None) => bail!("give --queen"),
+    };
+    let token = if let Some(p) = &a.token_file {
+        borg::control::load_token(p).map_err(|e| anyhow::anyhow!(e))?
+    } else if let Ok(t) = std::env::var("BORG_CONTROL_TOKEN") {
+        t.trim().to_owned()
+    } else {
+        let path = cfg
+            .as_ref()
+            .and_then(|c| c.control.as_ref())
+            .map(|c| c.token_path.clone())
+            .context("the queen config has no control block; give --token-file")?;
+        borg::control::load_token(&path).map_err(|e| anyhow::anyhow!(e))?
+    };
+    let actor = a.actor.clone().unwrap_or_else(|| {
+        let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned());
+        let host = std::env::var("HOSTNAME")
+            .ok()
+            .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "unknown-host".to_owned());
+        format!("{user}@{host}")
+    });
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let send = |req: reqwest::RequestBuilder| async move {
+        let resp = req.bearer_auth(&token).send().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            bail!("queen answered {status}: {body}");
+        }
+        serde_json::from_str::<serde_json::Value>(&body).context("decode queen response")
+    };
+    let write =
+        |w: borg::control::BurstWrite| http.post(format!("{base}/v1/control/burst")).json(&w);
+    let body = |reason: String| borg::control::BurstWrite {
+        actor: actor.clone(),
+        reason,
+        ..borg::control::BurstWrite::default()
+    };
+    let (out, audit_only) = match a.command {
+        QueenCtlCommand::Status => (
+            send(http.get(format!("{base}/v1/control/burst"))).await?,
+            false,
+        ),
+        QueenCtlCommand::Audit { limit } => (
+            send(http.get(format!("{base}/v1/control/audit?limit={limit}"))).await?,
+            true,
+        ),
+        QueenCtlCommand::Burst { command } => {
+            let w = match command {
+                BurstCtlCommand::On { reason } => borg::control::BurstWrite {
+                    enabled: Some(true),
+                    ..body(reason)
+                },
+                BurstCtlCommand::Off { reason } => borg::control::BurstWrite {
+                    enabled: Some(false),
+                    ..body(reason)
+                },
+                BurstCtlCommand::Set {
+                    max_drones,
+                    drone_hours_per_day,
+                    drone_hours_per_month,
+                    reason,
+                } => borg::control::BurstWrite {
+                    max_drones,
+                    drone_hours_per_day,
+                    drone_hours_per_month,
+                    ..body(reason)
+                },
+                BurstCtlCommand::Clear { knobs, reason } => borg::control::BurstWrite {
+                    clear: knobs.into_iter().map(Into::into).collect(),
+                    ..body(reason)
+                },
+            };
+            (send(write(w)).await?, false)
+        }
+    };
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if audit_only {
+        for line in borg::control::render_audit(&out) {
+            println!("{line}");
+        }
+    } else {
+        for line in borg::control::render_status(&out) {
+            println!("{line}");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Args)]
@@ -510,8 +723,8 @@ async fn run_queen(path: &Path) -> Result<()> {
         .with_context(|| format!("bind {}", cfg.listen))?;
     tracing::info!("queen listening on {}", cfg.listen);
     let mut gce = None;
-    if let Some(b) = cfg.burst.as_ref().filter(|b| b.enabled) {
-        if b.live() {
+    if let Some(b) = cfg.burst.as_ref() {
+        if b.provisions() {
             // Validation guarantees the paths are set; they must also be
             // readable now, so a misconfigured queen fails at start and not
             // at the first create.
@@ -528,7 +741,8 @@ async fn run_queen(path: &Path) -> Result<()> {
             let client = GceClient::from_key_file(key, &g.project, &g.api_base)
                 .with_context(|| format!("burst.gce.credentials_path: {}", key.display()))?;
             tracing::info!(
-                "burst capacity LIVE: creating up to {} {} spot VMs in {} ({}), {} drone-hours/day, {} /month",
+                "burst capacity LIVE (configured enabled={}; control overrides may change it): up to {} {} spot VMs in {} ({}), {} drone-hours/day, {} /month",
+                b.enabled,
                 b.max_drones,
                 g.machine_type,
                 g.project,
@@ -600,7 +814,18 @@ async fn run_queen(path: &Path) -> Result<()> {
             settings,
         }
     });
+    let control_token = match &cfg.control {
+        Some(c) => Some(
+            borg::control::load_token(&c.token_path)
+                .map_err(|e| anyhow::anyhow!("control.token_path: {e}"))?,
+        ),
+        None => None,
+    };
     let mut queen = Queen::new(cfg, store, github);
+    if let Some(token) = control_token {
+        tracing::info!("control API enabled");
+        queen = queen.with_control_token(&token);
+    }
     if let Some(client) = gce {
         queen = queen.with_gce(client);
     }
@@ -961,6 +1186,7 @@ async fn dispatch(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Report(a) => report(a).await,
+        Command::QueenCtl(a) => queen_ctl(a).await,
         Command::Config {
             command: ConfigCommand::Check { path, drone },
         } => {

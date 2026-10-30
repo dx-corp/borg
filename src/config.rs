@@ -493,6 +493,19 @@ pub struct QueenConfig {
     /// inputs and makes the queen create and delete real VMs.
     #[serde(default)]
     pub burst: Option<crate::burst::BurstSettings>,
+    /// Absent (the default) disables the authenticated control API; see
+    /// [`crate::control`].
+    #[serde(default)]
+    pub control: Option<ControlSettings>,
+}
+
+/// The authenticated control API (`/v1/control/*`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlSettings {
+    /// File holding the bearer token (first line), readable only by the
+    /// queen's user. Read once at start.
+    pub token_path: PathBuf,
 }
 
 /// A second GitHub App, held by the queen only, whose short-lived read-only
