@@ -5,6 +5,9 @@
 //!   private interface.
 //! * `POST /v1/heartbeat` and `POST /v1/leases/{id}/result` are the drone API,
 //!   authenticated with `Authorization: Bearer <enrollment token>`.
+//! * `GET|POST /v1/control/burst` and `GET /v1/control/audit` are the operator
+//!   control API ([`crate::control`]), authenticated with the bearer token in
+//!   `control.token_path`; 404 when `control` is not configured.
 //!
 //! The queen speaks plain HTTP; terminate TLS in front of it.
 
@@ -341,22 +344,27 @@ pub fn router(queen: Arc<Queen>) -> Router {
         .route("/v1/enroll", post(tailnet_enroll))
         .route("/v1/heartbeat", post(heartbeat))
         .route("/v1/leases/{id}/result", post(lease_result))
+        .route(
+            "/v1/control/burst",
+            get(control_burst_read).post(control_burst_write),
+        )
+        .route("/v1/control/audit", get(control_audit))
         .merge(crate::units_api::routes())
         .with_state(queen)
 }
 
-/// The toolchain installer a live burst config serves to new drones.
+/// The toolchain installer a non-dry-run burst config serves to new drones.
 fn bootstrap_toolchain_path(queen: &Queen) -> Option<std::path::PathBuf> {
     queen
         .config()
         .burst
         .as_ref()
-        .filter(|b| b.live())
+        .filter(|b| b.provisions())
         .and_then(|b| b.gce().toolchain_script_path.clone())
 }
 
 /// `GET /bootstrap/borg`: this queen's own executable, which a burst VM's
-/// startup script installs as its drone. Served only while burst is live.
+/// startup script installs as its drone. Served only when burst is not dry-run.
 /// The binary is already on every drone, so this is not a secret; it is
 /// reachable only by tailnet nodes the policy lets reach the queen.
 async fn bootstrap_borg(State(queen): State<Arc<Queen>>) -> Result<Response, ApiError> {
@@ -375,7 +383,7 @@ async fn bootstrap_borg(State(queen): State<Arc<Queen>>) -> Result<Response, Api
 }
 
 /// `GET /bootstrap/toolchain.sh`: the toolchain installer from
-/// `burst.gce.toolchain_script_path`. Served only while burst is live.
+/// `burst.gce.toolchain_script_path`. Served only when burst is not dry-run.
 async fn bootstrap_toolchain(State(queen): State<Arc<Queen>>) -> Result<Response, ApiError> {
     let path = bootstrap_toolchain_path(&queen).ok_or(ApiError::NotFound)?;
     let bytes = tokio::fs::read(&path)
@@ -426,6 +434,92 @@ async fn explain(
         .placement_history(kind, &key, client.as_deref())
         .await?;
     Ok(Json(Explanation::new(query.key, history)))
+}
+
+/// Check the control API bearer token. 404 when the API is not configured.
+fn authenticate_control(queen: &Queen, headers: &HeaderMap) -> Result<(), ApiError> {
+    let expected = queen.control_token_hash().ok_or(ApiError::NotFound)?;
+    let presented = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(ApiError::Unauthorized)?;
+    // Both sides are SHA-256 digests, so comparing them leaks nothing useful
+    // about the token through timing.
+    if hash_token(presented) == expected {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized)
+    }
+}
+
+/// `GET /v1/control/burst`: capacity per class, the burst rule's last pass
+/// (state, spend against budget) and the effective settings with sources.
+#[derive(Debug, Serialize)]
+pub struct ControlBurstView {
+    pub now: i64,
+    capacity: BTreeMap<Class, CapacityStatus>,
+    burst: Option<crate::burst::BurstView>,
+    burst_control: Option<crate::control::ControlView>,
+    pub recent_audit: Vec<crate::control::AuditRow>,
+}
+
+async fn control_burst_view(queen: &Queen, now: i64) -> Result<ControlBurstView, ApiError> {
+    let s = build_status(queen, now).await?;
+    Ok(ControlBurstView {
+        now,
+        capacity: s.capacity,
+        burst: s.burst,
+        burst_control: s.burst_control,
+        recent_audit: queen.store().control_audit(10).await?,
+    })
+}
+
+async fn control_burst_read(
+    State(queen): State<Arc<Queen>>,
+    headers: HeaderMap,
+) -> Result<Json<ControlBurstView>, ApiError> {
+    authenticate_control(&queen, &headers)?;
+    Ok(Json(
+        control_burst_view(&queen, OffsetDateTime::now_utc().unix_timestamp()).await?,
+    ))
+}
+
+/// `POST /v1/control/burst`: change burst settings within the configured
+/// ceilings. 400 with the reason when refused; the response is the view after
+/// the write. The burst rule applies it at its next pass.
+async fn control_burst_write(
+    State(queen): State<Arc<Queen>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<ControlBurstView>, ApiError> {
+    authenticate_control(&queen, &headers)?;
+    let w: crate::control::BurstWrite = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("bad request body: {e}")))?;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    queen
+        .write_burst_control(&w, now)
+        .await?
+        .map_err(ApiError::BadRequest)?;
+    Ok(Json(control_burst_view(&queen, now).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// `GET /v1/control/audit?limit=N`: control writes, newest first (default 50,
+/// at most 500).
+async fn control_audit(
+    State(queen): State<Arc<Queen>>,
+    headers: HeaderMap,
+    Query(q): Query<AuditQuery>,
+) -> Result<Json<Vec<crate::control::AuditRow>>, ApiError> {
+    authenticate_control(&queen, &headers)?;
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    Ok(Json(queen.store().control_audit(limit).await?))
 }
 
 /// The drone name behind the request's bearer token.
@@ -921,6 +1015,10 @@ pub struct Status {
     /// The burst rule after the last pass (simulated in dry-run); absent when
     /// burst is off.
     burst: Option<crate::burst::BurstView>,
+    /// The effective burst `enabled`, `max_drones` and budgets, each with its
+    /// source (`config` or a control `override`); absent without a burst
+    /// block. Read at request time, so a control write shows at once.
+    burst_control: Option<crate::control::ControlView>,
     pub rollout: RolloutStatus,
     pub warm_floors: Vec<crate::allocator::WarmFloor>,
     pub pressure: Vec<ClassPressure>,
@@ -1278,6 +1376,10 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             },
         );
     }
+    let burst_control = match &cfg.burst {
+        Some(b) => Some(crate::control::view(b, &queen.control_overrides().await?)),
+        None => None,
+    };
     let mut rollout = RolloutStatus {
         target_version: cfg.rollout_target_version.clone(),
         gate: snap.rollout.clone(),
@@ -1306,6 +1408,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         reserved_for: snap.reserved_for,
         static_runners_offline: snap.static_offline,
         burst: snap.burst,
+        burst_control,
         rollout,
         warm_floors: snap.warm_floors,
         pressure: snap.pressure,
@@ -1593,6 +1696,11 @@ pub fn render_metrics(status: &Status) -> String {
             .collect(),
     );
     if let Some(b) = &status.burst {
+        gauge(
+            "borg_burst_enabled",
+            "1 while burst may create drones (effective: config or control override).",
+            vec![(String::new(), f64::from(u8::from(b.enabled)))],
+        );
         gauge(
             "borg_burst_dry_run",
             "1 while burst decisions are only simulated.",

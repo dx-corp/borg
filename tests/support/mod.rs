@@ -764,7 +764,11 @@ impl Harness {
                 &settings.repositories,
             ));
         }
-        if let Some(b) = queen.config().burst.as_ref().filter(|b| b.live()) {
+        if let Some(c) = queen.config().control.clone() {
+            let token = borg::control::load_token(&c.token_path).unwrap();
+            queen = queen.with_control_token(&token);
+        }
+        if let Some(b) = queen.config().burst.as_ref().filter(|b| b.provisions()) {
             let g = b.gce();
             let client = borg::gce::GceClient::from_key_file(
                 g.credentials_path.as_ref().unwrap(),

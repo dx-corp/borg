@@ -220,6 +220,24 @@ CREATE TABLE IF NOT EXISTS burst_vms (
     ended_at     INTEGER,
     scrubbed_at  INTEGER
 );
+CREATE TABLE IF NOT EXISTS control_overrides (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL,
+    set_at  INTEGER NOT NULL,
+    actor   TEXT NOT NULL,
+    reason  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS control_audit (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    at         INTEGER NOT NULL,
+    actor      TEXT NOT NULL,
+    reason     TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    old_value  TEXT NOT NULL,
+    old_source TEXT NOT NULL,
+    new_value  TEXT NOT NULL,
+    new_source TEXT NOT NULL
+);
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -834,6 +852,113 @@ impl Store {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// The control overrides in force (see [`crate::control`]).
+    pub async fn control_overrides(&self) -> Result<Vec<crate::control::OverrideRow>, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let rows = sqlx::query(
+            "SELECT key, value, set_at, actor, reason FROM control_overrides ORDER BY key",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::control::OverrideRow {
+                    key: r.try_get("key")?,
+                    value: from_text(&r.try_get::<String, _>("value")?)?,
+                    set_at: r.try_get("set_at")?,
+                    actor: r.try_get("actor")?,
+                    reason: r.try_get("reason")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Store `changes` (set or drop each override) and append one audit row
+    /// per change, in one transaction.
+    pub async fn apply_control(
+        &self,
+        changes: &[crate::control::Change],
+        actor: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let source = |s: crate::control::Source| match s {
+            crate::control::Source::Config => "config",
+            crate::control::Source::Override => "override",
+        };
+        let mut tx = self.pool.begin().await?;
+        for c in changes {
+            let key = c.knob.key();
+            match &c.set {
+                Some(v) => {
+                    // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+                    sqlx::query(
+                        "INSERT OR REPLACE INTO control_overrides (key, value, set_at, actor, reason) VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(key)
+                    .bind(to_text(v)?)
+                    .bind(now)
+                    .bind(actor)
+                    .bind(reason)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                None => {
+                    // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+                    sqlx::query("DELETE FROM control_overrides WHERE key = ?")
+                        .bind(key)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+            // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+            sqlx::query(
+                "INSERT INTO control_audit (at, actor, reason, key, old_value, old_source, new_value, new_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(now)
+            .bind(actor)
+            .bind(reason)
+            .bind(key)
+            .bind(to_text(&c.old)?)
+            .bind(source(c.old_source))
+            .bind(to_text(&c.new)?)
+            .bind(source(c.new_source))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The newest control audit entries, newest first.
+    pub async fn control_audit(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::control::AuditRow>, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let rows = sqlx::query(
+            "SELECT id, at, actor, reason, key, old_value, old_source, new_value, new_source FROM control_audit ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::control::AuditRow {
+                    id: r.try_get("id")?,
+                    at: r.try_get("at")?,
+                    actor: r.try_get("actor")?,
+                    reason: r.try_get("reason")?,
+                    key: r.try_get("key")?,
+                    old_value: from_text(&r.try_get::<String, _>("old_value")?)?,
+                    old_source: r.try_get("old_source")?,
+                    new_value: from_text(&r.try_get::<String, _>("new_value")?)?,
+                    new_source: r.try_get("new_source")?,
+                })
+            })
+            .collect()
     }
 
     /// Quarantine (`Some(reason)`) or release (`None`) a drone on an

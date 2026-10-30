@@ -16,6 +16,7 @@ pub mod burst;
 pub mod classes;
 pub mod config;
 pub mod configfile;
+pub mod control;
 pub mod drone;
 pub mod enroll;
 pub mod envcontract;
