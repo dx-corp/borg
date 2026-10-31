@@ -642,6 +642,7 @@ impl Store {
             "ALTER TABLE units ADD COLUMN supersede_key TEXT",
             "ALTER TABLE units ADD COLUMN record INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE clients ADD COLUMN max_scope TEXT NOT NULL DEFAULT 'pr'",
+            "ALTER TABLE clients ADD COLUMN expires_at INTEGER",
         ] {
             // sqlx-runtime-query: one-off additive migration, no data involved
             if let Err(e) = sqlx::query(ddl).execute(&mut *conn).await

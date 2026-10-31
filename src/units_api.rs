@@ -68,6 +68,15 @@ pub(crate) async fn authenticate_client(
         .ok_or(ApiError::Unauthorized)
 }
 
+async fn authorize_unit(queen: &Queen, client: &str, unit: &Unit) -> Result<(), ApiError> {
+    if unit.client != client
+        && crate::client_registration::is_temporary(queen.store(), client).await?
+    {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubmitResponse {
     /// `new`, `joined` or `receipt`.
@@ -136,6 +145,9 @@ async fn submit(
             ("receipt", u, StatusCode::OK)
         }
     };
+    // Shared de-duplication may return another client's unit. Temporary
+    // approvals must not gain that owner's receipt, logs or cancellation power.
+    authorize_unit(&queen, &client, &unit).await?;
     tracing::info!(
         "unit {} {outcome} for {} {} by {client}",
         unit.id,
@@ -167,8 +179,9 @@ async fn show(
     Path(id): Path<String>,
 ) -> Result<Json<UnitView>, ApiError> {
     enabled(&queen)?;
-    authenticate_client(&queen, &headers).await?;
+    let client = authenticate_client(&queen, &headers).await?;
     let unit = queen.store().unit(&id).await?.ok_or(ApiError::NotFound)?;
+    authorize_unit(&queen, &client, &unit).await?;
     let receipt = unit.receipt();
     Ok(Json(UnitView { unit, receipt }))
 }
@@ -179,7 +192,9 @@ async fn cancel(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     enabled(&queen)?;
-    authenticate_client(&queen, &headers).await?;
+    let client = authenticate_client(&queen, &headers).await?;
+    let unit = queen.store().unit(&id).await?.ok_or(ApiError::NotFound)?;
+    authorize_unit(&queen, &client, &unit).await?;
     if queen.store().cancel_unit(&id, now()).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -203,12 +218,13 @@ async fn read_log(
     Query(q): Query<LogQuery>,
 ) -> Result<Response, ApiError> {
     enabled(&queen)?;
-    authenticate_client(&queen, &headers).await?;
+    let client = authenticate_client(&queen, &headers).await?;
     let from = q.from.unwrap_or(0);
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(q.wait.unwrap_or(0).min(MAX_WAIT_SECS));
     loop {
         let unit = queen.store().unit(&id).await?.ok_or(ApiError::NotFound)?;
+        authorize_unit(&queen, &client, &unit).await?;
         let data = queen.store().read_unit_log(&id, from, READ_CHUNK).await?;
         let finished = !unit.state.is_active();
         // Fully drained and finished, or data to hand over, or out of time.

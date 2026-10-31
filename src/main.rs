@@ -55,6 +55,15 @@ enum Command {
     /// Run a command on the fleet when capacity is free, otherwise here.
     /// Everything after `--` is the command.
     Run(RunArgs),
+    /// Prepare a hash-only registration request; does not grant fleet access.
+    RegisterClient {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        token_file: PathBuf,
+        #[arg(long)]
+        request_file: PathBuf,
+    },
     /// Update this host's borg (and, with --runner-only, just its actions-runner).
     /// Downloads and verifies the release, drains the service, swaps the binary
     /// (keeping borg.prev), restarts it, and rolls back if it does not come up.
@@ -472,8 +481,22 @@ enum QueenCommand {
         /// Drone name: lowercase letters, digits and dashes.
         name: String,
     },
-    /// Enroll a client (a developer machine or agent that submits work units)
-    /// and print its one-time token.
+    /// Revoke a temporary client without removing its replay tombstone.
+    RevokeClient {
+        #[command(flatten)]
+        config: ConfigArg,
+        name: String,
+    },
+    /// Approve a reviewed hash-only request as a temporary PR client.
+    ApproveClient {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[arg(long)]
+        request_file: PathBuf,
+        #[arg(long, default_value_t = 3600)]
+        lifetime_secs: u32,
+    },
+    /// Enroll a client locally and print its one-time token.
     EnrollClient {
         #[command(flatten)]
         config: ConfigArg,
@@ -1185,6 +1208,17 @@ async fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Explain(a) => explain(a).await,
         Command::Run(_) => Ok(()),
+        Command::RegisterClient {
+            name,
+            token_file,
+            request_file,
+        } => {
+            borg::client_registration::prepare(&name, &token_file, &request_file)?;
+            eprintln!(
+                "Registration request written; fleet access requires administrator approval."
+            );
+            Ok(())
+        }
         Command::Update(a) => {
             run_update(update::cli::Args {
                 config: a.config,
@@ -1252,6 +1286,33 @@ async fn dispatch(command: Command) -> Result<()> {
                     reason,
                     name,
                 } => set_quarantine(&config.config, &name, Some(&reason)).await,
+                QueenCommand::RevokeClient { config, name } => {
+                    let cfg = QueenConfig::load(&config.config)?;
+                    let store = open_store(&cfg).await?;
+                    if !borg::client_registration::revoke(&store, &name).await? {
+                        bail!("temporary client not found; legacy clients are unchanged");
+                    }
+                    eprintln!("Revoked temporary client {name}; accepted work is not cancelled");
+                    Ok(())
+                }
+                QueenCommand::ApproveClient {
+                    config,
+                    request_file,
+                    lifetime_secs,
+                } => {
+                    let request = borg::client_registration::read_request(&request_file)?;
+                    let cfg = QueenConfig::load(&config.config)?;
+                    let store = open_store(&cfg).await?;
+                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                    let expires =
+                        borg::client_registration::approve(&store, &request, lifetime_secs, now)
+                            .await?;
+                    eprintln!(
+                        "Approved PR client {} until Unix timestamp {expires}",
+                        request.name
+                    );
+                    Ok(())
+                }
                 QueenCommand::EnrollClient {
                     config,
                     name,
