@@ -290,6 +290,12 @@ enum BurstCtlCommand {
         #[arg(long)]
         reason: String,
     },
+    /// Close the enrollment circuit breaker after fixing why burst VMs did
+    /// not enroll; the queen creates burst VMs again.
+    ResetBreaker {
+        #[arg(long)]
+        reason: String,
+    },
     /// Drop overrides so the configured values apply again.
     Clear {
         /// enabled, max-drones, drone-hours-per-day, drone-hours-per-month.
@@ -388,6 +394,19 @@ async fn queen_ctl(a: QueenCtlArgs) -> Result<()> {
             send(http.get(format!("{base}/v1/control/audit?limit={limit}"))).await?,
             true,
         ),
+        QueenCtlCommand::Burst {
+            command: BurstCtlCommand::ResetBreaker { reason },
+        } => (
+            send(
+                http.post(format!("{base}/v1/control/burst/reset-breaker"))
+                    .json(&borg::control::BreakerReset {
+                        actor: actor.clone(),
+                        reason,
+                    }),
+            )
+            .await?,
+            false,
+        ),
         QueenCtlCommand::Burst { command } => {
             let w = match command {
                 BurstCtlCommand::On { reason } => borg::control::BurstWrite {
@@ -413,6 +432,9 @@ async fn queen_ctl(a: QueenCtlArgs) -> Result<()> {
                     clear: knobs.into_iter().map(Into::into).collect(),
                     ..body(reason)
                 },
+                BurstCtlCommand::ResetBreaker { .. } => {
+                    bail!("reset-breaker is handled above")
+                }
             };
             (send(write(w)).await?, false)
         }

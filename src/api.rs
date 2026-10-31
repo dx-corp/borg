@@ -348,6 +348,10 @@ pub fn router(queen: Arc<Queen>) -> Router {
             "/v1/control/burst",
             get(control_burst_read).post(control_burst_write),
         )
+        .route(
+            "/v1/control/burst/reset-breaker",
+            post(control_reset_breaker),
+        )
         .route("/v1/control/audit", get(control_audit))
         .merge(crate::units_api::routes())
         .with_state(queen)
@@ -461,6 +465,7 @@ pub struct ControlBurstView {
     capacity: BTreeMap<Class, CapacityStatus>,
     burst: Option<crate::burst::BurstView>,
     burst_control: Option<crate::control::ControlView>,
+    burst_breaker: Option<crate::control::BreakerView>,
     pub recent_audit: Vec<crate::control::AuditRow>,
 }
 
@@ -471,6 +476,7 @@ async fn control_burst_view(queen: &Queen, now: i64) -> Result<ControlBurstView,
         capacity: s.capacity,
         burst: s.burst,
         burst_control: s.burst_control,
+        burst_breaker: s.burst_breaker,
         recent_audit: queen.store().control_audit(10).await?,
     })
 }
@@ -501,6 +507,40 @@ async fn control_burst_write(
         .write_burst_control(&w, now)
         .await?
         .map_err(ApiError::BadRequest)?;
+    Ok(Json(control_burst_view(&queen, now).await?))
+}
+
+/// `POST /v1/control/burst/reset-breaker`: close the enrollment circuit
+/// breaker and zero its count, audited as `burst.breaker`. 404 unless burst
+/// is configured and not dry-run.
+async fn control_reset_breaker(
+    State(queen): State<Arc<Queen>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<ControlBurstView>, ApiError> {
+    authenticate_control(&queen, &headers)?;
+    let r: crate::control::BreakerReset = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("bad request body: {e}")))?;
+    if !queen
+        .config()
+        .burst
+        .as_ref()
+        .is_some_and(crate::burst::BurstSettings::provisions)
+    {
+        return Err(ApiError::NotFound);
+    }
+    let (actor, reason) =
+        crate::control::check_actor_reason(&r.actor, &r.reason).map_err(ApiError::BadRequest)?;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let old = queen
+        .store()
+        .reset_burst_breaker(actor, reason, now)
+        .await?;
+    tracing::info!(
+        "control: burst.breaker reset by {actor} ({reason}); was tripped={} failures={}",
+        old.tripped(),
+        old.failures
+    );
     Ok(Json(control_burst_view(&queen, now).await?))
 }
 
@@ -1022,6 +1062,9 @@ pub struct Status {
     /// source (`config` or a control `override`); absent without a burst
     /// block. Read at request time, so a control write shows at once.
     burst_control: Option<crate::control::ControlView>,
+    /// The burst enrollment circuit breaker; absent unless burst is
+    /// configured and not dry-run. Read at request time.
+    burst_breaker: Option<crate::control::BreakerView>,
     pub rollout: RolloutStatus,
     pub warm_floors: Vec<crate::allocator::WarmFloor>,
     pub pressure: Vec<ClassPressure>,
@@ -1388,6 +1431,13 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         Some(b) => Some(crate::control::view(b, &queen.control_overrides().await?)),
         None => None,
     };
+    let burst_breaker = match cfg.burst.as_ref().filter(|b| b.provisions()) {
+        Some(b) => Some(crate::control::BreakerView::new(
+            &queen.store().burst_breaker().await?.0,
+            b.breaker_failures,
+        )),
+        None => None,
+    };
     let mut rollout = RolloutStatus {
         target_version: cfg.rollout_target_version.clone(),
         gate: snap.rollout.clone(),
@@ -1417,6 +1467,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         static_runners_offline: snap.static_offline,
         burst: snap.burst,
         burst_control,
+        burst_breaker,
         rollout,
         warm_floors: snap.warm_floors,
         pressure: snap.pressure,
@@ -1752,6 +1803,23 @@ pub fn render_metrics(status: &Status) -> String {
             })
             .collect(),
     );
+    if let Some(br) = &status.burst_breaker {
+        gauge(
+            "borg_burst_breaker_tripped",
+            "1 while the burst enrollment circuit breaker is tripped: no burst VM is created until an operator resets it.",
+            vec![(String::new(), f64::from(u8::from(br.tripped)))],
+        );
+        gauge(
+            "borg_burst_breaker_failures",
+            "Consecutive burst VMs that never enrolled since the last enrollment or reset.",
+            vec![(String::new(), f64::from(br.failures))],
+        );
+        gauge(
+            "borg_burst_breaker_threshold",
+            "Consecutive never-enrolled burst VMs that trip the breaker.",
+            vec![(String::new(), f64::from(br.threshold))],
+        );
+    }
     if let Some(b) = &status.burst {
         gauge(
             "borg_burst_never_enrolled_timestamp_seconds",

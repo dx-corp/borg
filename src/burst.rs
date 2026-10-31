@@ -117,6 +117,9 @@ fn default_drone_max_vcpu() -> u32 {
 fn default_drone_max_mem_mib() -> u64 {
     104_448
 }
+fn default_breaker_failures() -> u32 {
+    2
+}
 
 /// The `burst` block of the queen config. Off unless `enabled`; dry-run unless
 /// `dry_run` is set to false.
@@ -142,6 +145,10 @@ pub struct BurstSettings {
     /// budgets to (see [`crate::control`]). Absent: the configured values.
     #[serde(default)]
     ceilings: Option<crate::control::Ceilings>,
+    /// Consecutive burst VMs that may fail to enroll before the circuit
+    /// breaker stops all creates (see [`Breaker`]).
+    #[serde(default = "default_breaker_failures")]
+    pub(crate) breaker_failures: u32,
     scale_up: ScaleUpSettings,
     scale_down: ScaleDownSettings,
     pub(super) gce: GceSettings,
@@ -322,6 +329,9 @@ impl BurstSettings {
                 );
             }
         }
+        if self.breaker_failures == 0 {
+            return bad("breaker_failures must be at least 1");
+        }
         if up.classes.is_empty()
             || up.min_weighted_unmet == 0
             || up.sustained_secs <= 0
@@ -439,6 +449,13 @@ pub(super) struct Observed<'a> {
     pub(super) idle: &'a [ClassIdle],
     pub(super) drones: &'a [ObservedDrone],
     pub(super) vms: &'a [BurstVm],
+    /// The enrollment circuit breaker is tripped (see [`Breaker`]): create
+    /// nothing until an operator resets it.
+    pub(super) breaker_tripped: bool,
+    /// Never-enrolled deletes the breaker still allows before it trips. A
+    /// pass whose own deletes reach it creates nothing, so the VM that trips
+    /// the breaker is not followed by another.
+    pub(super) breaker_room: u32,
 }
 
 /// Timers the rule remembers between passes, and what it decided.
@@ -567,7 +584,8 @@ pub struct Plan {
     spend: Spend,
     over_budget: bool,
     drones: DroneCounts,
-    /// Stable key for why a drone is or is not being created: `disabled`, `no_demand`,
+    /// Stable key for why a drone is or is not being created: `disabled`,
+    /// `breaker_tripped`, `no_demand`,
     /// `over_budget`, `provisioning`, `at_max_drones`, `sustaining`,
     /// `no_headroom` or `create`.
     pub(super) outcome: &'static str,
@@ -783,6 +801,13 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
 
     let (outcome, reason) = if disabled {
         ("disabled", "burst is disabled".to_owned())
+    } else if obs.breaker_tripped || never_enrolled_deletes(&actions, &live_vms) >= obs.breaker_room
+    {
+        (
+            "breaker_tripped",
+            "enrollment circuit breaker tripped; reset with borg queen-ctl burst reset-breaker"
+                .to_owned(),
+        )
     } else if !holds {
         (
             "no_demand",
@@ -960,6 +985,86 @@ pub(super) fn never_enrolled(vms: &[BurstVm], dry_run: bool, now: i64) -> Vec<Ne
         .collect();
     out.sort_by_key(|n| (n.ended_at, n.created_at));
     out
+}
+
+/// The enrollment circuit breaker, persisted in the queen store.
+///
+/// A burst VM that the queen deletes because its drone never heartbeated
+/// within `provision_grace_secs` is a failed enrollment. After
+/// `breaker_failures` consecutive failures the breaker trips: the burst rule
+/// creates nothing more (outcome `breaker_tripped`) until an operator resets
+/// it through the control API, which is audited. A drone's first heartbeat
+/// (the queen scrubs its bootstrap secrets) is a success and sets the count
+/// back to zero; it does not untrip a tripped breaker. On 2026-10-27..30 every
+/// burst VM crashed at boot and the queen kept creating them for three days.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Breaker {
+    /// Consecutive failed enrollments since the last success or reset.
+    pub failures: u32,
+    pub tripped_at: Option<i64>,
+    /// Why it tripped, with the last VM that failed.
+    pub reason: Option<String>,
+}
+
+impl Breaker {
+    pub fn tripped(&self) -> bool {
+        self.tripped_at.is_some()
+    }
+}
+
+/// Deletes in `actions` of VMs that never enrolled: what [`update_breaker`]
+/// will count as failures once they are carried out.
+fn never_enrolled_deletes(actions: &[Action], live_vms: &[&BurstVm]) -> u32 {
+    let n = actions
+        .iter()
+        .filter(|a| {
+            matches!(a, Action::Delete { drone, .. } if live_vms.iter().any(|v| {
+                &v.drone == drone && v.scrubbed_at.is_none() && v.draining_at.is_none()
+            }))
+        })
+        .count();
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Fold one live pass into the breaker. `before` is the VM list the pass
+/// started from and `after` the list once its actions were carried out; a
+/// failure is a VM deleted this pass as never enrolled (no scrub, no drain),
+/// a success a VM scrubbed this pass. Returns whether this pass tripped it.
+pub(super) fn update_breaker(
+    b: &mut Breaker,
+    threshold: u32,
+    before: &[BurstVm],
+    after: &[BurstVm],
+    now: i64,
+) -> bool {
+    let was = |drone: &str| before.iter().find(|v| v.drone == drone);
+    if after.iter().any(|v| {
+        v.scrubbed_at == Some(now) && was(&v.drone).is_some_and(|o| o.scrubbed_at.is_none())
+    }) {
+        b.failures = 0;
+    }
+    let mut tripped_now = false;
+    for v in after.iter().filter(|v| {
+        v.ended_at == Some(now)
+            && v.created_at < now
+            && v.scrubbed_at.is_none()
+            && v.draining_at.is_none()
+            && was(&v.drone).is_some_and(|o| o.ended_at.is_none())
+    }) {
+        b.failures = b.failures.saturating_add(1);
+        if !b.tripped() && b.failures >= threshold {
+            b.tripped_at = Some(now);
+            b.reason = Some(format!(
+                "{} consecutive burst VMs never enrolled (last: {} in {}, created {}s before it was deleted)",
+                b.failures,
+                v.vm,
+                v.zone,
+                now - v.created_at
+            ));
+            tripped_now = true;
+        }
+    }
+    tripped_now
 }
 
 /// [`Spend`] in dollars at `hourly_cost_usd`.
@@ -1190,6 +1295,8 @@ mod tests {
                 idle: &[],
                 drones,
                 vms,
+                breaker_tripped: false,
+                breaker_room: u32::MAX,
             },
         )
     }
@@ -1457,6 +1564,8 @@ mod tests {
                 idle: &idle,
                 drones: &[],
                 vms: &[],
+                breaker_tripped: false,
+                breaker_room: u32::MAX,
             },
         );
         assert!(!p.demand.holds);
@@ -1473,6 +1582,8 @@ mod tests {
                 idle: &idle,
                 drones: &[],
                 vms: &[],
+                breaker_tripped: false,
+                breaker_room: u32::MAX,
             },
         );
         assert!(p.demand.holds);
