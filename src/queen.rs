@@ -2423,6 +2423,19 @@ impl Queen {
         let cfg = &effective;
         let max_run = cfg.gce.max_run_secs;
         let live = cfg.provisions();
+        // Without the breaker's state the rule cannot know whether creates
+        // are allowed, so it does nothing this pass.
+        let (mut breaker, breaker_version) = if live {
+            match self.store.burst_breaker().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("burst: read circuit breaker failed: {e}");
+                    return None;
+                }
+            }
+        } else {
+            (crate::burst::Breaker::default(), 0)
+        };
         if live && !self.lock_burst().loaded {
             match self.store.burst_vms().await {
                 Ok(vms) => {
@@ -2480,10 +2493,17 @@ impl Queen {
                     idle,
                     drones: &drones,
                     vms,
+                    breaker_tripped: breaker.tripped(),
+                    breaker_room: if live {
+                        cfg.breaker_failures.saturating_sub(breaker.failures)
+                    } else {
+                        u32::MAX
+                    },
                 },
             );
             (plan, vms.clone())
         };
+        let before = vms.clone();
         let (decisions, failed_zones) = if live {
             let (applied, failed) = self
                 .apply_burst_live(cfg, &mut vms, &plan.actions, rows, now)
@@ -2509,6 +2529,10 @@ impl Queen {
         };
         if live && let Err(e) = self.store.save_burst_vms(&vms).await {
             tracing::warn!("burst: persist VM records failed: {e}");
+        }
+        if live {
+            self.burst_breaker_pass(cfg, (&mut breaker, breaker_version), &before, &vms, now)
+                .await;
         }
         let (prefix, mode) = if live {
             ("burst_", "live")
@@ -2542,6 +2566,45 @@ impl Queen {
             }
         }
         Some(view)
+    }
+
+    /// Count this pass's enrollment failures and successes into the circuit
+    /// breaker, persist it when it changed, and log a trip.
+    async fn burst_breaker_pass(
+        &self,
+        cfg: &crate::burst::BurstSettings,
+        (breaker, version): (&mut crate::burst::Breaker, i64),
+        before: &[BurstVm],
+        after: &[BurstVm],
+        now: i64,
+    ) {
+        let old = breaker.clone();
+        let tripped =
+            crate::burst::update_breaker(breaker, cfg.breaker_failures, before, after, now);
+        if *breaker == old {
+            return;
+        }
+        match self.store.save_burst_breaker(breaker, version, now).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    "burst: circuit breaker was reset during this pass; keeping the reset"
+                );
+                return;
+            }
+            Err(e) => tracing::warn!("burst: persist circuit breaker failed: {e}"),
+        }
+        if tripped {
+            let reason = breaker.reason.clone().unwrap_or_default();
+            tracing::warn!("burst_breaker_tripped: {reason}");
+            if let Err(e) = self
+                .store
+                .record_health_event(now, "burst", "burst_breaker_tripped", &reason)
+                .await
+            {
+                tracing::warn!("record burst_breaker_tripped failed: {e}");
+            }
+        }
     }
 
     fn lock_burst(&self) -> std::sync::MutexGuard<'_, BurstSim> {

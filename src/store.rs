@@ -227,6 +227,14 @@ CREATE TABLE IF NOT EXISTS control_overrides (
     actor   TEXT NOT NULL,
     reason  TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS burst_breaker (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    failures   INTEGER NOT NULL,
+    tripped_at INTEGER,
+    reason     TEXT,
+    updated_at INTEGER NOT NULL,
+    version    INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS control_audit (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     at         INTEGER NOT NULL,
@@ -441,6 +449,22 @@ pub struct LeaseResult {
 #[derive(Clone)]
 pub struct Store {
     pub(crate) pool: SqlitePool,
+}
+
+fn breaker_row(
+    row: Option<&sqlx::sqlite::SqliteRow>,
+) -> Result<(crate::burst::Breaker, i64), StoreError> {
+    Ok(match row {
+        Some(r) => (
+            crate::burst::Breaker {
+                failures: u32::try_from(r.try_get::<i64, _>("failures")?).unwrap_or(u32::MAX),
+                tripped_at: r.try_get("tripped_at")?,
+                reason: r.try_get("reason")?,
+            },
+            r.try_get("version")?,
+        ),
+        None => (crate::burst::Breaker::default(), 0),
+    })
 }
 
 fn to_text<T: Serialize>(v: &T) -> Result<String, StoreError> {
@@ -930,6 +954,86 @@ impl Store {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// The burst enrollment circuit breaker (see [`crate::burst::Breaker`])
+    /// and its row version (0 when never written: closed, no failures).
+    pub async fn burst_breaker(&self) -> Result<(crate::burst::Breaker, i64), StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let row = sqlx::query(
+            "SELECT failures, tripped_at, reason, version FROM burst_breaker WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        breaker_row(row.as_ref())
+    }
+
+    /// Write the breaker if its row is still at `version` (what the caller
+    /// read). False when another writer (an operator reset) got there first;
+    /// the caller's update is then dropped and the next pass starts over.
+    pub async fn save_burst_breaker(
+        &self,
+        b: &crate::burst::Breaker,
+        version: i64,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let done = sqlx::query(
+            "INSERT INTO burst_breaker (id, failures, tripped_at, reason, updated_at, version) VALUES (1, ?, ?, ?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET failures = excluded.failures, tripped_at = excluded.tripped_at, \
+             reason = excluded.reason, updated_at = excluded.updated_at, version = excluded.version \
+             WHERE burst_breaker.version = ?",
+        )
+        .bind(i64::from(b.failures))
+        .bind(b.tripped_at)
+        .bind(&b.reason)
+        .bind(now)
+        .bind(version + 1)
+        .bind(version)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// Close the circuit breaker and zero its count, auditing the change as
+    /// key `burst.breaker` in `control_audit`, in one transaction. Returns
+    /// the state it replaced.
+    pub async fn reset_burst_breaker(
+        &self,
+        actor: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<crate::burst::Breaker, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let row = sqlx::query(
+            "SELECT failures, tripped_at, reason, version FROM burst_breaker WHERE id = 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (old, version) = breaker_row(row.as_ref())?;
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query(
+            "INSERT OR REPLACE INTO burst_breaker (id, failures, tripped_at, reason, updated_at, version) VALUES (1, 0, NULL, NULL, ?, ?)",
+        )
+        .bind(now)
+        .bind(version + 1)
+        .execute(&mut *tx)
+        .await?;
+        let state = |b: &crate::burst::Breaker| serde_json::json!({"tripped": b.tripped(), "failures": b.failures, "reason": b.reason});
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query(
+            "INSERT INTO control_audit (at, actor, reason, key, old_value, old_source, new_value, new_source) VALUES (?, ?, ?, 'burst.breaker', ?, 'breaker', ?, 'operator_reset')",
+        )
+        .bind(now)
+        .bind(actor)
+        .bind(reason)
+        .bind(to_text(&state(&old))?)
+        .bind(to_text(&state(&crate::burst::Breaker::default()))?)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(old)
     }
 
     /// The newest control audit entries, newest first.

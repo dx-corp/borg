@@ -1121,6 +1121,24 @@ config does not change a value an override holds; `/status` `burst_control`
 shows which one applies. The burst rule reads the overrides every pass, so a
 write applies at the next pass (`poll_interval_secs`).
 
+#### Enrollment circuit breaker
+
+A burst VM whose drone never heartbeats within `provision_grace_secs` is
+deleted as never enrolled. After `burst.breaker_failures` (default 2) such VMs
+in a row, the breaker trips: the queen creates no burst VM (pass outcome
+`breaker_tripped`, health event `burst_breaker_tripped` with the reason and the
+last VM) and keeps the drones that work. A drone's first heartbeat sets the
+count back to zero but does not close a tripped breaker. The state lives in
+the queen store (`burst_breaker`), so a restart keeps it. After fixing the
+cause (read the next VM's serial console: `borg-burst:` lines), close it with
+`borg queen-ctl burst reset-breaker --reason "..."`
+(`POST /v1/control/burst/reset-breaker` with `actor` and `reason`), audited
+as key `burst.breaker`. `/status` `burst_breaker` and the metrics
+`borg_burst_breaker_tripped`, `borg_burst_breaker_failures` and
+`borg_burst_breaker_threshold` show it (present only when burst is not
+dry-run). On 10/27-10/30 every burst VM crashed at boot (`GLIBC_2.38 not
+found`) and the queen kept creating them.
+
 Turning burst off creates nothing more; the drones the queen made are drained
 (`burst: burst disabled`) and deleted once they hold no lease, and the pass
 outcome is `disabled`. The same applies when the config sets

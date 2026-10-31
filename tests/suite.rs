@@ -8,6 +8,7 @@
 mod support;
 
 mod admin_cli;
+mod breaker;
 mod burst;
 mod capacity;
 mod contract;

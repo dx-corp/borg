@@ -302,6 +302,59 @@ fn printable(s: &str) -> bool {
     !s.chars().any(char::is_control)
 }
 
+/// The trimmed actor and reason every write must carry.
+pub fn check_actor_reason<'a>(
+    actor: &'a str,
+    reason: &'a str,
+) -> Result<(&'a str, &'a str), String> {
+    let actor = actor.trim();
+    if actor.is_empty() || actor.len() > MAX_ACTOR || !printable(actor) {
+        return Err(format!(
+            "actor is required: 1-{MAX_ACTOR} printable characters"
+        ));
+    }
+    let reason = reason.trim();
+    if reason.len() < 3 || reason.len() > MAX_REASON || !printable(reason) {
+        return Err(format!(
+            "reason is required: 3-{MAX_REASON} printable characters"
+        ));
+    }
+    Ok((actor, reason))
+}
+
+/// `POST /v1/control/burst/reset-breaker`: close the enrollment circuit
+/// breaker (see [`crate::burst::Breaker`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BreakerReset {
+    pub actor: String,
+    pub reason: String,
+}
+
+/// The circuit breaker as `/status` and the control API show it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BreakerView {
+    pub tripped: bool,
+    /// Consecutive burst VMs that never enrolled since the last success or reset.
+    pub failures: u32,
+    /// Failures that trip it (`burst.breaker_failures`).
+    pub threshold: u32,
+    pub tripped_at: Option<i64>,
+    pub reason: Option<String>,
+}
+
+impl BreakerView {
+    pub fn new(b: &crate::burst::Breaker, threshold: u32) -> Self {
+        Self {
+            tripped: b.tripped(),
+            failures: b.failures,
+            threshold,
+            tripped_at: b.tripped_at,
+            reason: b.reason.clone(),
+        }
+    }
+}
+
 /// Validate `w` against `cfg`'s ceilings and the overrides in force; return
 /// the changes to store. A write that sets a value to what it already is is
 /// accepted and audited (it pins the value as an override).
@@ -310,18 +363,7 @@ pub fn check_write(
     current: &Overrides,
     w: &BurstWrite,
 ) -> Result<Vec<Change>, String> {
-    let actor = w.actor.trim();
-    if actor.is_empty() || actor.len() > MAX_ACTOR || !printable(actor) {
-        return Err(format!(
-            "actor is required: 1-{MAX_ACTOR} printable characters"
-        ));
-    }
-    let reason = w.reason.trim();
-    if reason.len() < 3 || reason.len() > MAX_REASON || !printable(reason) {
-        return Err(format!(
-            "reason is required: 3-{MAX_REASON} printable characters"
-        ));
-    }
+    let (actor, reason) = check_actor_reason(&w.actor, &w.reason)?;
     let mut sets: BTreeMap<Knob, Value> = BTreeMap::new();
     if let Some(v) = w.enabled {
         sets.insert(Knob::Enabled, Value::from(v));
@@ -522,6 +564,22 @@ pub fn render_status(v: &Value) -> Vec<String> {
                 line.push_str(&format!(" ceiling={}", plain(&s["ceiling"])));
             }
             out.push(line);
+        }
+    }
+    let br = &v["burst_breaker"];
+    if !br.is_null() {
+        if br["tripped"] == true {
+            out.push(format!(
+                "circuit breaker: TRIPPED at {}: {} (no burst VM is created until `borg queen-ctl burst reset-breaker --reason ...`)",
+                utc(&br["tripped_at"]),
+                plain(&br["reason"])
+            ));
+        } else {
+            out.push(format!(
+                "circuit breaker: closed, {}/{} consecutive VMs never enrolled",
+                plain(&br["failures"]),
+                plain(&br["threshold"])
+            ));
         }
     }
     let b = &v["burst"];
