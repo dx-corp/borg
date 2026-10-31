@@ -941,6 +941,9 @@ pub struct CapacityStatus {
     starved_since: Option<i64>,
     /// The `capacity_starved` health event is raised and not yet restored.
     alarm: bool,
+    /// Free slots on drones that admit every scope of the class, after the
+    /// last pass's grants: the room `capacity_starved` judges.
+    admitting_free_slots: u32,
 }
 
 /// What CPU pressure currently lets this drone take.
@@ -1332,6 +1335,11 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
                     unmet_deploy: unmet_of(class, Scope::Deploy),
                     starved_since: snap.starved_since.get(&class).copied(),
                     alarm: snap.starved.contains(&class),
+                    admitting_free_slots: snap
+                        .idle
+                        .iter()
+                        .find(|i| i.class == class)
+                        .map_or(0, |i| i.idle_slots),
                 },
             )
         })
@@ -1695,7 +1703,74 @@ pub fn render_metrics(status: &Status) -> String {
             .map(|r| (format!("runner=\"{}\"", label_value(&r.name)), 1.0))
             .collect(),
     );
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "ages, byte counts and timestamps are far below 2^52"
+    )]
+    let num = |v: i64| v as f64;
+    gauge(
+        "borg_capacity_starved_seconds",
+        "Seconds main demand of a class has been unmet with little free admitting room (capacity_alarm); absent when not starved.",
+        status
+            .capacity
+            .iter()
+            .filter_map(|(c, v)| {
+                v.starved_since
+                    .map(|since| (format!("class=\"{c}\""), num((status.now - since).max(0))))
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_capacity_admitting_free_slots",
+        "Free slots of a class on drones admitting every scope of it, after the last pass's grants.",
+        status
+            .capacity
+            .iter()
+            .map(|(c, v)| (format!("class=\"{c}\""), f64::from(v.admitting_free_slots)))
+            .collect(),
+    );
+    gauge(
+        "borg_drone_stale",
+        "1 for each enrolled drone whose heartbeat is older than drone_stale_secs.",
+        status
+            .stale_drones
+            .iter()
+            .map(|d| (format!("drone=\"{}\"", label_value(d)), 1.0))
+            .collect(),
+    );
+    gauge(
+        "borg_static_runner_offline_seconds",
+        "Seconds since this queen first saw a non-borg runner offline (resets on a queen restart).",
+        status
+            .static_runners_offline
+            .iter()
+            .map(|r| {
+                (
+                    format!("runner=\"{}\"", label_value(&r.name)),
+                    num((status.now - r.offline_since).max(0)),
+                )
+            })
+            .collect(),
+    );
     if let Some(b) = &status.burst {
+        gauge(
+            "borg_burst_never_enrolled_timestamp_seconds",
+            "End time of each burst VM that ended in the last 24h without its drone ever heartbeating (live mode).",
+            b.never_enrolled
+                .iter()
+                .map(|n| {
+                    (
+                        format!(
+                            "drone=\"{}\",vm=\"{}\",zone=\"{}\"",
+                            label_value(&n.drone),
+                            label_value(&n.vm),
+                            label_value(&n.zone)
+                        ),
+                        num(n.ended_at),
+                    )
+                })
+                .collect(),
+        );
         gauge(
             "borg_burst_enabled",
             "1 while burst may create drones (effective: config or control override).",
@@ -1836,6 +1911,63 @@ pub fn render_metrics(status: &Status) -> String {
                 count(&|d| d.quarantined),
             ),
         ],
+    );
+    gauge(
+        "borg_drone_disk_admission",
+        "1 for the drone's current disk admission state (pass, fail, unknown); fail blocks new leases.",
+        status
+            .drones
+            .iter()
+            .flat_map(|d| {
+                CheckState::ALL.into_iter().map(move |st| {
+                    (
+                        format!(
+                            "drone=\"{}\",state=\"{}\"",
+                            label_value(&d.name),
+                            st.as_str()
+                        ),
+                        f64::from(u8::from(d.disk_admission.state == st)),
+                    )
+                })
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_drone_disk_free_bytes",
+        "Free bytes the drone reported on its work and cache filesystems; absent when unreported.",
+        status
+            .drones
+            .iter()
+            .flat_map(|d| {
+                [
+                    ("work", d.disk_admission.work_free_bytes),
+                    ("cache", d.disk_admission.cache_free_bytes),
+                ]
+                .into_iter()
+                .filter_map(move |(mount, free)| {
+                    #[allow(clippy::cast_precision_loss, reason = "byte counts far below 2^52")]
+                    free.map(|f| {
+                        (
+                            format!("drone=\"{}\",mount=\"{mount}\"", label_value(&d.name)),
+                            f as f64,
+                        )
+                    })
+                })
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_drone_disk_min_free_bytes",
+        "Free bytes each disk must keep for the drone to take new leases.",
+        status
+            .drones
+            .iter()
+            .map(|d| {
+                #[allow(clippy::cast_precision_loss, reason = "byte counts far below 2^52")]
+                let v = d.disk_admission.minimum_free_bytes as f64;
+                (format!("drone=\"{}\"", label_value(&d.name)), v)
+            })
+            .collect(),
     );
     gauge(
         "borg_drone_quarantined",

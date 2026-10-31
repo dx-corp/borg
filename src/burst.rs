@@ -912,6 +912,54 @@ pub struct BurstView {
     counting_since: Option<i64>,
     /// Newest last.
     recent: Vec<Decision>,
+    /// VMs that ended within [`NEVER_ENROLLED_WINDOW_SECS`] without their
+    /// drone ever heartbeating (live mode only), newest last. On 2026-10-27..30
+    /// every burst VM crashed at boot (`GLIBC_2.38 not found` in the queen's
+    /// own binary) and was deleted as "never enrolled" for three days with no
+    /// alert; this list is what the alert reads.
+    pub(super) never_enrolled: Vec<NeverEnrolled>,
+}
+
+/// How long a never-enrolled VM stays listed after it ended.
+pub(crate) const NEVER_ENROLLED_WINDOW_SECS: i64 = 24 * 3600;
+
+/// A burst VM that was created and ended without its drone ever heartbeating.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NeverEnrolled {
+    pub(super) drone: String,
+    pub(super) vm: String,
+    pub(super) zone: String,
+    pub(super) created_at: i64,
+    pub(super) ended_at: i64,
+}
+
+/// VMs in `vms` that ended within the window without ever enrolling. The
+/// queen scrubs a VM's bootstrap secrets on its drone's first live
+/// heartbeat, so an ended VM that was never scrubbed or drained never
+/// enrolled. A create that failed outright ends in the pass that made it
+/// (`ended_at == created_at`) and is not counted: no VM booted.
+pub(super) fn never_enrolled(vms: &[BurstVm], dry_run: bool, now: i64) -> Vec<NeverEnrolled> {
+    if dry_run {
+        return Vec::new();
+    }
+    let mut out: Vec<NeverEnrolled> = vms
+        .iter()
+        .filter(|v| v.scrubbed_at.is_none() && v.draining_at.is_none())
+        .filter_map(|v| {
+            let ended = v.ended_at?;
+            (ended > v.created_at && now - ended <= NEVER_ENROLLED_WINDOW_SECS).then(|| {
+                NeverEnrolled {
+                    drone: v.drone.clone(),
+                    vm: v.vm.clone(),
+                    zone: v.zone.clone(),
+                    created_at: v.created_at,
+                    ended_at: ended,
+                }
+            })
+        })
+        .collect();
+    out.sort_by_key(|n| (n.ended_at, n.created_at));
+    out
 }
 
 /// [`Spend`] in dollars at `hourly_cost_usd`.
@@ -983,6 +1031,7 @@ pub(super) fn view(
         outcomes: st.outcomes.clone(),
         counting_since: st.counting_since,
         recent: st.recent.iter().cloned().collect(),
+        never_enrolled: never_enrolled(vms, cfg.dry_run, now),
     }
 }
 
@@ -1650,6 +1699,59 @@ mod tests {
         prune(&mut vms, max_run, feb1 + 3600);
         let names: Vec<&str> = vms.iter().map(|v| v.drone.as_str()).collect();
         assert_eq!(names, ["gcp-burst-straddles", "gcp-burst-ended"]);
+    }
+
+    #[test]
+    fn never_enrolled_lists_only_vms_that_ended_without_a_heartbeat() {
+        let now = 1_793_374_945;
+        let vms = vec![
+            // Booted, never heartbeated, deleted at the grace period: listed.
+            BurstVm {
+                ended_at: Some(now - 600),
+                ..vm("gcp-burst-a", "us-west1-b", now - 600 - 1500)
+            },
+            // Enrolled (scrubbed), later went silent: not listed.
+            BurstVm {
+                ended_at: Some(now - 300),
+                scrubbed_at: Some(now - 3000),
+                ..vm("gcp-burst-b", "us-west1-a", now - 4000)
+            },
+            // Drained and deleted normally: not listed.
+            BurstVm {
+                ended_at: Some(now - 200),
+                draining_at: Some(now - 900),
+                scrubbed_at: Some(now - 9000),
+                ..vm("gcp-burst-c", "us-west1-a", now - 10_000)
+            },
+            // The create failed outright in its own pass: no VM booted.
+            BurstVm {
+                ended_at: Some(now - 100),
+                ..vm("gcp-burst-d", "us-west1-c", now - 100)
+            },
+            // Still provisioning: not ended.
+            vm("gcp-burst-e", "us-west1-b", now - 60),
+            // Ended more than a day ago: aged out.
+            BurstVm {
+                ended_at: Some(now - NEVER_ENROLLED_WINDOW_SECS - 1),
+                ..vm(
+                    "gcp-burst-f",
+                    "us-west1-b",
+                    now - NEVER_ENROLLED_WINDOW_SECS - 2000,
+                )
+            },
+        ];
+        let listed = never_enrolled(&vms, false, now);
+        assert_eq!(
+            listed,
+            vec![NeverEnrolled {
+                drone: "gcp-burst-a".to_owned(),
+                vm: "borg-burst-a".to_owned(),
+                zone: "us-west1-b".to_owned(),
+                created_at: now - 2100,
+                ended_at: now - 600,
+            }]
+        );
+        assert!(never_enrolled(&vms, true, now).is_empty());
     }
 
     #[test]

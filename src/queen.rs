@@ -205,7 +205,7 @@ pub struct OfflineRunner {
     /// Custom labels only (`self-hosted`, `Linux` and the like are dropped).
     labels: Vec<String>,
     /// Unix time this queen first saw it offline (resets on a queen restart).
-    offline_since: i64,
+    pub(super) offline_since: i64,
 }
 
 /// Labels GitHub assigns to every self-hosted runner.
