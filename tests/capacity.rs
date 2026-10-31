@@ -179,6 +179,14 @@ async fn silent_drones_are_stale_then_expired_burst_drones_first() {
     assert!(d["expires_in_secs"].as_i64().unwrap() <= 480);
     assert_eq!(s["capacity"]["heavy"]["schedulable_slots"], 0);
     assert_eq!(s["stale_drones"], json!(["gcp-burst-1", "pve-1"]));
+    // `/metrics` renders at wall time, when both drones are still fresh.
+    let metrics = h.metrics().await;
+    assert!(!metrics.contains("borg_drone_stale{"), "{metrics}");
+    // No disk facts reported: admission is unknown, not failed.
+    assert!(
+        metrics.contains("borg_drone_disk_admission{drone=\"pve-1\",state=\"unknown\"} 1"),
+        "{metrics}"
+    );
     let ev = events(&s);
     assert!(
         ev.contains(&("gcp-burst-1".into(), "drone_stale".into())),
@@ -285,11 +293,20 @@ async fn a_drone_shedding_under_pressure_has_no_free_slot_for_the_alarm() {
     let s = status_at(&h, t1).await;
     assert_eq!(s["capacity"]["heavy"]["alarm"], true, "{}", s["capacity"]);
     assert!(events(&s).contains(&("fleet".into(), "capacity_starved".into())));
+    let metrics = h.metrics().await;
+    assert!(metrics.contains("borg_capacity_starved{class=\"heavy\"} 1"));
+    // Nominal room is 1, but the shedding drone admits no heavy lease: the
+    // alert reads the admitting room and how long the class has starved.
+    assert_eq!(s["capacity"]["heavy"]["admitting_free_slots"], 0);
     assert!(
-        h.metrics()
-            .await
-            .contains("borg_capacity_starved{class=\"heavy\"} 1")
+        metrics.contains("borg_capacity_admitting_free_slots{class=\"heavy\"} 0"),
+        "{metrics}"
     );
+    assert!(
+        metrics.contains("borg_capacity_starved_seconds{class=\"heavy\"} "),
+        "{metrics}"
+    );
+    assert!(!metrics.contains("borg_capacity_starved_seconds{class=\"light\"}"));
 
     // The queue drains: the alarm clears.
     h.state().jobs.clear();

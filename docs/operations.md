@@ -687,6 +687,23 @@ are never listed; they are ephemeral and expire with their lease.
 All of these events go to the same audit trail as quarantines: `health_log`,
 shown as `health_events` in `/status`, and a `WARN` line in the queen journal.
 
+#### Alert metrics
+
+Production Prometheus scrapes `/metrics` through the tailnet (job
+`borg-queen` in dx-corp/k8s), and the rules in
+`k8s/monitoring/prometheus-rules/borg-queen.yaml` there post to Slack
+`#ensemble`. These gauges exist for those rules:
+
+| Metric | Meaning |
+| --- | --- |
+| `borg_capacity_starved_seconds{class}` | How long main demand has starved (the alarm clock above); absent when not starved. |
+| `borg_capacity_admitting_free_slots{class}` | Free admitting slots after the last pass, the room the alarm judges (`capacity.<class>.admitting_free_slots`). |
+| `borg_drone_stale{drone}` | 1 for each stale drone. |
+| `borg_drone_disk_admission{drone,state}` | 1 for the current disk admission state (`pass`, `fail`, `unknown`); `fail` blocks new leases. |
+| `borg_drone_disk_free_bytes{drone,mount}` / `borg_drone_disk_min_free_bytes{drone}` | Reported free bytes on the `work` and `cache` filesystems, and the floor. |
+| `borg_static_runner_offline_seconds{runner}` | Seconds since this queen first saw the runner offline. |
+| `borg_burst_never_enrolled_timestamp_seconds{drone,vm,zone}` | End time of each burst VM that ended in the last 24 hours without its drone ever heartbeating (`burst.never_enrolled` in `/status`). |
+
 ### Tailnet enrollment
 
 Optional and off by default. With a `tailnet_enroll` block

@@ -313,7 +313,47 @@ async fn live_burst_creates_scrubs_drains_and_deletes_a_real_drone() {
     );
     assert_eq!(s["burst"]["drones"]["managed"], 0);
     assert!(s["burst"]["spend"]["day_hours"].as_f64().unwrap() > 0.4);
+    assert_eq!(s["burst"]["never_enrolled"], json!([]), "it enrolled");
     assert!(h.heartbeat(&token, &[]).await.status().is_client_error());
+}
+
+#[tokio::test]
+async fn a_vm_whose_drone_never_heartbeats_is_deleted_and_listed_as_never_enrolled() {
+    let h = Harness::start(live_config()).await;
+    h.queue_job(1, "borg-ci-heavy", 5);
+    h.queue_job(2, "borg-ci-heavy", 5);
+    let t0 = OffsetDateTime::now_utc().replace_time(time::Time::from_hms(12, 0, 0).unwrap());
+    let at = |s: i64| t0 + time::Duration::seconds(s);
+
+    h.queen.tick(at(0)).await.unwrap();
+    h.queen.tick(at(600)).await.unwrap();
+    let s = status_at(&h, at(600)).await;
+    assert_eq!(burst_events(&s), ["burst_create"]);
+    let drone_name = s["burst"]["vms"][0]["drone"].as_str().unwrap().to_owned();
+    let vm_name = s["burst"]["vms"][0]["vm"].as_str().unwrap().to_owned();
+
+    // The VM boots but its drone never heartbeats (2026-10-27..30: the
+    // queen's binary needed a newer glibc than the image had). Past the
+    // grace period the queen deletes it.
+    h.state().jobs.clear();
+    h.queen.tick(at(600 + 1500)).await.unwrap();
+    let s = status_at(&h, at(600 + 1500)).await;
+    assert!(
+        burst_events(&s).contains(&"burst_delete".to_owned()),
+        "{:?}",
+        burst_events(&s)
+    );
+    assert_eq!(h.state().gce_deleted, std::slice::from_ref(&vm_name));
+    let listed = &s["burst"]["never_enrolled"];
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed[0]["drone"], drone_name);
+    assert_eq!(listed[0]["vm"], vm_name);
+    assert_eq!(listed[0]["zone"], "us-west1-b");
+    assert_eq!(listed[0]["ended_at"], at(2100).unix_timestamp());
+    assert!(h.metrics().await.contains(&format!(
+        "borg_burst_never_enrolled_timestamp_seconds{{drone=\"{drone_name}\",vm=\"{vm_name}\",zone=\"us-west1-b\"}} {}",
+        at(2100).unix_timestamp()
+    )));
 }
 
 #[tokio::test]
