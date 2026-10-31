@@ -107,6 +107,10 @@ Class requirements and the label prefix are configurable. See
 
 ## Operate the fleet
 
+For temporary coding-agent access, see [administrator-approved registration](docs/agent-registration.md).
+Agents prepare hash-only requests; an operator grants bounded PR access without
+transmitting the bearer secret. Network access remains a separate prerequisite.
+
 ```sh
 borg queen drone list --config queen.toml
 borg queen quarantine --config queen.toml --reason "maintenance" host-a

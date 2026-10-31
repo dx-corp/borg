@@ -513,8 +513,9 @@ impl Store {
         token_hash: &str,
     ) -> Result<Option<String>, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
-        let row = sqlx::query("SELECT name FROM clients WHERE token_hash = ?")
+        let row = sqlx::query("SELECT name FROM clients WHERE (token_hash = ? OR token_hash = ?) AND (expires_at IS NULL OR expires_at > unixepoch())")
             .bind(token_hash)
+            .bind(format!("temporary:{token_hash}"))
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|r| r.get("name")))

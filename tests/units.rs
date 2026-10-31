@@ -7,6 +7,114 @@ use time::OffsetDateTime;
 
 const TREE: &str = "0123456789abcdef0123456789abcdef01234567";
 
+#[tokio::test]
+async fn registration_requires_approval_and_cannot_acquire_main_or_deploy_scope() {
+    let r = Rig::new(json!({})).await;
+    let token = enroll::new_token();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let request = borg::client_registration::Request {
+        name: "temporary-agent".into(),
+        token_hash: enroll::hash_token(&token),
+        created_at: now,
+    };
+    assert_eq!(r.submit_as(&token, &r.unit(json!({}))).await.0, 401);
+    borg::client_registration::approve(r.h.queen.store(), &request, 3600, now)
+        .await
+        .unwrap();
+    for scope in ["main", "deploy"] {
+        assert_eq!(
+            r.submit_as(&token, &r.unit(json!({"scope": scope})))
+                .await
+                .0,
+            403
+        );
+    }
+    assert_eq!(
+        r.submit_as(&token, &r.unit(json!({"scope": "pr"}))).await.0,
+        201
+    );
+
+    let expired = enroll::new_token();
+    let request = borg::client_registration::Request {
+        name: "expired-agent".into(),
+        token_hash: enroll::hash_token(&expired),
+        created_at: now - 10,
+    };
+    borg::client_registration::approve(r.h.queen.store(), &request, 1, now - 10)
+        .await
+        .unwrap();
+    assert_eq!(r.submit_as(&expired, &r.unit(json!({}))).await.0, 401);
+}
+
+#[tokio::test]
+async fn temporary_client_cannot_read_cancel_or_join_another_owner_and_can_be_revoked() {
+    let r = Rig::new(json!({})).await;
+    let (_, existing) = r.submit(&r.unit(json!({}))).await;
+    let id = existing["unit_id"].as_str().unwrap();
+    let token = enroll::new_token();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let request = borg::client_registration::Request {
+        name: "bounded-agent".into(),
+        token_hash: enroll::hash_token(&token),
+        created_at: now,
+    };
+    borg::client_registration::approve(r.h.queen.store(), &request, 3600, now)
+        .await
+        .unwrap();
+    for suffix in [format!("/v1/units/{id}"), format!("/v1/units/{id}/log")] {
+        let response =
+            r.h.http
+                .get(format!("{}{suffix}", r.h.url))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap();
+        assert_eq!(response.status().as_u16(), 403);
+    }
+    let response =
+        r.h.http
+            .post(format!("{}/v1/units/{id}/cancel", r.h.url))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(response.status().as_u16(), 403);
+    assert_eq!(r.submit_as(&token, &r.unit(json!({}))).await.0, 403);
+    assert!(
+        !r.h.queen
+            .store()
+            .unit(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .cancel_requested
+    );
+
+    assert_eq!(
+        r.submit_as(&token, &r.unit(json!({"argv": ["cargo", "test"]})))
+            .await
+            .0,
+        201
+    );
+    assert!(
+        borg::client_registration::revoke(r.h.queen.store(), "bounded-agent")
+            .await
+            .unwrap()
+    );
+    assert_eq!(r.submit_as(&token, &r.unit(json!({}))).await.0, 401);
+    assert!(
+        borg::client_registration::approve(r.h.queen.store(), &request, 3600, now)
+            .await
+            .is_err()
+    );
+    assert!(
+        !borg::client_registration::revoke(r.h.queen.store(), "agent")
+            .await
+            .unwrap()
+    );
+    assert_eq!(r.submit(&r.unit(json!({}))).await.0, 200);
+}
+
 fn cfg() -> Value {
     json!({"drone_stale_secs": 1_000_000, "units": {"enabled": true, "lease_ttl_secs": 100, "max_attempts": 2}})
 }
