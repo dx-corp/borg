@@ -77,7 +77,7 @@ pub struct OverrideRow {
 }
 
 /// The overrides in force, by knob. Rows with an unknown key or a value of
-/// the wrong type are ignored (and reported by [`Overrides::from_rows`]).
+/// the wrong type are ignored and reported when the overrides are loaded.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Overrides(BTreeMap<Knob, OverrideRow>);
 
@@ -464,8 +464,8 @@ pub(super) fn check_write(
 /// Shortest control token accepted (a `borg_` token is 69 characters).
 const MIN_TOKEN_LEN: usize = 32;
 
-/// Read the control token from `path`: the first line, at least
-/// [`MIN_TOKEN_LEN`] characters. On Unix the file must not be readable by
+/// Read the control token from `path`: the first line, at least 32
+/// characters. On Unix the file must not be readable by
 /// group or others.
 pub fn load_token(path: &Path) -> Result<String, String> {
     #[cfg(unix)]
