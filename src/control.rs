@@ -35,7 +35,7 @@ pub enum Knob {
 }
 
 impl Knob {
-    pub const ALL: [Knob; 4] = [
+    const ALL: [Knob; 4] = [
         Knob::Enabled,
         Knob::MaxDrones,
         Knob::DroneHoursPerDay,
@@ -43,7 +43,7 @@ impl Knob {
     ];
 
     /// The store and audit key.
-    pub fn key(self) -> &'static str {
+    pub(super) fn key(self) -> &'static str {
         match self {
             Knob::Enabled => "burst.enabled",
             Knob::MaxDrones => "burst.max_drones",
@@ -52,7 +52,7 @@ impl Knob {
         }
     }
 
-    pub fn from_key(key: &str) -> Option<Self> {
+    fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.key() == key)
     }
 }
@@ -61,29 +61,29 @@ impl Knob {
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ceilings {
-    pub max_drones: u32,
-    pub drone_hours_per_day: f64,
-    pub drone_hours_per_month: f64,
+    pub(super) max_drones: u32,
+    pub(super) drone_hours_per_day: f64,
+    pub(super) drone_hours_per_month: f64,
 }
 
 /// A stored override: the value, and who set it, when and why.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OverrideRow {
-    pub key: String,
-    pub value: Value,
-    pub set_at: i64,
-    pub actor: String,
-    pub reason: String,
+    pub(super) key: String,
+    pub(super) value: Value,
+    pub(super) set_at: i64,
+    pub(super) actor: String,
+    pub(super) reason: String,
 }
 
 /// The overrides in force, by knob. Rows with an unknown key or a value of
 /// the wrong type are ignored (and reported by [`Overrides::from_rows`]).
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Overrides(pub BTreeMap<Knob, OverrideRow>);
+pub struct Overrides(BTreeMap<Knob, OverrideRow>);
 
 impl Overrides {
     /// Typed overrides from store rows, plus the keys that were ignored.
-    pub fn from_rows(rows: Vec<OverrideRow>) -> (Self, Vec<String>) {
+    pub(super) fn from_rows(rows: Vec<OverrideRow>) -> (Self, Vec<String>) {
         let mut map = BTreeMap::new();
         let mut ignored = Vec::new();
         for r in rows {
@@ -138,22 +138,22 @@ pub enum Source {
 /// who set the override.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Setting<T> {
-    pub value: T,
-    pub source: Source,
-    pub config: T,
-    pub ceiling: Option<T>,
-    pub set_by: Option<String>,
-    pub set_at: Option<i64>,
-    pub reason: Option<String>,
+    value: T,
+    source: Source,
+    config: T,
+    ceiling: Option<T>,
+    set_by: Option<String>,
+    set_at: Option<i64>,
+    reason: Option<String>,
 }
 
 /// The effective burst settings, as `/status` and the control API show them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ControlView {
-    pub enabled: Setting<bool>,
-    pub max_drones: Setting<u32>,
-    pub drone_hours_per_day: Setting<f64>,
-    pub drone_hours_per_month: Setting<f64>,
+    enabled: Setting<bool>,
+    max_drones: Setting<u32>,
+    drone_hours_per_day: Setting<f64>,
+    drone_hours_per_month: Setting<f64>,
 }
 
 impl ControlView {
@@ -211,7 +211,7 @@ fn setting<T: Copy + PartialOrd>(
 }
 
 /// The effective values of `cfg` under `ov`.
-pub fn view(cfg: &BurstSettings, ov: &Overrides) -> ControlView {
+pub(super) fn view(cfg: &BurstSettings, ov: &Overrides) -> ControlView {
     let c = cfg.ceilings();
     ControlView {
         enabled: setting(ov, Knob::Enabled, cfg.enabled, None, Overrides::bool),
@@ -240,7 +240,7 @@ pub fn view(cfg: &BurstSettings, ov: &Overrides) -> ControlView {
 }
 
 /// `cfg` with the overrides applied: what the burst rule runs with.
-pub fn effective(cfg: &BurstSettings, ov: &Overrides) -> BurstSettings {
+pub(super) fn effective(cfg: &BurstSettings, ov: &Overrides) -> BurstSettings {
     let v = view(cfg, ov);
     let mut out = cfg.clone();
     out.enabled = v.enabled.value;
@@ -273,37 +273,37 @@ pub struct BurstWrite {
 /// effective value before and after, for the audit log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Change {
-    pub knob: Knob,
-    pub set: Option<Value>,
-    pub old: Value,
-    pub old_source: Source,
-    pub new: Value,
-    pub new_source: Source,
+    pub(super) knob: Knob,
+    pub(super) set: Option<Value>,
+    pub(super) old: Value,
+    pub(super) old_source: Source,
+    pub(super) new: Value,
+    pub(super) new_source: Source,
 }
 
 /// A persisted audit entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditRow {
-    pub id: i64,
-    pub at: i64,
-    pub actor: String,
-    pub reason: String,
-    pub key: String,
-    pub old_value: Value,
-    pub old_source: String,
-    pub new_value: Value,
-    pub new_source: String,
+    pub(super) id: i64,
+    pub(super) at: i64,
+    pub(super) actor: String,
+    pub(super) reason: String,
+    pub(super) key: String,
+    pub(super) old_value: Value,
+    pub(super) old_source: String,
+    pub(super) new_value: Value,
+    pub(super) new_source: String,
 }
 
-pub const MAX_ACTOR: usize = 64;
-pub const MAX_REASON: usize = 500;
+const MAX_ACTOR: usize = 64;
+const MAX_REASON: usize = 500;
 
 fn printable(s: &str) -> bool {
     !s.chars().any(char::is_control)
 }
 
 /// The trimmed actor and reason every write must carry.
-pub fn check_actor_reason<'a>(
+pub(super) fn check_actor_reason<'a>(
     actor: &'a str,
     reason: &'a str,
 ) -> Result<(&'a str, &'a str), String> {
@@ -334,17 +334,17 @@ pub struct BreakerReset {
 /// The circuit breaker as `/status` and the control API show it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BreakerView {
-    pub tripped: bool,
+    pub(crate) tripped: bool,
     /// Consecutive burst VMs that never enrolled since the last success or reset.
-    pub failures: u32,
+    pub(crate) failures: u32,
     /// Failures that trip it (`burst.breaker_failures`).
-    pub threshold: u32,
-    pub tripped_at: Option<i64>,
-    pub reason: Option<String>,
+    pub(crate) threshold: u32,
+    tripped_at: Option<i64>,
+    reason: Option<String>,
 }
 
 impl BreakerView {
-    pub fn new(b: &crate::burst::Breaker, threshold: u32) -> Self {
+    pub(super) fn new(b: &crate::burst::Breaker, threshold: u32) -> Self {
         Self {
             tripped: b.tripped(),
             failures: b.failures,
@@ -358,7 +358,7 @@ impl BreakerView {
 /// Validate `w` against `cfg`'s ceilings and the overrides in force; return
 /// the changes to store. A write that sets a value to what it already is is
 /// accepted and audited (it pins the value as an override).
-pub fn check_write(
+pub(super) fn check_write(
     cfg: &BurstSettings,
     current: &Overrides,
     w: &BurstWrite,
@@ -462,7 +462,7 @@ pub fn check_write(
 }
 
 /// Shortest control token accepted (a `borg_` token is 69 characters).
-pub const MIN_TOKEN_LEN: usize = 32;
+const MIN_TOKEN_LEN: usize = 32;
 
 /// Read the control token from `path`: the first line, at least
 /// [`MIN_TOKEN_LEN`] characters. On Unix the file must not be readable by
