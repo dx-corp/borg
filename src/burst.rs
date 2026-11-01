@@ -10,9 +10,10 @@
 //!
 //! * **Scale up** when the weighted count of jobs borg could not place (main
 //!   jobs weigh more than pull-request jobs) stays at or above
-//!   `scale_up.min_weighted_unmet` for `scale_up.sustained_secs`, counting only
-//!   classes in `scale_up.classes` that have at most `max_free_slots` free
-//!   slots. After each create the timer restarts, so every further drone needs
+//!   `scale_up.min_weighted_unmet` for `scale_up.sustained_secs`, counting
+//!   classes in `scale_up.classes`. A class with more than `max_free_slots`
+//!   free slots counts only the jobs those slots cannot take (the
+//!   lowest-weight scope is absorbed first). After each create the timer restarts, so every further drone needs
 //!   its own sustained window. Nothing is created while a drone is still
 //!   provisioning, at `max_drones`, or without budget headroom. Deploy jobs
 //!   never count: burst drones enroll with shared trust and cannot take them.
@@ -641,16 +642,29 @@ fn spend(vms: &[BurstVm], max_run: i64, now: i64) -> Spend {
 fn weighted_unmet(cfg: &ScaleUpSettings, unmet: &[Unmet], idle: &[ClassIdle]) -> u32 {
     cfg.classes
         .iter()
-        .filter(|c| {
-            idle.iter()
-                .find(|i| i.class == **c)
-                .is_none_or(|i| i.idle_slots <= cfg.max_free_slots)
-        })
         .map(|c| {
-            unmet
+            let free = idle
+                .iter()
+                .find(|i| i.class == *c)
+                .map_or(0, |i| i.idle_slots);
+            // Free slots absorb queued jobs, the lowest-weight scope first. A
+            // class at or under max_free_slots counts all of its unmet jobs; a
+            // class with more free slots counts only the jobs those slots
+            // cannot take. Before 11/01 such a class counted nothing, so two
+            // free medium slots hid 32 queued medium jobs from scale-up.
+            let mut absorb = if free <= cfg.max_free_slots { 0 } else { free };
+            let mut jobs: Vec<(u32, u32)> = unmet
                 .iter()
                 .filter(|u| u.class == *c)
-                .map(|u| u.count.saturating_mul(cfg.weights.of(u.scope)))
+                .map(|u| (cfg.weights.of(u.scope), u.count))
+                .collect();
+            jobs.sort_unstable();
+            jobs.into_iter()
+                .map(|(weight, count)| {
+                    let taken = count.min(absorb);
+                    absorb -= taken;
+                    (count - taken).saturating_mul(weight)
+                })
                 .fold(0u32, u32::saturating_add)
         })
         .fold(0u32, u32::saturating_add)
@@ -1547,20 +1561,58 @@ mod tests {
     }
 
     #[test]
-    fn free_slots_in_a_class_mean_there_is_nothing_to_burst_for() {
+    fn free_slots_absorb_queued_jobs_before_they_count() {
+        let c = cfg();
+        let plan_with = |unmet: &[Unmet], idle_slots: u32| {
+            let mut st = BurstState::default();
+            let idle = [ClassIdle {
+                class: Class::Heavy,
+                idle_slots,
+            }];
+            plan(
+                &c,
+                &mut st,
+                &Observed {
+                    now: T0,
+                    unmet,
+                    idle: &idle,
+                    drones: &[],
+                    vms: &[],
+                    breaker_tripped: false,
+                    breaker_room: u32::MAX,
+                },
+            )
+        };
+        // Free slots that can take every queued job: nothing to burst for.
+        let two = [unmet(Class::Heavy, Scope::Main, 2)];
+        assert!(!plan_with(&two, 2).demand.holds);
+        // Four main jobs and one free slot: three main jobs (weight 3) remain.
+        let four = [unmet(Class::Heavy, Scope::Main, 4)];
+        assert_eq!(plan_with(&four, 1).demand.weighted_unmet, 9);
+        assert!(plan_with(&four, 1).demand.holds);
+        assert!(plan_with(&four, 0).demand.holds);
+    }
+
+    #[test]
+    fn a_full_medium_lane_with_two_free_slots_still_bursts() {
+        // Production 11/01 09:20Z: 24 medium slots, 2 free, 19 main and 13 pr
+        // jobs queued. Weighted unmet was 0, so the queen never scaled up.
         let c = cfg();
         let mut st = BurstState::default();
-        let heavy = [unmet(Class::Heavy, Scope::Main, 4)];
+        let queued = [
+            unmet(Class::Medium, Scope::Main, 19),
+            unmet(Class::Medium, Scope::Pr, 13),
+        ];
         let idle = [ClassIdle {
-            class: Class::Heavy,
-            idle_slots: 1,
+            class: Class::Medium,
+            idle_slots: 2,
         }];
         let p = plan(
             &c,
             &mut st,
             &Observed {
                 now: T0,
-                unmet: &heavy,
+                unmet: &queued,
                 idle: &idle,
                 drones: &[],
                 vms: &[],
@@ -1568,24 +1620,8 @@ mod tests {
                 breaker_room: u32::MAX,
             },
         );
-        assert!(!p.demand.holds);
-        let idle = [ClassIdle {
-            class: Class::Heavy,
-            idle_slots: 0,
-        }];
-        let p = plan(
-            &c,
-            &mut st,
-            &Observed {
-                now: T0,
-                unmet: &heavy,
-                idle: &idle,
-                drones: &[],
-                vms: &[],
-                breaker_tripped: false,
-                breaker_room: u32::MAX,
-            },
-        );
+        // The two free slots absorb two pr jobs: 19*3 + 11*1.
+        assert_eq!(p.demand.weighted_unmet, 68);
         assert!(p.demand.holds);
     }
 
