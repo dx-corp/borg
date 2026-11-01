@@ -394,11 +394,12 @@ impl BurstSettings {
     }
 
     /// Enabled and not dry-run: the queen creates and deletes real VMs.
-    pub fn live(&self) -> bool {
+    #[cfg(test)]
+    fn live(&self) -> bool {
         self.enabled && !self.dry_run
     }
 
-    /// Not dry-run: the queen acts on real VMs. Unlike [`Self::live`] this
+    /// Not dry-run: the queen acts on real VMs. Unlike the test-only `live` helper, this
     /// ignores `enabled`, which the control API can change at runtime; the
     /// Compute Engine client and bootstrap inputs are needed either way
     /// (disabled burst still drains and deletes the drones it made).
@@ -407,7 +408,7 @@ impl BurstSettings {
     }
 
     /// The control API's limits: `ceilings`, or the configured values.
-    pub fn ceilings(&self) -> crate::control::Ceilings {
+    pub(super) fn ceilings(&self) -> crate::control::Ceilings {
         self.ceilings.unwrap_or(crate::control::Ceilings {
             max_drones: self.max_drones,
             drone_hours_per_day: self.budget.drone_hours_per_day,
@@ -960,7 +961,7 @@ pub struct BurstView {
 }
 
 /// How long a never-enrolled VM stays listed after it ended.
-pub(crate) const NEVER_ENROLLED_WINDOW_SECS: i64 = 24 * 3600;
+const NEVER_ENROLLED_WINDOW_SECS: i64 = 24 * 3600;
 
 /// A burst VM that was created and ended without its drone ever heartbeating.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -968,7 +969,7 @@ pub struct NeverEnrolled {
     pub(super) drone: String,
     pub(super) vm: String,
     pub(super) zone: String,
-    pub(super) created_at: i64,
+    created_at: i64,
     pub(super) ended_at: i64,
 }
 
@@ -977,7 +978,7 @@ pub struct NeverEnrolled {
 /// heartbeat, so an ended VM that was never scrubbed or drained never
 /// enrolled. A create that failed outright ends in the pass that made it
 /// (`ended_at == created_at`) and is not counted: no VM booted.
-pub(super) fn never_enrolled(vms: &[BurstVm], dry_run: bool, now: i64) -> Vec<NeverEnrolled> {
+fn never_enrolled(vms: &[BurstVm], dry_run: bool, now: i64) -> Vec<NeverEnrolled> {
     if dry_run {
         return Vec::new();
     }
@@ -1014,14 +1015,14 @@ pub(super) fn never_enrolled(vms: &[BurstVm], dry_run: bool, now: i64) -> Vec<Ne
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Breaker {
     /// Consecutive failed enrollments since the last success or reset.
-    pub failures: u32,
-    pub tripped_at: Option<i64>,
+    pub(super) failures: u32,
+    pub(super) tripped_at: Option<i64>,
     /// Why it tripped, with the last VM that failed.
-    pub reason: Option<String>,
+    pub(super) reason: Option<String>,
 }
 
 impl Breaker {
-    pub fn tripped(&self) -> bool {
+    pub(super) fn tripped(&self) -> bool {
         self.tripped_at.is_some()
     }
 }

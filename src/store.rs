@@ -880,7 +880,9 @@ impl Store {
     }
 
     /// The control overrides in force (see [`crate::control`]).
-    pub async fn control_overrides(&self) -> Result<Vec<crate::control::OverrideRow>, StoreError> {
+    pub(super) async fn control_overrides(
+        &self,
+    ) -> Result<Vec<crate::control::OverrideRow>, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         let rows = sqlx::query(
             "SELECT key, value, set_at, actor, reason FROM control_overrides ORDER BY key",
@@ -902,7 +904,7 @@ impl Store {
 
     /// Store `changes` (set or drop each override) and append one audit row
     /// per change, in one transaction.
-    pub async fn apply_control(
+    pub(super) async fn apply_control(
         &self,
         changes: &[crate::control::Change],
         actor: &str,
@@ -959,7 +961,7 @@ impl Store {
 
     /// The burst enrollment circuit breaker (see [`crate::burst::Breaker`])
     /// and its row version (0 when never written: closed, no failures).
-    pub async fn burst_breaker(&self) -> Result<(crate::burst::Breaker, i64), StoreError> {
+    pub(super) async fn burst_breaker(&self) -> Result<(crate::burst::Breaker, i64), StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         let row = sqlx::query(
             "SELECT failures, tripped_at, reason, version FROM burst_breaker WHERE id = 1",
@@ -972,7 +974,7 @@ impl Store {
     /// Write the breaker if its row is still at `version` (what the caller
     /// read). False when another writer (an operator reset) got there first;
     /// the caller's update is then dropped and the next pass starts over.
-    pub async fn save_burst_breaker(
+    pub(super) async fn save_burst_breaker(
         &self,
         b: &crate::burst::Breaker,
         version: i64,
@@ -999,7 +1001,7 @@ impl Store {
     /// Close the circuit breaker and zero its count, auditing the change as
     /// key `burst.breaker` in `control_audit`, in one transaction. Returns
     /// the state it replaced.
-    pub async fn reset_burst_breaker(
+    pub(super) async fn reset_burst_breaker(
         &self,
         actor: &str,
         reason: &str,
@@ -1038,7 +1040,7 @@ impl Store {
     }
 
     /// The newest control audit entries, newest first.
-    pub async fn control_audit(
+    pub(super) async fn control_audit(
         &self,
         limit: i64,
     ) -> Result<Vec<crate::control::AuditRow>, StoreError> {

@@ -461,12 +461,12 @@ fn authenticate_control(queen: &Queen, headers: &HeaderMap) -> Result<(), ApiErr
 /// (state, spend against budget) and the effective settings with sources.
 #[derive(Debug, Serialize)]
 pub struct ControlBurstView {
-    pub now: i64,
+    now: i64,
     capacity: BTreeMap<Class, CapacityStatus>,
     burst: Option<crate::burst::BurstView>,
     burst_control: Option<crate::control::ControlView>,
     burst_breaker: Option<crate::control::BreakerView>,
-    pub recent_audit: Vec<crate::control::AuditRow>,
+    recent_audit: Vec<crate::control::AuditRow>,
 }
 
 async fn control_burst_view(queen: &Queen, now: i64) -> Result<ControlBurstView, ApiError> {
