@@ -57,7 +57,14 @@ struct ImageJson {
 #[serde(rename_all = "PascalCase", default)]
 struct StateJson {
     status: String,
+    started_at: Option<String>,
     finished_at: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct HostConfigJson {
+    network_mode: String,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -69,6 +76,7 @@ struct ContainerJson {
     created: Option<String>,
     state: Option<StateJson>,
     config: Option<ConfigJson>,
+    host_config: Option<HostConfigJson>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -107,12 +115,46 @@ pub struct Container {
     pub state: String,
     /// Seconds since it finished (or was created, if it never ran).
     pub idle_secs: u64,
+    /// Seconds since it started (0 when unknown).
+    pub running_secs: u64,
+    /// `HostConfig.NetworkMode`.
+    pub network: String,
     pub labels: BTreeMap<String, String>,
 }
 
 impl Container {
     fn stopped(&self) -> bool {
         matches!(self.state.as_str(), "exited" | "created" | "dead")
+    }
+
+    /// What CI created this container, if it provably did:
+    /// * a GitHub Actions job or service container: named
+    ///   `<32 hex>_<image>_<suffix>`, carrying the runner's instance label
+    ///   (six hex digits, empty value), on a `github_network_*` network;
+    /// * a CI postgres from `.github/actions/postgres-bootstrap`: named
+    ///   `ci-postgres-*` with its `ci.postgres.owner` label.
+    ///
+    /// Both have a post-job cleanup that a cancelled or crashed job skips;
+    /// on 2026-11-01 internal-runner-burst-01 ran six such postgres
+    /// containers, 1-3 days old.
+    pub fn ci_provenance(&self) -> Option<&'static str> {
+        let hex = |s: &str, n: usize| {
+            s.len() == n
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if self.name.starts_with("ci-postgres-") && self.labels.contains_key("ci.postgres.owner") {
+            return Some("CI postgres");
+        }
+        let job_named = self
+            .name
+            .split_once('_')
+            .is_some_and(|(h, rest)| hex(h, 32) && !rest.is_empty());
+        let runner_label = self.labels.iter().any(|(k, v)| hex(k, 6) && v.is_empty());
+        if job_named && runner_label && self.network.starts_with("github_network_") {
+            return Some("GitHub Actions service");
+        }
+        None
     }
 }
 
@@ -128,6 +170,8 @@ pub struct Volume {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub containers: Vec<(Container, String)>,
+    /// Running CI containers a finished job leaked (force-removed).
+    pub ci_containers: Vec<(Container, String)>,
     pub images: Vec<(Image, String)>,
     pub volumes: Vec<(Volume, String)>,
     /// `builder prune` arguments `(until_secs, keep_bytes)`, when due.
@@ -203,6 +247,30 @@ pub fn plan(
                 removed_containers.insert(c.id.as_str());
                 let reason = why(mode, usage_pct, "stopped", c.idle_secs, min);
                 out.containers.push((c.clone(), reason));
+            }
+        }
+    }
+
+    // Running CI containers a job leaked. Their age is the job's, not the
+    // disk's, so pressure does not shorten it.
+    if d.ci_container_max_age_secs > 0 {
+        for c in containers.iter().filter(|c| !c.stopped()) {
+            let Some(what) = c.ci_provenance() else {
+                continue;
+            };
+            if c.labels.contains_key(KEEP_LABEL) {
+                keep(&mut out, "container labelled borg.keep");
+            } else if of_held_lease(&c.name, &c.labels, held) {
+                keep(&mut out, "container of a running lease");
+            } else if c.running_secs < d.ci_container_max_age_secs {
+                keep(&mut out, "CI container running briefly");
+            } else {
+                let reason = format!(
+                    "{what} container running {} (>= {}): its job is over",
+                    age(c.running_secs),
+                    age(d.ci_container_max_age_secs)
+                );
+                out.ci_containers.push((c.clone(), reason));
             }
         }
     }
@@ -359,12 +427,15 @@ fn parse_container(j: ContainerJson, now: i64) -> Option<Container> {
         .as_deref()
         .and_then(unix)
         .or_else(|| j.created.as_deref().and_then(unix));
+    let started = state.started_at.as_deref().and_then(unix);
     Some(Container {
         id: j.id,
         name: j.name.trim_start_matches('/').to_owned(),
         image_id: j.image,
         state: status,
         idle_secs: since(now, at),
+        running_secs: started.map_or(0, |t| since(now, Some(t))),
+        network: j.host_config.map(|h| h.network_mode).unwrap_or_default(),
         labels: config_labels(j.config),
     })
 }
@@ -649,6 +720,45 @@ pub fn run(
         removals += 1;
     }
 
+    let ci_age = s.docker.ci_container_max_age_secs;
+    for (c, reason) in &p.ci_containers {
+        if removals >= cap {
+            break;
+        }
+        // Re-check: still CI-made, still old enough, still not a running
+        // lease's or pinned. Only these are ever forced: they run, and
+        // their job is over.
+        match cli.container_now(&c.id, input.now) {
+            Some(now)
+                if !now.stopped()
+                    && now.ci_provenance().is_some()
+                    && now.running_secs >= ci_age
+                    && !now.labels.contains_key(KEEP_LABEL)
+                    && !of_held_lease(&now.name, &now.labels, input.held) => {}
+            _ => {
+                *cycle
+                    .kept
+                    .entry("container changed since listing".into())
+                    .or_default() += 1;
+                continue;
+            }
+        }
+        record(
+            &mut cycle,
+            format!("container {} ({})", short(&c.id), c.name),
+            Kind::DockerContainer,
+            0,
+            reason,
+        );
+        let ok = if s.dry_run {
+            Ok(())
+        } else {
+            cli.run(&["rm", "-f", "-v", &c.id]).map(drop)
+        };
+        finish(&mut cycle, ok, 0, "container refused by docker");
+        removals += 1;
+    }
+
     for (i, reason) in &p.images {
         if removals >= cap {
             break;
@@ -826,8 +936,164 @@ mod tests {
             image_id: image.to_owned(),
             state: state.to_owned(),
             idle_secs: idle_h * H,
+            running_secs: 0,
+            network: "bridge".to_owned(),
             labels: BTreeMap::new(),
         }
+    }
+
+    fn running_ci(name: &str, label: (&str, &str), network: &str, running_h: u64) -> Container {
+        Container {
+            id: format!("id-{name}"),
+            name: name.to_owned(),
+            image_id: "sha256:svc".to_owned(),
+            state: "running".to_owned(),
+            idle_secs: 0,
+            running_secs: running_h * H,
+            network: network.to_owned(),
+            labels: BTreeMap::from([(label.0.to_owned(), label.1.to_owned())]),
+        }
+    }
+
+    const GH: &str = "56ca9b86921a424bb444bf1c9f043727_mirrorgcriolibrarypostgres16alpine_30dc59";
+
+    #[test]
+    fn only_ci_made_containers_running_past_their_job_are_planned() {
+        // The burst-01 inventory of 2026-11-01, plus near misses.
+        let containers = vec![
+            running_ci(GH, ("c90bb5", ""), "github_network_be535a8c238", 30),
+            running_ci(
+                "ci-postgres-41202079965-1-units",
+                ("ci.postgres.owner", "da61"),
+                "bridge",
+                31,
+            ),
+            running_ci(
+                "ci-postgres-40807690395-1-units",
+                ("ci.postgres.owner", "2a0f"),
+                "bridge",
+                72,
+            ),
+            // nginx started by hand: no CI provenance, two weeks old.
+            running_ci("exciting_gagarin", ("maintainer", "NGINX"), "bridge", 400),
+            // Lookalikes: wrong network, label with a value, no owner label.
+            running_ci(GH, ("c90bb5", "x"), "github_network_1", 30),
+            running_ci(
+                &GH.replace("56ca", "ZZca"),
+                ("c90bb5", ""),
+                "github_network_1",
+                30,
+            ),
+            running_ci(GH, ("c90bb5", ""), "bridge", 30),
+            running_ci("ci-postgres-1", ("other", "x"), "bridge", 72),
+            // A job still inside its window.
+            running_ci("ci-postgres-2", ("ci.postgres.owner", "t"), "bridge", 3),
+        ];
+        let p = plan(
+            &ReclaimSettings::default(),
+            Mode::Hygiene,
+            0,
+            &[],
+            &containers,
+            &[],
+            &HashSet::new(),
+        );
+        let names: Vec<&str> = p
+            .ci_containers
+            .iter()
+            .map(|(c, _)| c.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                GH,
+                "ci-postgres-41202079965-1-units",
+                "ci-postgres-40807690395-1-units"
+            ]
+        );
+        assert_eq!(p.kept["CI container running briefly"], 1);
+        assert!(p.containers.is_empty());
+        // Off means off, and pressure does not shorten a job's lifetime.
+        let mut off = ReclaimSettings::default();
+        off.docker.ci_container_max_age_secs = 0;
+        assert!(
+            plan(
+                &off,
+                Mode::Critical,
+                0,
+                &[],
+                &containers,
+                &[],
+                &HashSet::new()
+            )
+            .ci_containers
+            .is_empty()
+        );
+        assert_eq!(
+            plan(
+                &ReclaimSettings::default(),
+                Mode::Critical,
+                0,
+                &[],
+                &containers,
+                &[],
+                &HashSet::new()
+            )
+            .ci_containers
+            .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_leaked_ci_container_is_force_removed_after_a_recheck_and_others_never() {
+        use serde_json::json;
+        let x = fake_docker("--reserved-space");
+        let leaked = json!({
+            "Id": "cpg", "Name": "/ci-postgres-40807690395-1-units", "Image": "sha256:pg",
+            "Created": "2026-10-29T05:00:00Z",
+            "State": {"Status": "running", "StartedAt": "2026-10-29T05:02:00Z",
+                      "FinishedAt": "0001-01-01T00:00:00Z"},
+            "Config": {"Labels": {"ci.postgres.owner": "2a0f"}},
+            "HostConfig": {"NetworkMode": "bridge"}
+        });
+        let nginx = json!({
+            "Id": "cng", "Name": "/exciting_gagarin", "Image": "sha256:ng",
+            "Created": "2026-10-16T14:14:00Z",
+            "State": {"Status": "running", "StartedAt": "2026-10-16T14:14:00Z"},
+            "Config": {"Labels": {"maintainer": "NGINX"}},
+            "HostConfig": {"NetworkMode": "bridge"}
+        });
+        x.on("docker ps -aq --no-trunc", "cng\ncpg");
+        x.on(
+            "docker container inspect cng cpg",
+            &json!([nginx, leaked.clone()]).to_string(),
+        );
+        x.on("docker container inspect cpg", &json!([leaked]).to_string());
+        let cli = DockerCli {
+            exec: &x,
+            docker: "docker",
+        };
+        let s = ReclaimSettings::default();
+        let held = HashSet::new();
+        let c = run(&cli, &input(&s, &held, 110, 10 << 30), || None, &mut 0).unwrap();
+        let calls = x.calls();
+        assert!(
+            calls.contains(&"docker rm -f -v cpg".to_owned()),
+            "{calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("cng") && c.contains(" rm "))
+        );
+        assert!(
+            calls
+                .iter()
+                .filter(|c| c.contains(" rm -f"))
+                .all(|c| c == "docker rm -f -v cpg")
+        );
+        assert_eq!(c.errors, 0);
     }
 
     fn vol(name: &str, age_h: u64, labels: &[(&str, &str)]) -> Volume {

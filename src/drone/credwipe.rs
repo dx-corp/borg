@@ -211,6 +211,42 @@ fn runner_units(listing: &str) -> Vec<String> {
         .collect()
 }
 
+/// The `_work` directory of every static GitHub runner unit on the host
+/// (`<WorkingDirectory>/_work`).
+pub(crate) fn static_runner_work_dirs(cmd: &Commands) -> Vec<PathBuf> {
+    let exec = cmd.exec();
+    let Ok(out) = exec.run(
+        "systemctl",
+        &[
+            "list-units",
+            "--type=service",
+            "--all",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            "actions.runner.*",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = runner_units(&out.stdout)
+        .iter()
+        .filter_map(|unit| {
+            let wd = exec
+                .run(
+                    "systemctl",
+                    &["show", "-p", "WorkingDirectory", "--value", unit],
+                )
+                .ok()?;
+            let wd = wd.stdout.trim();
+            (wd.starts_with('/') && wd != "/").then(|| Path::new(wd).join("_work"))
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 /// The home field of a `getent passwd` line.
 fn passwd_home(line: &str) -> Option<PathBuf> {
     let home = line.trim().split(':').nth(5)?;

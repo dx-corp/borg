@@ -64,6 +64,8 @@ pub enum Kind {
     Worktree,
     /// A regenerable cache directory (a CI slot's tool home).
     CacheDir,
+    /// A checkout in an idle static GitHub runner's `_work`.
+    RunnerWork,
     /// A container image no container uses.
     DockerImage,
     /// A stopped container.
@@ -81,6 +83,7 @@ impl Kind {
             Self::CargoTarget => "cargo_target",
             Self::Worktree => "worktree",
             Self::CacheDir => "cache_dir",
+            Self::RunnerWork => "runner_work",
             Self::DockerImage => "docker_image",
             Self::DockerContainer => "docker_container",
             Self::DockerBuildCache => "docker_build_cache",
@@ -134,6 +137,9 @@ pub struct ReclaimSettings {
     pub max_deletions_per_cycle: u32,
     /// Seconds between cycles.
     pub interval_secs: u64,
+    /// With default roots, also reclaim the `_work` checkouts of static
+    /// GitHub runners on this host while their runner has no job.
+    pub static_runner_work: bool,
     /// The Docker tier.
     pub docker: DockerReclaimSettings,
 }
@@ -168,6 +174,11 @@ pub struct DockerReclaimSettings {
     pub prune_dangling_volumes: bool,
     /// Dangling volumes created this long ago.
     pub volume_max_age_secs: u64,
+    /// Running CI service containers (GitHub Actions job services, CI
+    /// postgres) started this long ago were leaked by a job that ended
+    /// without its cleanup and are force-removed; 0 = never. Containers
+    /// without CI provenance are never touched by this rule.
+    pub ci_container_max_age_secs: u64,
 }
 
 impl Default for DockerReclaimSettings {
@@ -180,6 +191,7 @@ impl Default for DockerReclaimSettings {
             build_cache_keep_bytes: 10 << 30,
             prune_dangling_volumes: true,
             volume_max_age_secs: 24 * 3600,
+            ci_container_max_age_secs: 24 * 3600,
         }
     }
 }
@@ -215,6 +227,7 @@ impl Default for ReclaimSettings {
             idle_max_age_secs: 7 * 24 * 3600,
             max_deletions_per_cycle: 50,
             interval_secs: 600,
+            static_runner_work: true,
             docker: DockerReclaimSettings::default(),
         }
     }
@@ -510,10 +523,11 @@ fn tier(k: Kind) -> u8 {
         Kind::CargoIncremental => 0,
         Kind::CargoTarget => 1,
         Kind::CacheDir => 2,
-        Kind::Worktree => 3,
+        Kind::RunnerWork => 3,
+        Kind::Worktree => 4,
         // The Docker tier orders its own work.
         Kind::DockerImage | Kind::DockerContainer | Kind::DockerBuildCache | Kind::DockerVolume => {
-            4
+            5
         }
     }
 }

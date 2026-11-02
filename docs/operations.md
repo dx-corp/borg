@@ -580,8 +580,13 @@ by default) counts as **critical** whatever the percentage, and a pressure cycle
 then frees at least back to twice the floor. CI slot tool homes
 (`<cache_root>/<ns>/slots/<slot>/mise-home`) are a `cache_dir` tier between
 cargo targets and worktrees; one is busy while the drone runs any lease, because
-tools execute from it without holding a file open. Audit records of the newer
-kinds (`cache_dir`, `docker_*`) travel in `reclaim.recent_ext`, which a queen
+tools execute from it without holding a file open. With default roots and
+`static_runner_work` (default on), the `_work/<repo>` checkouts of static GitHub
+runners on the host (`actions.runner.*` units, `<WorkingDirectory>/_work`) are a
+`runner_work` tier between tool homes and worktrees; one is busy while that
+runner's `Runner.Worker` runs, and the runner's `_tool`, `_actions`, `_temp`,
+`_update` and `_PipelineMapping` are never candidates. Audit records of the newer
+kinds (`cache_dir`, `runner_work`, `docker_*`) travel in `reclaim.recent_ext`, which a queen
 older than them ignores instead of rejecting the heartbeat.
 
 #### Docker tier
@@ -601,6 +606,7 @@ until=<age>` with `--reserved-space <bytes>` (buildx 0.17+) or `--keep-storage
 | Stopped container (`exited`, `created`, `dead`) | finished `stopped_container_max_age_secs` ago (6h) | a container of a lease the drone runs; label `borg.keep` |
 | Image | built or last pulled/tagged `image_max_age_secs` ago (24h) | used by any remaining container (running, paused or stopped); the newest image of each repository; label `borg.keep`; anything Docker refuses to remove |
 | Build cache | unused `build_cache_max_age_secs` (24h) | `build_cache_keep_bytes` (10 GiB; 0 when critical) |
+| Running CI container | started `ci_container_max_age_secs` ago (24h; not shortened by pressure; 0 = off), and provably made by CI: a GitHub Actions job/service container (`<32 hex>_...` name, the runner's 6-hex instance label, `github_network_*` network) or a CI postgres (`ci-postgres-*` with `ci.postgres.owner`). The only forced removal (`docker rm -f -v`) | anything without that provenance (a hand-started nginx stays forever); a running lease's; label `borg.keep` |
 | Volume | dangling and created `volume_max_age_secs` ago (24h), only if anonymous (64-hex name) or created by a borg lease; `prune_dangling_volumes: false` turns it off | named volumes; a running lease's; label `borg.keep` |
 
 Under pressure each age drops to `min_age_secs` (6h), when critical to

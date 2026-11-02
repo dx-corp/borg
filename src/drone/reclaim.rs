@@ -310,6 +310,9 @@ const LIST_WORKTREES: &str =
 /// below a root; CI slot caches keep them at `<slots>/<slot>/cargo-target/<week>`.
 const LIST_TARGETS: &str = r#"find "$1" -mindepth 2 -maxdepth 4 -name .rustc_info.json -printf '%h\n' 2>/dev/null; echo .done"#;
 /// `incremental/` directories of a target directory (host and per-triple).
+/// A static runner's checkouts: `_work/<repo>`. The runner's own `_tool`,
+/// `_actions`, `_temp`, `_update` and `_PipelineMapping` stay.
+const LIST_RUNNER_WORK: &str = r#"find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '_*' -printf '%p\n' 2>/dev/null; echo .done"#;
 /// Per-slot tool homes: `<slots>/<slot>/mise-home`.
 const LIST_CACHE_DIRS: &str = r#"find "$1" -mindepth 2 -maxdepth 2 -type d -name mise-home -printf '%p\n' 2>/dev/null; echo .done"#;
 const LIST_INCREMENTAL: &str = r#"find "$1" -mindepth 2 -maxdepth 3 -type d -name incremental -prune -printf '%p\n' 2>/dev/null; echo .done"#;
@@ -420,6 +423,32 @@ impl LiveHost<'_> {
             .any(|l| Path::new(l.trim_end_matches(" (deleted)")).starts_with(path)))
     }
 
+    /// Whether the owner of `path` (a static runner's user) runs a job now.
+    fn runner_job_running(&self, path: &Path) -> Option<bool> {
+        let uid = self.cmd.owner_uid(path).ok()?;
+        if uid == "0" || !uid.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let out = self
+            .cmd
+            .exec()
+            .run(
+                "sh",
+                &[
+                    "-c",
+                    r#"pgrep -u "$1" -x Runner.Worker >/dev/null; echo $?"#,
+                    "reclaim",
+                    &uid,
+                ],
+            )
+            .ok()?;
+        match out.stdout.trim() {
+            "0" => Some(true),
+            "1" => Some(false),
+            _ => None,
+        }
+    }
+
     fn probe_worktree(&self, path: &Path, s: &mut Safety) -> Result<(), String> {
         if !path.join(".git").exists() {
             s.not_git = true;
@@ -485,6 +514,7 @@ impl ReclaimHost for LiveHost<'_> {
             let script = match root.kind {
                 Kind::Worktree => LIST_WORKTREES,
                 Kind::CacheDir => LIST_CACHE_DIRS,
+                Kind::RunnerWork => LIST_RUNNER_WORK,
                 _ => LIST_TARGETS,
             };
             let found = match self
@@ -525,6 +555,21 @@ impl ReclaimHost for LiveHost<'_> {
         if !c.path.exists() {
             s.unknown = Some("gone".into());
             return s;
+        }
+        if c.kind == Kind::RunnerWork {
+            // The runner's job may sit between steps with no process inside
+            // `_work`; its `Runner.Worker` lives for the whole job.
+            match self.runner_job_running(&c.path) {
+                Some(false) => {}
+                Some(true) => {
+                    s.busy = true;
+                    return s;
+                }
+                None => {
+                    s.unknown = Some("cannot tell whether the runner has a job".into());
+                    return s;
+                }
+            }
         }
         if c.kind == Kind::CacheDir {
             match self.leases.lock() {
@@ -665,9 +710,22 @@ impl Reclaimer {
         let roots = if settings.roots.is_empty() {
             // Checked as the directory's owner: a private home hides its
             // build directories from the drone itself.
-            default_roots(&host_homes(cfg), &ci_slot_roots(cfg), |p| {
+            let mut roots = default_roots(&host_homes(cfg), &ci_slot_roots(cfg), |p| {
                 cmd.sh(p, PROBE_SECS, r#"test -d "$1""#).is_ok()
-            })
+            });
+            // Static GitHub runners sharing the host (internal-runner-burst-01
+            // ran eight, 14-21 GB of `_work` each on 2026-11-01).
+            if settings.static_runner_work {
+                for w in crate::drone::credwipe::static_runner_work_dirs(&cmd) {
+                    if cmd.sh(&w, PROBE_SECS, r#"test -d "$1""#).is_ok() {
+                        roots.push(Root {
+                            path: w,
+                            kind: Kind::RunnerWork,
+                        });
+                    }
+                }
+            }
+            roots
         } else {
             settings.roots.clone()
         };
@@ -928,6 +986,27 @@ mod tests {
         let found = listed(&out).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(found, vec![week]);
+    }
+
+    #[test]
+    fn runner_work_listing_offers_checkouts_never_the_runner_s_own_dirs() {
+        let root = std::env::temp_dir().join(format!("borg-reclaim-work-{}", std::process::id()));
+        for d in [
+            "k8s/k8s",
+            "mono/mono",
+            "_tool/node",
+            "_actions/a",
+            "_temp",
+            "_update",
+            "_PipelineMapping/x",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let cmd = Commands::new(Arc::new(crate::drone::exec::SystemExec), "setpriv".into());
+        let out = cmd.sh(&root, 30, LIST_RUNNER_WORK).unwrap();
+        let found = listed(&out).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(found, vec![root.join("k8s"), root.join("mono")]);
     }
 
     #[test]
