@@ -172,6 +172,14 @@ impl Layout {
     }
 }
 
+/// sysctl drop-in that keeps IPv4 forwarding on for Docker job containers.
+const FORWARDING_SYSCTL: &str = "/etc/sysctl.d/99-borg-docker-forwarding.conf";
+const FORWARDING_SYSCTL_CONTENT: &str = "\
+# Written by `borg drone install`. Docker job containers need IPv4 forwarding;
+# GCE's 60-gce-network-security.conf turns it off whenever systemd-sysctl runs.
+net.ipv4.ip_forward=1
+";
+
 pub fn render_systemd_unit(
     layout_bin: &Path,
     config: &Path,
@@ -885,6 +893,16 @@ impl Installer<'_> {
         let before = self.changed;
         match self.opts.platform {
             Platform::Linux => {
+                // Keep IPv4 forwarding on for job containers (see
+                // `probe::ipv4_forwarding`): GCE's sysctl drop-in turns it off
+                // whenever systemd-sysctl runs. This file sorts after it.
+                let sysctl = Path::new(FORWARDING_SYSCTL);
+                let sysctl_changed =
+                    self.write_file(sysctl, FORWARDING_SYSCTL_CONTENT.as_bytes(), 0o644, None)?;
+                if sysctl_changed && !self.opts.dry_run {
+                    self.must("sysctl", &["-p", FORWARDING_SYSCTL])?;
+                    self.note("ran", format_args!("sysctl -p {FORWARDING_SYSCTL}"));
+                }
                 let unit =
                     render_systemd_unit(&bin, &cfg, &data, &user, drain, self.job_user().is_some());
                 let unit_changed = self.write_file(&service_file, unit.as_bytes(), 0o644, None)?;
@@ -1174,6 +1192,8 @@ mod tests {
             "created /etc/borg/drone.token",
             "created /etc/borg/drone.json",
             "created /etc/systemd/system/borg-drone.service",
+            "created /etc/sysctl.d/99-borg-docker-forwarding.conf",
+            "ran sysctl -p /etc/sysctl.d/99-borg-docker-forwarding.conf",
             "ran systemctl restart borg-drone.service",
             "done: changes applied",
         ] {

@@ -278,7 +278,19 @@ impl Commands {
             .exec
             .run("df", &["-Pk", "--", &p])
             .map_err(|e| format!("df {p}: {e}"))?;
-        let line = out.stdout.lines().nth(1).ok_or("df: no output")?;
+        // Inside a private home (mode 700, as the static runner homes on
+        // internal-runner-burst-01) the drone cannot even stat the path, so
+        // `df` prints nothing; ask as the owner, like every other probe.
+        let stdout = if out.success && out.stdout.lines().nth(1).is_some() {
+            out.stdout
+        } else {
+            self.run_as_owner(path, PROBE_SECS, &["df", "-Pk", "--", &p])?
+        };
+        Self::parse_df(&stdout)
+    }
+
+    fn parse_df(stdout: &str) -> Result<(Disk, String), String> {
+        let line = stdout.lines().nth(1).ok_or("df: no output")?;
         let f: Vec<&str> = line.split_whitespace().collect();
         let num = |i: usize| -> Result<u64, String> {
             f.get(i)
@@ -1007,6 +1019,55 @@ mod tests {
         let found = listed(&out).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(found, vec![root.join("k8s"), root.join("mono")]);
+    }
+
+    #[test]
+    fn df_inside_a_private_home_is_asked_as_the_owner() {
+        use crate::drone::exec::Output;
+        struct PrivateHome(Mutex<Vec<String>>);
+        impl Exec for PrivateHome {
+            fn run(&self, program: &str, args: &[&str]) -> std::io::Result<Output> {
+                let call = format!("{program} {}", args.join(" "));
+                self.0.lock().unwrap().push(call.clone());
+                let ok = |stdout: &str| {
+                    Ok(Output {
+                        success: true,
+                        stdout: stdout.to_owned(),
+                    })
+                };
+                if program == "stat" {
+                    return ok("1006:1006");
+                }
+                // As the drone: no permission, no output. As the owner (via
+                // timeout/setpriv): the filesystem.
+                if program == "df" {
+                    return Ok(Output {
+                        success: false,
+                        stdout: String::new(),
+                    });
+                }
+                if call.contains(" df -Pk -- /home/runner6/actions-runner/_work") {
+                    return ok(
+                        "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 300000000 180000000 120000000 60% /",
+                    );
+                }
+                ok("")
+            }
+        }
+        let exec = Arc::new(PrivateHome(Mutex::new(Vec::new())));
+        let cmd = Commands::new(Arc::clone(&exec) as Arc<dyn Exec>, "setpriv".into());
+        let (disk, mount) = cmd
+            .disk(Path::new("/home/runner6/actions-runner/_work"))
+            .unwrap();
+        assert_eq!(mount, "/");
+        assert_eq!(disk.free_bytes, 120_000_000 * 1024);
+        assert!(
+            exec.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("timeout ") && c.contains("--reuid 1006"))
+        );
     }
 
     #[test]

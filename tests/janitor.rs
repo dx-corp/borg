@@ -702,6 +702,51 @@ async fn a_pending_promotion_yields_to_a_started_newer_run_of_its_services() {
 }
 
 #[tokio::test]
+async fn a_run_waiting_in_apply_is_never_superseded_by_a_newer_receipt() {
+    // 2026-11-02: k8s 41392061823 (the platform-api read fix) waited on its
+    // publication lock and was cancelled when 41392484470 merely started.
+    for apply_status in ["queued", "pending", "waiting"] {
+        let h = Harness::start(promotions(false, json!({}))).await;
+        h.add_promotion_run(promo(1, "pending", None, 'a', "platform-api", 600));
+        h.add_run_job(1, "resolve-lane-contract", "completed", Some("arc-light-1"));
+        h.add_run_job(
+            1,
+            "prepare-platform-production",
+            "completed",
+            Some("promotion-gce-02-1"),
+        );
+        h.add_run_job(1, "apply-platform-production", apply_status, None);
+        h.add_promotion_run(promo(2, "in_progress", None, 'b', "platform-api", 60));
+        ahead(&h, 'a', 'b');
+        let r = h.janitor_pass().await;
+        assert_eq!(
+            (r.promotion_superseded, r.promotion_cancelled, r.errors),
+            (0, 0, 0),
+            "{apply_status}: {r:?}"
+        );
+        assert!(h.state().cancelled.is_empty(), "{apply_status}");
+    }
+}
+
+#[tokio::test]
+async fn two_receipts_before_apply_keep_only_the_newer() {
+    let h = Harness::start(promotions(false, json!({}))).await;
+    // The older run is still preparing: no apply job yet, so latest wins.
+    h.add_promotion_run(promo(1, "pending", None, 'a', "platform-api", 600));
+    h.add_run_job(1, "resolve-lane-contract", "completed", Some("arc-light-1"));
+    h.add_run_job(1, "prepare-platform-production", "queued", None);
+    h.add_promotion_run(promo(2, "in_progress", None, 'b', "platform-api", 60));
+    ahead(&h, 'a', 'b');
+    let r = h.janitor_pass().await;
+    assert_eq!(
+        (r.promotion_superseded, r.promotion_cancelled),
+        (1, 1),
+        "{r:?}"
+    );
+    assert_eq!(h.state().cancelled, [1]);
+}
+
+#[tokio::test]
 async fn an_unproven_successor_never_cancels() {
     let h = Harness::start(promotions(false, json!({}))).await;
     // The compare answers 404: ancestry is unproven, the run is kept.

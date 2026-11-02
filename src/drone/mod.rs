@@ -96,6 +96,9 @@ pub struct Drone {
     update_wanted: AtomicBool,
     /// The last tools probe, reused for a minute.
     tools_cache: probe::ToolsCache,
+    /// Whether the last heartbeat found container networking broken
+    /// (IPv4 forwarding off on a Docker host); logged on change only.
+    no_forwarding: AtomicBool,
     /// Last Queen floor, retained while the Queen is unreachable (shared
     /// with reclaim, which treats free space below it as critical).
     disk_floor: Arc<AtomicU64>,
@@ -166,6 +169,7 @@ impl Drone {
             cfg,
             selfupdate,
             update_wanted: AtomicBool::new(false),
+            no_forwarding: AtomicBool::new(false),
             tools_cache: probe::ToolsCache::default(),
             disk_floor,
             capability_cache: capabilities::CapabilityCache::default(),
@@ -283,7 +287,24 @@ impl Drone {
             status: 0,
         })?;
         env_facts.cache_dir_free_bytes = cache_free;
+        // A Docker host without IPv4 forwarding runs every container job
+        // without network: refuse work rather than take jobs that fail late.
+        let no_forwarding =
+            capacity.docker_usable && probe::ipv4_forwarding(self.host.as_ref()) == Some(false);
+        if self.no_forwarding.swap(no_forwarding, Ordering::Relaxed) != no_forwarding {
+            if no_forwarding {
+                tracing::error!(
+                    "IPv4 forwarding is off (/proc/sys/net/ipv4/ip_forward = 0): containers \
+                     have no network, so this drone takes no leases. Fix: `borg drone install` \
+                     writes /etc/sysctl.d/99-borg-docker-forwarding.conf, or run \
+                     `sysctl -w net.ipv4.ip_forward=1` and persist it"
+                );
+            } else {
+                tracing::info!("IPv4 forwarding is on again: taking leases");
+            }
+        }
         let accepting = accepting
+            && !no_forwarding
             && !crate::envcontract::disk_admission(
                 self.disk_floor.load(Ordering::Relaxed),
                 capacity.free_disk_mib,
