@@ -15,6 +15,7 @@ pub mod docker_reclaim;
 pub mod exec;
 pub mod fsops;
 pub mod install;
+pub mod invariants;
 pub mod jobuser;
 pub mod pins;
 pub mod reclaim;
@@ -96,9 +97,10 @@ pub struct Drone {
     update_wanted: AtomicBool,
     /// The last tools probe, reused for a minute.
     tools_cache: probe::ToolsCache,
-    /// Whether the last heartbeat found container networking broken
-    /// (IPv4 forwarding off on a Docker host); logged on change only.
-    no_forwarding: AtomicBool,
+    /// Host invariants the last heartbeat found broken; logged on change.
+    invariant_failures: Mutex<Vec<crate::envcontract::InvariantFailure>>,
+    /// The last container network probe (`None`: passed or not run yet).
+    network_probe: Arc<Mutex<Option<crate::envcontract::InvariantFailure>>>,
     /// Last Queen floor, retained while the Queen is unreachable (shared
     /// with reclaim, which treats free space below it as critical).
     disk_floor: Arc<AtomicU64>,
@@ -169,7 +171,8 @@ impl Drone {
             cfg,
             selfupdate,
             update_wanted: AtomicBool::new(false),
-            no_forwarding: AtomicBool::new(false),
+            invariant_failures: Mutex::new(Vec::new()),
+            network_probe: Arc::default(),
             tools_cache: probe::ToolsCache::default(),
             disk_floor,
             capability_cache: capabilities::CapabilityCache::default(),
@@ -287,24 +290,35 @@ impl Drone {
             status: 0,
         })?;
         env_facts.cache_dir_free_bytes = cache_free;
-        // A Docker host without IPv4 forwarding runs every container job
-        // without network: refuse work rather than take jobs that fail late.
-        let no_forwarding =
-            capacity.docker_usable && probe::ipv4_forwarding(self.host.as_ref()) == Some(false);
-        if self.no_forwarding.swap(no_forwarding, Ordering::Relaxed) != no_forwarding {
-            if no_forwarding {
-                tracing::error!(
-                    "IPv4 forwarding is off (/proc/sys/net/ipv4/ip_forward = 0): containers \
-                     have no network, so this drone takes no leases. Fix: `borg drone install` \
-                     writes /etc/sysctl.d/99-borg-docker-forwarding.conf, or run \
-                     `sysctl -w net.ipv4.ip_forward=1` and persist it"
-                );
-            } else {
-                tracing::info!("IPv4 forwarding is on again: taking leases");
+        // Host invariants (see `invariants`): any broken one means jobs
+        // would fail late, so take none and say why.
+        let disk_blocked = crate::envcontract::disk_admission(
+            self.disk_floor.load(Ordering::Relaxed),
+            capacity.free_disk_mib,
+            cache_free,
+        )
+        .blocked();
+        let failures = if self.cfg.host_invariants.enabled {
+            let mut f =
+                invariants::fast_checks(self.host.as_ref(), capacity.docker_usable, disk_blocked);
+            if let Ok(p) = self.network_probe.lock()
+                && let Some(n) = p.as_ref()
+            {
+                f.push(n.clone());
             }
+            f.sort();
+            f
+        } else {
+            Vec::new()
+        };
+        if let Ok(mut last) = self.invariant_failures.lock() {
+            invariants::log_change(&last, &failures);
+            last.clone_from(&failures);
         }
+        let invariants_hold = failures.iter().all(|f| f.check == "disk");
+        env_facts.host_invariant_failures = failures;
         let accepting = accepting
-            && !no_forwarding
+            && invariants_hold
             && !crate::envcontract::disk_admission(
                 self.disk_floor.load(Ordering::Relaxed),
                 capacity.free_disk_mib,
@@ -486,6 +500,48 @@ impl Drone {
         true
     }
 
+    /// Probe container networking end to end now and every
+    /// `host_invariants.interval_secs`; heartbeats use the latest result.
+    fn spawn_network_probe(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let s = self.cfg.host_invariants.clone();
+        if !s.enabled || !s.container_network {
+            return None;
+        }
+        let (exec, docker, out) = (
+            Arc::clone(&self.exec),
+            self.cfg.docker_bin.clone(),
+            Arc::clone(&self.network_probe),
+        );
+        let host = Arc::clone(&self.host);
+        Some(tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(s.interval_secs.max(60)));
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                let (exec, docker, s2, host) = (
+                    Arc::clone(&exec),
+                    docker.clone(),
+                    s.clone(),
+                    Arc::clone(&host),
+                );
+                let result = tokio::task::spawn_blocking(move || {
+                    // No docker here: nothing to probe.
+                    host.run(&docker, &["--version"])?;
+                    invariants::container_network(exec.as_ref(), &docker, &s2)
+                })
+                .await;
+                match result {
+                    Ok(r) => {
+                        if let Ok(mut slot) = out.lock() {
+                            *slot = r;
+                        }
+                    }
+                    Err(e) => tracing::warn!("container network probe panicked: {e}"),
+                }
+            }
+        }))
+    }
+
     /// What a successful heartbeat means for self-update: the queen has the
     /// updater's report, the running binary is demonstrably working, and the
     /// queen may want another version (older ones included). Returns true when
@@ -578,6 +634,7 @@ impl Drone {
         let mut tasks = JoinSet::new();
         let cache_background = self.caches.spawn_background();
         let reclaim_background = self.reclaimer.as_ref().map(reclaim::Reclaimer::spawn);
+        let network_background = self.spawn_network_probe();
         let held = Arc::clone(&self.held);
         let credwipe_background = self
             .credwipe
@@ -648,6 +705,9 @@ impl Drone {
         }
         if let Some(w) = credwipe_background {
             w.abort();
+        }
+        if let Some(n) = network_background {
+            n.abort();
         }
     }
 }

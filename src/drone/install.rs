@@ -860,6 +860,11 @@ impl Installer<'_> {
             job_completed_hook: o.job_completed_hook.clone(),
             reclaim,
             credential_wipe,
+            host_invariants: on_disk
+                .as_ref()
+                .and_then(|v| v.get("host_invariants").cloned())
+                .and_then(|r| serde_json::from_value(r).ok())
+                .unwrap_or_default(),
             caches: crate::drone::config::CachesConfig {
                 git: crate::drone::config::GitCaches {
                     mirrors: o.git_mirrors.clone(),

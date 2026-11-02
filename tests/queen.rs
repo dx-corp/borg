@@ -1626,3 +1626,41 @@ async fn job_listing_reads_runs_concurrently_and_keeps_run_order() {
     assert!(peak > 1, "jobs listings overlap (peak {peak})");
     assert!(peak <= 8, "at most eight listings at once (peak {peak})");
 }
+
+#[tokio::test]
+async fn host_invariant_failures_a_drone_reports_are_exported_per_check() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": {
+            "observed_at": now,
+            "host_invariant_failures": [
+                {"check": "container_network", "detail": "a container on the default bridge cannot resolve github.com"},
+                {"check": "ip_forward", "detail": "/proc/sys/net/ipv4/ip_forward is 0"}
+            ]
+        }}),
+    )
+    .await;
+    let metrics = h.metrics().await;
+    for line in [
+        "borg_drone_host_invariant_failing{drone=\"d1\",check=\"container_network\"} 1",
+        "borg_drone_host_invariant_failing{drone=\"d1\",check=\"ip_forward\"} 1",
+    ] {
+        assert!(metrics.contains(line), "missing {line}\n{metrics}");
+    }
+    let s = h.status().await;
+    assert_eq!(
+        s["drones"][0]["host_invariant_failures"][1]["check"],
+        "ip_forward"
+    );
+    // Healthy again: the series go away.
+    h.heartbeat_with(&token, json!({"env_facts": {"observed_at": now}}))
+        .await;
+    assert!(
+        !h.metrics()
+            .await
+            .contains("borg_drone_host_invariant_failing{")
+    );
+}

@@ -107,6 +107,16 @@ fn sanitize_facts(f: &EnvFacts, now: i64) -> EnvFacts {
         fact.observed_at = fact.observed_at.min(now);
     }
     out.rustc_wrapper = out.rustc_wrapper.as_ref().map(clip);
+    out.host_invariant_failures.truncate(16);
+    for f in &mut out.host_invariant_failures {
+        f.check = f
+            .check
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take(40)
+            .collect();
+        f.detail = clip(&f.detail);
+    }
     out.sccache_dir = out.sccache_dir.as_ref().map(clip);
     if let Some(list) = &mut out.toolchains {
         list.truncate(32);
@@ -950,6 +960,10 @@ pub struct DroneStatus {
     pub health: Option<DroneHealth>,
     /// Build-box reclaim stats, when the drone reports them.
     pub reclaim: Option<ReclaimStats>,
+    /// Host invariants the drone reports broken (it takes no leases while
+    /// any but `disk` is); empty when all hold or not reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_invariant_failures: Vec<crate::envcontract::InvariantFailure>,
     /// The build environment contract as it stands for this drone; absent when
     /// the contract is off.
     pub contract: Option<ContractStatus>,
@@ -1319,6 +1333,11 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             version: d.version.clone(),
             health: snap.health.get(&d.name).cloned(),
             reclaim: d.reclaim.clone(),
+            host_invariant_failures: d
+                .env_facts
+                .as_ref()
+                .map(|f| f.host_invariant_failures.clone())
+                .unwrap_or_default(),
             admission: snap
                 .admission
                 .iter()
@@ -2159,6 +2178,28 @@ pub fn render_metrics(status: &Status) -> String {
                             label_value(&d.name),
                             label_value(v),
                             d.trust.as_str()
+                        ),
+                        1.0,
+                    )
+                })
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_drone_host_invariant_failing",
+        "1 for each host invariant a drone reports broken (ip_forward, docker_daemon, \
+         container_network, disk); it takes no leases while one other than disk fails.",
+        status
+            .drones
+            .iter()
+            .filter(|d| d.fresh)
+            .flat_map(|d| {
+                d.host_invariant_failures.iter().map(move |f| {
+                    (
+                        format!(
+                            "drone=\"{}\",check=\"{}\"",
+                            label_value(&d.name),
+                            label_value(&f.check)
                         ),
                         1.0,
                     )

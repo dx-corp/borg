@@ -763,6 +763,7 @@ Production Prometheus scrapes `/metrics` through the tailnet (job
 | `borg_static_runner_offline_seconds{runner}` | Seconds since this queen first saw the runner offline. |
 | `borg_burst_never_enrolled_timestamp_seconds{drone,vm,zone}` | End time of each burst VM that ended in the last 24 hours without its drone ever heartbeating (`burst.never_enrolled` in `/status`). |
 | `borg_drone_info{drone,version,trust}` | The version each drone reports: `<package>+<first 12 hex of the binary's sha256>`, so a drone that missed a roll shows a different `version` from the fleet. Rollout targets without `+` match every build of a release. |
+| `borg_drone_host_invariant_failing{drone,check}` | 1 per host invariant the drone reports broken (`ip_forward`, `docker_daemon`, `container_network`, `disk`; `drone::invariants`). The drone takes no leases while any but `disk` fails (disk has its own admission). The container network check runs a `busybox` container on the default bridge that must resolve and connect to `host_invariants.probe_host:probe_port` (github.com:443) at startup and every `interval_secs` (600). |
 | `borg_drone_active_leases{drone}` / `borg_drone_accepting{drone}` | Leases the drone runs, and whether it takes new ones: a drone with free capacity 0 and no leases while its class has queued jobs is stuck. |
 
 ### Tailnet enrollment

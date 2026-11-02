@@ -288,6 +288,10 @@ pub struct DroneConfig {
     /// default. See [`crate::drone::credwipe`].
     #[serde(default)]
     pub credential_wipe: crate::drone::credwipe::CredentialWipeSettings,
+    /// Host invariants checked before taking leases; on by default. See
+    /// [`crate::drone::invariants`].
+    #[serde(default)]
+    pub host_invariants: crate::drone::invariants::InvariantSettings,
 }
 
 /// Slot directories when neither `slots` nor `max_leases` is set.
@@ -364,6 +368,9 @@ impl DroneConfig {
         self.validate_job_settings()?;
         self.reclaim.validate().map_err(DroneConfigError::Invalid)?;
         self.credential_wipe
+            .validate()
+            .map_err(DroneConfigError::Invalid)?;
+        self.host_invariants
             .validate()
             .map_err(DroneConfigError::Invalid)?;
         self.validate_caches()

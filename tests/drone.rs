@@ -168,6 +168,10 @@ impl Rig {
         if cfg["reclaim"].is_null() {
             cfg["reclaim"] = json!({"enabled": false});
         }
+        // Never let a test start probe containers on the real host.
+        if cfg["host_invariants"].is_null() {
+            cfg["host_invariants"] = json!({"container_network": false});
+        }
         let cfg = DroneConfig::from_json(&cfg.to_string()).unwrap();
         let client = QueenClient::new(&cfg, Secret::new(self.token.clone())).unwrap();
         Drone::new(cfg, client, host, exec)

@@ -215,6 +215,19 @@ pub struct EnvFacts {
     /// Actual execution proofs as the job user, each with its probe timestamp.
     #[serde(default)]
     pub capabilities: BTreeMap<Capability, CapabilityFact>,
+    /// Host invariants the drone found broken; while any is, it takes no
+    /// leases (see `drone::invariants`). Empty when all hold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_invariant_failures: Vec<InvariantFailure>,
+}
+
+/// One broken host invariant, as the drone reports it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct InvariantFailure {
+    /// Stable key: `ip_forward`, `docker_daemon`, `container_network`, `disk`.
+    pub check: String,
+    /// What failed, for people.
+    pub detail: String,
 }
 
 /// Admission safety, independent of optional cache efficiency checks.
@@ -973,6 +986,7 @@ mod tests {
                 ("gh", "gh version 2.50.0"),
             ])),
             capabilities: BTreeMap::new(),
+            host_invariant_failures: Vec::new(),
         }
     }
 
