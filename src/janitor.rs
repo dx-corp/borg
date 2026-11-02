@@ -198,7 +198,9 @@ struct Run {
 
 #[derive(Debug, Deserialize)]
 struct RepoRef {
-    full_name: String,
+    // Embedded PR heads can carry only id/name/url. Missing identity is not proof.
+    #[serde(default)]
+    full_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,7 +284,8 @@ fn post_close_rerun(repo: &str, run: &Run, pulls: &[PullByHead]) -> bool {
             .head
             .repo
             .as_ref()
-            .is_some_and(|head| head.full_name.eq_ignore_ascii_case(repo))
+            .and_then(|head| head.full_name.as_deref())
+            .is_some_and(|name| name.eq_ignore_ascii_case(repo))
         || pulls.iter().any(|p| p.state == "open")
     {
         return false;
@@ -671,7 +674,8 @@ impl Janitor {
     fn same_repository(&self, repo: &str, run: &Run) -> bool {
         run.head_repository
             .as_ref()
-            .is_some_and(|r| r.full_name.eq_ignore_ascii_case(repo))
+            .and_then(|r| r.full_name.as_deref())
+            .is_some_and(|name| name.eq_ignore_ascii_case(repo))
     }
 
     /// Whether `run` is a run of a `closed_pr_workflows` entry.

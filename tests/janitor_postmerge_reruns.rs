@@ -76,7 +76,12 @@ async fn rerun_exemption_requires_exact_head_and_complete_attempt_proof() {
 
 #[tokio::test]
 async fn a_same_owner_branch_and_sha_cannot_substitute_another_repository() {
-    for repository in [Value::Null, json!({"full_name": "example-org/fork"})] {
+    for repository in [
+        Value::Null,
+        json!({"full_name": "example-org/fork"}),
+        json!({"id": 11, "name": "app", "url": "https://api.github.com/repos/example-org/app"}),
+        json!({"full_name": null}),
+    ] {
         let h = Harness::start(settings(true)).await;
         {
             let mut st = h.state();
@@ -86,8 +91,55 @@ async fn a_same_owner_branch_and_sha_cannot_substitute_another_repository() {
             st.pulls_by_head.insert("fix/projection".into(), vec![pull]);
         }
         let result = h.janitor_pass().await;
+        assert_eq!(
+            result.errors, 0,
+            "unverified repository metadata must parse: {result:?}"
+        );
         assert_eq!(result.cancelled, 1, "{result:?}");
     }
+}
+
+#[tokio::test]
+async fn abbreviated_embedded_repositories_do_not_poison_the_run_batch() {
+    let h = Harness::start(settings(true)).await;
+    {
+        let mut st = h.state();
+        for (id, actual, current, repository) in [
+            (
+                1,
+                "current",
+                "current",
+                json!({"id": 11, "name": "app", "url": "https://api.github.com/repos/example-org/app"}),
+            ),
+            (
+                2,
+                "superseded",
+                "current",
+                json!({"id": 11, "full_name": null}),
+            ),
+        ] {
+            st.pr_runs.push(
+                json!({"id": id, "status": "queued", "event": "pull_request",
+                "head_sha": actual,
+                "pull_requests": [{"number": 10, "head": {"sha": current, "repo": repository}}]}),
+            );
+        }
+        st.pr_runs.push(rerun(3, "queued"));
+        let mut obsolete = rerun(4, "queued");
+        obsolete["run_attempt"] = json!(1);
+        obsolete["run_started_at"] = json!(CREATED);
+        st.pr_runs.push(obsolete);
+        st.pulls_by_head
+            .insert("fix/projection".into(), vec![closed_pull("qualified-head")]);
+    }
+    let result = h.janitor_pass().await;
+    assert_eq!(
+        result.errors, 0,
+        "one abbreviated reference must not stop cleanup: {result:?}"
+    );
+    let mut cancelled = h.state().cancelled.clone();
+    cancelled.sort_unstable();
+    assert_eq!(cancelled, [2, 4], "{result:?}");
 }
 
 #[tokio::test]
