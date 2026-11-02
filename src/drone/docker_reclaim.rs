@@ -24,9 +24,64 @@ use crate::reclaim::{
 /// Label that pins an image, container or volume against reclaim.
 pub const KEEP_LABEL: &str = "borg.keep";
 
-const IMAGE_FORMAT: &str = "{{.Id}}\t{{.Size}}\t{{.Created}}\t{{.Metadata.LastTagTime}}\t{{json .RepoTags}}\t{{json .RepoDigests}}\t{{json .Config.Labels}}";
-const CONTAINER_FORMAT: &str = "{{.Id}}\t{{.Name}}\t{{.Image}}\t{{.State.Status}}\t{{.Created}}\t{{.State.FinishedAt}}\t{{json .Config.Labels}}";
-const VOLUME_FORMAT: &str = "{{.Name}}\t{{.CreatedAt}}\t{{json .Labels}}";
+// `inspect` output is read as JSON, not through a `--format` template: a Go
+// template aborts on a key the object lacks, and Docker 29 omits
+// `Config.Labels` for unlabelled images (27 of 40 images on borg-deploy-1 on
+// 2026-11-02), so the template run failed and the tier freed nothing.
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct ConfigJson {
+    labels: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct ImageMetaJson {
+    last_tag_time: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct ImageJson {
+    id: String,
+    size: Option<u64>,
+    created: Option<String>,
+    metadata: Option<ImageMetaJson>,
+    repo_tags: Option<Vec<String>>,
+    repo_digests: Option<Vec<String>>,
+    config: Option<ConfigJson>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct StateJson {
+    status: String,
+    finished_at: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct ContainerJson {
+    id: String,
+    name: String,
+    image: String,
+    created: Option<String>,
+    state: Option<StateJson>,
+    config: Option<ConfigJson>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct VolumeJson {
+    name: String,
+    created_at: Option<String>,
+    labels: Option<BTreeMap<String, String>>,
+}
+
+fn config_labels(c: Option<ConfigJson>) -> BTreeMap<String, String> {
+    c.and_then(|c| c.labels).unwrap_or_default()
+}
 
 /// One image as `docker image inspect` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,12 +298,6 @@ fn since(now: i64, at: Option<i64>) -> u64 {
     at.map_or(0, |t| u64::try_from(now.saturating_sub(t)).unwrap_or(0))
 }
 
-fn labels(json: &str) -> Option<BTreeMap<String, String>> {
-    serde_json::from_str::<Option<BTreeMap<String, String>>>(json.trim())
-        .ok()
-        .map(Option::unwrap_or_default)
-}
-
 /// `registry:5000/team/app:tag` -> `registry:5000/team/app`;
 /// `app@sha256:...` -> `app`.
 fn repository(reference: &str) -> &str {
@@ -261,71 +310,74 @@ fn repository(reference: &str) -> &str {
     }
 }
 
-fn parse_image(line: &str, now: i64) -> Option<Image> {
-    let f: Vec<&str> = line.split('\t').collect();
-    let [id, size, created, tagged, tags, digests, label_json] = f[..] else {
-        return None;
-    };
-    if id.is_empty() {
+fn parse_image(j: ImageJson, now: i64) -> Option<Image> {
+    if j.id.is_empty() {
         return None;
     }
-    let tags: Vec<String> = serde_json::from_str::<Option<Vec<String>>>(tags)
-        .ok()?
+    let tags: Vec<String> = j
+        .repo_tags
         .unwrap_or_default()
         .into_iter()
         .filter(|t| t != "<none>:<none>")
         .collect();
-    let digests: Vec<String> = serde_json::from_str::<Option<Vec<String>>>(digests)
-        .ok()?
-        .unwrap_or_default();
-    let mut repos: Vec<String> = tags
-        .iter()
-        .chain(if tags.is_empty() {
-            digests.iter()
-        } else {
-            [].iter()
-        })
-        .map(|r| repository(r).to_owned())
-        .collect();
+    let digests = j.repo_digests.unwrap_or_default();
+    let refs = if tags.is_empty() { &digests } else { &tags };
+    let mut repos: Vec<String> = refs.iter().map(|r| repository(r).to_owned()).collect();
     repos.sort();
     repos.dedup();
-    let newest = unix(created).max(unix(tagged));
+    let tagged = j.metadata.and_then(|m| m.last_tag_time);
+    let newest = j
+        .created
+        .as_deref()
+        .and_then(unix)
+        .max(tagged.as_deref().and_then(unix));
     Some(Image {
-        id: id.to_owned(),
-        size_bytes: size.trim().parse().ok()?,
+        id: j.id,
+        // An image Docker reports no size for counts as free to remove.
+        size_bytes: j.size.unwrap_or(0),
         age_secs: since(now, newest),
         tags,
         repos,
-        keep: labels(label_json)?.contains_key(KEEP_LABEL),
+        keep: config_labels(j.config).contains_key(KEEP_LABEL),
     })
 }
 
-fn parse_container(line: &str, now: i64) -> Option<Container> {
-    let f: Vec<&str> = line.split('\t').collect();
-    let [id, name, image, state, created, finished, label_json] = f[..] else {
+fn parse_container(j: ContainerJson, now: i64) -> Option<Container> {
+    if j.id.is_empty() {
         return None;
+    }
+    let state = j.state.unwrap_or_default();
+    // A container whose state Docker did not report is treated as running,
+    // which keeps it and its image.
+    let status = if state.status.is_empty() {
+        "running".to_owned()
+    } else {
+        state.status
     };
-    let at = unix(finished).or_else(|| unix(created));
+    let at = state
+        .finished_at
+        .as_deref()
+        .and_then(unix)
+        .or_else(|| j.created.as_deref().and_then(unix));
     Some(Container {
-        id: id.to_owned(),
-        name: name.trim_start_matches('/').to_owned(),
-        image_id: image.to_owned(),
-        state: state.to_owned(),
+        id: j.id,
+        name: j.name.trim_start_matches('/').to_owned(),
+        image_id: j.image,
+        state: status,
         idle_secs: since(now, at),
-        labels: labels(label_json)?,
+        labels: config_labels(j.config),
     })
 }
 
-fn parse_volume(line: &str, now: i64) -> Option<Volume> {
-    let f: Vec<&str> = line.split('\t').collect();
-    let [name, created, label_json] = f[..] else {
+fn parse_volume(j: VolumeJson, now: i64) -> Option<Volume> {
+    if j.name.is_empty() {
         return None;
-    };
+    }
     Some(Volume {
-        name: name.to_owned(),
+        name: j.name,
         // An unparsable creation time reads as brand new, which keeps it.
-        age_secs: since(now, unix(created)),
-        labels: labels(label_json)?,
+        age_secs: since(now, j.created_at.as_deref().and_then(unix)),
+        labels: j.labels.unwrap_or_default(),
     })
 }
 
@@ -390,43 +442,57 @@ impl DockerCli<'_> {
         Ok(ids)
     }
 
-    /// `inspect` every id in one call; lines that do not parse are dropped
-    /// (the item stays).
-    fn inspect<T>(
+    /// `inspect` every id in one call and read Docker's JSON array; an
+    /// object that does not parse is dropped (the item stays).
+    fn inspect<J: serde::de::DeserializeOwned, T>(
         &self,
         cmd: &[&str],
-        format: &str,
         ids: &[String],
-        parse: impl Fn(&str) -> Option<T>,
+        parse: impl Fn(J) -> Option<T>,
     ) -> Result<Vec<T>, String> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         let mut args: Vec<&str> = cmd.to_vec();
-        args.extend(["--format", format]);
         args.extend(ids.iter().map(String::as_str));
-        Ok(self.run(&args)?.lines().filter_map(parse).collect())
+        let out = self
+            .exec
+            .run(self.docker, &args)
+            .map_err(|e| format!("{}: {e}", self.docker))?;
+        // Docker exits non-zero when any id vanished since the listing (jobs
+        // pull, prune and remove concurrently) yet still prints the others.
+        // A vanished item is simply not a candidate; only a run that printed
+        // nothing usable is a failure.
+        let items: Vec<serde_json::Value> = match serde_json::from_str(out.stdout.trim()) {
+            Ok(items) => items,
+            Err(e) if out.success => {
+                return Err(format!(
+                    "`docker {}`: unreadable output: {e}",
+                    cmd.join(" ")
+                ));
+            }
+            Err(_) => return Err(format!("`docker {}` failed", cmd.join(" "))),
+        };
+        Ok(items
+            .into_iter()
+            .filter_map(|v| serde_json::from_value::<J>(v).ok())
+            .filter_map(parse)
+            .collect())
     }
 
     pub fn images(&self, now: i64) -> Result<Vec<Image>, String> {
         let ids = self.ids(&["image", "ls", "-q", "--no-trunc"])?;
-        self.inspect(&["image", "inspect"], IMAGE_FORMAT, &ids, |l| {
-            parse_image(l, now)
-        })
+        self.inspect(&["image", "inspect"], &ids, |j| parse_image(j, now))
     }
 
     pub fn containers(&self, now: i64) -> Result<Vec<Container>, String> {
         let ids = self.ids(&["ps", "-aq", "--no-trunc"])?;
-        self.inspect(&["inspect"], CONTAINER_FORMAT, &ids, |l| {
-            parse_container(l, now)
-        })
+        self.inspect(&["container", "inspect"], &ids, |j| parse_container(j, now))
     }
 
     pub fn dangling_volumes(&self, now: i64) -> Result<Vec<Volume>, String> {
         let ids = self.ids(&["volume", "ls", "-q", "--filter", "dangling=true"])?;
-        self.inspect(&["volume", "inspect"], VOLUME_FORMAT, &ids, |l| {
-            parse_volume(l, now)
-        })
+        self.inspect(&["volume", "inspect"], &ids, |j| parse_volume(j, now))
     }
 
     /// Docker's data root (`/var/lib/docker` unless configured otherwise).
@@ -454,8 +520,8 @@ impl DockerCli<'_> {
 
     /// Fresh state of one container immediately before removal.
     fn container_now(&self, id: &str, now: i64) -> Option<Container> {
-        self.inspect(&["inspect"], CONTAINER_FORMAT, &[id.to_owned()], |l| {
-            parse_container(l, now)
+        self.inspect(&["container", "inspect"], &[id.to_owned()], |j| {
+            parse_container(j, now)
         })
         .ok()?
         .into_iter()
@@ -945,10 +1011,18 @@ mod tests {
     }
 
     #[test]
-    fn inspect_lines_parse_including_never_and_registry_ports() {
+    fn inspect_json_parses_including_docker_29_omissions_and_registry_ports() {
+        use serde_json::{from_value, json};
         let now = unix("2026-11-01T22:00:00Z").unwrap();
         let i = parse_image(
-            "sha256:aa\t620000000\t2026-10-30T22:00:00.123456789Z\t2026-11-01T20:00:00.5Z\t[\"registry:5000/team/app:v1\"]\t[]\t{\"borg.keep\":\"\"}",
+            from_value(json!({
+                "Id": "sha256:aa", "Size": 620000000,
+                "Created": "2026-10-30T22:00:00.123456789Z",
+                "Metadata": {"LastTagTime": "2026-11-01T20:00:00.5Z"},
+                "RepoTags": ["registry:5000/team/app:v1"], "RepoDigests": [],
+                "Config": {"Labels": {"borg.keep": ""}}
+            }))
+            .unwrap(),
             now,
         )
         .unwrap();
@@ -958,23 +1032,39 @@ mod tests {
             (2 * H, 620_000_000, true)
         );
         assert_eq!(i.repos, ["registry:5000/team/app"]);
+        // Docker 29 on borg-deploy-1: no Config.Labels, no Metadata, null tags.
         let d = parse_image(
-            "sha256:bb\t1\t2026-10-01T00:00:00Z\t0001-01-01T00:00:00Z\t[]\t[\"app@sha256:cc\"]\tnull",
+            from_value(json!({
+                "Id": "sha256:bb", "Size": 1, "Created": "2026-10-01T00:00:00Z",
+                "RepoTags": null, "RepoDigests": ["app@sha256:cc"], "Config": {"Env": []}
+            }))
+            .unwrap(),
             now,
         )
         .unwrap();
         assert_eq!(
-            (d.repos.as_slice(), d.tags.is_empty()),
-            (&["app".to_owned()][..], true)
+            (d.repos.as_slice(), d.tags.is_empty(), d.keep),
+            (&["app".to_owned()][..], true, false)
         );
         let c = parse_container(
-            "c1\t/svc\tsha256:aa\texited\t2026-11-01T10:00:00Z\t0001-01-01T00:00:00Z\tnull",
+            from_value(json!({
+                "Id": "c1", "Name": "/svc", "Image": "sha256:aa",
+                "Created": "2026-11-01T10:00:00Z",
+                "State": {"Status": "exited", "FinishedAt": "0001-01-01T00:00:00Z"},
+                "Config": {}
+            }))
+            .unwrap(),
             now,
         )
         .unwrap();
         // Never finished: idle since creation.
         assert_eq!((c.name.as_str(), c.idle_secs), ("svc", 12 * H));
-        assert!(parse_image("garbage", now).is_none());
+        assert!(c.labels.is_empty());
+        // No state reported: treated as running, so it and its image stay.
+        let unknown =
+            parse_container(from_value(json!({"Id": "c2", "Image": "i"})).unwrap(), now).unwrap();
+        assert_eq!(unknown.state, "running");
+        assert!(parse_image(ImageJson::default(), now).is_none());
         assert_eq!(parse_freed("ID\nabc\nTotal:\t60.19GB\n"), 60_190_000_000);
         assert_eq!(parse_freed("Total reclaimed space: 512kB"), 512_000);
         assert_eq!(parse_freed("nothing"), 0);
@@ -984,43 +1074,73 @@ mod tests {
     /// images, the newest one, an image a running container uses, an old
     /// stopped container and an anonymous dangling volume.
     fn fake_docker(buildx_help: &str) -> FakeExec {
+        use serde_json::json;
         let x = FakeExec::default();
         x.on("docker version --format {{.Server.Version}}", "29.1.3");
         x.on("docker ps -aq --no-trunc", "crun\ncold");
+        let cold = json!({
+            "Id": "cold", "Name": "/old", "Image": "sha256:gone",
+            "Created": "2026-10-01T00:00:00Z",
+            "State": {"Status": "exited", "FinishedAt": "2026-10-02T00:00:00Z"},
+            "Config": {}
+        });
+        let crun = json!({
+            "Id": "crun", "Name": "/svc", "Image": "sha256:busy",
+            "Created": "2026-11-01T00:00:00Z",
+            "State": {"Status": "running", "FinishedAt": "0001-01-01T00:00:00Z"},
+            "Config": {"Labels": null}
+        });
         x.on(
-            &format!("docker inspect --format {CONTAINER_FORMAT} cold crun"),
-            "cold\t/old\tsha256:gone\texited\t2026-10-01T00:00:00Z\t2026-10-02T00:00:00Z\tnull\n\
-             crun\t/svc\tsha256:busy\trunning\t2026-11-01T00:00:00Z\t0001-01-01T00:00:00Z\tnull",
+            "docker container inspect cold crun",
+            &json!([cold.clone(), crun]).to_string(),
         );
-        x.on(
-            &format!("docker inspect --format {CONTAINER_FORMAT} cold"),
-            "cold\t/old\tsha256:gone\texited\t2026-10-01T00:00:00Z\t2026-10-02T00:00:00Z\tnull",
-        );
+        x.on("docker container inspect cold", &json!([cold]).to_string());
         x.on(
             "docker image ls -q --no-trunc",
             "sha256:a1\nsha256:a2\nsha256:a3\nsha256:busy\nsha256:multi",
         );
-        let line = |id: &str, created: &str, tags: &str| {
-            format!("{id}\t620000000\t{created}\t0001-01-01T00:00:00Z\t{tags}\t[]\tnull")
+        // As Docker 29 prints them: no Config.Labels key, no Metadata.
+        let image = |id: &str, created: &str, tags: Vec<String>| {
+            json!({"Id": id, "Size": 620000000, "Created": created,
+                   "RepoTags": tags, "RepoDigests": [], "Config": {"Env": []}})
         };
         x.on(
-            &format!(
-                "docker image inspect --format {IMAGE_FORMAT} sha256:a1 sha256:a2 sha256:a3 sha256:busy sha256:multi"
-            ),
-            &[
-                line("sha256:a1", "2026-10-20T00:00:00Z", &format!("[\"{API}:c1\"]")),
-                line("sha256:a2", "2026-10-25T00:00:00Z", &format!("[\"{API}:c2\"]")),
-                line("sha256:a3", "2026-11-01T00:00:00Z", &format!("[\"{API}:c3\"]")),
-                line("sha256:busy", "2026-10-01T00:00:00Z", "[\"svc:1\"]"),
-                line("sha256:multi", "2026-10-21T00:00:00Z", &format!("[\"{API}:x\",\"{API}:y\"]")),
-            ]
-            .join("\n"),
+            "docker image inspect sha256:a1 sha256:a2 sha256:a3 sha256:busy sha256:multi",
+            &json!([
+                image(
+                    "sha256:a1",
+                    "2026-10-20T00:00:00Z",
+                    vec![format!("{API}:c1")]
+                ),
+                image(
+                    "sha256:a2",
+                    "2026-10-25T00:00:00Z",
+                    vec![format!("{API}:c2")]
+                ),
+                image(
+                    "sha256:a3",
+                    "2026-11-01T00:00:00Z",
+                    vec![format!("{API}:c3")]
+                ),
+                image(
+                    "sha256:busy",
+                    "2026-10-01T00:00:00Z",
+                    vec!["svc:1".to_owned()]
+                ),
+                image(
+                    "sha256:multi",
+                    "2026-10-21T00:00:00Z",
+                    vec![format!("{API}:x"), format!("{API}:y")]
+                ),
+            ])
+            .to_string(),
         );
         let anon = "d".repeat(64);
         x.on("docker volume ls -q --filter dangling=true", &anon);
         x.on(
-            &format!("docker volume inspect --format {VOLUME_FORMAT} {anon}"),
-            &format!("{anon}\t2026-10-01T00:00:00Z\tnull"),
+            &format!("docker volume inspect {anon}"),
+            &json!([{"Name": anon, "CreatedAt": "2026-10-01T00:00:00Z", "Labels": null}])
+                .to_string(),
         );
         x.on("docker builder prune --help", buildx_help);
         x.on(
@@ -1211,6 +1331,46 @@ mod tests {
         assert!(c.records.iter().all(|r| r.outcome == Outcome::WouldDelete));
         assert_eq!(c.reclaimed_bytes, 0);
         assert_eq!(c.would_reclaim_bytes, 3 * 620_000_000);
+    }
+
+    #[test]
+    fn an_item_that_vanished_since_the_listing_does_not_fail_the_run() {
+        use crate::drone::exec::Output;
+        let x = fake_docker("--reserved-space");
+        // `image ls` listed sha256:gone too; it was removed before the inspect,
+        // so docker exits 1 but prints the others.
+        x.on(
+            "docker image ls -q --no-trunc",
+            "sha256:a1\nsha256:a2\nsha256:a3\nsha256:busy\nsha256:gone\nsha256:multi",
+        );
+        let ok = x
+            .script
+            .lock()
+            .unwrap()
+            .get("docker image inspect sha256:a1 sha256:a2 sha256:a3 sha256:busy sha256:multi")
+            .cloned()
+            .unwrap();
+        x.script.lock().unwrap().insert(
+            "docker image inspect sha256:a1 sha256:a2 sha256:a3 sha256:busy sha256:gone sha256:multi"
+                .into(),
+            Output {
+                success: false,
+                stdout: ok.stdout,
+            },
+        );
+        let cli = DockerCli {
+            exec: &x,
+            docker: "docker",
+        };
+        let s = ReclaimSettings::default();
+        let held = HashSet::new();
+        let c = run(&cli, &input(&s, &held, 110, 10 << 30), || None, &mut 0).unwrap();
+        assert!(x.calls().contains(&"docker image rm sha256:a1".to_owned()));
+        assert!(!x.calls().iter().any(|c| c.contains("rm sha256:gone")));
+        assert_eq!(c.errors, 0);
+        // A failed inspect that printed nothing usable is still a failure.
+        x.fail("docker container inspect cold crun");
+        assert!(run(&cli, &input(&s, &held, 110, 10 << 30), || None, &mut 0).is_err());
     }
 
     #[test]
