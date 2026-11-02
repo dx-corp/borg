@@ -1227,7 +1227,14 @@ impl Store {
                 .take(MAX_TEXT)
                 .collect::<String>()
         };
-        for r in stats.recent.iter().take(MAX_ENTRIES) {
+        // Docker and cache-dir records arrive in `recent_ext` (older queens
+        // ignore that field); both lists land in the same log.
+        for r in stats
+            .recent
+            .iter()
+            .chain(stats.recent_ext.iter())
+            .take(MAX_ENTRIES)
+        {
             let size = i64::try_from(r.size_bytes).unwrap_or(i64::MAX);
             let seq = i64::try_from(r.seq).unwrap_or(i64::MAX);
             // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
@@ -1246,6 +1253,7 @@ impl Store {
         }
         let mut kept = stats.clone();
         kept.recent.clear();
+        kept.recent_ext.clear();
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         sqlx::query("UPDATE drones SET reclaim = ? WHERE name = ?")
             .bind(to_text(&kept)?)

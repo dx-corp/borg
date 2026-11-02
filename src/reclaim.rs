@@ -10,7 +10,12 @@
 //! What it removes, cheapest first (tiers):
 //! 1. `incremental/` directories under cargo target directories (regenerable);
 //! 2. whole cargo target directories;
-//! 3. git worktrees.
+//! 3. regenerable cache directories (per-slot CI tool homes);
+//! 4. git worktrees.
+//!
+//! Docker state (unused images, stopped containers, build cache, dangling
+//! volumes) is a separate tier with its own keep rules; see
+//! [`DockerReclaimSettings`] and `drone::docker_reclaim`.
 //!
 //! When it runs:
 //! * **Pressure.** Disk usage at or above `high_water_pct` starts reclaiming;
@@ -20,6 +25,10 @@
 //!   `critical_min_age_secs`.
 //! * **Hygiene.** Below the high-water mark only items untouched for
 //!   `idle_max_age_secs` (7 days; 0 turns it off) are removed.
+//! * **Admission.** Free space below the queen's disk-admission floor means
+//!   the drone takes no jobs, whatever the percentage: that counts as
+//!   critical (a 291 GB disk at 80% still has the 10 GiB floor free, but a
+//!   small one does not).
 //!
 //! What it never removes (checked immediately before each deletion, so state
 //! that changed since the scan is respected; an unreadable or unknown state
@@ -53,6 +62,16 @@ pub enum Kind {
     CargoTarget,
     /// A git worktree.
     Worktree,
+    /// A regenerable cache directory (a CI slot's tool home).
+    CacheDir,
+    /// A container image no container uses.
+    DockerImage,
+    /// A stopped container.
+    DockerContainer,
+    /// Build cache records (one record per prune).
+    DockerBuildCache,
+    /// A dangling volume.
+    DockerVolume,
 }
 
 impl Kind {
@@ -61,7 +80,22 @@ impl Kind {
             Self::CargoIncremental => "cargo_incremental",
             Self::CargoTarget => "cargo_target",
             Self::Worktree => "worktree",
+            Self::CacheDir => "cache_dir",
+            Self::DockerImage => "docker_image",
+            Self::DockerContainer => "docker_container",
+            Self::DockerBuildCache => "docker_build_cache",
+            Self::DockerVolume => "docker_volume",
         }
+    }
+
+    /// Kinds every queen understands. Records of other kinds travel in
+    /// [`ReclaimStats::recent_ext`], which a queen built before they existed
+    /// ignores instead of rejecting the whole heartbeat.
+    pub fn is_wire_v1(self) -> bool {
+        matches!(
+            self,
+            Self::CargoIncremental | Self::CargoTarget | Self::Worktree
+        )
     }
 }
 
@@ -100,6 +134,71 @@ pub struct ReclaimSettings {
     pub max_deletions_per_cycle: u32,
     /// Seconds between cycles.
     pub interval_secs: u64,
+    /// The Docker tier.
+    pub docker: DockerReclaimSettings,
+}
+
+/// The Docker tier (the `reclaim.docker` block). On by default.
+///
+/// Keep rules, checked immediately before each removal: an image used by
+/// any remaining container, the newest image of each repository, and
+/// anything labelled `borg.keep` stay; a container or volume of a lease the
+/// drone is running is busy and stays; a volume is removed only when it is
+/// dangling and either anonymous or created by a borg lease, never a named
+/// volume someone made on purpose. Nothing uses `-f` or `system prune`.
+///
+/// Ages: below high water each kind goes once it is older than its
+/// `*_max_age_secs` (0 = never by age alone); under pressure the shared
+/// `min_age_secs`, when critical `critical_min_age_secs`, whichever is
+/// younger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DockerReclaimSettings {
+    pub enabled: bool,
+    /// Unused images older than this (since built or last pulled/tagged).
+    pub image_max_age_secs: u64,
+    /// Stopped containers that finished this long ago.
+    pub stopped_container_max_age_secs: u64,
+    /// Build cache records unused this long (`builder prune --filter until`).
+    pub build_cache_max_age_secs: u64,
+    /// Build cache kept regardless of age (`--reserved-space`, or
+    /// `--keep-storage` on older buildx); 0 when critical.
+    pub build_cache_keep_bytes: u64,
+    /// Remove dangling anonymous or lease-created volumes.
+    pub prune_dangling_volumes: bool,
+    /// Dangling volumes created this long ago.
+    pub volume_max_age_secs: u64,
+}
+
+impl Default for DockerReclaimSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            image_max_age_secs: 24 * 3600,
+            stopped_container_max_age_secs: 6 * 3600,
+            build_cache_max_age_secs: 24 * 3600,
+            build_cache_keep_bytes: 10 << 30,
+            prune_dangling_volumes: true,
+            volume_max_age_secs: 24 * 3600,
+        }
+    }
+}
+
+impl DockerReclaimSettings {
+    /// The minimum age for a kind whose hygiene age is `hygiene_secs`.
+    /// `None`: nothing of that kind is eligible in this mode.
+    pub fn min_age(&self, s: &ReclaimSettings, mode: Mode, hygiene_secs: u64) -> Option<u64> {
+        let by_mode = match mode {
+            Mode::Critical => Some(s.critical_min_age_secs),
+            Mode::Pressure => Some(s.min_age_secs),
+            Mode::Hygiene | Mode::Idle => None,
+        };
+        let hygiene = (hygiene_secs > 0).then_some(hygiene_secs);
+        match (by_mode, hygiene) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 impl Default for ReclaimSettings {
@@ -116,6 +215,7 @@ impl Default for ReclaimSettings {
             idle_max_age_secs: 7 * 24 * 3600,
             max_deletions_per_cycle: 50,
             interval_secs: 600,
+            docker: DockerReclaimSettings::default(),
         }
     }
 }
@@ -154,7 +254,7 @@ impl ReclaimSettings {
             if !r.path.is_absolute() {
                 return Err("reclaim root paths must be absolute".into());
             }
-            if r.kind == Kind::CargoIncremental {
+            if !matches!(r.kind, Kind::Worktree | Kind::CargoTarget) {
                 return Err("reclaim roots are worktree or cargo_target".into());
             }
         }
@@ -243,6 +343,11 @@ impl Disk {
 /// The filesystem, git and process table, as the drone provides them.
 pub trait ReclaimHost {
     fn disk(&self) -> Result<Disk, String>;
+    /// Free bytes below which the drone takes no jobs (the queen's disk
+    /// admission floor); 0 when unknown.
+    fn admission_floor_bytes(&self) -> u64 {
+        0
+    }
     /// List candidates under the configured roots.
     fn scan(&self, roots: &[Root]) -> Result<Vec<Candidate>, String>;
     /// Probe a candidate immediately before it is deleted.
@@ -319,9 +424,21 @@ pub struct ReclaimStats {
     /// Candidates the last run kept, by reason.
     pub kept: BTreeMap<String, u32>,
     /// Audit entries created since the previous heartbeat; the queen stores
-    /// them and ignores any it already has (by `seq`).
+    /// them and ignores any it already has (by `seq`). Only
+    /// [`Kind::is_wire_v1`] kinds.
     #[serde(default)]
     pub recent: Vec<DeletionRecord>,
+    /// Audit entries of the newer kinds (cache dirs, Docker), kept apart so a
+    /// queen that predates them still accepts the heartbeat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_ext: Vec<DeletionRecord>,
+    /// Bytes the Docker tier freed since the drone started (also counted in
+    /// `reclaimed_bytes_total`).
+    #[serde(default)]
+    pub docker_reclaimed_bytes_total: u64,
+    /// Bytes the last Docker tier run freed.
+    #[serde(default)]
+    pub last_run_docker_reclaimed_bytes: u64,
 }
 
 impl ReclaimStats {
@@ -339,14 +456,52 @@ impl ReclaimStats {
         self.usage_pct = Some(cycle.usage_pct_before);
         self.last_run_mode = Some(cycle.mode);
         self.kept = cycle.kept.clone();
-        self.recent.extend(cycle.records.iter().cloned());
+        self.push_records(&cycle.records);
     }
 
-    /// Take the audit entries for the next heartbeat (at most `max`; the rest
-    /// stay for the following one).
-    pub fn drain_recent(&mut self, max: usize) -> Vec<DeletionRecord> {
+    /// Fold a Docker tier run into the stats of the cycle just absorbed: its
+    /// bytes count toward the run and the running totals, its errors toward
+    /// the run's errors, and its keep reasons join the run's.
+    pub fn absorb_docker(&mut self, cycle: &Cycle) {
+        self.reclaimed_bytes_total = self
+            .reclaimed_bytes_total
+            .saturating_add(cycle.reclaimed_bytes);
+        self.last_run_reclaimed_bytes = self
+            .last_run_reclaimed_bytes
+            .saturating_add(cycle.reclaimed_bytes);
+        self.last_run_would_reclaim_bytes = self
+            .last_run_would_reclaim_bytes
+            .saturating_add(cycle.would_reclaim_bytes);
+        self.docker_reclaimed_bytes_total = self
+            .docker_reclaimed_bytes_total
+            .saturating_add(cycle.reclaimed_bytes);
+        self.last_run_docker_reclaimed_bytes = cycle.reclaimed_bytes;
+        self.last_run_errors = self.last_run_errors.saturating_add(cycle.errors);
+        for (k, v) in &cycle.kept {
+            *self.kept.entry(format!("docker: {k}")).or_default() += v;
+        }
+        self.push_records(&cycle.records);
+    }
+
+    fn push_records(&mut self, records: &[DeletionRecord]) {
+        for r in records {
+            if r.kind.is_wire_v1() {
+                self.recent.push(r.clone());
+            } else {
+                self.recent_ext.push(r.clone());
+            }
+        }
+    }
+
+    /// Take the audit entries for the next heartbeat (at most `max` of each
+    /// list; the rest stay for the following one): `(recent, recent_ext)`.
+    pub fn drain_recent(&mut self, max: usize) -> (Vec<DeletionRecord>, Vec<DeletionRecord>) {
         let n = self.recent.len().min(max);
-        self.recent.drain(..n).collect()
+        let m = self.recent_ext.len().min(max);
+        (
+            self.recent.drain(..n).collect(),
+            self.recent_ext.drain(..m).collect(),
+        )
     }
 }
 
@@ -354,7 +509,12 @@ fn tier(k: Kind) -> u8 {
     match k {
         Kind::CargoIncremental => 0,
         Kind::CargoTarget => 1,
-        Kind::Worktree => 2,
+        Kind::CacheDir => 2,
+        Kind::Worktree => 3,
+        // The Docker tier orders its own work.
+        Kind::DockerImage | Kind::DockerContainer | Kind::DockerBuildCache | Kind::DockerVolume => {
+            4
+        }
     }
 }
 
@@ -376,8 +536,14 @@ fn hours(secs: u64) -> String {
 
 /// The mode for this disk state.
 pub fn mode_for(s: &ReclaimSettings, disk: &Disk) -> Mode {
+    mode_for_floor(s, disk, 0)
+}
+
+/// The mode for this disk state when the drone stops taking jobs below
+/// `floor_bytes` free: below the floor is critical.
+pub fn mode_for_floor(s: &ReclaimSettings, disk: &Disk, floor_bytes: u64) -> Mode {
     let u = disk.usage_pct();
-    if u >= s.critical_pct {
+    if u >= s.critical_pct || (floor_bytes > 0 && disk.free_bytes < floor_bytes) {
         Mode::Critical
     } else if u >= s.high_water_pct {
         Mode::Pressure
@@ -442,7 +608,7 @@ pub fn run_cycle(
 ) -> Result<Cycle, String> {
     let disk = host.disk()?;
     let before = disk.usage_pct();
-    let mode = mode_for(settings, &disk);
+    let mode = mode_for_floor(settings, &disk, host.admission_floor_bytes());
     let mut cycle = Cycle {
         mode,
         usage_pct_before: before,
@@ -463,7 +629,14 @@ pub fn run_cycle(
         Mode::Hygiene => u64::MAX,
         _ => disk
             .used()
-            .saturating_sub(disk.total_bytes / 100 * u64::from(settings.low_water_pct)),
+            .saturating_sub(disk.total_bytes / 100 * u64::from(settings.low_water_pct))
+            // Below the admission floor, at least back above it (with the
+            // same margin again, so the next job does not drop it back).
+            .max(
+                host.admission_floor_bytes()
+                    .saturating_mul(2)
+                    .saturating_sub(disk.free_bytes),
+            ),
     };
     let mut freed: u64 = 0;
     // Bytes already freed inside a target directory (its incremental/), so a
@@ -877,8 +1050,8 @@ mod tests {
             (stats.reclaimed_bytes_total, stats.last_run_at),
             (25 * GIB, Some(1000))
         );
-        assert_eq!(stats.drain_recent(100).len(), 1);
-        assert!(stats.drain_recent(100).is_empty());
+        assert_eq!(stats.drain_recent(100).0.len(), 1);
+        assert!(stats.drain_recent(100).0.is_empty());
     }
 
     #[test]

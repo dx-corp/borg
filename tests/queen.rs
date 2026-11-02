@@ -334,7 +334,9 @@ async fn rollout_metrics_compare_reported_versions_with_the_target() {
         h.enroll("d2").await,
         h.enroll("d3").await,
     );
-    h.heartbeat_version(&a, "2.0.0").await;
+    // Drones report the binary hash as build metadata; it still counts as
+    // the target release.
+    h.heartbeat_version(&a, "2.0.0+abcdef123456").await;
     h.heartbeat_version(&b, "1.9.0\"x").await;
     h.heartbeat(&c, &[]).await;
 
@@ -344,7 +346,9 @@ async fn rollout_metrics_compare_reported_versions_with_the_target() {
         "borg_rollout_drones{state=\"current\"} 1",
         "borg_rollout_drones{state=\"outdated\"} 1",
         "borg_rollout_drones{state=\"unknown\"} 1",
-        "borg_drone_info{drone=\"d1\",version=\"2.0.0\"} 1",
+        "borg_drone_info{drone=\"d1\",version=\"2.0.0+abcdef123456\",trust=\"shared\"} 1",
+        "borg_drone_active_leases{drone=\"d1\"} 0",
+        "borg_drone_accepting{drone=\"d1\"} ",
     ] {
         assert!(metrics.contains(line), "missing {line}\n{metrics}");
     }
@@ -361,7 +365,7 @@ async fn no_rollout_series_without_a_target() {
     let metrics = h.metrics().await;
     assert!(!metrics.contains("borg_rollout_drones{"), "{metrics}");
     assert!(!metrics.contains("borg_rollout_target_info{"), "{metrics}");
-    assert!(metrics.contains("borg_drone_info{drone=\"d1\",version=\"1.0.0\"} 1"));
+    assert!(metrics.contains("borg_drone_info{drone=\"d1\",version=\"1.0.0\",trust=\"shared\"} 1"));
 }
 
 #[tokio::test]

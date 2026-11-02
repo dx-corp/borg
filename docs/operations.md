@@ -575,6 +575,59 @@ in the repository, so removing a linked worktree never loses one. `delete` runs
 repository. Audit sequence numbers start from the clock so they keep growing
 across drone restarts.
 
+Free space below the queen's disk admission floor (`min_free_disk_bytes`, 10 GiB
+by default) counts as **critical** whatever the percentage, and a pressure cycle
+then frees at least back to twice the floor. CI slot tool homes
+(`<cache_root>/<ns>/slots/<slot>/mise-home`) are a `cache_dir` tier between
+cargo targets and worktrees; one is busy while the drone runs any lease, because
+tools execute from it without holding a file open. Audit records of the newer
+kinds (`cache_dir`, `docker_*`) travel in `reclaim.recent_ext`, which a queen
+older than them ignores instead of rejecting the heartbeat.
+
+#### Docker tier
+
+`reclaim.docker` (on by default; `"enabled": false` turns only this tier off)
+runs after the file tiers, on the filesystem holding Docker's data root
+(`docker info .DockerRootDir`). Each run lists containers, images and dangling
+volumes, decides with the pure `drone::docker_reclaim::plan`, re-checks each
+item immediately before removing it, and removes one item per command: `docker
+rm -v <id>`, `docker image rm <id>` (a multi-tagged image is untagged tag by
+tag), `docker volume rm <name>`, then `docker builder prune -f --filter
+until=<age>` with `--reserved-space <bytes>` (buildx 0.17+) or `--keep-storage
+<bytes>` (older). Nothing is forced and there is no `system prune`.
+
+| Kind | Removed when | Always kept |
+| --- | --- | --- |
+| Stopped container (`exited`, `created`, `dead`) | finished `stopped_container_max_age_secs` ago (6h) | a container of a lease the drone runs; label `borg.keep` |
+| Image | built or last pulled/tagged `image_max_age_secs` ago (24h) | used by any remaining container (running, paused or stopped); the newest image of each repository; label `borg.keep`; anything Docker refuses to remove |
+| Build cache | unused `build_cache_max_age_secs` (24h) | `build_cache_keep_bytes` (10 GiB; 0 when critical) |
+| Volume | dangling and created `volume_max_age_secs` ago (24h), only if anonymous (64-hex name) or created by a borg lease; `prune_dangling_volumes: false` turns it off | named volumes; a running lease's; label `borg.keep` |
+
+Under pressure each age drops to `min_age_secs` (6h), when critical to
+`critical_min_age_secs` (1h), never above its hygiene age; a `*_max_age_secs` of
+0 means "only under pressure". The cap `max_deletions_per_cycle` covers the
+tier's removals. Reclaimed bytes are what the filesystem gained (image sizes
+overlap through shared layers); they count toward `reclaimed_bytes_total`
+(`borg_reclaim_bytes_total`) and separately `docker_reclaimed_bytes_total`.
+
+#### Job-credential wipe
+
+`credential_wipe` (on by default) removes the credential files CI jobs write into
+a home: `.netrc`, `.git-credentials`, `.docker/config.json`, `.kube`,
+`.config/gcloud`, `.terraform.d/credentials.tfrc.json`, `.npmrc`, `.pypirc`,
+`.aws`, `.azure`, `.config/gh`, `.config/helm/registry`,
+`.config/containers/auth.json`, `.cargo/credentials{,.toml}`, `.vault-token`,
+plus `extra_paths`. Caches and the runner's own registration (`actions-runner/`)
+stay. Leases already get a private `HOME` that is deleted with the lease; the job
+user's own home is wiped anyway at startup and whenever the last running lease
+ends. With `static_runner_homes` (default) the drone also wipes the homes of the
+static GitHub runners on its host (users of `actions.runner.*` units, as on
+internal-runner-burst-01) every `interval_secs` (300) when that runner has no
+job (`Runner.Worker` not running) and the file is untouched for `min_idle_secs`
+(600). Removals run as the home's owner, never as the owner of the path (which a
+job could make a symlink); root-owned homes and administrator accounts (`sudo`,
+`wheel`, `admin`) are never wiped. Paths are logged, never contents.
+
 ### Quorum rollout
 
 `rollout_target_version` plus `rollout.previous_version` turns on a gated rollout
@@ -703,6 +756,8 @@ Production Prometheus scrapes `/metrics` through the tailnet (job
 | `borg_drone_disk_free_bytes{drone,mount}` / `borg_drone_disk_min_free_bytes{drone}` | Reported free bytes on the `work` and `cache` filesystems, and the floor. |
 | `borg_static_runner_offline_seconds{runner}` | Seconds since this queen first saw the runner offline. |
 | `borg_burst_never_enrolled_timestamp_seconds{drone,vm,zone}` | End time of each burst VM that ended in the last 24 hours without its drone ever heartbeating (`burst.never_enrolled` in `/status`). |
+| `borg_drone_info{drone,version,trust}` | The version each drone reports: `<package>+<first 12 hex of the binary's sha256>`, so a drone that missed a roll shows a different `version` from the fleet. Rollout targets without `+` match every build of a release. |
+| `borg_drone_active_leases{drone}` / `borg_drone_accepting{drone}` | Leases the drone runs, and whether it takes new ones: a drone with free capacity 0 and no leases while its class has queued jobs is stuck. |
 
 ### Tailnet enrollment
 

@@ -1447,7 +1447,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
     for d in &drones {
         match (&d.version, &cfg.rollout_target_version) {
             (None, _) => rollout.unknown += 1,
-            (Some(v), Some(t)) if v == t => rollout.current += 1,
+            (Some(v), Some(t)) if crate::rollout::same_release(v, t) => rollout.current += 1,
             (Some(_), _) => rollout.outdated += 1,
         }
     }
@@ -2146,7 +2146,8 @@ pub fn render_metrics(status: &Status) -> String {
     );
     gauge(
         "borg_drone_info",
-        "The borg version each drone reported (always 1).",
+        "The borg version each drone reported (always 1). Drones report \
+         <package>+<first 12 hex of the binary's sha256>, so builds differ.",
         status
             .drones
             .iter()
@@ -2154,13 +2155,42 @@ pub fn render_metrics(status: &Status) -> String {
                 d.version.as_ref().map(|v| {
                     (
                         format!(
-                            "drone=\"{}\",version=\"{}\"",
+                            "drone=\"{}\",version=\"{}\",trust=\"{}\"",
                             label_value(&d.name),
-                            label_value(v)
+                            label_value(v),
+                            d.trust.as_str()
                         ),
                         1.0,
                     )
                 })
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_drone_active_leases",
+        "Leases each drone reports running.",
+        status
+            .drones
+            .iter()
+            .map(|d| {
+                (
+                    format!("drone=\"{}\"", label_value(&d.name)),
+                    f64::from(d.active_leases),
+                )
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_drone_accepting",
+        "1 when the drone's last heartbeat said it takes new leases.",
+        status
+            .drones
+            .iter()
+            .map(|d| {
+                (
+                    format!("drone=\"{}\"", label_value(&d.name)),
+                    f64::from(u8::from(d.accepting)),
+                )
             })
             .collect(),
     );

@@ -804,12 +804,20 @@ impl Installer<'_> {
         // A host's reclaim policy is edited in place; reinstalling must not
         // reset it. The block older installs wrote verbatim (off, dry run, no
         // roots) was never an operator choice, so it takes today's default.
-        let reclaim = std::fs::read_to_string(self.on_disk(&self.layout.config()))
+        let on_disk = std::fs::read_to_string(self.on_disk(&self.layout.config()))
             .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        let reclaim = on_disk
+            .as_ref()
             .and_then(|v| v.get("reclaim").cloned())
             .and_then(|r| serde_json::from_value::<crate::reclaim::ReclaimSettings>(r).ok())
             .filter(|r| !r.is_legacy_default())
+            .unwrap_or_default();
+        // The same for the credential wipe block.
+        let credential_wipe = on_disk
+            .as_ref()
+            .and_then(|v| v.get("credential_wipe").cloned())
+            .and_then(|r| serde_json::from_value(r).ok())
             .unwrap_or_default();
         let cfg = DroneConfig {
             queen_url: o.queen_url.clone(),
@@ -843,6 +851,7 @@ impl Installer<'_> {
             job_started_hook: o.job_started_hook.clone(),
             job_completed_hook: o.job_completed_hook.clone(),
             reclaim,
+            credential_wipe,
             caches: crate::drone::config::CachesConfig {
                 git: crate::drone::config::GitCaches {
                     mirrors: o.git_mirrors.clone(),

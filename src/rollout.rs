@@ -130,6 +130,16 @@ impl Phase {
     }
 }
 
+/// Whether a drone reporting `reported` runs `target`. Drones report SemVer
+/// build metadata (`0.1.0+<binary hash>`); a target without it names a
+/// release and matches every build of it, a target with it names one build.
+pub fn same_release(reported: &str, target: &str) -> bool {
+    if target.contains('+') {
+        return reported == target;
+    }
+    reported.split('+').next() == Some(target)
+}
+
 /// The persisted state of one rollout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutState {
@@ -350,7 +360,11 @@ pub fn advance(
 
     let by_name = |n: &str| drones.iter().find(|d| d.name == n);
     let members: BTreeSet<&str> = st.members.iter().map(String::as_str).collect();
-    let on_target = |d: &DroneView| d.version.as_deref() == Some(target);
+    let on_target = |d: &DroneView| {
+        d.version
+            .as_deref()
+            .is_some_and(|v| same_release(v, target))
+    };
     let since_of = |n: &str| by_name(n).and_then(|d| d.version_since).unwrap_or(i64::MAX);
     let timeout = i64::try_from(s.update_timeout_secs).unwrap_or(i64::MAX);
     let overdue = now.saturating_sub(st.stage_started_at) > timeout;
@@ -533,6 +547,17 @@ pub fn advance(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_metadata_is_ignored_unless_the_target_names_a_build() {
+        use super::same_release;
+        assert!(same_release("0.1.0+abcdef123456", "0.1.0"));
+        assert!(same_release("0.1.0", "0.1.0"));
+        assert!(!same_release("0.2.0+abcdef123456", "0.1.0"));
+        assert!(same_release("0.1.0+abcdef123456", "0.1.0+abcdef123456"));
+        assert!(!same_release("0.1.0+000000000000", "0.1.0+abcdef123456"));
+        assert!(!same_release("0.1.0", "0.1.0+abcdef123456"));
+    }
+
     use super::*;
 
     const NEW: &str = "2.0.0";
