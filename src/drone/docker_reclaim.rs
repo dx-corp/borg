@@ -22,7 +22,7 @@ use crate::reclaim::{
 };
 
 /// Label that pins an image, container or volume against reclaim.
-pub const KEEP_LABEL: &str = "borg.keep";
+const KEEP_LABEL: &str = "borg.keep";
 
 // `inspect` output is read as JSON, not through a `--format` template: a Go
 // template aborts on a key the object lacks, and Docker 29 omits
@@ -94,32 +94,32 @@ fn config_labels(c: Option<ConfigJson>) -> BTreeMap<String, String> {
 /// One image as `docker image inspect` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image {
-    pub id: String,
-    pub size_bytes: u64,
+    id: String,
+    size_bytes: u64,
     /// Seconds since it was built or last pulled/tagged, whichever is newer.
-    pub age_secs: u64,
-    pub tags: Vec<String>,
+    age_secs: u64,
+    tags: Vec<String>,
     /// Repositories it belongs to (from tags, else digests); empty when
     /// dangling.
-    pub repos: Vec<String>,
-    pub keep: bool,
+    repos: Vec<String>,
+    keep: bool,
 }
 
 /// One container as `docker inspect` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Container {
-    pub id: String,
-    pub name: String,
-    pub image_id: String,
+    id: String,
+    name: String,
+    image_id: String,
     /// `running`, `paused`, `restarting`, `exited`, `created`, `dead`, ...
-    pub state: String,
+    state: String,
     /// Seconds since it finished (or was created, if it never ran).
-    pub idle_secs: u64,
+    idle_secs: u64,
     /// Seconds since it started (0 when unknown).
-    pub running_secs: u64,
+    running_secs: u64,
     /// `HostConfig.NetworkMode`.
-    pub network: String,
-    pub labels: BTreeMap<String, String>,
+    network: String,
+    labels: BTreeMap<String, String>,
 }
 
 impl Container {
@@ -137,7 +137,7 @@ impl Container {
     /// Both have a post-job cleanup that a cancelled or crashed job skips;
     /// on 2026-11-01 internal-runner-burst-01 ran six such postgres
     /// containers, 1-3 days old.
-    pub fn ci_provenance(&self) -> Option<&'static str> {
+    fn ci_provenance(&self) -> Option<&'static str> {
         let hex = |s: &str, n: usize| {
             s.len() == n
                 && s.bytes()
@@ -161,22 +161,22 @@ impl Container {
 /// One dangling volume as `docker volume inspect` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Volume {
-    pub name: String,
-    pub age_secs: u64,
-    pub labels: BTreeMap<String, String>,
+    name: String,
+    age_secs: u64,
+    labels: BTreeMap<String, String>,
 }
 
 /// What the Docker tier would remove, in order, each with its reason.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Plan {
-    pub containers: Vec<(Container, String)>,
+    containers: Vec<(Container, String)>,
     /// Running CI containers a finished job leaked (force-removed).
-    pub ci_containers: Vec<(Container, String)>,
-    pub images: Vec<(Image, String)>,
-    pub volumes: Vec<(Volume, String)>,
+    ci_containers: Vec<(Container, String)>,
+    images: Vec<(Image, String)>,
+    volumes: Vec<(Volume, String)>,
     /// `builder prune` arguments `(until_secs, keep_bytes)`, when due.
-    pub build_cache: Option<(u64, u64)>,
-    pub kept: BTreeMap<String, u32>,
+    build_cache: Option<(u64, u64)>,
+    kept: BTreeMap<String, u32>,
 }
 
 fn age(secs: u64) -> String {
@@ -221,7 +221,7 @@ fn keep(out: &mut Plan, why: &str) {
 }
 
 /// Decide what the Docker tier removes in `mode`. Pure and deterministic.
-pub fn plan(
+fn plan(
     s: &ReclaimSettings,
     mode: Mode,
     usage_pct: u8,
@@ -486,9 +486,9 @@ fn parse_freed(out: &str) -> u64 {
 }
 
 /// The docker CLI and the disk under Docker's data root.
-pub struct DockerCli<'a> {
-    pub exec: &'a dyn Exec,
-    pub docker: &'a str,
+pub(crate) struct DockerCli<'a> {
+    pub(crate) exec: &'a dyn Exec,
+    pub(crate) docker: &'a str,
 }
 
 impl DockerCli<'_> {
@@ -551,23 +551,23 @@ impl DockerCli<'_> {
             .collect())
     }
 
-    pub fn images(&self, now: i64) -> Result<Vec<Image>, String> {
+    fn images(&self, now: i64) -> Result<Vec<Image>, String> {
         let ids = self.ids(&["image", "ls", "-q", "--no-trunc"])?;
         self.inspect(&["image", "inspect"], &ids, |j| parse_image(j, now))
     }
 
-    pub fn containers(&self, now: i64) -> Result<Vec<Container>, String> {
+    fn containers(&self, now: i64) -> Result<Vec<Container>, String> {
         let ids = self.ids(&["ps", "-aq", "--no-trunc"])?;
         self.inspect(&["container", "inspect"], &ids, |j| parse_container(j, now))
     }
 
-    pub fn dangling_volumes(&self, now: i64) -> Result<Vec<Volume>, String> {
+    fn dangling_volumes(&self, now: i64) -> Result<Vec<Volume>, String> {
         let ids = self.ids(&["volume", "ls", "-q", "--filter", "dangling=true"])?;
         self.inspect(&["volume", "inspect"], &ids, |j| parse_volume(j, now))
     }
 
     /// Docker's data root (`/var/lib/docker` unless configured otherwise).
-    pub fn root_dir(&self) -> String {
+    fn root_dir(&self) -> String {
         self.run(&["info", "--format", "{{.DockerRootDir}}"])
             .ok()
             .map(|s| s.trim().to_owned())
@@ -609,22 +609,22 @@ impl DockerCli<'_> {
 }
 
 /// What a Docker tier run needs from the drone.
-pub struct Inputs<'a> {
-    pub settings: &'a ReclaimSettings,
+pub(crate) struct Inputs<'a> {
+    pub(crate) settings: &'a ReclaimSettings,
     /// Disk of the filesystem holding Docker's data root, before the run.
-    pub disk: Disk,
+    pub(crate) disk: Disk,
     /// The queen's admission floor (0 when unknown).
-    pub floor_bytes: u64,
+    pub(crate) floor_bytes: u64,
     /// Leases the drone is running now.
-    pub held: &'a HashSet<String>,
-    pub now: i64,
+    pub(crate) held: &'a HashSet<String>,
+    pub(crate) now: i64,
 }
 
 /// Run the Docker tier. `measure` re-reads the disk after the removals; the
 /// cycle's `reclaimed_bytes` is the free space it gained (never negative),
 /// because image sizes overlap through shared layers and only the
 /// filesystem knows what was really released. `seq` numbers the records.
-pub fn run(
+pub(crate) fn run(
     cli: &DockerCli<'_>,
     input: &Inputs<'_>,
     measure: impl Fn() -> Option<Disk>,
@@ -894,13 +894,13 @@ fn short(id: &str) -> &str {
 }
 
 /// Whether Docker is usable here (a host without it skips the tier).
-pub fn available(cli: &DockerCli<'_>) -> bool {
+pub(crate) fn available(cli: &DockerCli<'_>) -> bool {
     cli.run(&["version", "--format", "{{.Server.Version}}"])
         .is_ok()
 }
 
 /// The filesystem path whose `df` measures Docker's data.
-pub fn root_path(cli: &DockerCli<'_>) -> std::path::PathBuf {
+pub(crate) fn root_path(cli: &DockerCli<'_>) -> std::path::PathBuf {
     Path::new(&cli.root_dir()).to_path_buf()
 }
 

@@ -27,16 +27,16 @@ use crate::probe::{self, Host};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InvariantSettings {
-    pub enabled: bool,
+    pub(crate) enabled: bool,
     /// Run the end-to-end container network probe.
-    pub container_network: bool,
+    pub(crate) container_network: bool,
     /// Image the probe runs; needs `sh`, `nslookup` and `nc` (busybox).
-    pub probe_image: String,
+    probe_image: String,
     /// Name the probe resolves and connects to.
-    pub probe_host: String,
-    pub probe_port: u16,
+    probe_host: String,
+    probe_port: u16,
     /// Seconds between container network probes.
-    pub interval_secs: u64,
+    pub(crate) interval_secs: u64,
 }
 
 impl Default for InvariantSettings {
@@ -53,7 +53,7 @@ impl Default for InvariantSettings {
 }
 
 impl InvariantSettings {
-    pub fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         let plain = |s: &str| {
             !s.is_empty()
                 && s.len() <= 200
@@ -82,7 +82,7 @@ fn failure(check: &str, detail: impl Into<String>) -> InvariantFailure {
 /// The checks cheap enough for every heartbeat. `docker_usable` is the
 /// capacity probe's `docker info` result; `disk_blocked` is the admission
 /// verdict.
-pub fn fast_checks(
+pub(crate) fn fast_checks(
     host: &dyn Host,
     docker_usable: bool,
     disk_blocked: bool,
@@ -113,7 +113,7 @@ pub fn fast_checks(
 }
 
 /// The end-to-end container network probe. `None` when it passed.
-pub fn container_network(
+pub(crate) fn container_network(
     exec: &dyn Exec,
     docker: &str,
     s: &InvariantSettings,
@@ -176,7 +176,7 @@ echo ok"#;
 
 /// Log a change of the failing set: the reasons when something breaks, a
 /// note when everything holds again. Returns whether it changed.
-pub fn log_change(previous: &[InvariantFailure], now: &[InvariantFailure]) -> bool {
+pub(crate) fn log_change(previous: &[InvariantFailure], now: &[InvariantFailure]) -> bool {
     let keys = |v: &[InvariantFailure]| -> Vec<String> {
         let mut k: Vec<String> = v.iter().map(|f| f.check.clone()).collect();
         k.sort();

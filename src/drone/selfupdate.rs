@@ -23,7 +23,7 @@ use crate::update::{Request, UpdateResult, request_path, result_path};
 /// `borg_drone_info`) cannot tell a drone that missed a roll from one that
 /// got it; internal-runner-burst-01 ran the 2026-10-22 build for ten days
 /// unnoticed. Build metadata never affects version comparison.
-pub fn build_version(package: &str, binary: &[u8]) -> String {
+fn build_version(package: &str, binary: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = hex::encode(Sha256::digest(binary));
     format!("{package}+{}", &digest[..12])
@@ -32,7 +32,7 @@ pub fn build_version(package: &str, binary: &[u8]) -> String {
 /// [`build_version`] of the running binary (`/proc/self/exe` opens the
 /// running image even after the file was replaced on disk). Blocking: reads
 /// the whole binary.
-pub fn running_build_version() -> Option<String> {
+pub(crate) fn running_build_version() -> Option<String> {
     let bytes = fs::read("/proc/self/exe")
         .or_else(|_| std::env::current_exe().and_then(fs::read))
         .ok()?;

@@ -31,7 +31,7 @@ use crate::drone::reclaim::Commands;
 /// it. Caches (`.cache`, `.cargo/registry`, `.rustup`, `.npm`, the Sigstore
 /// TUF root, ...) and the runner's own registration (`actions-runner/`) are
 /// not on the list.
-pub const CREDENTIAL_PATHS: &[&str] = &[
+const CREDENTIAL_PATHS: &[&str] = &[
     ".netrc",
     ".git-credentials",
     ".docker/config.json",
@@ -54,16 +54,16 @@ pub const CREDENTIAL_PATHS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CredentialWipeSettings {
-    pub enabled: bool,
+    enabled: bool,
     /// Also wipe the homes of static GitHub runners on this host.
-    pub static_runner_homes: bool,
+    static_runner_homes: bool,
     /// More home-relative paths to treat as credentials.
-    pub extra_paths: Vec<String>,
+    extra_paths: Vec<String>,
     /// Static runner homes: leave files touched more recently than this (a
     /// job may be starting).
-    pub min_idle_secs: u64,
+    min_idle_secs: u64,
     /// Seconds between sweeps of idle homes.
-    pub interval_secs: u64,
+    interval_secs: u64,
 }
 
 impl Default for CredentialWipeSettings {
@@ -79,7 +79,7 @@ impl Default for CredentialWipeSettings {
 }
 
 impl CredentialWipeSettings {
-    pub fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         for p in &self.extra_paths {
             relative(p).ok_or_else(|| {
                 format!("credential_wipe.extra_paths: {p:?} must be a plain relative path")
@@ -92,7 +92,7 @@ impl CredentialWipeSettings {
     }
 
     /// Every path to wipe under `home`.
-    pub fn paths(&self, home: &Path) -> Vec<PathBuf> {
+    fn paths(&self, home: &Path) -> Vec<PathBuf> {
         CREDENTIAL_PATHS
             .iter()
             .copied()
@@ -132,16 +132,16 @@ pub trait WipeHost {
 /// What one home's wipe did. Paths only, never contents.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct WipeReport {
-    pub removed: Vec<PathBuf>,
+    removed: Vec<PathBuf>,
     /// Touched within `min_idle_secs`.
-    pub recent: Vec<PathBuf>,
-    pub skipped: Option<String>,
-    pub errors: Vec<String>,
+    recent: Vec<PathBuf>,
+    skipped: Option<String>,
+    errors: Vec<String>,
 }
 
 /// Wipe one home. `user` is set for a static runner's home: its job state
 /// is re-checked before every removal and recently touched files stay.
-pub fn wipe_home(
+fn wipe_home(
     host: &dyn WipeHost,
     s: &CredentialWipeSettings,
     home: &Path,
@@ -271,7 +271,7 @@ fn plain_user(u: &str) -> bool {
 
 /// The live host, through the drone's reclaim command runner.
 pub struct LiveWipeHost<'a> {
-    pub cmd: &'a Commands,
+    cmd: &'a Commands,
 }
 
 const PROBE_SECS: u32 = 60;

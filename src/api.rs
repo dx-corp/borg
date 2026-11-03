@@ -963,7 +963,7 @@ pub struct DroneStatus {
     /// Host invariants the drone reports broken (it takes no leases while
     /// any but `disk` is); empty when all hold or not reported.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub host_invariant_failures: Vec<crate::envcontract::InvariantFailure>,
+    host_invariant_failures: Vec<crate::envcontract::InvariantFailure>,
     /// The build environment contract as it stands for this drone; absent when
     /// the contract is off.
     pub contract: Option<ContractStatus>,

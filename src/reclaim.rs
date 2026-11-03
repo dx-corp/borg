@@ -94,7 +94,7 @@ impl Kind {
     /// Kinds every queen understands. Records of other kinds travel in
     /// [`ReclaimStats::recent_ext`], which a queen built before they existed
     /// ignores instead of rejecting the whole heartbeat.
-    pub fn is_wire_v1(self) -> bool {
+    pub(crate) fn is_wire_v1(self) -> bool {
         matches!(
             self,
             Self::CargoIncremental | Self::CargoTarget | Self::Worktree
@@ -139,9 +139,9 @@ pub struct ReclaimSettings {
     pub interval_secs: u64,
     /// With default roots, also reclaim the `_work` checkouts of static
     /// GitHub runners on this host while their runner has no job.
-    pub static_runner_work: bool,
+    pub(crate) static_runner_work: bool,
     /// The Docker tier.
-    pub docker: DockerReclaimSettings,
+    pub(crate) docker: DockerReclaimSettings,
 }
 
 /// The Docker tier (the `reclaim.docker` block). On by default.
@@ -160,25 +160,25 @@ pub struct ReclaimSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DockerReclaimSettings {
-    pub enabled: bool,
+    pub(crate) enabled: bool,
     /// Unused images older than this (since built or last pulled/tagged).
-    pub image_max_age_secs: u64,
+    pub(crate) image_max_age_secs: u64,
     /// Stopped containers that finished this long ago.
-    pub stopped_container_max_age_secs: u64,
+    pub(crate) stopped_container_max_age_secs: u64,
     /// Build cache records unused this long (`builder prune --filter until`).
-    pub build_cache_max_age_secs: u64,
+    pub(crate) build_cache_max_age_secs: u64,
     /// Build cache kept regardless of age (`--reserved-space`, or
     /// `--keep-storage` on older buildx); 0 when critical.
-    pub build_cache_keep_bytes: u64,
+    pub(crate) build_cache_keep_bytes: u64,
     /// Remove dangling anonymous or lease-created volumes.
-    pub prune_dangling_volumes: bool,
+    pub(crate) prune_dangling_volumes: bool,
     /// Dangling volumes created this long ago.
-    pub volume_max_age_secs: u64,
+    pub(crate) volume_max_age_secs: u64,
     /// Running CI service containers (GitHub Actions job services, CI
     /// postgres) started this long ago were leaked by a job that ended
     /// without its cleanup and are force-removed; 0 = never. Containers
     /// without CI provenance are never touched by this rule.
-    pub ci_container_max_age_secs: u64,
+    pub(crate) ci_container_max_age_secs: u64,
 }
 
 impl Default for DockerReclaimSettings {
@@ -199,7 +199,12 @@ impl Default for DockerReclaimSettings {
 impl DockerReclaimSettings {
     /// The minimum age for a kind whose hygiene age is `hygiene_secs`.
     /// `None`: nothing of that kind is eligible in this mode.
-    pub fn min_age(&self, s: &ReclaimSettings, mode: Mode, hygiene_secs: u64) -> Option<u64> {
+    pub(crate) fn min_age(
+        &self,
+        s: &ReclaimSettings,
+        mode: Mode,
+        hygiene_secs: u64,
+    ) -> Option<u64> {
         let by_mode = match mode {
             Mode::Critical => Some(s.critical_min_age_secs),
             Mode::Pressure => Some(s.min_age_secs),
@@ -444,14 +449,14 @@ pub struct ReclaimStats {
     /// Audit entries of the newer kinds (cache dirs, Docker), kept apart so a
     /// queen that predates them still accepts the heartbeat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub recent_ext: Vec<DeletionRecord>,
+    pub(crate) recent_ext: Vec<DeletionRecord>,
     /// Bytes the Docker tier freed since the drone started (also counted in
     /// `reclaimed_bytes_total`).
     #[serde(default)]
-    pub docker_reclaimed_bytes_total: u64,
+    pub(crate) docker_reclaimed_bytes_total: u64,
     /// Bytes the last Docker tier run freed.
     #[serde(default)]
-    pub last_run_docker_reclaimed_bytes: u64,
+    pub(crate) last_run_docker_reclaimed_bytes: u64,
 }
 
 impl ReclaimStats {
@@ -475,7 +480,7 @@ impl ReclaimStats {
     /// Fold a Docker tier run into the stats of the cycle just absorbed: its
     /// bytes count toward the run and the running totals, its errors toward
     /// the run's errors, and its keep reasons join the run's.
-    pub fn absorb_docker(&mut self, cycle: &Cycle) {
+    pub(crate) fn absorb_docker(&mut self, cycle: &Cycle) {
         self.reclaimed_bytes_total = self
             .reclaimed_bytes_total
             .saturating_add(cycle.reclaimed_bytes);
@@ -548,14 +553,9 @@ fn hours(secs: u64) -> String {
     }
 }
 
-/// The mode for this disk state.
-pub fn mode_for(s: &ReclaimSettings, disk: &Disk) -> Mode {
-    mode_for_floor(s, disk, 0)
-}
-
 /// The mode for this disk state when the drone stops taking jobs below
 /// `floor_bytes` free: below the floor is critical.
-pub fn mode_for_floor(s: &ReclaimSettings, disk: &Disk, floor_bytes: u64) -> Mode {
+pub(crate) fn mode_for_floor(s: &ReclaimSettings, disk: &Disk, floor_bytes: u64) -> Mode {
     let u = disk.usage_pct();
     if u >= s.critical_pct || (floor_bytes > 0 && disk.free_bytes < floor_bytes) {
         Mode::Critical

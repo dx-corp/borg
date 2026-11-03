@@ -196,12 +196,7 @@ impl Commands {
     /// Run `argv` as the owner of `anchor` (not of the paths in `argv`):
     /// for paths below a directory whose owner is trusted while the paths
     /// themselves may be symlinks a job planted.
-    pub(crate) fn run_as_owner_of(
-        &self,
-        anchor: &Path,
-        secs: u32,
-        argv: &[&str],
-    ) -> Result<String, String> {
+    fn run_as_owner_of(&self, anchor: &Path, secs: u32, argv: &[&str]) -> Result<String, String> {
         let (uid, gid) = self.owner(anchor)?;
         let secs = secs.to_string();
         let mut full: Vec<&str> = vec!["-k", "10", &secs];

@@ -133,7 +133,7 @@ impl Phase {
 /// Whether a drone reporting `reported` runs `target`. Drones report SemVer
 /// build metadata (`0.1.0+<binary hash>`); a target without it names a
 /// release and matches every build of it, a target with it names one build.
-pub fn same_release(reported: &str, target: &str) -> bool {
+pub(crate) fn same_release(reported: &str, target: &str) -> bool {
     if target.contains('+') {
         return reported == target;
     }

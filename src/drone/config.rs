@@ -287,11 +287,11 @@ pub struct DroneConfig {
     /// Removal of credentials CI jobs left in home directories; on by
     /// default. See [`crate::drone::credwipe`].
     #[serde(default)]
-    pub credential_wipe: crate::drone::credwipe::CredentialWipeSettings,
+    pub(crate) credential_wipe: crate::drone::credwipe::CredentialWipeSettings,
     /// Host invariants checked before taking leases; on by default. See
     /// [`crate::drone::invariants`].
     #[serde(default)]
-    pub host_invariants: crate::drone::invariants::InvariantSettings,
+    pub(crate) host_invariants: crate::drone::invariants::InvariantSettings,
 }
 
 /// Slot directories when neither `slots` nor `max_leases` is set.

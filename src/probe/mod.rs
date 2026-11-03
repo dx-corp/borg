@@ -348,7 +348,7 @@ pub fn job_disk_space(
 /// platform-api publish spent 58 minutes failing `apt-get` inside its image
 /// build while holding the publish concurrency group, stalling the prod
 /// deploy lane for 23 minutes.
-pub fn ipv4_forwarding(host: &dyn Host) -> Option<bool> {
+pub(crate) fn ipv4_forwarding(host: &dyn Host) -> Option<bool> {
     if host.os() != "linux" {
         return None;
     }
