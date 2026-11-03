@@ -1,6 +1,6 @@
 //! The Docker tier of build-box reclaim: unused images, stopped containers,
 //! build cache and dangling volumes. Policy (what may go, and why) is the
-//! pure [`plan`]; [`run`] lists through the docker CLI, re-checks each item
+//! pure `plan`; `run` lists through the docker CLI, re-checks each item
 //! immediately before removing it, removes it with a single-item command
 //! (`docker image rm <id>`, `docker rm -v <id>`, `docker volume rm <name>`,
 //! never `-f`, never `system prune`), and measures what was freed on the

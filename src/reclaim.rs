@@ -443,7 +443,7 @@ pub struct ReclaimStats {
     pub kept: BTreeMap<String, u32>,
     /// Audit entries created since the previous heartbeat; the queen stores
     /// them and ignores any it already has (by `seq`). Only
-    /// [`Kind::is_wire_v1`] kinds.
+    /// `Kind::is_wire_v1` kinds.
     #[serde(default)]
     pub recent: Vec<DeletionRecord>,
     /// Audit entries of the newer kinds (cache dirs, Docker), kept apart so a

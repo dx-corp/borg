@@ -112,7 +112,7 @@ pub struct Drone {
     /// Job-credential wipe; `None` when off or unsupported here.
     credwipe: Option<Arc<credwipe::CredWiper>>,
     /// The version reported to the queen, with the binary's hash once
-    /// measured (see [`selfupdate::build_version`]).
+    /// measured (see `selfupdate::running_build_version`).
     reported_version: Arc<std::sync::OnceLock<String>>,
 }
 
