@@ -57,6 +57,33 @@ fn elapsed(start: Option<&str>, end: Option<&str>) -> Option<u64> {
     u64::try_from(timestamp(end?)?.checked_sub(timestamp(start?)?)?).ok()
 }
 
+/// A workflow run as the runs listing returns it.
+#[derive(Debug, Clone, Deserialize)]
+struct RunRef {
+    id: u64,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Run statuses whose jobs can still be queued or running.
+const ACTIVE_RUN_STATUSES: [&str; 5] = ["queued", "in_progress", "waiting", "pending", "requested"];
+
+/// Active runs in `recent` (the unfiltered newest page) that the status-filtered
+/// listings did not return, in id order.
+fn recent_active_missing(listed: &BTreeSet<u64>, recent: &[RunRef]) -> Vec<u64> {
+    let missing: BTreeSet<u64> = recent
+        .iter()
+        .filter(|r| {
+            r.status
+                .as_deref()
+                .is_some_and(|s| ACTIVE_RUN_STATUSES.contains(&s))
+        })
+        .map(|r| r.id)
+        .filter(|id| !listed.contains(id))
+        .collect();
+    missing.into_iter().collect()
+}
+
 impl WorkflowJob {
     pub fn queued(&self, repo: &str) -> Result<Option<QueuedJob>, GithubError> {
         if self.status != "queued" {
@@ -408,10 +435,6 @@ impl GithubClient {
             workflow_runs: Vec<RunRef>,
         }
         #[derive(Deserialize)]
-        struct RunRef {
-            id: u64,
-        }
-        #[derive(Deserialize)]
         struct Jobs {
             jobs: Vec<WorkflowJob>,
         }
@@ -430,6 +453,21 @@ impl GithubClient {
                     break;
                 }
             }
+        }
+        // The status-filtered listings can omit a run that is still active:
+        // on 2026-11-04 05:58-06:07Z a main publish run's queued deploy job
+        // went uncounted for 9 minutes with no error while the run's own jobs
+        // endpoint reported it queued. The newest page of the unfiltered
+        // listing reads each run's live status, so an active run there joins
+        // the poll; one logged here was missing from the filtered listings.
+        let recent: Runs = self
+            .get(&format!("/repos/{repo}/actions/runs?per_page=100"))
+            .await?;
+        for id in recent_active_missing(&run_ids, &recent.workflow_runs) {
+            tracing::warn!(
+                "run {repo}#{id} is active but missing from the status-filtered run listings; polling it anyway"
+            );
+            run_ids.insert(id);
         }
         // One jobs listing per run dominates a tick (hundreds of runs across
         // the watched repositories), so list several runs at once. Workers
@@ -594,6 +632,20 @@ fn static_method(m: &Method) -> &'static str {
 mod job_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn active_runs_missing_from_the_filtered_listings_are_polled() {
+        let listed: BTreeSet<u64> = [10, 11].into_iter().collect();
+        let recent: Vec<RunRef> = serde_json::from_value(json!([
+            {"id": 12, "status": "in_progress"},
+            {"id": 11, "status": "queued"},
+            {"id": 13, "status": "completed"},
+            {"id": 14, "status": "waiting"},
+            {"id": 15}
+        ]))
+        .unwrap();
+        assert_eq!(recent_active_missing(&listed, &recent), vec![12, 14]);
+    }
 
     #[test]
     fn missing_and_reversed_timestamps_do_not_invent_timings() {
