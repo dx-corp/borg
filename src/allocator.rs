@@ -1050,82 +1050,87 @@ fn allocate_inner(
         .map(|r| (r.drone_id.clone(), (r.class, r.scope)))
         .collect();
 
-    // Pull-request turn: one grant per listed class to pull-request demand
-    // that has waited long enough, ahead of main's demand for that class.
-    // Deploy demand is unaffected: it runs only on deploy-trust drones, which
-    // never take pull-request work.
-    for class in Class::ALL.into_iter().rev() {
-        let key = (Scope::Pr, class);
-        let wanted = need.get(&key).copied().unwrap_or(0);
-        if wanted == 0
-            || !input.pr_turn.classes.contains(&class)
-            || get(&queued, class, Scope::Pr) == 0
-            || !waited(class, Scope::Pr, input.pr_turn.after_secs)
-        {
+    // Deploy keeps first claim. On shared hosts, reserve larger aged work
+    // across Main and PR before a smaller grant or PR turn can refill its
+    // draining host. Main stays first within a class, apart from its PR turn.
+    let placement_order = Class::ALL
+        .into_iter()
+        .rev()
+        .map(|class| (Scope::Deploy, class))
+        .chain(
+            Class::ALL
+                .into_iter()
+                .rev()
+                .flat_map(|class| [(Scope::Main, class), (Scope::Pr, class)]),
+        );
+    for (scope, class) in placement_order {
+        if scope == Scope::Main {
+            // One grant per listed class to aged PR demand, ahead of Main's
+            // demand for that class, while respecting larger reservations.
+            let key = (Scope::Pr, class);
+            let wanted = need.get(&key).copied().unwrap_or(0);
+            if wanted > 0
+                && input.pr_turn.classes.contains(&class)
+                && get(&queued, class, Scope::Pr) > 0
+                && waited(class, Scope::Pr, input.pr_turn.after_secs)
+            {
+                let n = place(input, &mut free, &pressure, &reserved, key, 1, &mut out);
+                *placed.entry(key).or_default() += n;
+                need.insert(key, wanted - n);
+            }
+        }
+
+        // Aged work that still cannot fit holds the host that can free up
+        // soonest. Smaller grants may only use the existing safe backfill.
+        let wanted = need.get(&(scope, class)).copied().unwrap_or(0);
+        if wanted == 0 || get(&queued, class, scope) == 0 || !aged(class, scope) {
             continue;
         }
-        let n = place(input, &mut free, &pressure, &reserved, key, 1, &mut out);
-        *placed.entry(key).or_default() += n;
-        need.insert(key, wanted - n);
-    }
-
-    // Starvation guard. Demand that has waited too long is placed first; if it
-    // still cannot fit, hold back the drone that will free up soonest so the
-    // stream of smaller jobs cannot keep it full.
-    if input.starvation_after_secs.is_some() {
-        for scope in Scope::ALL {
-            for class in Class::ALL.into_iter().rev() {
-                let wanted = need.get(&(scope, class)).copied().unwrap_or(0);
-                if wanted == 0 || get(&queued, class, scope) == 0 || !aged(class, scope) {
-                    continue;
-                }
-                let n = place(
-                    input,
-                    &mut free,
-                    &pressure,
-                    &reserved,
-                    (scope, class),
-                    wanted,
-                    &mut out,
-                );
-                *placed.entry((scope, class)).or_default() += n;
-                need.insert((scope, class), 0);
-                if n < wanted {
-                    let spec = input.classes.spec(class);
-                    let target = free
-                        .iter()
-                        .filter(|(id, f)| {
-                            !reserved.contains_key(**id)
-                                && f.drone.trust.admits(scope)
-                                && f.could_ever_fit(spec)
-                                && f.admission.admits(class, scope)
-                                && !f.drone.blocked_classes.contains(&class)
-                                && f.offer(
-                                    class,
-                                    scope,
-                                    pressure.get(&class).copied().unwrap_or(0),
-                                    &input.weights,
-                                )
-                                .is_some()
-                        })
-                        .min_by_key(|(id, f)| (f.in_flight, **id))
-                        .map(|(id, _)| (*id).to_owned());
-                    if let Some(id) = target {
-                        if let Some(decision) = out.decisions.last_mut()
-                            && decision.class == class
-                            && decision.scope == scope
-                            && decision.winner.is_none()
-                        {
-                            decision.reservation = Some(id.clone());
-                        }
-                        reserved.insert(id.clone(), (class, scope));
-                        out.reserved_for.push(Reservation {
-                            drone_id: id,
+        let n = place(
+            input,
+            &mut free,
+            &pressure,
+            &reserved,
+            (scope, class),
+            wanted,
+            &mut out,
+        );
+        *placed.entry((scope, class)).or_default() += n;
+        need.insert((scope, class), 0);
+        if n < wanted {
+            let spec = input.classes.spec(class);
+            let target = free
+                .iter()
+                .filter(|(id, f)| {
+                    !reserved.contains_key(**id)
+                        && f.drone.trust.admits(scope)
+                        && f.could_ever_fit(spec)
+                        && f.admission.admits(class, scope)
+                        && !f.drone.blocked_classes.contains(&class)
+                        && f.offer(
                             class,
                             scope,
-                        });
-                    }
+                            pressure.get(&class).copied().unwrap_or(0),
+                            &input.weights,
+                        )
+                        .is_some()
+                })
+                .min_by_key(|(id, f)| (f.in_flight, **id))
+                .map(|(id, _)| (*id).to_owned());
+            if let Some(id) = target {
+                if let Some(decision) = out.decisions.last_mut()
+                    && decision.class == class
+                    && decision.scope == scope
+                    && decision.winner.is_none()
+                {
+                    decision.reservation = Some(id.clone());
                 }
+                reserved.insert(id.clone(), (class, scope));
+                out.reserved_for.push(Reservation {
+                    drone_id: id,
+                    class,
+                    scope,
+                });
             }
         }
     }
@@ -1907,6 +1912,123 @@ mod tests {
         i.leases = vec![lease("a", Class::Heavy, Scope::Main, LeaseState::Running)];
         aged(&mut i, Class::Heavy, Scope::Main, 300);
         i
+    }
+
+    /// Main has its own occupied heavy host; the other heavy-capable host
+    /// must drain its existing medium lease for the waiting heavy PR.
+    fn cross_scope_reservation_input() -> AllocatorInput {
+        let mut i = input(
+            &[
+                (Class::Heavy, Scope::Main, 1),
+                (Class::Medium, Scope::Main, 1),
+                (Class::Heavy, Scope::Pr, 1),
+            ],
+            vec![
+                DroneState {
+                    mem_mib: 16 * 1024,
+                    vcpu: 8,
+                    max_leases: Some(1),
+                    ..host("a-main")
+                },
+                DroneState {
+                    mem_mib: 16 * 1024,
+                    vcpu: 6,
+                    ..host("b-pr")
+                },
+            ],
+        );
+        i.classes.medium = ClassSpec {
+            mem_mib: 8192,
+            vcpu: 2,
+            docker: true,
+        };
+        i.classes.heavy = ClassSpec {
+            mem_mib: 14336,
+            vcpu: 4,
+            docker: true,
+        };
+        i.leases = vec![
+            lease("a-main", Class::Heavy, Scope::Main, LeaseState::Running),
+            lease("b-pr", Class::Medium, Scope::Main, LeaseState::Running),
+        ];
+        for (class, scope) in [
+            (Class::Heavy, Scope::Main),
+            (Class::Medium, Scope::Main),
+            (Class::Heavy, Scope::Pr),
+        ] {
+            aged(&mut i, class, scope, 1200);
+        }
+        i
+    }
+
+    #[test]
+    fn aged_heavy_pr_reservation_precedes_smaller_main_refill() {
+        let i = cross_scope_reservation_input();
+        let a = allocate(&i);
+        assert_eq!(
+            count(&a, Class::Medium, Scope::Main),
+            0,
+            "a smaller Main grant must not refill the host the heavy PR needs to drain"
+        );
+        assert_eq!(
+            a.reserved_for,
+            [
+                Reservation {
+                    drone_id: "a-main".into(),
+                    class: Class::Heavy,
+                    scope: Scope::Main,
+                },
+                Reservation {
+                    drone_id: "b-pr".into(),
+                    class: Class::Heavy,
+                    scope: Scope::Pr,
+                },
+            ]
+        );
+        assert_within_budget(&i, &a);
+
+        // Only the PR host's existing lease finishes. The normal heavy PR
+        // turn can now start, while Main retains its occupied host.
+        let mut next = i;
+        next.leases.retain(|l| l.drone_id != "b-pr");
+        next.pr_turn = PrTurn {
+            after_secs: Some(900),
+            classes: vec![Class::Heavy],
+        };
+        let admitted = allocate(&next);
+        assert!(
+            admitted.grants.iter().any(|g| {
+                g.drone_id == "b-pr" && g.class == Class::Heavy && g.scope == Scope::Pr
+            })
+        );
+        assert_within_budget(&next, &admitted);
+    }
+
+    #[test]
+    fn aged_heavy_pr_reservation_precedes_a_smaller_pr_turn() {
+        let mut i = cross_scope_reservation_input();
+        i.demand.push(Demand {
+            class: Class::Medium,
+            scope: Scope::Pr,
+            count: 1,
+        });
+        aged(&mut i, Class::Medium, Scope::Pr, 1200);
+        i.pr_turn = PrTurn {
+            after_secs: Some(900),
+            classes: vec![Class::Medium],
+        };
+        let a = allocate(&i);
+        assert_eq!(
+            count(&a, Class::Medium, Scope::Pr),
+            0,
+            "a smaller PR turn must preserve the waiting heavy PR's drain"
+        );
+        assert!(a.reserved_for.contains(&Reservation {
+            drone_id: "b-pr".into(),
+            class: Class::Heavy,
+            scope: Scope::Pr,
+        }));
+        assert_within_budget(&i, &a);
     }
 
     #[test]
