@@ -10,9 +10,12 @@ pub mod capabilities;
 pub mod cleanup;
 pub mod client;
 pub mod config;
+pub mod credwipe;
+pub mod docker_reclaim;
 pub mod exec;
 pub mod fsops;
 pub mod install;
+pub mod invariants;
 pub mod jobuser;
 pub mod pins;
 pub mod reclaim;
@@ -94,13 +97,23 @@ pub struct Drone {
     update_wanted: AtomicBool,
     /// The last tools probe, reused for a minute.
     tools_cache: probe::ToolsCache,
-    /// Last Queen floor, retained while the Queen is unreachable.
-    disk_floor: AtomicU64,
+    /// Host invariants the last heartbeat found broken; logged on change.
+    invariant_failures: Mutex<Vec<crate::envcontract::InvariantFailure>>,
+    /// The last container network probe (`None`: passed or not run yet).
+    network_probe: Arc<Mutex<Option<crate::envcontract::InvariantFailure>>>,
+    /// Last Queen floor, retained while the Queen is unreachable (shared
+    /// with reclaim, which treats free space below it as critical).
+    disk_floor: Arc<AtomicU64>,
     capability_cache: capabilities::CapabilityCache,
     /// Busy-cores rate of the host, fed by heartbeats and lease samples.
     cpu_meter: Arc<crate::hostdiag::CpuMeter>,
     /// Build-box reclaim; `None` when off or unsupported here.
     reclaimer: Option<Arc<reclaim::Reclaimer>>,
+    /// Job-credential wipe; `None` when off or unsupported here.
+    credwipe: Option<Arc<credwipe::CredWiper>>,
+    /// The version reported to the queen, with the binary's hash once
+    /// measured (see `selfupdate::running_build_version`).
+    reported_version: Arc<std::sync::OnceLock<String>>,
 }
 
 impl Drone {
@@ -134,17 +147,39 @@ impl Drone {
             Arc::clone(&host),
         ));
         let selfupdate = cfg.state_dir.clone().map(SelfUpdate::new);
-        let reclaimer = reclaim::Reclaimer::new(&cfg, Arc::clone(&exec));
+        let held = Held::default();
+        let disk_floor = Arc::new(AtomicU64::new(
+            crate::envcontract::DEFAULT_MIN_DISK_FREE_BYTES,
+        ));
+        let reclaimer = reclaim::Reclaimer::new(
+            &cfg,
+            Arc::clone(&exec),
+            Arc::clone(&held),
+            Arc::clone(&disk_floor),
+        );
+        let setpriv = cfg
+            .job_user
+            .as_ref()
+            .map_or_else(|| "setpriv".to_owned(), |u| u.priv_bin.clone());
+        let credwipe = credwipe::CredWiper::new(
+            &cfg.credential_wipe,
+            cfg.job_user.as_ref().map(|u| u.home.clone()),
+            reclaim::Commands::new(Arc::clone(&exec), setpriv),
+        );
         let standbys = Standbys::load(cfg.state_dir.clone());
         Self {
             cfg,
             selfupdate,
             update_wanted: AtomicBool::new(false),
+            invariant_failures: Mutex::new(Vec::new()),
+            network_probe: Arc::default(),
             tools_cache: probe::ToolsCache::default(),
-            disk_floor: AtomicU64::new(crate::envcontract::DEFAULT_MIN_DISK_FREE_BYTES),
+            disk_floor,
             capability_cache: capabilities::CapabilityCache::default(),
             cpu_meter: Arc::default(),
             reclaimer,
+            credwipe,
+            reported_version: Arc::default(),
             client: Arc::new(client),
             host,
             exec,
@@ -152,7 +187,7 @@ impl Drone {
             fs_ops,
             caches,
             slots: Slots::new(slot_count),
-            held: Held::default(),
+            held,
             standbys,
             preempts: Preempts::default(),
             abort,
@@ -184,9 +219,17 @@ impl Drone {
             self.cfg.docker_bin.clone(),
             Arc::clone(&self.fs_ops),
         );
+        let wiper = self.credwipe.clone();
+        let reported = Arc::clone(&self.reported_version);
         let swept = tokio::task::spawn_blocking(move || {
+            if let Some(v) = selfupdate::running_build_version() {
+                let _ = reported.set(v);
+            }
             let dirs = sweep_work_root(fs_ops.as_ref(), &work_root);
             let docker = cleanup_docker(exec.as_ref(), &docker, Scope::AnyLease);
+            if let Some(w) = wiper {
+                w.wipe_job_home();
+            }
             (dirs, docker)
         })
         .await;
@@ -247,7 +290,35 @@ impl Drone {
             status: 0,
         })?;
         env_facts.cache_dir_free_bytes = cache_free;
+        // Host invariants (see `invariants`): any broken one means jobs
+        // would fail late, so take none and say why.
+        let disk_blocked = crate::envcontract::disk_admission(
+            self.disk_floor.load(Ordering::Relaxed),
+            capacity.free_disk_mib,
+            cache_free,
+        )
+        .blocked();
+        let failures = if self.cfg.host_invariants.enabled {
+            let mut f =
+                invariants::fast_checks(self.host.as_ref(), capacity.docker_usable, disk_blocked);
+            if let Ok(p) = self.network_probe.lock()
+                && let Some(n) = p.as_ref()
+            {
+                f.push(n.clone());
+            }
+            f.sort();
+            f
+        } else {
+            Vec::new()
+        };
+        if let Ok(mut last) = self.invariant_failures.lock() {
+            invariants::log_change(&last, &failures);
+            last.clone_from(&failures);
+        }
+        let invariants_hold = failures.iter().all(|f| f.check == "disk");
+        env_facts.host_invariant_failures = failures;
         let accepting = accepting
+            && invariants_hold
             && !crate::envcontract::disk_admission(
                 self.disk_floor.load(Ordering::Relaxed),
                 capacity.free_disk_mib,
@@ -278,7 +349,12 @@ impl Drone {
             accepting,
             active_leases: self.held_ids(),
             cache_stats: self.caches.stats(),
-            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            version: Some(
+                self.reported_version
+                    .get()
+                    .cloned()
+                    .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned()),
+            ),
             extra_labels: self.cfg.extra_labels.clone(),
             trust: self.cfg.trust,
             held_standby: self.standbys.ids(),
@@ -416,11 +492,54 @@ impl Drone {
             preempt,
             proc_root: Arc::clone(&self.proc_root),
             caches: Arc::clone(&self.caches),
+            credwipe: self.credwipe.clone(),
             slot,
             held,
         };
         tasks.spawn(handle_lease(ctx, grant));
         true
+    }
+
+    /// Probe container networking end to end now and every
+    /// `host_invariants.interval_secs`; heartbeats use the latest result.
+    fn spawn_network_probe(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let s = self.cfg.host_invariants.clone();
+        if !s.enabled || !s.container_network {
+            return None;
+        }
+        let (exec, docker, out) = (
+            Arc::clone(&self.exec),
+            self.cfg.docker_bin.clone(),
+            Arc::clone(&self.network_probe),
+        );
+        let host = Arc::clone(&self.host);
+        Some(tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(s.interval_secs.max(60)));
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                let (exec, docker, s2, host) = (
+                    Arc::clone(&exec),
+                    docker.clone(),
+                    s.clone(),
+                    Arc::clone(&host),
+                );
+                let result = tokio::task::spawn_blocking(move || {
+                    // No docker here: nothing to probe.
+                    host.run(&docker, &["--version"])?;
+                    invariants::container_network(exec.as_ref(), &docker, &s2)
+                })
+                .await;
+                match result {
+                    Ok(r) => {
+                        if let Ok(mut slot) = out.lock() {
+                            *slot = r;
+                        }
+                    }
+                    Err(e) => tracing::warn!("container network probe panicked: {e}"),
+                }
+            }
+        }))
     }
 
     /// What a successful heartbeat means for self-update: the queen has the
@@ -515,6 +634,12 @@ impl Drone {
         let mut tasks = JoinSet::new();
         let cache_background = self.caches.spawn_background();
         let reclaim_background = self.reclaimer.as_ref().map(reclaim::Reclaimer::spawn);
+        let network_background = self.spawn_network_probe();
+        let held = Arc::clone(&self.held);
+        let credwipe_background = self
+            .credwipe
+            .as_ref()
+            .map(|w| w.spawn(move || held.lock().is_ok_and(|h| h.is_empty())));
         let mut every = tokio::time::interval(Duration::from_secs(self.cfg.heartbeat_secs));
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tokio::pin!(shutdown);
@@ -578,6 +703,12 @@ impl Drone {
         if let Some(r) = reclaim_background {
             r.abort();
         }
+        if let Some(w) = credwipe_background {
+            w.abort();
+        }
+        if let Some(n) = network_background {
+            n.abort();
+        }
     }
 }
 
@@ -593,6 +724,7 @@ struct LeaseContext {
     preempt: tokio::sync::watch::Receiver<bool>,
     proc_root: Arc<Path>,
     caches: Arc<Caches>,
+    credwipe: Option<Arc<credwipe::CredWiper>>,
     /// Dropped before `held`, so the slot is free whenever the id is.
     slot: SlotGuard,
     held: HeldGuard,
@@ -675,12 +807,17 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         Arc::clone(&ctx.exec),
         Arc::clone(&ctx.fs_ops),
     );
+    // The job user's home is shared by every lease, so it is wiped only
+    // when this is the last lease running.
+    let last_lease = ctx.held.held.lock().is_ok_and(|h| h.len() <= 1);
+    let wiper = ctx.credwipe.clone().filter(|_| last_lease);
     let cleaned = tokio::task::spawn_blocking(move || {
         let docker = cleanup_docker(exec.as_ref(), &docker, Scope::Lease(&id));
-        (
-            remove_lease_dir(fs_ops.as_ref(), &work_root, &slot_name),
-            docker,
-        )
+        let dir = remove_lease_dir(fs_ops.as_ref(), &work_root, &slot_name);
+        if let Some(w) = wiper {
+            w.wipe_job_home();
+        }
+        (dir, docker)
     })
     .await;
     match cleaned {

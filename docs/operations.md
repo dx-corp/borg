@@ -19,6 +19,7 @@ Configuration, scheduling, drone administration, and protocol details for
   - [Build-box reclaim](#build-box-reclaim)
   - [Quorum rollout](#quorum-rollout)
   - [Learned profiles](#learned-profiles)
+  - [Owned hosts before burst](#owned-hosts-before-burst)
   - [Warm-floor controller](#warm-floor-controller)
   - [Host health](#host-health)
   - [Tailnet enrollment](#tailnet-enrollment)
@@ -575,6 +576,65 @@ in the repository, so removing a linked worktree never loses one. `delete` runs
 repository. Audit sequence numbers start from the clock so they keep growing
 across drone restarts.
 
+Free space below the queen's disk admission floor (`min_free_disk_bytes`, 10 GiB
+by default) counts as **critical** whatever the percentage, and a pressure cycle
+then frees at least back to twice the floor. CI slot tool homes
+(`<cache_root>/<ns>/slots/<slot>/mise-home`) are a `cache_dir` tier between
+cargo targets and worktrees; one is busy while the drone runs any lease, because
+tools execute from it without holding a file open. With default roots and
+`static_runner_work` (default on), the `_work/<repo>` checkouts of static GitHub
+runners on the host (`actions.runner.*` units, `<WorkingDirectory>/_work`) are a
+`runner_work` tier between tool homes and worktrees; one is busy while that
+runner's `Runner.Worker` runs, and the runner's `_tool`, `_actions`, `_temp`,
+`_update` and `_PipelineMapping` are never candidates. Audit records of the newer
+kinds (`cache_dir`, `runner_work`, `docker_*`) travel in `reclaim.recent_ext`, which a queen
+older than them ignores instead of rejecting the heartbeat.
+
+#### Docker tier
+
+`reclaim.docker` (on by default; `"enabled": false` turns only this tier off)
+runs after the file tiers, on the filesystem holding Docker's data root
+(`docker info .DockerRootDir`). Each run lists containers, images and dangling
+volumes, decides with the pure `drone::docker_reclaim::plan`, re-checks each
+item immediately before removing it, and removes one item per command: `docker
+rm -v <id>`, `docker image rm <id>` (a multi-tagged image is untagged tag by
+tag), `docker volume rm <name>`, then `docker builder prune -f --filter
+until=<age>` with `--reserved-space <bytes>` (buildx 0.17+) or `--keep-storage
+<bytes>` (older). Nothing is forced and there is no `system prune`.
+
+| Kind | Removed when | Always kept |
+| --- | --- | --- |
+| Stopped container (`exited`, `created`, `dead`) | finished `stopped_container_max_age_secs` ago (6h) | a container of a lease the drone runs; label `borg.keep` |
+| Image | built or last pulled/tagged `image_max_age_secs` ago (24h) | used by any remaining container (running, paused or stopped); the newest image of each repository; label `borg.keep`; anything Docker refuses to remove |
+| Build cache | unused `build_cache_max_age_secs` (24h) | `build_cache_keep_bytes` (10 GiB; 0 when critical) |
+| Running CI container | started `ci_container_max_age_secs` ago (24h; not shortened by pressure; 0 = off), and provably made by CI: a GitHub Actions job/service container (`<32 hex>_...` name, the runner's 6-hex instance label, `github_network_*` network) or a CI postgres (`ci-postgres-*` with `ci.postgres.owner`). The only forced removal (`docker rm -f -v`) | anything without that provenance (a hand-started nginx stays forever); a running lease's; label `borg.keep` |
+| Volume | dangling and created `volume_max_age_secs` ago (24h), only if anonymous (64-hex name) or created by a borg lease; `prune_dangling_volumes: false` turns it off | named volumes; a running lease's; label `borg.keep` |
+
+Under pressure each age drops to `min_age_secs` (6h), when critical to
+`critical_min_age_secs` (1h), never above its hygiene age; a `*_max_age_secs` of
+0 means "only under pressure". The cap `max_deletions_per_cycle` covers the
+tier's removals. Reclaimed bytes are what the filesystem gained (image sizes
+overlap through shared layers); they count toward `reclaimed_bytes_total`
+(`borg_reclaim_bytes_total`) and separately `docker_reclaimed_bytes_total`.
+
+#### Job-credential wipe
+
+`credential_wipe` (on by default) removes the credential files CI jobs write into
+a home: `.netrc`, `.git-credentials`, `.docker/config.json`, `.kube`,
+`.config/gcloud`, `.terraform.d/credentials.tfrc.json`, `.npmrc`, `.pypirc`,
+`.aws`, `.azure`, `.config/gh`, `.config/helm/registry`,
+`.config/containers/auth.json`, `.cargo/credentials{,.toml}`, `.vault-token`,
+plus `extra_paths`. Caches and the runner's own registration (`actions-runner/`)
+stay. Leases already get a private `HOME` that is deleted with the lease; the job
+user's own home is wiped anyway at startup and whenever the last running lease
+ends. With `static_runner_homes` (default) the drone also wipes the homes of the
+static GitHub runners on its host (users of `actions.runner.*` units, as on
+internal-runner-burst-01) every `interval_secs` (300) when that runner has no
+job (`Runner.Worker` not running) and the file is untouched for `min_idle_secs`
+(600). Removals run as the home's owner, never as the owner of the path (which a
+job could make a symlink); root-owned homes and administrator accounts (`sudo`,
+`wheel`, `admin`) are never wiped. Paths are logged, never contents.
+
 ### Quorum rollout
 
 `rollout_target_version` plus `rollout.previous_version` turns on a gated rollout
@@ -606,6 +666,29 @@ drones that are fast and idle first. A host that is historically slow (speed
 gets work only when nothing better has room, and above the admission
 thresholds it gets none. Light work keeps packing onto the tightest fit.
 `/explain` shows each candidate's `host` term next to `bid` and `profile`.
+
+### Owned hosts before burst
+
+Paid burst drones (names matching `drone_expiry.burst_prefixes`) carry a cost
+term: `-(burst_cost_permille - 1000)`, 0 for owned hosts. Drones send no bids
+today, so without it a burst VM's larger, faster profile wins every grant, the
+VM is never idle long enough to drain, and owned hosts sit empty. The default
+`burst_cost_permille` of 5000 (a 4000-point penalty) outweighs the speed and
+idle terms, so a burst drone only gets work no owned host has room or admission
+for. The cost reorders eligible drones only: trust, admission, environment,
+owner caps and bid thresholds still decide who may take a lease.
+
+```json
+"placement": {"dry_run": true, "burst_cost_permille": 5000}
+```
+
+`dry_run` is the default. Placement is unchanged, and each pass the queen also
+runs the allocator with the cost applied and reports in `/status` `placement`:
+`grants` and `burst_grants` (what it did), `would_grants` and
+`would_burst_grants` (what the costed pass would have done), `moved` (actual
+grants the costed pass would have placed on another drone or not at all) and
+the newest `recent` moves. Set `dry_run: false` once the comparison looks
+right; `/explain` then shows each candidate's `cost_score`.
 
 ### Warm-floor controller
 
@@ -703,6 +786,9 @@ Production Prometheus scrapes `/metrics` through the tailnet (job
 | `borg_drone_disk_free_bytes{drone,mount}` / `borg_drone_disk_min_free_bytes{drone}` | Reported free bytes on the `work` and `cache` filesystems, and the floor. |
 | `borg_static_runner_offline_seconds{runner}` | Seconds since this queen first saw the runner offline. |
 | `borg_burst_never_enrolled_timestamp_seconds{drone,vm,zone}` | End time of each burst VM that ended in the last 24 hours without its drone ever heartbeating (`burst.never_enrolled` in `/status`). |
+| `borg_drone_info{drone,version,trust}` | The version each drone reports: `<package>+<first 12 hex of the binary's sha256>`, so a drone that missed a roll shows a different `version` from the fleet. Rollout targets without `+` match every build of a release. |
+| `borg_drone_host_invariant_failing{drone,check}` | 1 per host invariant the drone reports broken (`ip_forward`, `docker_daemon`, `container_network`, `disk`; `drone::invariants`). The drone takes no leases while any but `disk` fails (disk has its own admission). The container network check runs a `busybox` container on the default bridge that must resolve and connect to `host_invariants.probe_host:probe_port` (github.com:443) at startup and every `interval_secs` (600). |
+| `borg_drone_active_leases{drone}` / `borg_drone_accepting{drone}` | Leases the drone runs, and whether it takes new ones: a drone with free capacity 0 and no leases while its class has queued jobs is stuck. |
 
 ### Tailnet enrollment
 

@@ -337,6 +337,31 @@ pub fn job_disk_space(
 }
 
 /// Free space, in MiB, on the filesystem holding `path`.
+/// Whether the kernel forwards IPv4 (`/proc/sys/net/ipv4/ip_forward`), which
+/// every container on a Docker bridge needs to reach the network. `None`
+/// off Linux or when unreadable.
+///
+/// GCE images ship `/etc/sysctl.d/60-gce-network-security.conf` with
+/// `net.ipv4.ip_forward=0`. Docker turns forwarding on when it starts, but a
+/// later `systemd-sysctl` run (package upgrades) turns it off again: on
+/// internal-runner-burst-01 that happened on 2026-10-23, and on 2026-11-02 a
+/// platform-api publish spent 58 minutes failing `apt-get` inside its image
+/// build while holding the publish concurrency group, stalling the prod
+/// deploy lane for 23 minutes.
+pub(crate) fn ipv4_forwarding(host: &dyn Host) -> Option<bool> {
+    if host.os() != "linux" {
+        return None;
+    }
+    match host
+        .read_to_string(Path::new("/proc/sys/net/ipv4/ip_forward"))?
+        .trim()
+    {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
 pub fn free_disk_mib_at(host: &dyn Host, path: &Path) -> Option<u64> {
     // POSIX `df -Pk`: header line, then `fs blocks used avail cap mount`.
     let out = host.run("df", &["-Pk", &path.to_string_lossy()])?;
@@ -424,6 +449,24 @@ mod tests {
             job_disk_space(&host, Path::new("/missing"), Path::new("/cache")),
             (None, Some(50 << 30))
         );
+    }
+
+    #[test]
+    fn ipv4_forwarding_reads_the_kernel_switch_and_is_unknown_elsewhere() {
+        let with = |v: &'static str| FakeHost {
+            files: HashMap::from([("/proc/sys/net/ipv4/ip_forward", v)]),
+            ..linux()
+        };
+        // internal-runner-burst-01 after systemd-sysctl re-applied GCE's file.
+        assert_eq!(ipv4_forwarding(&with("0\n")), Some(false));
+        assert_eq!(ipv4_forwarding(&with("1\n")), Some(true));
+        assert_eq!(ipv4_forwarding(&with("garbage")), None);
+        assert_eq!(ipv4_forwarding(&linux()), None);
+        let mac = FakeHost {
+            os: "macos",
+            ..with("0")
+        };
+        assert_eq!(ipv4_forwarding(&mac), None);
     }
 
     fn linux() -> FakeHost {

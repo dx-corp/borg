@@ -172,6 +172,14 @@ impl Layout {
     }
 }
 
+/// sysctl drop-in that keeps IPv4 forwarding on for Docker job containers.
+const FORWARDING_SYSCTL: &str = "/etc/sysctl.d/99-borg-docker-forwarding.conf";
+const FORWARDING_SYSCTL_CONTENT: &str = "\
+# Written by `borg drone install`. Docker job containers need IPv4 forwarding;
+# GCE's 60-gce-network-security.conf turns it off whenever systemd-sysctl runs.
+net.ipv4.ip_forward=1
+";
+
 pub fn render_systemd_unit(
     layout_bin: &Path,
     config: &Path,
@@ -804,12 +812,20 @@ impl Installer<'_> {
         // A host's reclaim policy is edited in place; reinstalling must not
         // reset it. The block older installs wrote verbatim (off, dry run, no
         // roots) was never an operator choice, so it takes today's default.
-        let reclaim = std::fs::read_to_string(self.on_disk(&self.layout.config()))
+        let on_disk = std::fs::read_to_string(self.on_disk(&self.layout.config()))
             .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        let reclaim = on_disk
+            .as_ref()
             .and_then(|v| v.get("reclaim").cloned())
             .and_then(|r| serde_json::from_value::<crate::reclaim::ReclaimSettings>(r).ok())
             .filter(|r| !r.is_legacy_default())
+            .unwrap_or_default();
+        // The same for the credential wipe block.
+        let credential_wipe = on_disk
+            .as_ref()
+            .and_then(|v| v.get("credential_wipe").cloned())
+            .and_then(|r| serde_json::from_value(r).ok())
             .unwrap_or_default();
         let cfg = DroneConfig {
             queen_url: o.queen_url.clone(),
@@ -843,6 +859,12 @@ impl Installer<'_> {
             job_started_hook: o.job_started_hook.clone(),
             job_completed_hook: o.job_completed_hook.clone(),
             reclaim,
+            credential_wipe,
+            host_invariants: on_disk
+                .as_ref()
+                .and_then(|v| v.get("host_invariants").cloned())
+                .and_then(|r| serde_json::from_value(r).ok())
+                .unwrap_or_default(),
             caches: crate::drone::config::CachesConfig {
                 git: crate::drone::config::GitCaches {
                     mirrors: o.git_mirrors.clone(),
@@ -876,6 +898,16 @@ impl Installer<'_> {
         let before = self.changed;
         match self.opts.platform {
             Platform::Linux => {
+                // Keep IPv4 forwarding on for job containers (see
+                // `probe::ipv4_forwarding`): GCE's sysctl drop-in turns it off
+                // whenever systemd-sysctl runs. This file sorts after it.
+                let sysctl = Path::new(FORWARDING_SYSCTL);
+                let sysctl_changed =
+                    self.write_file(sysctl, FORWARDING_SYSCTL_CONTENT.as_bytes(), 0o644, None)?;
+                if sysctl_changed && !self.opts.dry_run {
+                    self.must("sysctl", &["-p", FORWARDING_SYSCTL])?;
+                    self.note("ran", format_args!("sysctl -p {FORWARDING_SYSCTL}"));
+                }
                 let unit =
                     render_systemd_unit(&bin, &cfg, &data, &user, drain, self.job_user().is_some());
                 let unit_changed = self.write_file(&service_file, unit.as_bytes(), 0o644, None)?;
@@ -1165,6 +1197,8 @@ mod tests {
             "created /etc/borg/drone.token",
             "created /etc/borg/drone.json",
             "created /etc/systemd/system/borg-drone.service",
+            "created /etc/sysctl.d/99-borg-docker-forwarding.conf",
+            "ran sysctl -p /etc/sysctl.d/99-borg-docker-forwarding.conf",
             "ran systemctl restart borg-drone.service",
             "done: changes applied",
         ] {

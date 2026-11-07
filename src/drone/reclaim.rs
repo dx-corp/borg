@@ -12,12 +12,14 @@
 //! Roots are grouped by filesystem and each group gets its own cycle, because
 //! a host can keep worktrees and build output on different volumes.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::drone::config::DroneConfig;
+use crate::drone::docker_reclaim::{self, DockerCli};
 use crate::drone::exec::Exec;
 use crate::reclaim::{
     Candidate, Cycle, Disk, Kind, Mode, ReclaimHost, ReclaimSettings, ReclaimStats, Root, Safety,
@@ -85,9 +87,12 @@ fn default_roots(
         push(PathBuf::from(d), Kind::CargoTarget);
     }
     // CI jobs keep weekly cargo targets per cache slot; they are regenerable
-    // and were never reclaimed, so drones filled their disks with them.
+    // and were never reclaimed, so drones filled their disks with them. The
+    // same slots keep a tool home (`mise-home`: rustup, cargo, mise tools),
+    // 3-11 GB each on internal-runner-burst-01 on 2026-11-01.
     for d in ci_slots {
         push(d.clone(), Kind::CargoTarget);
+        push(d.clone(), Kind::CacheDir);
     }
     out
 }
@@ -135,7 +140,7 @@ pub struct Commands {
 }
 
 impl Commands {
-    fn new(exec: Arc<dyn Exec>, setpriv: String) -> Self {
+    pub(crate) fn new(exec: Arc<dyn Exec>, setpriv: String) -> Self {
         // Real uid of this process (`Uid:` line of /proc/self/status).
         let self_uid = std::fs::read_to_string("/proc/self/status")
             .ok()
@@ -185,7 +190,14 @@ impl Commands {
     /// Run `argv` as the owner of `path`, under a timeout. `Ok` carries
     /// stdout of a successful run; a non-zero exit or a timeout is `Err`.
     fn run_as_owner(&self, path: &Path, secs: u32, argv: &[&str]) -> Result<String, String> {
-        let (uid, gid) = self.owner(path)?;
+        self.run_as_owner_of(path, secs, argv)
+    }
+
+    /// Run `argv` as the owner of `anchor` (not of the paths in `argv`):
+    /// for paths below a directory whose owner is trusted while the paths
+    /// themselves may be symlinks a job planted.
+    fn run_as_owner_of(&self, anchor: &Path, secs: u32, argv: &[&str]) -> Result<String, String> {
+        let (uid, gid) = self.owner(anchor)?;
         let secs = secs.to_string();
         let mut full: Vec<&str> = vec!["-k", "10", &secs];
         if self.self_uid.as_deref() != Some(uid.as_str()) {
@@ -221,6 +233,27 @@ impl Commands {
         }
     }
 
+    /// `sh -c script _ path` as the owner of `anchor`.
+    pub(crate) fn sh_as(
+        &self,
+        anchor: &Path,
+        path: &Path,
+        secs: u32,
+        script: &str,
+    ) -> Result<String, String> {
+        let p = path.to_string_lossy();
+        self.run_as_owner_of(anchor, secs, &["sh", "-c", script, "reclaim", &p])
+    }
+
+    /// The `uid` of `path`'s owner (or nearest stat-able ancestor's).
+    pub(crate) fn owner_uid(&self, path: &Path) -> Result<String, String> {
+        self.owner(path).map(|(u, _)| u)
+    }
+
+    pub(crate) fn exec(&self) -> &dyn Exec {
+        self.exec.as_ref()
+    }
+
     /// `sh -c script _ path` as the owner of `path`.
     fn sh(&self, path: &Path, secs: u32, script: &str) -> Result<String, String> {
         let p = path.to_string_lossy();
@@ -240,7 +273,19 @@ impl Commands {
             .exec
             .run("df", &["-Pk", "--", &p])
             .map_err(|e| format!("df {p}: {e}"))?;
-        let line = out.stdout.lines().nth(1).ok_or("df: no output")?;
+        // Inside a private home (mode 700, as the static runner homes on
+        // internal-runner-burst-01) the drone cannot even stat the path, so
+        // `df` prints nothing; ask as the owner, like every other probe.
+        let stdout = if out.success && out.stdout.lines().nth(1).is_some() {
+            out.stdout
+        } else {
+            self.run_as_owner(path, PROBE_SECS, &["df", "-Pk", "--", &p])?
+        };
+        Self::parse_df(&stdout)
+    }
+
+    fn parse_df(stdout: &str) -> Result<(Disk, String), String> {
+        let line = stdout.lines().nth(1).ok_or("df: no output")?;
         let f: Vec<&str> = line.split_whitespace().collect();
         let num = |i: usize| -> Result<u64, String> {
             f.get(i)
@@ -272,6 +317,11 @@ const LIST_WORKTREES: &str =
 /// below a root; CI slot caches keep them at `<slots>/<slot>/cargo-target/<week>`.
 const LIST_TARGETS: &str = r#"find "$1" -mindepth 2 -maxdepth 4 -name .rustc_info.json -printf '%h\n' 2>/dev/null; echo .done"#;
 /// `incremental/` directories of a target directory (host and per-triple).
+/// A static runner's checkouts: `_work/<repo>`. The runner's own `_tool`,
+/// `_actions`, `_temp`, `_update` and `_PipelineMapping` stay.
+const LIST_RUNNER_WORK: &str = r#"find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '_*' -printf '%p\n' 2>/dev/null; echo .done"#;
+/// Per-slot tool homes: `<slots>/<slot>/mise-home`.
+const LIST_CACHE_DIRS: &str = r#"find "$1" -mindepth 2 -maxdepth 2 -type d -name mise-home -printf '%p\n' 2>/dev/null; echo .done"#;
 const LIST_INCREMENTAL: &str = r#"find "$1" -mindepth 2 -maxdepth 3 -type d -name incremental -prune -printf '%p\n' 2>/dev/null; echo .done"#;
 /// Every cwd and open file of the processes the caller may inspect.
 const OPEN_PATHS: &str = r#"find /proc -mindepth 2 -maxdepth 3 \( -path '/proc/[0-9]*/cwd' -o -path '/proc/[0-9]*/fd/*' \) -printf '%l\n' 2>/dev/null; echo .done"#;
@@ -310,6 +360,12 @@ pub struct LiveHost<'a> {
     sizes: &'a Mutex<HashMap<PathBuf, (i64, u64)>>,
     /// Common git dir of each worktree probed, for `worktree prune`.
     common: Mutex<HashMap<PathBuf, PathBuf>>,
+    /// The queen's disk admission floor (0 when unknown).
+    floor: u64,
+    /// Leases the drone is running now: a CI slot's tool home is busy
+    /// while any lease runs (its tools execute from there without holding
+    /// a file open, so the process scan cannot see them).
+    leases: &'a Mutex<HashSet<String>>,
 }
 
 impl LiveHost<'_> {
@@ -374,6 +430,32 @@ impl LiveHost<'_> {
             .any(|l| Path::new(l.trim_end_matches(" (deleted)")).starts_with(path)))
     }
 
+    /// Whether the owner of `path` (a static runner's user) runs a job now.
+    fn runner_job_running(&self, path: &Path) -> Option<bool> {
+        let uid = self.cmd.owner_uid(path).ok()?;
+        if uid == "0" || !uid.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let out = self
+            .cmd
+            .exec()
+            .run(
+                "sh",
+                &[
+                    "-c",
+                    r#"pgrep -u "$1" -x Runner.Worker >/dev/null; echo $?"#,
+                    "reclaim",
+                    &uid,
+                ],
+            )
+            .ok()?;
+        match out.stdout.trim() {
+            "0" => Some(true),
+            "1" => Some(false),
+            _ => None,
+        }
+    }
+
     fn probe_worktree(&self, path: &Path, s: &mut Safety) -> Result<(), String> {
         if !path.join(".git").exists() {
             s.not_git = true;
@@ -429,11 +511,17 @@ impl ReclaimHost for LiveHost<'_> {
         self.cmd.disk(&self.anchor).map(|(d, _)| d)
     }
 
+    fn admission_floor_bytes(&self) -> u64 {
+        self.floor
+    }
+
     fn scan(&self, roots: &[Root]) -> Result<Vec<Candidate>, String> {
         let mut out = Vec::new();
         for root in roots {
             let script = match root.kind {
                 Kind::Worktree => LIST_WORKTREES,
+                Kind::CacheDir => LIST_CACHE_DIRS,
+                Kind::RunnerWork => LIST_RUNNER_WORK,
                 _ => LIST_TARGETS,
             };
             let found = match self
@@ -474,6 +562,34 @@ impl ReclaimHost for LiveHost<'_> {
         if !c.path.exists() {
             s.unknown = Some("gone".into());
             return s;
+        }
+        if c.kind == Kind::RunnerWork {
+            // The runner's job may sit between steps with no process inside
+            // `_work`; its `Runner.Worker` lives for the whole job.
+            match self.runner_job_running(&c.path) {
+                Some(false) => {}
+                Some(true) => {
+                    s.busy = true;
+                    return s;
+                }
+                None => {
+                    s.unknown = Some("cannot tell whether the runner has a job".into());
+                    return s;
+                }
+            }
+        }
+        if c.kind == Kind::CacheDir {
+            match self.leases.lock() {
+                Ok(l) if l.is_empty() => {}
+                Ok(_) => {
+                    s.busy = true;
+                    return s;
+                }
+                Err(_) => {
+                    s.unknown = Some("lease table unavailable".into());
+                    return s;
+                }
+            }
         }
         match self.busy(&c.path) {
             Ok(true) => {
@@ -559,46 +675,6 @@ fn merge(into: &mut Option<Cycle>, c: Cycle) {
     acc.errors += c.errors;
 }
 
-/// Where the container runtime keeps images (the root filesystem on the
-/// drones); `df` here measures the filesystem image pulls fill.
-const DOCKER_ROOT: &str = "/var/lib/docker";
-/// `docker image ls` rows: repository, full image id, creation time.
-const IMAGE_FORMAT: &str = "{{.Repository}}\t{{.ID}}\t{{.CreatedAt}}";
-
-/// Image ids superseded by a newer image of the same repository, from
-/// `IMAGE_FORMAT` rows. CI pulls a new platform image per commit, so old
-/// ones pile up; the newest image of every repository is kept, which keeps
-/// deliberately pre-pulled CI tool images. Images with no repository are
-/// dangling layers and always superseded. `CreatedAt` is
-/// `YYYY-MM-DD HH:MM:SS +0000 UTC` on the drones, so it sorts as text.
-fn superseded_images(listing: &str) -> Vec<String> {
-    let mut by_repo: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
-    let mut out = Vec::new();
-    for line in listing.lines() {
-        let mut f = line.split('\t');
-        let (Some(repo), Some(id), Some(created)) = (f.next(), f.next(), f.next()) else {
-            continue;
-        };
-        if id.is_empty() {
-            continue;
-        }
-        if repo == "<none>" {
-            out.push(id.to_owned());
-        } else {
-            by_repo.entry(repo).or_default().push((created, id));
-        }
-    }
-    for images in by_repo.values_mut() {
-        images.sort_unstable();
-        images.dedup_by(|a, b| a.1 == b.1);
-        images.pop();
-        out.extend(images.iter().map(|(_, id)| (*id).to_owned()));
-    }
-    out.sort_unstable();
-    out.dedup();
-    out
-}
-
 /// The drone's reclaim loop and the stats its heartbeat reports.
 pub struct Reclaimer {
     settings: ReclaimSettings,
@@ -608,6 +684,10 @@ pub struct Reclaimer {
     anchors: Vec<PathBuf>,
     cmd: Commands,
     docker_bin: String,
+    /// Leases the drone is running (shared with the drone).
+    leases: Arc<Mutex<HashSet<String>>>,
+    /// The queen's disk admission floor (shared with the drone).
+    floor: Arc<AtomicU64>,
     stats: Mutex<ReclaimStats>,
     seq: Mutex<u64>,
     sizes: Mutex<HashMap<PathBuf, (i64, u64)>>,
@@ -615,7 +695,12 @@ pub struct Reclaimer {
 
 impl Reclaimer {
     /// `None` when reclaim is off or the host is not Linux.
-    pub(super) fn new(cfg: &DroneConfig, exec: Arc<dyn Exec>) -> Option<Arc<Self>> {
+    pub(super) fn new(
+        cfg: &DroneConfig,
+        exec: Arc<dyn Exec>,
+        leases: Arc<Mutex<HashSet<String>>>,
+        floor: Arc<AtomicU64>,
+    ) -> Option<Arc<Self>> {
         let settings = cfg.reclaim.clone();
         if !settings.enabled {
             return None;
@@ -632,9 +717,22 @@ impl Reclaimer {
         let roots = if settings.roots.is_empty() {
             // Checked as the directory's owner: a private home hides its
             // build directories from the drone itself.
-            default_roots(&host_homes(cfg), &ci_slot_roots(cfg), |p| {
+            let mut roots = default_roots(&host_homes(cfg), &ci_slot_roots(cfg), |p| {
                 cmd.sh(p, PROBE_SECS, r#"test -d "$1""#).is_ok()
-            })
+            });
+            // Static GitHub runners sharing the host (internal-runner-burst-01
+            // ran eight, 14-21 GB of `_work` each on 2026-11-01).
+            if settings.static_runner_work {
+                for w in crate::drone::credwipe::static_runner_work_dirs(&cmd) {
+                    if cmd.sh(&w, PROBE_SECS, r#"test -d "$1""#).is_ok() {
+                        roots.push(Root {
+                            path: w,
+                            kind: Kind::RunnerWork,
+                        });
+                    }
+                }
+            }
+            roots
         } else {
             settings.roots.clone()
         };
@@ -644,8 +742,9 @@ impl Reclaimer {
             .unwrap_or(0)
             .saturating_mul(1000);
         tracing::info!(
-            "reclaim: on (dry_run={}), roots: {}",
+            "reclaim: on (dry_run={}, docker={}), roots: {}",
             settings.dry_run,
+            settings.docker.enabled,
             roots
                 .iter()
                 .map(|r| format!("{}={}", r.kind.as_str(), r.path.display()))
@@ -663,6 +762,8 @@ impl Reclaimer {
             anchors: vec![cfg.work_root.clone(), cfg.cache_root.clone()],
             cmd,
             docker_bin: cfg.docker_bin.clone(),
+            leases,
+            floor,
             seq: Mutex::new(seq),
             sizes: Mutex::new(HashMap::new()),
         }))
@@ -672,7 +773,7 @@ impl Reclaimer {
     pub(super) fn heartbeat_stats(&self) -> Option<ReclaimStats> {
         let mut s = self.stats.lock().ok()?;
         let mut out = s.clone();
-        out.recent = s.drain_recent(RECENT_PER_HEARTBEAT);
+        (out.recent, out.recent_ext) = s.drain_recent(RECENT_PER_HEARTBEAT);
         Some(out)
     }
 
@@ -707,6 +808,8 @@ impl Reclaimer {
                 size_floor_secs: self.settings.critical_min_age_secs,
                 sizes: &self.sizes,
                 common: Mutex::new(HashMap::new()),
+                floor: self.floor.load(Ordering::Relaxed),
+                leases: &self.leases,
             };
             let settings = ReclaimSettings {
                 roots,
@@ -747,51 +850,68 @@ impl Reclaimer {
         if let (Some(c), Ok(mut stats)) = (combined, self.stats.lock()) {
             stats.absorb(&self.settings, now, &c);
         }
-        self.prune_superseded_images();
+        if self.settings.docker.enabled {
+            self.run_docker(now);
+        }
     }
 
-    /// Above the high-water mark on the image filesystem, removes images a
-    /// newer image of the same repository superseded (pve50-vm240 failed
-    /// disk admission on 2026-10-25 holding 7 GiB of them). `docker image rm`
-    /// without `-f` refuses an image a container still uses, so a running
-    /// job's image stays.
-    fn prune_superseded_images(&self) {
-        let Ok((disk, mount)) = self.cmd.disk(Path::new(DOCKER_ROOT)) else {
+    /// The Docker tier, on the filesystem holding Docker's data root.
+    fn run_docker(&self, now: i64) {
+        let cli = DockerCli {
+            exec: self.cmd.exec(),
+            docker: &self.docker_bin,
+        };
+        if !docker_reclaim::available(&cli) {
+            return;
+        }
+        let root = docker_reclaim::root_path(&cli);
+        let Ok((disk, mount)) = self.cmd.disk(&root) else {
             return;
         };
-        let usage = disk.usage_pct();
-        if usage < self.settings.high_water_pct {
-            return;
-        }
-        let listing = match self.cmd.exec.run(
-            &self.docker_bin,
-            &["image", "ls", "--no-trunc", "--format", IMAGE_FORMAT],
-        ) {
-            Ok(out) if out.success => out.stdout,
-            _ => return,
+        let held: HashSet<String> = match self.leases.lock() {
+            Ok(l) => l.clone(),
+            Err(_) => return,
         };
-        let ids = superseded_images(&listing);
-        if ids.is_empty() {
-            return;
-        }
-        if self.settings.dry_run {
-            tracing::info!(
-                "reclaim images {mount}: usage {usage}%, would remove {} superseded image(s)",
-                ids.len()
-            );
-            return;
-        }
-        let mut removed = 0usize;
-        for id in &ids {
-            match self.cmd.exec.run(&self.docker_bin, &["image", "rm", id]) {
-                Ok(out) if out.success => removed += 1,
-                _ => tracing::info!("reclaim images: kept {id} (in use or referenced elsewhere)"),
+        let input = docker_reclaim::Inputs {
+            settings: &self.settings,
+            disk,
+            floor_bytes: self.floor.load(Ordering::Relaxed),
+            held: &held,
+            now,
+        };
+        let Ok(mut seq) = self.seq.lock() else { return };
+        let measure = || self.cmd.disk(&root).ok().map(|(d, _)| d);
+        match docker_reclaim::run(&cli, &input, measure, &mut seq) {
+            Ok(c) => {
+                for r in &c.records {
+                    tracing::info!(
+                        "reclaim {:?}: {} ({}): {}{}",
+                        r.outcome,
+                        r.path,
+                        r.kind.as_str(),
+                        r.reason,
+                        r.error
+                            .as_deref()
+                            .map(|e| format!("; {e}"))
+                            .unwrap_or_default()
+                    );
+                }
+                tracing::info!(
+                    "reclaim docker {mount}: mode={:?} usage {}% -> {}%, freed {} MiB, would free {} MiB, errors {}, kept {:?}",
+                    c.mode,
+                    c.usage_pct_before,
+                    c.usage_pct_after,
+                    c.reclaimed_bytes >> 20,
+                    c.would_reclaim_bytes >> 20,
+                    c.errors,
+                    c.kept
+                );
+                if let Ok(mut stats) = self.stats.lock() {
+                    stats.absorb_docker(&c);
+                }
             }
+            Err(e) => tracing::warn!("reclaim docker {mount} failed: {e}"),
         }
-        tracing::info!(
-            "reclaim images {mount}: usage {usage}%, removed {removed} of {} superseded image(s)",
-            ids.len()
-        );
     }
 
     /// Run a cycle shortly after start and then every `interval_secs`.
@@ -852,6 +972,10 @@ mod tests {
                     "/var/lib/borg-job/cache/mono-ci/slots".to_owned(),
                     "cargo_target"
                 ),
+                (
+                    "/var/lib/borg-job/cache/mono-ci/slots".to_owned(),
+                    "cache_dir"
+                ),
             ]
         );
     }
@@ -869,6 +993,76 @@ mod tests {
         let found = listed(&out).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(found, vec![week]);
+    }
+
+    #[test]
+    fn runner_work_listing_offers_checkouts_never_the_runner_s_own_dirs() {
+        let root = std::env::temp_dir().join(format!("borg-reclaim-work-{}", std::process::id()));
+        for d in [
+            "k8s/k8s",
+            "mono/mono",
+            "_tool/node",
+            "_actions/a",
+            "_temp",
+            "_update",
+            "_PipelineMapping/x",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let cmd = Commands::new(Arc::new(crate::drone::exec::SystemExec), "setpriv".into());
+        let out = cmd.sh(&root, 30, LIST_RUNNER_WORK).unwrap();
+        let found = listed(&out).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(found, vec![root.join("k8s"), root.join("mono")]);
+    }
+
+    #[test]
+    fn df_inside_a_private_home_is_asked_as_the_owner() {
+        use crate::drone::exec::Output;
+        struct PrivateHome(Mutex<Vec<String>>);
+        impl Exec for PrivateHome {
+            fn run(&self, program: &str, args: &[&str]) -> std::io::Result<Output> {
+                let call = format!("{program} {}", args.join(" "));
+                self.0.lock().unwrap().push(call.clone());
+                let ok = |stdout: &str| {
+                    Ok(Output {
+                        success: true,
+                        stdout: stdout.to_owned(),
+                    })
+                };
+                if program == "stat" {
+                    return ok("1006:1006");
+                }
+                // As the drone: no permission, no output. As the owner (via
+                // timeout/setpriv): the filesystem.
+                if program == "df" {
+                    return Ok(Output {
+                        success: false,
+                        stdout: String::new(),
+                    });
+                }
+                if call.contains(" df -Pk -- /home/runner6/actions-runner/_work") {
+                    return ok(
+                        "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 300000000 180000000 120000000 60% /",
+                    );
+                }
+                ok("")
+            }
+        }
+        let exec = Arc::new(PrivateHome(Mutex::new(Vec::new())));
+        let cmd = Commands::new(Arc::clone(&exec) as Arc<dyn Exec>, "setpriv".into());
+        let (disk, mount) = cmd
+            .disk(Path::new("/home/runner6/actions-runner/_work"))
+            .unwrap();
+        assert_eq!(mount, "/");
+        assert_eq!(disk.free_bytes, 120_000_000 * 1024);
+        assert!(
+            exec.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("timeout ") && c.contains("--reuid 1006"))
+        );
     }
 
     #[test]
@@ -904,33 +1098,6 @@ mod tests {
             [PathBuf::from("/a/x"), PathBuf::from("/a/y")]
         );
         assert!(listed(".done").unwrap().is_empty());
-    }
-
-    #[test]
-    fn superseded_images_keep_the_newest_of_each_repository() {
-        let listing = "\
-ghcr.io/dx-corp/platform/platform-worker\tsha256:w3\t2026-10-25 18:00:00 +0000 UTC
-ghcr.io/dx-corp/platform/platform-worker\tsha256:w1\t2026-10-25 08:00:00 +0000 UTC
-ghcr.io/dx-corp/platform/platform-api\tsha256:a2\t2026-10-25 12:00:00 +0000 UTC
-ghcr.io/dx-corp/platform/platform-worker\tsha256:w2\t2026-10-25 10:00:00 +0000 UTC
-ghcr.io/dx-corp/deploy-feature-flag-ci-tools\tsha256:tools\t2026-08-20 09:00:00 +0000 UTC
-ghcr.io/dx-corp/platform/platform-api\tsha256:a1\t2026-10-24 12:00:00 +0000 UTC
-<none>\tsha256:dangling\t2026-10-01 00:00:00 +0000 UTC
-malformed line
-";
-        assert_eq!(
-            superseded_images(listing),
-            vec!["sha256:a1", "sha256:dangling", "sha256:w1", "sha256:w2"]
-        );
-    }
-
-    #[test]
-    fn one_image_per_repository_is_never_superseded() {
-        let listing = "repo-a\tsha256:x\t2026-01-01 00:00:00 +0000 UTC\nrepo-b\tsha256:y\t2026-01-01 00:00:00 +0000 UTC\n";
-        assert!(superseded_images(listing).is_empty());
-        // The same id listed twice for one repository is one image.
-        let twice = "repo-a\tsha256:x\t2026-01-01 00:00:00 +0000 UTC\nrepo-a\tsha256:x\t2026-01-01 00:00:00 +0000 UTC\n";
-        assert!(superseded_images(twice).is_empty());
     }
 
     #[test]
@@ -1012,6 +1179,7 @@ malformed line
 
         let cmd = Commands::new(Arc::new(SystemExec), "setpriv".into());
         let sizes = Mutex::new(HashMap::new());
+        let leases = Mutex::new(HashSet::new());
         let host = LiveHost {
             cmd: &cmd,
             anchor: root.clone(),
@@ -1019,6 +1187,8 @@ malformed line
             size_floor_secs: 0,
             sizes: &sizes,
             common: Mutex::new(HashMap::new()),
+            floor: 0,
+            leases: &leases,
         };
         let roots = [Root {
             path: wts.clone(),

@@ -55,7 +55,7 @@ fn name_has_prefix(name: &str, prefix: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('-') || rest.starts_with('_'))
 }
 
-fn belongs(scope: Scope<'_>, name: &str, labels: &BTreeMap<String, String>) -> bool {
+pub(crate) fn belongs(scope: Scope<'_>, name: &str, labels: &BTreeMap<String, String>) -> bool {
     match scope {
         Scope::Lease(id) => {
             let prefix = docker_prefix(id);

@@ -41,6 +41,33 @@ impl Host for FixedHost {
     }
 }
 
+/// [`FixedHost`] whose IPv4 forwarding switch the test flips.
+struct ForwardingHost(Arc<Mutex<&'static str>>);
+
+impl Host for ForwardingHost {
+    fn read_to_string(&self, path: &Path) -> Option<String> {
+        if path == Path::new("/proc/sys/net/ipv4/ip_forward") {
+            return Some((*self.0.lock().unwrap()).to_owned());
+        }
+        FixedHost.read_to_string(path)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        FixedHost.exists(path)
+    }
+    fn run(&self, program: &str, args: &[&str]) -> Option<String> {
+        FixedHost.run(program, args)
+    }
+    fn os(&self) -> &'static str {
+        FixedHost.os()
+    }
+    fn arch(&self) -> &'static str {
+        FixedHost.arch()
+    }
+    fn available_parallelism(&self) -> Option<u32> {
+        FixedHost.available_parallelism()
+    }
+}
+
 /// Records host commands instead of running them.
 #[derive(Default)]
 struct RecordingExec(Mutex<Vec<String>>);
@@ -108,6 +135,15 @@ impl Rig {
     }
 
     fn drone_with(&self, extra: Value, exec: Arc<dyn Exec>) -> Drone {
+        self.drone_on(extra, exec, Arc::new(FixedHost))
+    }
+
+    fn drone_on(
+        &self,
+        extra: Value,
+        exec: Arc<dyn Exec>,
+        host: Arc<dyn Host + Send + Sync>,
+    ) -> Drone {
         let mut cfg = json!({
             "queen_url": self.h.url,
             "allow_insecure": true,
@@ -132,9 +168,13 @@ impl Rig {
         if cfg["reclaim"].is_null() {
             cfg["reclaim"] = json!({"enabled": false});
         }
+        // Never let a test start probe containers on the real host.
+        if cfg["host_invariants"].is_null() {
+            cfg["host_invariants"] = json!({"container_network": false});
+        }
         let cfg = DroneConfig::from_json(&cfg.to_string()).unwrap();
         let client = QueenClient::new(&cfg, Secret::new(self.token.clone())).unwrap();
-        Drone::new(cfg, client, Arc::new(FixedHost), exec)
+        Drone::new(cfg, client, host, exec)
     }
 
     async fn lease_state(&self) -> Vec<String> {
@@ -149,6 +189,33 @@ impl Rig {
 
 async fn drain(tasks: &mut JoinSet<()>) {
     while tasks.join_next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn a_docker_host_without_ipv4_forwarding_takes_no_leases_until_it_is_back() {
+    let rig = Rig::new().await;
+    rig.install_runner("exit 0");
+    let forwarding = Arc::new(Mutex::new("0\n"));
+    let drone = rig.drone_on(
+        json!({}),
+        Arc::clone(&rig.exec) as Arc<dyn Exec>,
+        Arc::new(ForwardingHost(Arc::clone(&forwarding))),
+    );
+    let mut tasks = JoinSet::new();
+    let accepting = |s: &Value| s["drones"][0]["accepting"].as_bool();
+
+    assert_eq!(drone.heartbeat_once(true, &mut tasks).await.unwrap(), 0);
+    rig.h.queue_job(1, "borg-ci-light-pr", 3);
+    rig.h.tick().await;
+    assert_eq!(drone.heartbeat_once(true, &mut tasks).await.unwrap(), 0);
+    assert_eq!(accepting(&rig.h.status().await), Some(false));
+
+    *forwarding.lock().unwrap() = "1\n";
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    assert_eq!(accepting(&rig.h.status().await), Some(true));
+    rig.h.tick().await;
+    assert_eq!(drone.heartbeat_once(true, &mut tasks).await.unwrap(), 1);
+    drain(&mut tasks).await;
 }
 
 #[tokio::test]
