@@ -227,3 +227,45 @@ async fn without_a_previous_version_the_target_is_only_reported_and_everyone_is_
     none.tick(0).await;
     assert_eq!(none.desired("l1", "1.0.0").await, None);
 }
+
+#[tokio::test]
+async fn a_queen_that_follows_its_own_build_rolls_drones_to_it_through_the_gate() {
+    let rig = Rig::new(json!({
+        "drone_stale_secs": 1_000_000_000,
+        "rollout": {"follow_queen": true, "canary_jobs": 2, "waves_pct": [50, 100],
+                    "wave_jobs": 2, "soak_secs": 60, "update_timeout_secs": 300,
+                    "min_baseline_jobs": 100}
+    }))
+    .await;
+    let queen = rig.h.status().await["queen"]["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Before a gate pass nobody is told anything.
+    assert_eq!(rig.desired("l1", "1.0.0").await, None);
+    rig.h.tick().await;
+    let s = rig.h.status().await;
+    assert_eq!(s["rollout"]["target_version"], queen.as_str());
+    let gate = &s["rollout"]["gate"]["state"];
+    assert_eq!(gate["target"], queen.as_str());
+    assert_eq!(
+        gate["previous"], "1.0.0",
+        "what the fleet ran when it started"
+    );
+    assert_eq!(gate["phase"], "canary");
+    // The Linux canary is told the queen's build; the rest stay put.
+    let canaries: Vec<String> = gate["canaries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_owned())
+        .collect();
+    for d in ["l1", "l2", "m1"] {
+        let want = if canaries.iter().any(|c| c == d) {
+            queen.as_str()
+        } else {
+            "1.0.0"
+        };
+        assert_eq!(rig.desired(d, "1.0.0").await.as_deref(), Some(want), "{d}");
+    }
+}

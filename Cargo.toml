@@ -10,6 +10,7 @@ repository = "https://github.com/dx-corp/borg"
 description = "Self-organizing CI fleet agent: drones probe their host and run ephemeral runners that a queen leases to them."
 
 [lib]
+doctest = false
 name = "borg"
 path = "src/lib.rs"
 

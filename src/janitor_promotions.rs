@@ -6,10 +6,15 @@
 //! sit for days on its verification jobs after newer revisions went live.
 //! Rules, applied per configured workflow every `sweep_secs`:
 //!
-//! * **superseded**: a pending run whose apply job never executed is cancelled
-//!   when a newer run that covers all of its services (same `source-event`)
-//!   has started or succeeded. Requiring a started successor keeps a cohort
-//!   from being pushed to the back of the runner queue by its own successors.
+//! * **superseded**: a pending run that has not reached its apply job is
+//!   cancelled when a newer run that covers all of its services (same
+//!   `source-event`) has started or succeeded. Requiring a started successor
+//!   keeps a cohort from being pushed to the back of the runner queue by its
+//!   own successors. A run whose apply job exists in any state (waiting on its
+//!   publication lock included) has passed prepare and admission and is never
+//!   superseded: the newer run queues behind it. Cancelling waiting applies in
+//!   favour of merely started successors starved platform-api on 2026-11-02
+//!   (k8s run 41392061823, the read fix, cancelled for 41392484470).
 //! * **stale**: a run older than `stale_after_hours`, in any unfinished state,
 //!   is cancelled when a newer covering run has succeeded. Its own
 //!   verification would check a revision production no longer runs.
@@ -306,7 +311,11 @@ impl Janitor {
             {
                 continue;
             }
-            let applied = jobs.iter().any(|j| j.name == p.apply_job && executed(j));
+            // Reached apply: the apply job ran, runs, or waits for a runner or
+            // its publication lock. Such a run runs to completion.
+            let entered_apply = jobs.iter().any(|j| {
+                j.name == p.apply_job && (executed(j) || ACTIVE.contains(&j.status.as_str()))
+            });
             // Successors newest first: a successful one serves both rules, a
             // started one only the pending rule.
             let mut successors: Vec<(&Run, &Intent, bool)> = parsed_succeeded
@@ -316,7 +325,7 @@ impl Janitor {
                 .filter(|(r, i, _)| r.id > run.id && covers(i, &intent))
                 .collect();
             successors.sort_by_key(|(r, _, _)| std::cmp::Reverse(r.id));
-            let superseded_rule = pending && !applied;
+            let superseded_rule = pending && !entered_apply;
             let Some(source) = p.source_repos.get(&intent.event) else {
                 if !successors.is_empty() {
                     report.promotion_unprovable += 1;

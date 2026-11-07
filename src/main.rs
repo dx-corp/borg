@@ -23,8 +23,21 @@ use borg::tailnet::{TailnetEnroll, TailscaledWhois};
 use borg::update;
 use clap::{Args, Parser, Subcommand};
 
+/// `borg --version` names the commit a release was built from
+/// (`BORG_BUILD_SHA`, set by the release workflow), the same one `/status`
+/// `queen.build_sha` reports.
+const LONG_VERSION: &str = match option_env!("BORG_BUILD_SHA") {
+    Some(sha) => sha,
+    None => "(no BORG_BUILD_SHA: not a release build)",
+};
+
 #[derive(Parser)]
-#[command(name = "borg", version, about = "Self-organizing CI fleet agent")]
+#[command(
+    name = "borg",
+    version,
+    long_version = LONG_VERSION,
+    about = "Self-organizing CI fleet agent"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -93,6 +106,23 @@ enum ConfigCommand {
         /// Read it as a drone config instead of a queen config.
         #[arg(long)]
         drone: bool,
+    },
+    /// Write one file of a private repository at a git ref to `--out`, read
+    /// with the queen config's contents-read App (`mirror_auth`, else
+    /// `supersede_janitor.compare_auth`). Delivers the queen config privately.
+    Fetch {
+        /// The queen config whose App credentials to use.
+        #[arg(long, default_value = "/etc/borg/queen.json")]
+        config: PathBuf,
+        /// Bare repository name in `github.org`.
+        #[arg(long, default_value = "mono")]
+        repo: String,
+        #[arg(long, default_value = "main")]
+        git_ref: String,
+        #[arg(long, default_value = "config/borg/queen.json")]
+        path: String,
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -866,7 +896,12 @@ async fn run_queen(path: &Path) -> Result<()> {
         ),
         None => None,
     };
-    let mut queen = Queen::new(cfg, store, github);
+    let started_at = time::OffsetDateTime::now_utc().unix_timestamp();
+    let build = tokio::task::spawn_blocking(move || borg::queen::QueenBuild::current(started_at))
+        .await
+        .context("hash the running queen binary")?;
+    tracing::info!(?build, "queen build");
+    let mut queen = Queen::new(cfg, store, github).with_build(build);
     if let Some(token) = control_token {
         tracing::info!("control API enabled");
         queen = queen.with_control_token(&token);
@@ -1255,6 +1290,27 @@ async fn dispatch(command: Command) -> Result<()> {
                 println!("{cfg:#?}");
             }
             eprintln!("{}: ok", path.display());
+            Ok(())
+        }
+        Command::Config {
+            command:
+                ConfigCommand::Fetch {
+                    config,
+                    repo,
+                    git_ref,
+                    path,
+                    out,
+                },
+        } => {
+            let cfg = QueenConfig::load(&config)?;
+            let bytes = borg::configfetch::fetch(&cfg, &repo, &git_ref, &path).await?;
+            borg::configfetch::write_atomic(&out, &bytes)
+                .with_context(|| format!("write {}", out.display()))?;
+            eprintln!(
+                "{repo}/{path}@{git_ref} -> {} ({} bytes)",
+                out.display(),
+                bytes.len()
+            );
             Ok(())
         }
         Command::Drone { command } => {

@@ -280,10 +280,18 @@ pub struct DroneConfig {
     /// Host-level caches the drone manages under `cache_root`.
     #[serde(default)]
     pub caches: CachesConfig,
-    /// Build-box reclaim of abandoned worktrees and cargo directories; off
-    /// unless a host opts in, and dry-run by default. See [`crate::reclaim`].
+    /// Build-box reclaim of abandoned worktrees, cargo directories, CI tool
+    /// homes and unused Docker state; on by default. See [`crate::reclaim`].
     #[serde(default)]
     pub reclaim: crate::reclaim::ReclaimSettings,
+    /// Removal of credentials CI jobs left in home directories; on by
+    /// default. See [`crate::drone::credwipe`].
+    #[serde(default)]
+    pub(crate) credential_wipe: crate::drone::credwipe::CredentialWipeSettings,
+    /// Host invariants checked before taking leases; on by default. See
+    /// [`crate::drone::invariants`].
+    #[serde(default)]
+    pub(crate) host_invariants: crate::drone::invariants::InvariantSettings,
 }
 
 /// Slot directories when neither `slots` nor `max_leases` is set.
@@ -359,6 +367,12 @@ impl DroneConfig {
             .map_err(DroneConfigError::Invalid)?;
         self.validate_job_settings()?;
         self.reclaim.validate().map_err(DroneConfigError::Invalid)?;
+        self.credential_wipe
+            .validate()
+            .map_err(DroneConfigError::Invalid)?;
+        self.host_invariants
+            .validate()
+            .map_err(DroneConfigError::Invalid)?;
         self.validate_caches()
     }
 

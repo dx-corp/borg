@@ -17,6 +17,28 @@ use crate::api::UpdateReport;
 use crate::update::health::{self, HealthRecord};
 use crate::update::{Request, UpdateResult, request_path, result_path};
 
+/// The version a drone reports: the package version plus, as SemVer build
+/// metadata, the first 12 hex digits of the running binary's SHA-256. Every
+/// build reports package version 0.1.0, so without the hash the queen (and
+/// `borg_drone_info`) cannot tell a drone that missed a roll from one that
+/// got it; internal-runner-burst-01 ran the 2026-10-22 build for ten days
+/// unnoticed. Build metadata never affects version comparison.
+pub(crate) fn build_version(package: &str, binary: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(Sha256::digest(binary));
+    format!("{package}+{}", &digest[..12])
+}
+
+/// [`build_version`] of the running binary (`/proc/self/exe` opens the
+/// running image even after the file was replaced on disk). Blocking: reads
+/// the whole binary.
+pub(crate) fn running_build_version() -> Option<String> {
+    let bytes = fs::read("/proc/self/exe")
+        .or_else(|_| std::env::current_exe().and_then(fs::read))
+        .ok()?;
+    Some(build_version(env!("CARGO_PKG_VERSION"), &bytes))
+}
+
 /// What to do about the queen's `desired_version` right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plan {
@@ -142,6 +164,19 @@ pub fn backoff(interval_secs: u64, failures: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_versions_tell_builds_apart_and_stay_short_printable_semver() {
+        let a = super::build_version("0.1.0", b"binary a");
+        let b = super::build_version("0.1.0", b"binary b");
+        assert_ne!(a, b);
+        assert!(
+            a.starts_with("0.1.0+") && a.len() == "0.1.0+".len() + 12,
+            "{a}"
+        );
+        assert!(a.len() <= 64 && a.bytes().all(|c| c.is_ascii_graphic()));
+        assert_eq!(a, super::build_version("0.1.0", b"binary a"));
+    }
+
     use super::*;
 
     #[test]

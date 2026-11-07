@@ -46,7 +46,7 @@ use crate::janitor::Janitor;
 use crate::mirror_auth::MirrorAuth;
 use crate::preempt::{PreemptInput, Running, select as select_victims};
 use crate::probe::Capacity;
-use crate::profile::{ClassProfile, build_profiles};
+use crate::profile::{ClassProfile, QueuedFamilies, build_profiles, family_of};
 use crate::requeue::Requeuer;
 use crate::rollout::{
     Check as RolloutCheck, DroneView, Observed as RolloutObserved, RolloutState, advance,
@@ -112,6 +112,9 @@ pub struct Snapshot {
     pub(crate) starved: BTreeSet<Class>,
     /// The burst rule after the last pass; `None` when burst is off.
     pub(super) burst: Option<BurstView>,
+    /// Cost-aware placement: running totals of where grants went and, in
+    /// dry-run, where they would have gone.
+    pub placement: crate::placement::PlacementView,
 }
 
 /// The burst rule's memory and the fleet it made (simulated in dry-run,
@@ -280,7 +283,13 @@ pub struct QueueEntry {
     pub scope: Scope,
     pub queued: u32,
     pub oldest_age_secs: u64,
+    /// The most-queued job families under this label, largest first (at most
+    /// [`QUEUE_FAMILIES_SHOWN`]); they steer placement.
+    families: Vec<(String, u32)>,
 }
+
+/// Families listed per queue entry in `/status`.
+const QUEUE_FAMILIES_SHOWN: usize = 10;
 
 #[derive(Default)]
 struct UnitPlacement {
@@ -314,6 +323,7 @@ fn spend_bids(drones: &mut [DroneState], granted: &[ActiveLease]) {
 
 pub struct Queen {
     pub(crate) cfg: QueenConfig,
+    build: Option<QueenBuild>,
     pub(crate) store: Store,
     github: GithubClient,
     snapshot: RwLock<Snapshot>,
@@ -528,6 +538,7 @@ impl Queen {
     pub fn new(cfg: QueenConfig, store: Store, github: GithubClient) -> Self {
         Self {
             cfg,
+            build: None,
             store,
             github,
             snapshot: RwLock::new(Snapshot::default()),
@@ -794,7 +805,7 @@ impl Queen {
                 observed.push((repo.as_str(), job));
             }
         }
-        let (queue, demand, queue_ages) = self.summarize(&jobs, now);
+        let (queue, demand, queue_ages, queued_families) = self.summarize(&jobs, now);
 
         if let Err(e) = self.assess_health(now_ts).await {
             tracing::warn!("health assessment failed: {e}");
@@ -852,11 +863,16 @@ impl Queen {
                     state.cpu_load_pm =
                         crate::allocator::load_pressure_pm(f.load_per_cpu_pm, f.cpu_busy_pm);
                 }
-                state.profiles = profiles
-                    .iter()
-                    .filter(|p| p.drone == d.name)
-                    .map(ClassProfile::score)
-                    .collect();
+                state.profiles = placement_profiles(
+                    &profiles,
+                    &d.name,
+                    &queued_families,
+                    !self.cfg.placement.dry_run,
+                );
+                if !self.cfg.placement.dry_run {
+                    state.cost_permille =
+                        self.cfg.placement.cost_for(&self.cfg.drone_expiry, &d.name);
+                }
                 drones.push(state);
                 capacities.insert(d.name.clone(), cap.clone());
                 if d.trust.serves_deploy() {
@@ -954,6 +970,17 @@ impl Queen {
             spend_bids(&mut runner_input.drones, &spent_bids);
         }
         let mut allocation = allocate_reserved(&runner_input, &unit_reserved);
+        // Dry-run: the same pure pass with paid drones costed, for comparison
+        // only. Its grants are never minted.
+        let would_grants = self.cfg.placement.dry_run.then(|| {
+            let mut costed = runner_input.clone();
+            for d in &mut costed.drones {
+                d.cost_permille = self.cfg.placement.cost_for(&self.cfg.drone_expiry, &d.id);
+                d.profiles = placement_profiles(&profiles, &d.id, &queued_families, true);
+            }
+            allocate_reserved(&costed, &unit_reserved).grants
+        });
+        let runner_grants = allocation.grants.clone();
         if let Some(f) = &self.cfg.pr_fairness {
             let mut w = self.watch.lock().expect("fleet watch lock");
             advance_pr_turns(
@@ -1233,6 +1260,13 @@ impl Queen {
             s.starved_since = starved_since;
             s.starved = starved;
             s.burst = burst;
+            s.placement.dry_run = self.cfg.placement.dry_run;
+            s.placement.burst_cost_permille = self.cfg.placement.burst_cost_permille;
+            s.placement
+                .record(now_ts, &runner_grants, would_grants.as_deref(), |d| {
+                    self.cfg.drone_expiry.is_burst(d)
+                });
+            s.placement.record_decisions(now_ts, &allocation.decisions);
         });
         if let Err(e) = self
             .store
@@ -1267,6 +1301,7 @@ impl Queen {
             Ok(Err(e)) => tracing::warn!("GitHub job telemetry collection failed: {e}"),
             Err(_) => tracing::warn!("GitHub job telemetry collection exceeded its deadline"),
         }
+        self.write_health(&drone_rows, now_ts).await;
         Ok(())
     }
 
@@ -1362,7 +1397,27 @@ impl Queen {
     /// The version `drone` should run: from the gated rollout when it is on,
     /// otherwise the configured target (report-only mode), otherwise no
     /// instruction.
+    /// The version drones are rolled out to: the configured target, or with
+    /// `rollout.follow_queen` the build this queen runs.
+    pub(crate) fn rollout_target(&self) -> Option<String> {
+        self.cfg.rollout_target_version.clone().or_else(|| {
+            self.cfg
+                .rollout
+                .follow_queen
+                .then(|| self.build.as_ref().map(|b| b.version().to_owned()))
+                .flatten()
+        })
+    }
+
     pub fn desired_version(&self, drone: &str) -> Option<String> {
+        if self.cfg.rollout_target_version.is_none() && self.cfg.rollout.follow_queen {
+            // Only what the gate decided: no drone is told anything before
+            // the first pass has a previous version to fall back to.
+            return self
+                .snapshot()
+                .rollout
+                .map(|r| desired_for(&r.state, drone).to_owned());
+        }
         let target = self.cfg.rollout_target_version.as_ref()?;
         if self.cfg.rollout.previous_version.is_none() {
             return Some(target.clone());
@@ -1375,12 +1430,12 @@ impl Queen {
     /// One pass of the quorum rollout gate (only when both the target and
     /// `rollout.previous_version` are configured).
     async fn advance_rollout(&self, now: i64) -> Result<(), QueenError> {
-        let (Some(target), Some(previous)) = (
-            self.cfg.rollout_target_version.as_deref(),
-            self.cfg.rollout.previous_version.as_deref(),
-        ) else {
+        let Some(target) = self.rollout_target() else {
             return Ok(());
         };
+        if self.cfg.rollout.previous_version.is_none() && !self.cfg.rollout.follow_queen {
+            return Ok(());
+        }
         let stored = self.store.rollout_state().await?;
         let rows = self.store.drones().await?;
         let since = stored
@@ -1411,11 +1466,20 @@ impl Queen {
                 version_since: d.version_since,
             })
             .collect();
+        let Some(previous) = self
+            .cfg
+            .rollout
+            .previous_version
+            .clone()
+            .or_else(|| crate::rollout::previous_for(&target, stored.as_ref(), &views))
+        else {
+            return Ok(());
+        };
         let adv = advance(
             now,
             &self.cfg.rollout,
-            previous,
-            target,
+            &previous,
+            &target,
             stored.clone(),
             &views,
             &outcomes,
@@ -2219,8 +2283,14 @@ impl Queen {
         &self,
         jobs: &[QueuedJob],
         now: OffsetDateTime,
-    ) -> (Vec<QueueEntry>, Vec<Demand>, Vec<QueueAge>) {
+    ) -> (
+        Vec<QueueEntry>,
+        Vec<Demand>,
+        Vec<QueueAge>,
+        BTreeMap<Class, QueuedFamilies>,
+    ) {
         let mut by: BTreeMap<(Class, Scope), (u32, u64)> = BTreeMap::new();
+        let mut families: BTreeMap<(Class, Scope), QueuedFamilies> = BTreeMap::new();
         for job in jobs {
             let Some((class, scope)) = job
                 .labels
@@ -2232,6 +2302,11 @@ impl Queen {
             let e = by.entry((class, scope)).or_default();
             e.0 += 1;
             e.1 = e.1.max(age_secs(now, job.created_at));
+            *families
+                .entry((class, scope))
+                .or_default()
+                .entry(family_of(&job.name))
+                .or_default() += 1;
         }
         let queue = by
             .iter()
@@ -2241,6 +2316,15 @@ impl Queen {
                 scope,
                 queued,
                 oldest_age_secs,
+                families: {
+                    let mut top: Vec<(String, u32)> = families
+                        .get(&(class, scope))
+                        .map(|f| f.iter().map(|(k, v)| (k.clone(), *v)).collect())
+                        .unwrap_or_default();
+                    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    top.truncate(QUEUE_FAMILIES_SHOWN);
+                    top
+                },
             })
             .collect();
         let demand = by
@@ -2259,7 +2343,7 @@ impl Queen {
                 oldest_age_secs,
             })
             .collect();
-        (queue, demand, ages)
+        (queue, demand, ages, families_by_class(&families))
     }
 
     /// Per-class totals for status and metrics: slots the fleet could hold.
@@ -2906,6 +2990,11 @@ impl Queen {
             .collect()
     }
 }
+
+mod build;
+mod families;
+pub use build::QueenBuild;
+use families::{families_by_class, placement_profiles};
 
 #[cfg(test)]
 mod tests;

@@ -92,7 +92,53 @@ pub struct ClassProfile {
     pub families: Vec<FamilyStat>,
 }
 
+/// Queued jobs per family for one class: what a runner minted now will run.
+pub(crate) type QueuedFamilies = BTreeMap<String, u32>;
+
 impl ClassProfile {
+    /// The profile placement uses while `queued` jobs wait: each queued job
+    /// counts at this drone's speed for its family when the drone has
+    /// evidence for that family ([`FamilyStat`], at least `min_samples` runs
+    /// and a fleet median), and at the class speed otherwise; confidence
+    /// likewise. So a family goes to the drone that runs it fastest, and a
+    /// family with little evidence falls back to the class profile. With
+    /// nothing queued (a warm floor) this is [`Self::score`]. GitHub still
+    /// picks which queued job a runner takes, so the queued mix, not one job,
+    /// is what a fresh runner should be good at.
+    pub(crate) fn queue_weighted(&self, queued: Option<&QueuedFamilies>) -> ProfileScore {
+        let Some(queued) = queued.filter(|q| q.values().any(|n| *n > 0)) else {
+            return self.score();
+        };
+        let mut total = 0u64;
+        let mut speed = 0u64;
+        let mut confidence = 0u64;
+        for (family, &n) in queued {
+            let (s, c) = self.families.iter().find(|f| &f.family == family).map_or(
+                (
+                    u64::from(self.speed_permille),
+                    u64::from(self.speed_confidence_permille),
+                ),
+                |f| {
+                    (
+                        (f.fleet_median_secs.saturating_mul(1000) / f.median_secs.max(1))
+                            .clamp(SPEED_MIN, SPEED_MAX),
+                        u64::from(f.jobs.min(FULL_CONFIDENCE_AT) * 1000 / FULL_CONFIDENCE_AT),
+                    )
+                },
+            );
+            let n = u64::from(n);
+            total += n;
+            speed += s * n;
+            confidence += c * n;
+        }
+        ProfileScore {
+            class: self.class,
+            speed_permille: u32::try_from(speed / total).unwrap_or(1000),
+            speed_confidence_permille: u32::try_from(confidence / total).unwrap_or(0),
+            reliability_permille: self.reliability_permille,
+        }
+    }
+
     pub fn score(&self) -> ProfileScore {
         ProfileScore {
             class: self.class,
@@ -419,5 +465,78 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    fn medium(drone: &str, speed: u32, families: &[(&str, u32, u64, u64)]) -> ClassProfile {
+        ClassProfile {
+            drone: drone.into(),
+            class: Class::Medium,
+            jobs: 500,
+            speed_permille: speed,
+            speed_confidence_permille: 1000,
+            reliability_permille: 1000,
+            families: families
+                .iter()
+                .map(
+                    |&(family, jobs, median_secs, fleet_median_secs)| FamilyStat {
+                        family: family.into(),
+                        jobs,
+                        median_secs,
+                        fleet_median_secs,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn queued(v: &[(&str, u32)]) -> QueuedFamilies {
+        v.iter().map(|&(f, n)| (f.to_owned(), n)).collect()
+    }
+
+    #[test]
+    fn queue_weighting_uses_family_evidence_and_falls_back_to_the_class() {
+        // wsl-desktop on 11/07: slow at rust-visibility-scan, fast at
+        // platform-ui-quality, 748 overall.
+        let wsl = medium(
+            "wsl-desktop",
+            748,
+            &[
+                ("rust-visibility-scan", 130, 507, 176),
+                ("platform-ui-quality", 27, 1121, 1288),
+                ("smoke_gate", 4, 4, 4),
+            ],
+        );
+        // Nothing queued: the class profile.
+        assert_eq!(wsl.queue_weighted(None), wsl.score());
+        assert_eq!(wsl.queue_weighted(Some(&queued(&[]))), wsl.score());
+        // One family with full evidence: its own ratio.
+        let ui = wsl.queue_weighted(Some(&queued(&[("platform-ui-quality", 3)])));
+        assert_eq!(
+            (ui.speed_permille, ui.speed_confidence_permille),
+            (1148, 1000)
+        );
+        // Slower than half the fleet clamps at 500.
+        let scan = wsl.queue_weighted(Some(&queued(&[("rust-visibility-scan", 1)])));
+        assert_eq!(scan.speed_permille, 500);
+        // A family with no evidence here counts at the class speed.
+        let new = wsl.queue_weighted(Some(&queued(&[("never-seen", 2)])));
+        assert_eq!(
+            (new.speed_permille, new.speed_confidence_permille),
+            (748, 1000)
+        );
+        // A mix weighs by queued count: (1148*1 + 748*3) / 4 = 848.
+        let mix = wsl.queue_weighted(Some(&queued(&[
+            ("platform-ui-quality", 1),
+            ("never-seen", 3),
+        ])));
+        assert_eq!(mix.speed_permille, 848);
+        // Thin family evidence carries thin confidence: 4 of 20 samples.
+        let thin = wsl.queue_weighted(Some(&queued(&[("smoke_gate", 1)])));
+        assert_eq!(
+            (thin.speed_permille, thin.speed_confidence_permille),
+            (1000, 200)
+        );
+        assert_eq!(thin.reliability_permille, 1000);
+        assert_eq!(thin.class, Class::Medium);
     }
 }

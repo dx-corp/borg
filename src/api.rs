@@ -107,6 +107,16 @@ fn sanitize_facts(f: &EnvFacts, now: i64) -> EnvFacts {
         fact.observed_at = fact.observed_at.min(now);
     }
     out.rustc_wrapper = out.rustc_wrapper.as_ref().map(clip);
+    out.host_invariant_failures.truncate(16);
+    for f in &mut out.host_invariant_failures {
+        f.check = f
+            .check
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take(40)
+            .collect();
+        f.detail = clip(&f.detail);
+    }
     out.sccache_dir = out.sccache_dir.as_ref().map(clip);
     if let Some(list) = &mut out.toolchains {
         list.truncate(32);
@@ -950,6 +960,10 @@ pub struct DroneStatus {
     pub health: Option<DroneHealth>,
     /// Build-box reclaim stats, when the drone reports them.
     pub reclaim: Option<ReclaimStats>,
+    /// Host invariants the drone reports broken (it takes no leases while
+    /// any but `disk` is); empty when all hold or not reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    host_invariant_failures: Vec<crate::envcontract::InvariantFailure>,
     /// The build environment contract as it stands for this drone; absent when
     /// the contract is off.
     pub contract: Option<ContractStatus>,
@@ -1065,6 +1079,12 @@ pub struct Status {
     /// The burst enrollment circuit breaker; absent unless burst is
     /// configured and not dry-run. Read at request time.
     burst_breaker: Option<crate::control::BreakerView>,
+    /// What this queen runs: version (binary digest), build commit and start
+    /// time. Absent for a queen built without [`crate::queen::QueenBuild`].
+    queen: Option<crate::queen::QueenBuild>,
+    /// Cost-aware placement (owned hosts before burst): where grants went
+    /// and, in dry-run, where they would have gone.
+    pub placement: crate::placement::PlacementView,
     pub rollout: RolloutStatus,
     pub warm_floors: Vec<crate::allocator::WarmFloor>,
     pub pressure: Vec<ClassPressure>,
@@ -1319,6 +1339,11 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             version: d.version.clone(),
             health: snap.health.get(&d.name).cloned(),
             reclaim: d.reclaim.clone(),
+            host_invariant_failures: d
+                .env_facts
+                .as_ref()
+                .map(|f| f.host_invariant_failures.clone())
+                .unwrap_or_default(),
             admission: snap
                 .admission
                 .iter()
@@ -1439,15 +1464,15 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         None => None,
     };
     let mut rollout = RolloutStatus {
-        target_version: cfg.rollout_target_version.clone(),
+        target_version: queen.rollout_target(),
         gate: snap.rollout.clone(),
         log: queen.store().rollout_log(20).await?,
         ..RolloutStatus::default()
     };
     for d in &drones {
-        match (&d.version, &cfg.rollout_target_version) {
+        match (&d.version, &rollout.target_version) {
             (None, _) => rollout.unknown += 1,
-            (Some(v), Some(t)) if v == t => rollout.current += 1,
+            (Some(v), Some(t)) if crate::rollout::same_release(v, t) => rollout.current += 1,
             (Some(_), _) => rollout.outdated += 1,
         }
     }
@@ -1468,6 +1493,8 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         burst: snap.burst,
         burst_control,
         burst_breaker,
+        queen: queen.build().cloned(),
+        placement: snap.placement,
         rollout,
         warm_floors: snap.warm_floors,
         pressure: snap.pressure,
@@ -2146,7 +2173,8 @@ pub fn render_metrics(status: &Status) -> String {
     );
     gauge(
         "borg_drone_info",
-        "The borg version each drone reported (always 1).",
+        "The borg version each drone reported (always 1). Drones report \
+         <package>+<first 12 hex of the binary's sha256>, so builds differ.",
         status
             .drones
             .iter()
@@ -2154,13 +2182,64 @@ pub fn render_metrics(status: &Status) -> String {
                 d.version.as_ref().map(|v| {
                     (
                         format!(
-                            "drone=\"{}\",version=\"{}\"",
+                            "drone=\"{}\",version=\"{}\",trust=\"{}\"",
                             label_value(&d.name),
-                            label_value(v)
+                            label_value(v),
+                            d.trust.as_str()
                         ),
                         1.0,
                     )
                 })
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_drone_host_invariant_failing",
+        "1 for each host invariant a drone reports broken (ip_forward, docker_daemon, \
+         container_network, disk); it takes no leases while one other than disk fails.",
+        status
+            .drones
+            .iter()
+            .filter(|d| d.fresh)
+            .flat_map(|d| {
+                d.host_invariant_failures.iter().map(move |f| {
+                    (
+                        format!(
+                            "drone=\"{}\",check=\"{}\"",
+                            label_value(&d.name),
+                            label_value(&f.check)
+                        ),
+                        1.0,
+                    )
+                })
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_drone_active_leases",
+        "Leases each drone reports running.",
+        status
+            .drones
+            .iter()
+            .map(|d| {
+                (
+                    format!("drone=\"{}\"", label_value(&d.name)),
+                    f64::from(d.active_leases),
+                )
+            })
+            .collect(),
+    );
+    gauge(
+        "borg_drone_accepting",
+        "1 when the drone's last heartbeat said it takes new leases.",
+        status
+            .drones
+            .iter()
+            .map(|d| {
+                (
+                    format!("drone=\"{}\"", label_value(&d.name)),
+                    f64::from(u8::from(d.accepting)),
+                )
             })
             .collect(),
     );

@@ -202,6 +202,46 @@ fn default_janitor_max() -> u32 {
     20
 }
 
+/// Cost-aware placement. A paid cloud drone (one whose name matches
+/// `drone_expiry.burst_prefixes`) scores `burst_cost_permille - 1000` below an
+/// otherwise equal owned host (the allocator's cost term), so the
+/// allocator fills idle owned hosts first and a burst drone only gets work
+/// owned hosts have no room or admission for. A burst drone that stops getting
+/// leases then drains on the burst rule's idle timer.
+///
+/// With `dry_run` (the default) placement is unchanged: each pass the queen
+/// also runs the allocator with the cost applied and reports in `/status`
+/// `placement` where those grants would have gone against where they went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PlacementSettings {
+    pub(crate) dry_run: bool,
+    /// Relative slot-hour cost of a burst drone (1000 = owned). The default,
+    /// 5000, outweighs the largest speed and idle terms, so a faster idle
+    /// burst drone still loses to an owned host with room.
+    pub(crate) burst_cost_permille: u32,
+}
+
+impl Default for PlacementSettings {
+    fn default() -> Self {
+        Self {
+            dry_run: true,
+            burst_cost_permille: 5000,
+        }
+    }
+}
+
+impl PlacementSettings {
+    /// The cost the allocator should see for `drone` when the cost applies.
+    pub(crate) fn cost_for(&self, expiry: &DroneExpirySettings, drone: &str) -> u32 {
+        if expiry.is_burst(drone) {
+            self.burst_cost_permille
+        } else {
+            crate::allocator::OWNED_COST_PERMILLE
+        }
+    }
+}
+
 /// A drone silent past `drone_stale_secs` is `stale`: it holds no
 /// schedulable capacity. One silent past its expiry is removed (token and
 /// lease records with it) and the removal is logged as a health event.
@@ -228,13 +268,17 @@ impl Default for DroneExpirySettings {
 }
 
 impl DroneExpirySettings {
-    /// The silence after which `name` is removed, if ever.
-    pub(crate) fn expiry_for(&self, name: &str) -> Option<i64> {
-        let secs = if self
-            .burst_prefixes
+    /// A short-lived, paid cloud drone (its name has a `burst_prefixes`
+    /// prefix), as opposed to owned hardware.
+    pub(crate) fn is_burst(&self, name: &str) -> bool {
+        self.burst_prefixes
             .iter()
             .any(|p| name.starts_with(p.as_str()))
-        {
+    }
+
+    /// The silence after which `name` is removed, if ever.
+    pub(crate) fn expiry_for(&self, name: &str) -> Option<i64> {
+        let secs = if self.is_burst(name) {
             self.burst_after_secs
         } else {
             self.after_secs
@@ -462,6 +506,14 @@ pub struct QueenConfig {
     /// Learned per-drone profiles that feed placement; see [`crate::profile`].
     #[serde(default)]
     pub profiles: ProfileSettings,
+    /// Cost-aware placement: owned hosts before paid cloud drones.
+    #[serde(default)]
+    pub(crate) placement: PlacementSettings,
+    /// Written after each successful pass once a drone has heartbeated to
+    /// this process; `borg update` waits for it after a swap and rolls back
+    /// without it. Absent: not written.
+    #[serde(default)]
+    pub(crate) health_file: Option<PathBuf>,
     /// Host-health thresholds, decay and cooldown; see [`crate::health`].
     #[serde(default)]
     pub health: HealthSettings,
@@ -709,6 +761,11 @@ impl QueenConfig {
         }
         if let Some(p) = &self.preemption {
             p.validate().map_err(ConfigError::Invalid)?;
+        }
+        if !(crate::allocator::OWNED_COST_PERMILLE..=100_000)
+            .contains(&self.placement.burst_cost_permille)
+        {
+            return bad("placement.burst_cost_permille must be between 1000 and 100000");
         }
         if let Some(b) = &self.burst {
             b.validate().map_err(ConfigError::Invalid)?;

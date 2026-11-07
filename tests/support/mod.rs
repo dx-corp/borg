@@ -78,6 +78,8 @@ pub struct MockState {
     pulls_need_mirror: bool,
     /// Status the single-run endpoint reports instead of the listed one.
     pub fresh_status: HashMap<u64, String>,
+    /// Attempt metadata returned by a fresh run read after the listing.
+    pub fresh_attempts: HashMap<u64, (u64, String)>,
     /// Runs the janitor cancelled.
     pub cancelled: Vec<u64>,
     /// Runs whose cancel answers 409.
@@ -351,6 +353,10 @@ async fn one_run(
         .ok_or(StatusCode::NOT_FOUND)?;
     if let Some(status) = st.fresh_status.get(&id) {
         run["status"] = json!(status);
+    }
+    if let Some((attempt, started)) = st.fresh_attempts.get(&id) {
+        run["run_attempt"] = json!(attempt);
+        run["run_started_at"] = json!(started);
     }
     Ok(Json(run))
 }
@@ -742,7 +748,15 @@ impl Harness {
                 .unwrap()
             });
         let wakes = Arc::new(RecordingWake::default());
-        let mut queen = Queen::new(cfg, store, github).with_wake_sender(wakes.clone());
+        // Started a little in the past so a heartbeat in the same second counts.
+        let started_at = OffsetDateTime::now_utc().unix_timestamp() - 1;
+        let build =
+            tokio::task::spawn_blocking(move || borg::queen::QueenBuild::current(started_at))
+                .await
+                .unwrap();
+        let mut queen = Queen::new(cfg, store, github)
+            .with_wake_sender(wakes.clone())
+            .with_build(build);
         if let Some(j) = janitor {
             queen = queen.with_janitor(j);
         }

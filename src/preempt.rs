@@ -211,6 +211,7 @@ mod tests {
             trust: crate::classes::Trust::Shared,
             cpu_psi_pm: None,
             cpu_load_pm: None,
+            cost_permille: crate::allocator::OWNED_COST_PERMILLE,
         }
     }
 

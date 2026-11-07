@@ -33,6 +33,9 @@
 //!   or the pulls API shows the branch's pull request closed *after* the run
 //!   was created (a run created after the close is the `closed` event's own
 //!   handler and is kept), and a fresh read must still show no pull request;
+//! * a rerun started after closure is kept only when the pulls API proves
+//!   its exact head is the latest closed pull request's head; absent or
+//!   invalid attempt metadata grants no exemption, including listed workflows;
 //! * the pulls API is read with `compare_auth` when configured (tokens carry
 //!   `contents: read` and `pull_requests: read`), else with the janitor's own
 //!   token; a refused read is counted once per pass and keeps every run;
@@ -187,11 +190,17 @@ struct Run {
     display_title: String,
     #[serde(default)]
     created_at: String,
+    #[serde(default)]
+    run_attempt: u64,
+    #[serde(default)]
+    run_started_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RepoRef {
-    full_name: String,
+    // Embedded PR heads can carry only id/name/url. Missing identity is not proof.
+    #[serde(default)]
+    full_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,6 +218,8 @@ struct Pull {
 #[derive(Debug, Deserialize)]
 struct PullHead {
     sha: String,
+    #[serde(default)]
+    repo: Option<RepoRef>,
 }
 
 /// A pull request as `GET /pulls?head=owner:branch&state=all` lists it.
@@ -259,6 +270,33 @@ fn branch_verdict(run_head: &str, created_at: Option<i64>, pulls: &[PullByHead])
             closed_at: newest.closed_at.clone().unwrap_or_default(),
         },
         _ => BranchVerdict::Keep,
+    }
+}
+
+fn post_close_rerun(repo: &str, run: &Run, pulls: &[PullByHead]) -> bool {
+    let Some(newest) = pulls.first() else {
+        return false;
+    };
+    if run.run_attempt <= 1
+        || newest.state != "closed"
+        || newest.head.sha != run.head_sha
+        || !newest
+            .head
+            .repo
+            .as_ref()
+            .and_then(|head| head.full_name.as_deref())
+            .is_some_and(|name| name.eq_ignore_ascii_case(repo))
+        || pulls.iter().any(|p| p.state == "open")
+    {
+        return false;
+    }
+    match (
+        unix(&run.created_at),
+        run.run_started_at.as_deref().and_then(unix),
+        newest.closed_at.as_deref().and_then(unix),
+    ) {
+        (Some(created), Some(started), Some(closed)) => created <= closed && closed < started,
+        _ => false,
     }
 }
 
@@ -496,6 +534,14 @@ impl Janitor {
                 // A fork's run never names a pull request either; forks are
                 // left alone.
                 [] if self.same_repository(repo, run) => {
+                    if run.run_attempt > 1
+                        && let Some(branch) = run.head_branch.as_deref()
+                        && let Some(pulls) =
+                            self.branch_pulls(repo, branch, &mut branches, report).await
+                        && post_close_rerun(repo, run, &pulls)
+                    {
+                        continue;
+                    }
                     if self.closed_pr_workflow(run) {
                         report.considered += 1;
                         report.closed_pr += 1;
@@ -628,7 +674,8 @@ impl Janitor {
     fn same_repository(&self, repo: &str, run: &Run) -> bool {
         run.head_repository
             .as_ref()
-            .is_some_and(|r| r.full_name.eq_ignore_ascii_case(repo))
+            .and_then(|r| r.full_name.as_deref())
+            .is_some_and(|name| name.eq_ignore_ascii_case(repo))
     }
 
     /// Whether `run` is a run of a `closed_pr_workflows` entry.
@@ -748,6 +795,8 @@ impl Janitor {
         if fresh.status != run.status
             || fresh.head_sha != run.head_sha
             || fresh.pull_requests.len() != run.pull_requests.len()
+            || fresh.run_attempt != run.run_attempt
+            || fresh.run_started_at != run.run_started_at
         {
             return Ok(Outcome::Raced);
         }
@@ -932,6 +981,8 @@ mod tests {
                 .collect(),
             display_title: String::new(),
             created_at: String::new(),
+            run_attempt: 0,
+            run_started_at: None,
         }
     }
 
