@@ -30,6 +30,7 @@ pub mod hostdiag;
 pub mod janitor;
 pub mod lead;
 pub mod mirror_auth;
+pub mod placement;
 pub mod preempt;
 pub mod probe;
 pub mod profile;

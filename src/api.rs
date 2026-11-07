@@ -1079,6 +1079,9 @@ pub struct Status {
     /// The burst enrollment circuit breaker; absent unless burst is
     /// configured and not dry-run. Read at request time.
     burst_breaker: Option<crate::control::BreakerView>,
+    /// Cost-aware placement (owned hosts before burst): where grants went
+    /// and, in dry-run, where they would have gone.
+    pub placement: crate::placement::PlacementView,
     pub rollout: RolloutStatus,
     pub warm_floors: Vec<crate::allocator::WarmFloor>,
     pub pressure: Vec<ClassPressure>,
@@ -1487,6 +1490,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         burst: snap.burst,
         burst_control,
         burst_breaker,
+        placement: snap.placement,
         rollout,
         warm_floors: snap.warm_floors,
         pressure: snap.pressure,

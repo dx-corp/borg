@@ -24,6 +24,7 @@ mod janitor;
 mod janitor_postmerge_reruns;
 mod job_user;
 mod placement_batch;
+mod placement_cost;
 mod queen;
 mod requeue;
 mod rollout;

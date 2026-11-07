@@ -91,6 +91,28 @@ pub struct DroneState {
     /// is `None`.
     #[serde(default)]
     pub(crate) cpu_load_pm: Option<u16>,
+    /// What a slot-hour on this host costs the fleet (permille; 1000 = owned
+    /// hardware, whose marginal cost is nothing). The queen sets it, not the
+    /// drone: paid cloud drones get `placement.burst_cost_permille`, so work
+    /// goes to idle owned hosts first. See [`cost_term`].
+    #[serde(default = "owned_cost")]
+    pub(crate) cost_permille: u32,
+}
+
+/// The cost of an owned host, permille.
+pub(crate) const OWNED_COST_PERMILLE: u32 = 1000;
+
+fn owned_cost() -> u32 {
+    OWNED_COST_PERMILLE
+}
+
+/// The placement term for what the host costs: `-cost * (cost_permille -
+/// 1000)`, so an owned host adds nothing and a paid one subtracts in
+/// proportion to its price. A drone's self-reported `estimated_cost` (in its
+/// bid) is a separate term; this one is the queen's.
+fn cost_term(drone: &DroneState, w: &ScoreWeights) -> i64 {
+    let excess = i64::from(drone.cost_permille.min(100_000)) - i64::from(OWNED_COST_PERMILLE);
+    -w.cost.saturating_mul(excess)
 }
 
 /// CPU pressure (permille) estimated from the 1-minute load average per CPU
@@ -209,6 +231,7 @@ impl DroneState {
             cpu_psi_pm: None,
             cpu_load_pm: None,
             trust: Trust::Shared,
+            cost_permille: OWNED_COST_PERMILLE,
         }
     }
 }
@@ -405,6 +428,10 @@ pub struct Candidate {
     /// medium and heavy work. See [`host_term`].
     #[serde(default)]
     pub(crate) host_score: i64,
+    /// What the host costs: 0 for owned hardware, negative for a paid cloud
+    /// drone. See [`cost_term`].
+    #[serde(default)]
+    cost_score: i64,
     pub score: Option<i64>,
 }
 
@@ -519,6 +546,7 @@ struct BidEvaluation {
     bid_score: i64,
     profile_score: i64,
     host_score: i64,
+    cost_score: i64,
     rejection_reasons: Vec<Rejection>,
     score: Option<i64>,
 }
@@ -538,6 +566,7 @@ impl Free<'_> {
             .find(|p| p.class == class)
             .map_or(0, |p| profile_term(p, weights));
         let host_score = host_term(self.drone, self.vcpu, class, weights);
+        let cost_score = cost_term(self.drone, weights);
         let bid = self
             .drone
             .bids
@@ -565,10 +594,12 @@ impl Free<'_> {
             bid_score,
             profile_score,
             host_score,
+            cost_score,
             score: rejection_reasons.is_empty().then_some(
                 bid_score
                     .saturating_add(profile_score)
-                    .saturating_add(host_score),
+                    .saturating_add(host_score)
+                    .saturating_add(cost_score),
             ),
             rejection_reasons,
         }
@@ -691,6 +722,7 @@ impl Free<'_> {
             bid_score: evaluated.bid_score,
             profile_score: evaluated.profile_score,
             host_score: evaluated.host_score,
+            cost_score: evaluated.cost_score,
         }
     }
 
@@ -1188,6 +1220,7 @@ mod tests {
             cpu_psi_pm: None,
             cpu_load_pm: None,
             trust: Trust::Shared,
+            cost_permille: OWNED_COST_PERMILLE,
         }
     }
 
@@ -2176,6 +2209,7 @@ mod tests {
                 cpu_psi_pm: None,
                 cpu_load_pm: None,
                 trust: Trust::Shared,
+                cost_permille: OWNED_COST_PERMILLE,
             },
             DroneState {
                 id: "c".into(),
@@ -2190,6 +2224,7 @@ mod tests {
                 cpu_psi_pm: None,
                 cpu_load_pm: None,
                 trust: Trust::Shared,
+                cost_permille: OWNED_COST_PERMILLE,
             },
         ];
         for lm in 0..3 {
@@ -2461,6 +2496,97 @@ mod tests {
         // a: 3*100 = 300; b: 1000 from the profile.
         assert_eq!(only_drone(&allocate(&i)), "b");
         assert_eq!(allocate(&i), allocate(&i));
+    }
+
+    /// A big, fast, idle cloud drone, as the 52 vCPU burst VMs look on 11/07.
+    fn burst(id: &str, class: Class, cost: u32) -> DroneState {
+        DroneState {
+            vcpu: 52,
+            mem_mib: 100 * 1024,
+            cost_permille: cost,
+            ..profiled(id, class, 1600, 1000, 1000)
+        }
+    }
+
+    #[test]
+    fn without_a_cost_a_faster_burst_drone_takes_work_from_an_idle_owned_host() {
+        // The behaviour seen live on 11/07: no drone bids, so nothing prices
+        // the burst drone and its learned speed wins every grant.
+        for class in Class::ALL {
+            let i = input(
+                &[(class, Scope::Main, 1)],
+                vec![
+                    profiled("build-heavy-1", class, 730, 1000, 1000),
+                    burst("gcp-burst-a", class, OWNED_COST_PERMILLE),
+                ],
+            );
+            assert_eq!(only_drone(&allocate(&i)), "gcp-burst-a", "{class}");
+        }
+    }
+
+    #[test]
+    fn a_costed_burst_drone_gets_only_what_owned_hosts_have_no_room_for() {
+        for class in Class::ALL {
+            let owned = profiled("build-heavy-1", class, 500, 1000, 1000);
+            let slots = max_slots(&owned, Classes::default().spec(class));
+            let i = input(
+                &[(class, Scope::Main, slots + 2)],
+                vec![owned, burst("gcp-burst-a", class, 5000)],
+            );
+            let a = allocate(&i);
+            let on = |d: &str| a.grants.iter().filter(|g| g.drone_id == d).count();
+            assert_eq!(on("build-heavy-1"), slots as usize, "{class}");
+            assert_eq!(on("gcp-burst-a"), 2, "{class}");
+            // The owned host's grants come first.
+            assert!(
+                a.grants[..slots as usize]
+                    .iter()
+                    .all(|g| g.drone_id == "build-heavy-1"),
+                "{class}"
+            );
+            let d = &a.decisions[0];
+            let c = |id: &str| d.candidates.iter().find(|c| c.drone_id == id).unwrap();
+            assert_eq!(c("build-heavy-1").cost_score, 0);
+            assert_eq!(c("gcp-burst-a").cost_score, -4000);
+        }
+    }
+
+    #[test]
+    fn cost_never_overrides_eligibility() {
+        // A draining owned host, or one the trust or admission rules exclude,
+        // still declines: the cost only reorders eligible drones.
+        let draining = DroneState {
+            accepting: false,
+            ..host("owned")
+        };
+        let i = input(
+            &[(Class::Light, Scope::Pr, 1)],
+            vec![draining, burst("gcp-burst-a", Class::Light, 5000)],
+        );
+        assert_eq!(only_drone(&allocate(&i)), "gcp-burst-a");
+        let deploy_only = DroneState {
+            trust: Trust::DeployOnly,
+            ..host("owned")
+        };
+        let i = input(
+            &[(Class::Light, Scope::Pr, 1)],
+            vec![deploy_only, burst("gcp-burst-a", Class::Light, 5000)],
+        );
+        assert_eq!(only_drone(&allocate(&i)), "gcp-burst-a");
+    }
+
+    #[test]
+    fn cost_term_is_zero_for_owned_and_clamped_for_hostile_values() {
+        let w = ScoreWeights::default();
+        assert_eq!(cost_term(&host("a"), &w), 0);
+        let priced = |cost| DroneState {
+            cost_permille: cost,
+            ..host("a")
+        };
+        assert_eq!(cost_term(&priced(5000), &w), -4000);
+        assert_eq!(cost_term(&priced(u32::MAX), &w), -99_000);
+        // Cheaper than owned is not offered by the config, but scores higher.
+        assert_eq!(cost_term(&priced(0), &w), 1000);
     }
 
     fn deploy_host(id: &str) -> DroneState {

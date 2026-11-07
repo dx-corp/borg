@@ -112,6 +112,9 @@ pub struct Snapshot {
     pub(crate) starved: BTreeSet<Class>,
     /// The burst rule after the last pass; `None` when burst is off.
     pub(super) burst: Option<BurstView>,
+    /// Cost-aware placement: running totals of where grants went and, in
+    /// dry-run, where they would have gone.
+    pub placement: crate::placement::PlacementView,
 }
 
 /// The burst rule's memory and the fleet it made (simulated in dry-run,
@@ -857,6 +860,10 @@ impl Queen {
                     .filter(|p| p.drone == d.name)
                     .map(ClassProfile::score)
                     .collect();
+                if !self.cfg.placement.dry_run {
+                    state.cost_permille =
+                        self.cfg.placement.cost_for(&self.cfg.drone_expiry, &d.name);
+                }
                 drones.push(state);
                 capacities.insert(d.name.clone(), cap.clone());
                 if d.trust.serves_deploy() {
@@ -954,6 +961,16 @@ impl Queen {
             spend_bids(&mut runner_input.drones, &spent_bids);
         }
         let mut allocation = allocate_reserved(&runner_input, &unit_reserved);
+        // Dry-run: the same pure pass with paid drones costed, for comparison
+        // only. Its grants are never minted.
+        let would_grants = self.cfg.placement.dry_run.then(|| {
+            let mut costed = runner_input.clone();
+            for d in &mut costed.drones {
+                d.cost_permille = self.cfg.placement.cost_for(&self.cfg.drone_expiry, &d.id);
+            }
+            allocate_reserved(&costed, &unit_reserved).grants
+        });
+        let runner_grants = allocation.grants.clone();
         if let Some(f) = &self.cfg.pr_fairness {
             let mut w = self.watch.lock().expect("fleet watch lock");
             advance_pr_turns(
@@ -1233,6 +1250,12 @@ impl Queen {
             s.starved_since = starved_since;
             s.starved = starved;
             s.burst = burst;
+            s.placement.dry_run = self.cfg.placement.dry_run;
+            s.placement.burst_cost_permille = self.cfg.placement.burst_cost_permille;
+            s.placement
+                .record(now_ts, &runner_grants, would_grants.as_deref(), |d| {
+                    self.cfg.drone_expiry.is_burst(d)
+                });
         });
         if let Err(e) = self
             .store

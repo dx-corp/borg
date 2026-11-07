@@ -19,6 +19,7 @@ Configuration, scheduling, drone administration, and protocol details for
   - [Build-box reclaim](#build-box-reclaim)
   - [Quorum rollout](#quorum-rollout)
   - [Learned profiles](#learned-profiles)
+  - [Owned hosts before burst](#owned-hosts-before-burst)
   - [Warm-floor controller](#warm-floor-controller)
   - [Host health](#host-health)
   - [Tailnet enrollment](#tailnet-enrollment)
@@ -665,6 +666,29 @@ drones that are fast and idle first. A host that is historically slow (speed
 gets work only when nothing better has room, and above the admission
 thresholds it gets none. Light work keeps packing onto the tightest fit.
 `/explain` shows each candidate's `host` term next to `bid` and `profile`.
+
+### Owned hosts before burst
+
+Paid burst drones (names matching `drone_expiry.burst_prefixes`) carry a cost
+term: `-(burst_cost_permille - 1000)`, 0 for owned hosts. Drones send no bids
+today, so without it a burst VM's larger, faster profile wins every grant, the
+VM is never idle long enough to drain, and owned hosts sit empty. The default
+`burst_cost_permille` of 5000 (a 4000-point penalty) outweighs the speed and
+idle terms, so a burst drone only gets work no owned host has room or admission
+for. The cost reorders eligible drones only: trust, admission, environment,
+owner caps and bid thresholds still decide who may take a lease.
+
+```json
+"placement": {"dry_run": true, "burst_cost_permille": 5000}
+```
+
+`dry_run` is the default. Placement is unchanged, and each pass the queen also
+runs the allocator with the cost applied and reports in `/status` `placement`:
+`grants` and `burst_grants` (what it did), `would_grants` and
+`would_burst_grants` (what the costed pass would have done), `moved` (actual
+grants the costed pass would have placed on another drone or not at all) and
+the newest `recent` moves. Set `dry_run: false` once the comparison looks
+right; `/explain` then shows each candidate's `cost_score`.
 
 ### Warm-floor controller
 
