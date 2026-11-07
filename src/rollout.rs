@@ -51,7 +51,7 @@ pub struct RolloutSettings {
     /// With no `rollout_target_version`, roll the drones out to the build the
     /// queen itself runs, so a queen self-update carries the fleet with it
     /// through the same gate. The previous version is then the one the fleet
-    /// was on when that rollout started (see [`previous_for`]).
+    /// was on when that rollout started.
     pub follow_queen: bool,
     /// OSes that each need a canary host, as reported by the drone probe.
     pub canary_oses: Vec<String>,

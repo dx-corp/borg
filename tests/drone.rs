@@ -353,17 +353,29 @@ async fn shutdown_stops_taking_leases_and_lets_the_running_job_finish() {
         let _ = stop_rx.await;
     }));
 
-    // Wait for the first heartbeat to register, then give the queen a job.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait on conditions, not wall time: under load the first heartbeat and
+    // the lease start can each take seconds. A queen tick before the drone
+    // registered its capacity grants nothing, so wait for that first.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while rig
+        .h
+        .queen
+        .store()
+        .drones()
+        .await
+        .unwrap()
+        .iter()
+        .all(|d| d.capacity.is_none())
+    {
+        assert!(tokio::time::Instant::now() < deadline, "drone registered");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     rig.h.queue_job(1, "borg-ci-light", 1);
     rig.h.tick().await;
-    for _ in 0..50 {
-        if rig.path("out/started").exists() {
-            break;
-        }
+    while !rig.path("out/started").exists() {
+        assert!(tokio::time::Instant::now() < deadline, "lease started");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(rig.path("out/started").exists(), "lease started");
     assert!(
         !rig.path("work/stale-lease").exists(),
         "startup sweep removed stale lease dirs"
