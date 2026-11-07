@@ -175,6 +175,7 @@ impl Rig {
             host_arch: "x86_64",
             runner_dir: None,
             runner_owner: None,
+            config_check: None,
         }
     }
 
@@ -637,4 +638,78 @@ async fn manifests_are_fetched_over_http_only_when_allowed() {
         manifest::fetch(&format!("{base}/borg"), false).await,
         Err(ManifestError::Insecure(_))
     ));
+}
+
+/// Answers `<bin> config check <path>` with a fixed verdict and records it.
+struct ConfigCheck {
+    passes: bool,
+    calls: Mutex<Vec<String>>,
+}
+impl Exec for ConfigCheck {
+    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        assert_eq!(
+            &args[..2],
+            ["config", "check"],
+            "unexpected command {program}"
+        );
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("{program} {}", args.join(" ")));
+        Ok(Output {
+            success: self.passes,
+            stdout: if self.passes {
+                String::new()
+            } else {
+                "unknown field `nope`".into()
+            },
+        })
+    }
+}
+
+#[tokio::test]
+async fn the_new_binary_must_accept_the_service_config_before_anything_is_drained() {
+    let (base, _) = serve().await;
+    let rig = Rig::new();
+    let config = rig.dir.path().join("queen.json");
+    let m = manifest(&base, "0.5.0", &sha(NEW_BINARY), None);
+    let health = FakeHealth {
+        healthy_for: Some("0.5.0".into()),
+    };
+    let opts = Options {
+        config_check: Some(&config),
+        ..rig.options("0.4.0")
+    };
+
+    let reject = ConfigCheck {
+        passes: false,
+        calls: Mutex::default(),
+    };
+    let err = borg::update::run(&opts, &m, &rig.service(), &health, &reject)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, UpdateError::ConfigCheck(ref r) if r.contains("unknown field")),
+        "{err}"
+    );
+    // The check ran the downloaded binary, and nothing was stopped or swapped.
+    let calls = reject.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].ends_with(&format!("config check {}", config.display())),
+        "{calls:?}"
+    );
+    assert!(rig.events().is_empty(), "{:?}", rig.events());
+    assert_eq!(fs::read_to_string(&rig.bin).unwrap(), "v1\n");
+    assert!(rig.leftovers().is_empty(), "{:?}", rig.leftovers());
+
+    let accept = ConfigCheck {
+        passes: true,
+        calls: Mutex::default(),
+    };
+    let out = borg::update::run(&opts, &m, &rig.service(), &health, &accept)
+        .await
+        .unwrap();
+    assert!(matches!(out, Outcome::Updated { .. }), "{out:?}");
+    assert_eq!(fs::read(&rig.bin).unwrap(), NEW_BINARY);
 }

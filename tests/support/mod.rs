@@ -748,7 +748,15 @@ impl Harness {
                 .unwrap()
             });
         let wakes = Arc::new(RecordingWake::default());
-        let mut queen = Queen::new(cfg, store, github).with_wake_sender(wakes.clone());
+        // Started a little in the past so a heartbeat in the same second counts.
+        let started_at = OffsetDateTime::now_utc().unix_timestamp() - 1;
+        let build =
+            tokio::task::spawn_blocking(move || borg::queen::QueenBuild::current(started_at))
+                .await
+                .unwrap();
+        let mut queen = Queen::new(cfg, store, github)
+            .with_wake_sender(wakes.clone())
+            .with_build(build);
         if let Some(j) = janitor {
             queen = queen.with_janitor(j);
         }

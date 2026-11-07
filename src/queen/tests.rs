@@ -183,3 +183,99 @@ fn only_leases_with_an_in_progress_job_on_their_runner_are_preemptible() {
     assert_eq!(others.len(), 2);
     assert_eq!(jobs["l1"], ("example-org/app", 77, 5));
 }
+
+#[test]
+fn the_queued_family_picks_the_owned_host_that_runs_it_fastest() {
+    use crate::allocator::{Demand, PrTurn, allocate};
+    use crate::bid::ScoreWeights;
+    use crate::profile::FamilyStat;
+
+    // Live 11/07 medians (secs) against the fleet median.
+    let profile = |drone: &str, speed: u32, families: &[(&str, u64, u64)]| ClassProfile {
+        drone: drone.into(),
+        class: Class::Medium,
+        jobs: 500,
+        speed_permille: speed,
+        speed_confidence_permille: 1000,
+        reliability_permille: 1000,
+        families: families
+            .iter()
+            .map(|&(family, median_secs, fleet_median_secs)| FamilyStat {
+                family: family.into(),
+                jobs: 20,
+                median_secs,
+                fleet_median_secs,
+            })
+            .collect(),
+    };
+    let profiles = vec![
+        profile(
+            "build-medium-1",
+            633,
+            &[("platform-ui-quality", 1779, 1288), ("live-gate", 368, 402)],
+        ),
+        profile(
+            "wsl-desktop",
+            748,
+            &[("platform-ui-quality", 1121, 1288), ("live-gate", 500, 402)],
+        ),
+    ];
+    let host = |id: &str| DroneState {
+        id: id.into(),
+        vcpu: 8,
+        mem_mib: 16 * 1024,
+        docker: true,
+        accepting: true,
+        max_leases: None,
+        bids: vec![],
+        profiles: vec![],
+        blocked_classes: vec![],
+        trust: crate::classes::Trust::Shared,
+        cpu_psi_pm: None,
+        cpu_load_pm: None,
+        cost_permille: crate::allocator::OWNED_COST_PERMILLE,
+    };
+    let winner = |queued: &[(&str, u32)], family_aware: bool| {
+        let mut by_key = BTreeMap::new();
+        by_key.insert(
+            (Class::Medium, Scope::Pr),
+            queued
+                .iter()
+                .map(|&(f, n)| (f.to_owned(), n))
+                .collect::<QueuedFamilies>(),
+        );
+        let families = families_by_class(&by_key);
+        let drones = ["build-medium-1", "wsl-desktop"]
+            .into_iter()
+            .map(|id| DroneState {
+                profiles: placement_profiles(&profiles, id, &families, family_aware),
+                ..host(id)
+            })
+            .collect();
+        let a = allocate(&AllocatorInput {
+            classes: crate::classes::Classes::default(),
+            demand: vec![Demand {
+                class: Class::Medium,
+                scope: Scope::Pr,
+                count: 1,
+            }],
+            drones,
+            leases: vec![],
+            warm_floors: vec![],
+            queue_ages: vec![],
+            starvation_after_secs: None,
+            weights: ScoreWeights::default(),
+            admission: None,
+            pr_turn: PrTurn::default(),
+        });
+        a.grants[0].drone_id.clone()
+    };
+    // The class profile alone always prefers wsl-desktop (748 > 633).
+    assert_eq!(winner(&[("live-gate", 2)], false), "wsl-desktop");
+    // live-gate runs faster on build-medium-1 (1092) than on wsl (804).
+    assert_eq!(winner(&[("live-gate", 2)], true), "build-medium-1");
+    // platform-ui-quality runs faster on wsl (1148 against 724).
+    assert_eq!(winner(&[("platform-ui-quality", 2)], true), "wsl-desktop");
+    // An unseen family falls back to the class profiles.
+    assert_eq!(winner(&[("brand-new", 2)], true), "wsl-desktop");
+}

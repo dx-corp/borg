@@ -23,7 +23,7 @@ use crate::update::{Request, UpdateResult, request_path, result_path};
 /// `borg_drone_info`) cannot tell a drone that missed a roll from one that
 /// got it; internal-runner-burst-01 ran the 2026-10-22 build for ten days
 /// unnoticed. Build metadata never affects version comparison.
-fn build_version(package: &str, binary: &[u8]) -> String {
+pub(crate) fn build_version(package: &str, binary: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = hex::encode(Sha256::digest(binary));
     format!("{package}+{}", &digest[..12])

@@ -94,6 +94,7 @@ impl WorkflowJob {
         Ok(Some(QueuedJob {
             id: self.id,
             repo: repo.to_owned(),
+            name: self.name.clone(),
             labels: self.labels.clone().ok_or_else(|| {
                 GithubError::Decode(format!("job {} missing queued labels", self.id))
             })?,
@@ -180,6 +181,9 @@ impl GithubError {
 pub struct QueuedJob {
     pub id: u64,
     pub repo: String,
+    /// The job's display name; its family steers placement (see
+    /// [`crate::profile::family_of`]).
+    pub(crate) name: String,
     pub labels: Vec<String>,
     pub created_at: OffsetDateTime,
 }

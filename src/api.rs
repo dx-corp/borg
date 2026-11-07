@@ -1079,6 +1079,9 @@ pub struct Status {
     /// The burst enrollment circuit breaker; absent unless burst is
     /// configured and not dry-run. Read at request time.
     burst_breaker: Option<crate::control::BreakerView>,
+    /// What this queen runs: version (binary digest), build commit and start
+    /// time. Absent for a queen built without [`crate::queen::QueenBuild`].
+    queen: Option<crate::queen::QueenBuild>,
     /// Cost-aware placement (owned hosts before burst): where grants went
     /// and, in dry-run, where they would have gone.
     pub placement: crate::placement::PlacementView,
@@ -1490,6 +1493,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         burst: snap.burst,
         burst_control,
         burst_breaker,
+        queen: queen.build().cloned(),
         placement: snap.placement,
         rollout,
         warm_floors: snap.warm_floors,

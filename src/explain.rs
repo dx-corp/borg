@@ -89,13 +89,16 @@ pub fn render_text(report: &Explanation) -> String {
         let d = &row.decision;
         let _ = writeln!(
             out,
-            "{} {} at {}: {:?}, selected {} (grant order {})",
+            "{} {} at {}: {:?}, selected {} (grant order {}){}",
             row.kind.as_str(),
             row.key,
             row.at,
             row.outcome,
             d.winner.as_deref().unwrap_or("none"),
-            d.grant_order
+            d.grant_order,
+            d.reason
+                .map(|r| format!(", reason {r:?}"))
+                .unwrap_or_default()
         );
         let _ = writeln!(
             out,
@@ -109,7 +112,7 @@ pub fn render_text(report: &Explanation) -> String {
         for host in &d.candidates {
             let _ = writeln!(
                 out,
-                "  {}: {} / {} MiB, {} / {} vCPU free; lease slots {:?}; score {:?} (bid {}, profile {}, host {}); {:?}; reservation {:?}",
+                "  {}: {} / {} MiB, {} / {} vCPU free; lease slots {:?}; score {:?} (bid {}, profile {}, host {}, cost {}); {:?}; reservation {:?}",
                 host.drone_id,
                 host.room.mem_mib,
                 host.budget.mem_mib,
@@ -120,6 +123,7 @@ pub fn render_text(report: &Explanation) -> String {
                 host.bid_score,
                 host.profile_score,
                 host.host_score,
+                host.cost_score,
                 host.rejection_reasons,
                 host.reserved_for
             );

@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde::Serialize;
 
-use crate::allocator::Grant;
+use crate::allocator::{Grant, PlacementDecision, PlacementReason};
 use crate::classes::{Class, Scope};
 
 /// Moves kept for `/status`.
@@ -32,6 +32,18 @@ struct GrantMove {
     actual: Option<String>,
     /// Where it would have gone; `None` when it would not have been made.
     would: Option<String>,
+}
+
+/// One allocator decision as `/status` shows it: where a runner went and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Placed {
+    at: i64,
+    class: Class,
+    scope: Scope,
+    /// `None`: no drone was eligible (see `/explain` for each rejection).
+    drone: Option<String>,
+    reason: Option<PlacementReason>,
+    score: Option<i64>,
 }
 
 /// Running totals since the queen started.
@@ -56,6 +68,8 @@ pub struct PlacementView {
     moved: u64,
     /// The newest moves.
     recent: VecDeque<GrantMove>,
+    /// The newest allocator decisions, with the chosen drone and reason.
+    placed: VecDeque<Placed>,
 }
 
 type Drones<'a> = BTreeMap<(Class, Scope), Vec<&'a str>>;
@@ -118,6 +132,29 @@ fn moves(at: i64, actual: &[Grant], would: &[Grant]) -> Vec<GrantMove> {
 }
 
 impl PlacementView {
+    /// Keep the newest of this pass's decisions.
+    pub(crate) fn record_decisions(&mut self, at: i64, decisions: &[PlacementDecision]) {
+        for d in decisions {
+            if self.placed.len() == RECENT_MOVES {
+                self.placed.pop_front();
+            }
+            let score = d.winner.as_deref().and_then(|w| {
+                d.candidates
+                    .iter()
+                    .find(|c| c.drone_id == w)
+                    .and_then(|c| c.score)
+            });
+            self.placed.push_back(Placed {
+                at,
+                class: d.class,
+                scope: d.scope,
+                drone: d.winner.clone(),
+                reason: d.reason,
+                score,
+            });
+        }
+    }
+
     /// Count one pass. `would` is the cost-aware grant set in dry-run, `None`
     /// live.
     pub(crate) fn record(

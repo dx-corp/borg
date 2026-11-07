@@ -148,6 +148,19 @@ pull-request runner (it carries the bare label) may absorb main demand, but
 deploy demand is absorbed only by pending deploy runners, and a pending deploy
 runner absorbs nothing else.
 
+### Running build and health file
+
+`/status` `queen` names what the queen runs: `version` (`0.1.0+` and the first
+12 hex digits of the binary's SHA-256, the scheme drones report and release
+manifests pin), `build_sha` (the git commit, when the build set
+`BORG_BUILD_SHA`) and `started_at`. Build releases with
+`BORG_BUILD_SHA=$(git rev-parse HEAD) CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release -p borg --target x86_64-unknown-linux-musl`.
+
+With `health_file` set, the queen writes the updater's health record (see
+[Updating a drone](#updating-a-drone)) after each successful pass, but only
+once a drone has heartbeated to this process, so a queen that ticks while no
+drone reaches it does not count as healthy.
+
 ### Leader lease
 
 The fenced leader lease for running several queens (`src/lead.rs`) exists as a
@@ -689,6 +702,22 @@ runs the allocator with the cost applied and reports in `/status` `placement`:
 grants the costed pass would have placed on another drone or not at all) and
 the newest `recent` moves. Set `dry_run: false` once the comparison looks
 right; `/explain` then shows each candidate's `cost_score`.
+
+The same switch makes the profile term follow the queue. GitHub, not borg,
+picks which queued job a fresh runner takes, so a runner is minted for the
+jobs queued under its class. With `dry_run: false` each drone's profile counts
+every queued job at that drone's speed for the job's family (its median
+against the fleet median), and at the drone's class speed when it has fewer
+than `profiles.min_samples` runs of that family. A family therefore goes to the
+drone that runs it fastest, and new or rare families fall back to the class
+profile. `/status` `queue[].families` lists the most-queued families per label.
+
+Every allocator decision records a `reason`: the term that separated the
+winner from the best other eligible drone (`cost`, `profile`, `host` or
+`bid`), or `only_eligible`, `tightest_fit` or `name` when nothing else did.
+`/explain` shows it with each candidate's terms, and `/status`
+`placement.placed` lists the newest decisions with their drone, reason and
+score.
 
 ### Warm-floor controller
 
@@ -1814,6 +1843,13 @@ document (`schema`, `version`, per-platform `url` and `sha256` for
 actions-runner). `https://` is required unless the config sets `allow_insecure`.
 There are no signatures: the trust anchor is HTTPS to the configured manifest
 URL plus the pinned digests.
+
+The installed version is the build version of the binary at `bin`
+(`0.1.0+` and its first 12 SHA-256 hex digits), so a manifest naming the same
+build is up to date and a periodic `borg update` changes nothing. With
+`config_check` set (the queen's `/etc/borg/queen.json`), the downloaded binary
+must pass `borg config check` on that file before the service is stopped; a
+rejection leaves everything as it was.
 
 ```text
 borg update --check          # what would change

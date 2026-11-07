@@ -509,6 +509,11 @@ pub struct QueenConfig {
     /// Cost-aware placement: owned hosts before paid cloud drones.
     #[serde(default)]
     pub(crate) placement: PlacementSettings,
+    /// Written after each successful pass once a drone has heartbeated to
+    /// this process; `borg update` waits for it after a swap and rolls back
+    /// without it. Absent: not written.
+    #[serde(default)]
+    pub(crate) health_file: Option<PathBuf>,
     /// Host-health thresholds, decay and cooldown; see [`crate::health`].
     #[serde(default)]
     pub health: HealthSettings,

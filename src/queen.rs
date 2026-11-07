@@ -46,7 +46,7 @@ use crate::janitor::Janitor;
 use crate::mirror_auth::MirrorAuth;
 use crate::preempt::{PreemptInput, Running, select as select_victims};
 use crate::probe::Capacity;
-use crate::profile::{ClassProfile, build_profiles};
+use crate::profile::{ClassProfile, QueuedFamilies, build_profiles, family_of};
 use crate::requeue::Requeuer;
 use crate::rollout::{
     Check as RolloutCheck, DroneView, Observed as RolloutObserved, RolloutState, advance,
@@ -283,7 +283,13 @@ pub struct QueueEntry {
     pub scope: Scope,
     pub queued: u32,
     pub oldest_age_secs: u64,
+    /// The most-queued job families under this label, largest first (at most
+    /// [`QUEUE_FAMILIES_SHOWN`]); they steer placement.
+    families: Vec<(String, u32)>,
 }
+
+/// Families listed per queue entry in `/status`.
+const QUEUE_FAMILIES_SHOWN: usize = 10;
 
 #[derive(Default)]
 struct UnitPlacement {
@@ -317,6 +323,7 @@ fn spend_bids(drones: &mut [DroneState], granted: &[ActiveLease]) {
 
 pub struct Queen {
     pub(crate) cfg: QueenConfig,
+    build: Option<QueenBuild>,
     pub(crate) store: Store,
     github: GithubClient,
     snapshot: RwLock<Snapshot>,
@@ -531,6 +538,7 @@ impl Queen {
     pub fn new(cfg: QueenConfig, store: Store, github: GithubClient) -> Self {
         Self {
             cfg,
+            build: None,
             store,
             github,
             snapshot: RwLock::new(Snapshot::default()),
@@ -797,7 +805,7 @@ impl Queen {
                 observed.push((repo.as_str(), job));
             }
         }
-        let (queue, demand, queue_ages) = self.summarize(&jobs, now);
+        let (queue, demand, queue_ages, queued_families) = self.summarize(&jobs, now);
 
         if let Err(e) = self.assess_health(now_ts).await {
             tracing::warn!("health assessment failed: {e}");
@@ -855,11 +863,12 @@ impl Queen {
                     state.cpu_load_pm =
                         crate::allocator::load_pressure_pm(f.load_per_cpu_pm, f.cpu_busy_pm);
                 }
-                state.profiles = profiles
-                    .iter()
-                    .filter(|p| p.drone == d.name)
-                    .map(ClassProfile::score)
-                    .collect();
+                state.profiles = placement_profiles(
+                    &profiles,
+                    &d.name,
+                    &queued_families,
+                    !self.cfg.placement.dry_run,
+                );
                 if !self.cfg.placement.dry_run {
                     state.cost_permille =
                         self.cfg.placement.cost_for(&self.cfg.drone_expiry, &d.name);
@@ -967,6 +976,7 @@ impl Queen {
             let mut costed = runner_input.clone();
             for d in &mut costed.drones {
                 d.cost_permille = self.cfg.placement.cost_for(&self.cfg.drone_expiry, &d.id);
+                d.profiles = placement_profiles(&profiles, &d.id, &queued_families, true);
             }
             allocate_reserved(&costed, &unit_reserved).grants
         });
@@ -1256,6 +1266,7 @@ impl Queen {
                 .record(now_ts, &runner_grants, would_grants.as_deref(), |d| {
                     self.cfg.drone_expiry.is_burst(d)
                 });
+            s.placement.record_decisions(now_ts, &allocation.decisions);
         });
         if let Err(e) = self
             .store
@@ -1290,6 +1301,7 @@ impl Queen {
             Ok(Err(e)) => tracing::warn!("GitHub job telemetry collection failed: {e}"),
             Err(_) => tracing::warn!("GitHub job telemetry collection exceeded its deadline"),
         }
+        self.write_health(&drone_rows, now_ts).await;
         Ok(())
     }
 
@@ -2242,8 +2254,14 @@ impl Queen {
         &self,
         jobs: &[QueuedJob],
         now: OffsetDateTime,
-    ) -> (Vec<QueueEntry>, Vec<Demand>, Vec<QueueAge>) {
+    ) -> (
+        Vec<QueueEntry>,
+        Vec<Demand>,
+        Vec<QueueAge>,
+        BTreeMap<Class, QueuedFamilies>,
+    ) {
         let mut by: BTreeMap<(Class, Scope), (u32, u64)> = BTreeMap::new();
+        let mut families: BTreeMap<(Class, Scope), QueuedFamilies> = BTreeMap::new();
         for job in jobs {
             let Some((class, scope)) = job
                 .labels
@@ -2255,6 +2273,11 @@ impl Queen {
             let e = by.entry((class, scope)).or_default();
             e.0 += 1;
             e.1 = e.1.max(age_secs(now, job.created_at));
+            *families
+                .entry((class, scope))
+                .or_default()
+                .entry(family_of(&job.name))
+                .or_default() += 1;
         }
         let queue = by
             .iter()
@@ -2264,6 +2287,15 @@ impl Queen {
                 scope,
                 queued,
                 oldest_age_secs,
+                families: {
+                    let mut top: Vec<(String, u32)> = families
+                        .get(&(class, scope))
+                        .map(|f| f.iter().map(|(k, v)| (k.clone(), *v)).collect())
+                        .unwrap_or_default();
+                    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    top.truncate(QUEUE_FAMILIES_SHOWN);
+                    top
+                },
             })
             .collect();
         let demand = by
@@ -2282,7 +2314,7 @@ impl Queen {
                 oldest_age_secs,
             })
             .collect();
-        (queue, demand, ages)
+        (queue, demand, ages, families_by_class(&families))
     }
 
     /// Per-class totals for status and metrics: slots the fleet could hold.
@@ -2929,6 +2961,11 @@ impl Queen {
             .collect()
     }
 }
+
+mod build;
+mod families;
+pub use build::QueenBuild;
+use families::{families_by_class, placement_profiles};
 
 #[cfg(test)]
 mod tests;

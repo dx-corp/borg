@@ -43,6 +43,8 @@ pub enum UpdateError {
     Drain(String),
     #[error("could not restart the service and could not roll back: {0}")]
     Unrecoverable(String),
+    #[error("the new binary rejects the service config; nothing was changed: {0}")]
+    ConfigCheck(String),
 }
 
 /// What an update run did (or, with `check`, would do).
@@ -87,6 +89,9 @@ pub struct Options<'a> {
     /// Where the pinned runner lives and who owns it; `None` skips runner updates.
     pub runner_dir: Option<&'a Path>,
     pub runner_owner: Option<&'a str>,
+    /// The service's config (the queen's `queen.json`): the downloaded binary
+    /// must pass `config check` on it before the service is stopped.
+    pub config_check: Option<&'a Path>,
 }
 
 /// Run an update against an already fetched manifest.
@@ -148,6 +153,12 @@ pub async fn run(
             opts.allow_insecure,
         )
         .await?;
+        if let Some(config) = opts.config_check
+            && let Err(reason) = config_check(exec, &new_bin, config)
+        {
+            let _ = std::fs::remove_file(&new_bin);
+            return Err(UpdateError::ConfigCheck(reason));
+        }
     }
     let mut runner_updated = false;
     if let (Some(pin), Some(dir)) = (&runner_pin, opts.runner_dir) {
@@ -197,6 +208,17 @@ pub async fn run(
         to: manifest.version.clone(),
         reason,
     })
+}
+
+/// `<bin> config check <config>`: the new binary must accept the config the
+/// service will start with.
+fn config_check(exec: &dyn Exec, bin: &Path, config: &Path) -> Result<(), String> {
+    let (bin, config) = (bin.to_string_lossy(), config.to_string_lossy());
+    match exec.run(&bin, &["config", "check", &config]) {
+        Ok(out) if out.success => Ok(()),
+        Ok(out) => Err(format!("{config}: {}", out.stdout.trim())),
+        Err(e) => Err(format!("run {bin}: {e}")),
+    }
 }
 
 /// Wait until the daemon reports `version` as healthy, or the timeout passes.

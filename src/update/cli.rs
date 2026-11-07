@@ -80,9 +80,21 @@ async fn attempt(
             exec: &exec,
         })
     };
+    // The installed binary's build version, the scheme manifests and health
+    // records use; the package version alone (0.1.0 for every build) would
+    // make every manifest look new and restart the service on each run.
+    let bin = cfg.bin.clone();
+    let current = tokio::task::spawn_blocking(move || std::fs::read(bin).ok())
+        .await
+        .ok()
+        .flatten()
+        .map_or_else(
+            || env!("CARGO_PKG_VERSION").to_owned(),
+            |bytes| crate::drone::selfupdate::build_version(env!("CARGO_PKG_VERSION"), &bytes),
+        );
     let opts = Options {
         bin: &cfg.bin,
-        current_version: env!("CARGO_PKG_VERSION"),
+        current_version: &current,
         requested_version: version,
         check: args.check,
         runner_only: args.runner_only,
@@ -93,6 +105,7 @@ async fn attempt(
         host_arch: std::env::consts::ARCH,
         runner_dir: cfg.runner_dir.as_deref(),
         runner_owner: cfg.runner_owner.as_deref(),
+        config_check: cfg.config_check.as_deref(),
     };
     crate::update::run(
         &opts,

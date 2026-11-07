@@ -42,6 +42,9 @@ async fn dry_run_places_as_before_and_reports_where_the_cost_would_move_grants()
     assert_eq!(p["recent"][0]["actual"], "gcp-burst-a");
     assert_eq!(p["recent"][0]["would"], "owned");
     assert_eq!(p["recent"][0]["class"], "light");
+    // Today's tie-break, made visible.
+    assert_eq!(p["placed"][0]["drone"], "gcp-burst-a");
+    assert_eq!(p["placed"][0]["reason"], "name");
 }
 
 #[tokio::test]
@@ -70,6 +73,12 @@ async fn live_cost_sends_work_to_the_owned_host_and_explains_the_burst_penalty()
         .unwrap();
     let d = &e["history"][0]["decision"];
     assert_eq!(d["winner"], "owned");
+    assert_eq!(d["reason"], "cost");
+    let placed = &h.status().await["placement"]["placed"][0];
+    assert_eq!(
+        (placed["drone"].as_str(), placed["reason"].as_str()),
+        (Some("owned"), Some("cost"))
+    );
     let cost = |id: &str| {
         d["candidates"]
             .as_array()
@@ -90,4 +99,53 @@ async fn an_out_of_range_burst_cost_is_rejected() {
         );
         assert!(borg::config::QueenConfig::from_json(&cfg).is_err(), "{bad}");
     }
+}
+
+#[tokio::test]
+async fn status_lists_the_queued_families_that_steer_placement() {
+    let h = Harness::start(json!({})).await;
+    let created = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    {
+        let mut st = h.state();
+        st.queued_runs.push(1);
+        for (id, name) in [
+            (1, "rust-test (shard 2)"),
+            (2, "rust-test (shard 7)"),
+            (3, "lint"),
+        ] {
+            st.jobs.push(json!({
+                "id": id, "name": name, "status": "queued",
+                "labels": ["borg-ci-heavy-pr"], "created_at": created,
+            }));
+        }
+    }
+    h.tick().await;
+    let q = &h.status().await["queue"][0];
+    assert_eq!(q["label"], "borg-ci-heavy-pr");
+    assert_eq!(q["families"], json!([["rust-test", 2], ["lint", 1]]));
+}
+
+#[tokio::test]
+async fn status_names_the_running_build_and_health_waits_for_a_drone() {
+    let dir = tempfile::tempdir().unwrap();
+    let health = dir.path().join("queen-health.json");
+    let h = Harness::start(json!({"health_file": health})).await;
+    let build = &h.status().await["queen"];
+    let version = build["version"].as_str().unwrap().to_owned();
+    assert!(version.starts_with("0.1.0+"), "{version}");
+    assert_eq!(version.len(), "0.1.0+".len() + 12);
+    assert!(build["started_at"].as_i64().unwrap() > 0);
+
+    // Ticking with no drone reaching this process is not health.
+    h.tick().await;
+    assert!(!health.exists());
+    let t = h.enroll("owned").await;
+    h.heartbeat(&t, &[]).await;
+    h.tick().await;
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&health).unwrap()).unwrap();
+    assert_eq!(record["version"], version.as_str());
+    assert_eq!(record["pid"], std::process::id());
 }

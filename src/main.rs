@@ -866,7 +866,12 @@ async fn run_queen(path: &Path) -> Result<()> {
         ),
         None => None,
     };
-    let mut queen = Queen::new(cfg, store, github);
+    let started_at = time::OffsetDateTime::now_utc().unix_timestamp();
+    let build = tokio::task::spawn_blocking(move || borg::queen::QueenBuild::current(started_at))
+        .await
+        .context("hash the running queen binary")?;
+    tracing::info!(?build, "queen build");
+    let mut queen = Queen::new(cfg, store, github).with_build(build);
     if let Some(token) = control_token {
         tracing::info!("control API enabled");
         queen = queen.with_control_token(&token);
