@@ -1464,13 +1464,13 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         None => None,
     };
     let mut rollout = RolloutStatus {
-        target_version: cfg.rollout_target_version.clone(),
+        target_version: queen.rollout_target(),
         gate: snap.rollout.clone(),
         log: queen.store().rollout_log(20).await?,
         ..RolloutStatus::default()
     };
     for d in &drones {
-        match (&d.version, &cfg.rollout_target_version) {
+        match (&d.version, &rollout.target_version) {
             (None, _) => rollout.unknown += 1,
             (Some(v), Some(t)) if crate::rollout::same_release(v, t) => rollout.current += 1,
             (Some(_), _) => rollout.outdated += 1,

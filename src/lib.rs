@@ -16,6 +16,7 @@ pub mod burst;
 pub mod classes;
 pub mod client_registration;
 pub mod config;
+pub mod configfetch;
 pub mod configfile;
 pub mod control;
 pub mod drone;

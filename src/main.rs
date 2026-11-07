@@ -94,6 +94,23 @@ enum ConfigCommand {
         #[arg(long)]
         drone: bool,
     },
+    /// Write one file of a private repository at a git ref to `--out`, read
+    /// with the queen config's contents-read App (`mirror_auth`, else
+    /// `supersede_janitor.compare_auth`). Delivers the queen config privately.
+    Fetch {
+        /// The queen config whose App credentials to use.
+        #[arg(long, default_value = "/etc/borg/queen.json")]
+        config: PathBuf,
+        /// Bare repository name in `github.org`.
+        #[arg(long, default_value = "mono")]
+        repo: String,
+        #[arg(long, default_value = "main")]
+        git_ref: String,
+        #[arg(long, default_value = "config/borg/queen.json")]
+        path: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -1260,6 +1277,27 @@ async fn dispatch(command: Command) -> Result<()> {
                 println!("{cfg:#?}");
             }
             eprintln!("{}: ok", path.display());
+            Ok(())
+        }
+        Command::Config {
+            command:
+                ConfigCommand::Fetch {
+                    config,
+                    repo,
+                    git_ref,
+                    path,
+                    out,
+                },
+        } => {
+            let cfg = QueenConfig::load(&config)?;
+            let bytes = borg::configfetch::fetch(&cfg, &repo, &git_ref, &path).await?;
+            borg::configfetch::write_atomic(&out, &bytes)
+                .with_context(|| format!("write {}", out.display()))?;
+            eprintln!(
+                "{repo}/{path}@{git_ref} -> {} ({} bytes)",
+                out.display(),
+                bytes.len()
+            );
             Ok(())
         }
         Command::Drone { command } => {

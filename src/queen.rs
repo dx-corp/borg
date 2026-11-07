@@ -1397,7 +1397,27 @@ impl Queen {
     /// The version `drone` should run: from the gated rollout when it is on,
     /// otherwise the configured target (report-only mode), otherwise no
     /// instruction.
+    /// The version drones are rolled out to: the configured target, or with
+    /// `rollout.follow_queen` the build this queen runs.
+    pub(crate) fn rollout_target(&self) -> Option<String> {
+        self.cfg.rollout_target_version.clone().or_else(|| {
+            self.cfg
+                .rollout
+                .follow_queen
+                .then(|| self.build.as_ref().map(|b| b.version().to_owned()))
+                .flatten()
+        })
+    }
+
     pub fn desired_version(&self, drone: &str) -> Option<String> {
+        if self.cfg.rollout_target_version.is_none() && self.cfg.rollout.follow_queen {
+            // Only what the gate decided: no drone is told anything before
+            // the first pass has a previous version to fall back to.
+            return self
+                .snapshot()
+                .rollout
+                .map(|r| desired_for(&r.state, drone).to_owned());
+        }
         let target = self.cfg.rollout_target_version.as_ref()?;
         if self.cfg.rollout.previous_version.is_none() {
             return Some(target.clone());
@@ -1410,12 +1430,12 @@ impl Queen {
     /// One pass of the quorum rollout gate (only when both the target and
     /// `rollout.previous_version` are configured).
     async fn advance_rollout(&self, now: i64) -> Result<(), QueenError> {
-        let (Some(target), Some(previous)) = (
-            self.cfg.rollout_target_version.as_deref(),
-            self.cfg.rollout.previous_version.as_deref(),
-        ) else {
+        let Some(target) = self.rollout_target() else {
             return Ok(());
         };
+        if self.cfg.rollout.previous_version.is_none() && !self.cfg.rollout.follow_queen {
+            return Ok(());
+        }
         let stored = self.store.rollout_state().await?;
         let rows = self.store.drones().await?;
         let since = stored
@@ -1446,11 +1466,20 @@ impl Queen {
                 version_since: d.version_since,
             })
             .collect();
+        let Some(previous) = self
+            .cfg
+            .rollout
+            .previous_version
+            .clone()
+            .or_else(|| crate::rollout::previous_for(&target, stored.as_ref(), &views))
+        else {
+            return Ok(());
+        };
         let adv = advance(
             now,
             &self.cfg.rollout,
-            previous,
-            target,
+            &previous,
+            &target,
             stored.clone(),
             &views,
             &outcomes,

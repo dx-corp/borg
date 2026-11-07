@@ -161,6 +161,16 @@ With `health_file` set, the queen writes the updater's health record (see
 once a drone has heartbeated to this process, so a queen that ticks while no
 drone reaches it does not count as healthy.
 
+### Private config delivery
+
+`borg config fetch --out <file>` writes `config/borg/queen.json` from
+`dx-corp/mono` at `--git-ref` (default `main`) using the queen config's
+existing contents-read App (`mirror_auth`, else
+`supersede_janitor.compare_auth`). The token is minted per call with
+`contents: read` on that one repository. The queen config is never published
+with a release; the queen host's self-update unit fetches it, runs
+`config check`, swaps it and rolls back without health.
+
 ### Leader lease
 
 The fenced leader lease for running several queens (`src/lead.rs`) exists as a
@@ -659,6 +669,14 @@ otherwise. State is persisted; see `rollout` in `/status` and
 `borg queen rollout halt|reset`. Drones update between jobs when
 `desired_version` differs from what they run, and may downgrade.
 
+
+With `"rollout": {"follow_queen": true}` and no `rollout_target_version`, the
+target is the build the queen runs (`/status` `queen.version`), so a queen
+self-update carries the drones with it through the same canary and wave gate.
+The previous version (what a halt rolls back to) is fixed when each rollout
+starts: the last rollout's target if it completed, its previous otherwise, or
+with no history the version most fresh drones run. No drone is told a
+version before the gate's first pass.
 ### Learned profiles
 
 The queen builds per-drone, per-class profiles from telemetry: speed against the

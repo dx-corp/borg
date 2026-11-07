@@ -48,6 +48,11 @@ pub struct RolloutSettings {
     /// `rollout_target_version`) turns on the gated rollout; without it the
     /// target is only reported and every drone is told the target.
     pub previous_version: Option<String>,
+    /// With no `rollout_target_version`, roll the drones out to the build the
+    /// queen itself runs, so a queen self-update carries the fleet with it
+    /// through the same gate. The previous version is then the one the fleet
+    /// was on when that rollout started (see [`previous_for`]).
+    pub follow_queen: bool,
     /// OSes that each need a canary host, as reported by the drone probe.
     pub canary_oses: Vec<String>,
     /// Successful jobs each canary must complete on the target.
@@ -72,6 +77,7 @@ impl Default for RolloutSettings {
     fn default() -> Self {
         Self {
             previous_version: None,
+            follow_queen: false,
             canary_oses: vec!["linux".into(), "macos".into()],
             canary_jobs: 5,
             waves_pct: vec![25, 50, 100],
@@ -138,6 +144,34 @@ pub(crate) fn same_release(reported: &str, target: &str) -> bool {
         return reported == target;
     }
     reported.split('+').next() == Some(target)
+}
+
+/// The version a rollout to `target` rolls back to when nothing configures
+/// one. An unchanged target keeps the previous it started with; a new target
+/// starts from where the last rollout left the fleet (its target if it
+/// completed, its previous otherwise); with no history, the version most
+/// fresh drones run, other than `target`. `None` when nothing is known.
+pub(crate) fn previous_for(
+    target: &str,
+    stored: Option<&RolloutState>,
+    drones: &[DroneView],
+) -> Option<String> {
+    match stored {
+        Some(s) if s.target == target => return Some(s.previous.clone()),
+        Some(s) if s.phase == Phase::Complete => return Some(s.target.clone()),
+        Some(s) => return Some(s.previous.clone()),
+        None => {}
+    }
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for d in drones.iter().filter(|d| d.fresh) {
+        if let Some(v) = d.version.as_deref().filter(|v| !same_release(v, target)) {
+            *counts.entry(v).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        .map(|(v, _)| v.to_owned())
 }
 
 /// The persisted state of one rollout.
@@ -872,5 +906,55 @@ mod tests {
         ] {
             assert!(bad.validate().is_err());
         }
+    }
+
+    #[test]
+    fn previous_comes_from_the_rollout_history_then_the_fleet() {
+        let fleet = [
+            drone("a", "linux", "0.1.0+old", 0),
+            drone("b", "linux", "0.1.0+old", 0),
+            drone("c", "linux", "0.1.0+other", 0),
+            drone("d", "linux", "0.1.0+new", 0),
+            DroneView {
+                fresh: false,
+                ..drone("e", "linux", "0.1.0+stale", 0)
+            },
+        ];
+        // No history: what most fresh drones run, never the target itself.
+        assert_eq!(
+            previous_for("0.1.0+new", None, &fleet).as_deref(),
+            Some("0.1.0+old")
+        );
+        assert_eq!(previous_for("0.1.0+new", None, &fleet[3..]), None);
+        let state = |target: &str, previous: &str, phase| RolloutState {
+            target: target.into(),
+            previous: previous.into(),
+            phase,
+            canaries: vec![],
+            members: vec![],
+            wave: 0,
+            started_at: 0,
+            stage_started_at: 0,
+            halted_reason: None,
+        };
+        // The same rollout keeps the previous it started with, whatever the
+        // fleet runs now.
+        let running = state("0.1.0+new", "0.1.0+first", Phase::Wave);
+        assert_eq!(
+            previous_for("0.1.0+new", Some(&running), &fleet).as_deref(),
+            Some("0.1.0+first")
+        );
+        // A new target starts from a completed rollout's target, or from a
+        // halted one's previous (where it rolled the fleet back to).
+        let done = state("0.1.0+mid", "0.1.0+first", Phase::Complete);
+        assert_eq!(
+            previous_for("0.1.0+new", Some(&done), &fleet).as_deref(),
+            Some("0.1.0+mid")
+        );
+        let halted = state("0.1.0+mid", "0.1.0+first", Phase::Halted);
+        assert_eq!(
+            previous_for("0.1.0+new", Some(&halted), &fleet).as_deref(),
+            Some("0.1.0+first")
+        );
     }
 }

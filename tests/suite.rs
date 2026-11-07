@@ -11,6 +11,7 @@ mod admin_cli;
 mod breaker;
 mod burst;
 mod capacity;
+mod config_fetch;
 mod contract;
 mod control;
 mod drone;
