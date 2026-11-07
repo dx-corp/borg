@@ -23,8 +23,21 @@ use borg::tailnet::{TailnetEnroll, TailscaledWhois};
 use borg::update;
 use clap::{Args, Parser, Subcommand};
 
+/// `borg --version` names the commit a release was built from
+/// (`BORG_BUILD_SHA`, set by the release workflow), the same one `/status`
+/// `queen.build_sha` reports.
+const LONG_VERSION: &str = match option_env!("BORG_BUILD_SHA") {
+    Some(sha) => sha,
+    None => "(no BORG_BUILD_SHA: not a release build)",
+};
+
 #[derive(Parser)]
-#[command(name = "borg", version, about = "Self-organizing CI fleet agent")]
+#[command(
+    name = "borg",
+    version,
+    long_version = LONG_VERSION,
+    about = "Self-organizing CI fleet agent"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
