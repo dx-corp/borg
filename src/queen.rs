@@ -351,7 +351,7 @@ pub struct Queen {
     control_lock: tokio::sync::Mutex<()>,
     /// Per drone, the CPU pressure samples (`observed_at`, `some avg10`
     /// permille) from recent heartbeats; admission reads their mean over
-    /// `admission.facts_max_age_secs`. See [`pressure_window_mean`].
+    /// `admission.facts_max_age_secs` using `pressure_window_mean`.
     cpu_pressure: std::sync::Mutex<BTreeMap<String, VecDeque<(i64, u16)>>>,
     /// Per drone, the admission state its last pass settled in; the next pass
     /// relaxes from it only past the hysteresis margin.

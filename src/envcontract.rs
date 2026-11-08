@@ -213,7 +213,7 @@ pub struct EnvFacts {
     #[serde(default)]
     pub(crate) mem_psi_some_avg10_pm: Option<u16>,
     /// The node's `MemAvailable` (MiB) from its `node_exporter`; `None`
-    /// without `host_metrics_url` (see [`crate::drone::hostview`]).
+    /// without `host_metrics_url`.
     #[serde(default)]
     pub(crate) host_mem_available_mib: Option<u64>,
     /// The node's name and boot time: drones reporting the same key share
