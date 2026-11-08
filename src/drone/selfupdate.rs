@@ -54,7 +54,7 @@ pub enum Plan {
 pub fn plan(desired: Option<&str>, own_version: &str, leases_held: usize) -> Plan {
     match desired {
         None => Plan::Stay,
-        Some(d) if d == own_version => Plan::Stay,
+        Some(d) if crate::rollout::same_release(own_version, d) => Plan::Stay,
         Some(_) if leases_held > 0 => Plan::FinishJobsFirst,
         Some(_) => Plan::UpdateNow,
     }
@@ -97,16 +97,32 @@ impl SelfUpdate {
         })
     }
 
-    /// The queen has the report; forget it.
+    /// The queen has the report; forget it, but keep a failed target so it
+    /// is not retried. Without this the next heartbeat asked for the same
+    /// build again and the drone restarted every two minutes.
     pub fn acknowledge_report(&self) {
+        if let Some(r) = self.result().filter(UpdateResult::failed) {
+            let _ = fs::write(self.failed_path(), r.target);
+        }
         let _ = fs::remove_file(result_path(&self.state_dir));
+    }
+
+    /// The last target that failed or rolled back here.
+    fn failed_path(&self) -> PathBuf {
+        self.state_dir.join("update-failed")
+    }
+
+    fn failed_before(&self, desired: &str) -> bool {
+        self.result()
+            .is_some_and(|r| r.target == desired && r.failed())
+            || fs::read_to_string(self.failed_path()).is_ok_and(|t| t.trim() == desired)
     }
 
     /// Act on the queen's `desired_version`. Any other version is a target,
     /// older ones included. At most one update is in flight: while a request
     /// file exists nothing further is written.
     pub fn handle(&self, desired: &str, own_version: &str) -> io::Result<Handled> {
-        if desired == own_version {
+        if crate::rollout::same_release(own_version, desired) {
             return Ok(Handled::UpToDate);
         }
         let request = request_path(&self.state_dir);
@@ -118,9 +134,7 @@ impl SelfUpdate {
             // The updater never picked it up (or died); ask again.
             fs::remove_file(&request)?;
         }
-        if self.result().is_some_and(|r| {
-            r.target == desired && matches!(r.state.as_str(), "rolled_back" | "failed")
-        }) {
+        if self.failed_before(desired) {
             return Ok(Handled::Blocked);
         }
         let tmp = request.with_extension("tmp");
@@ -215,9 +229,25 @@ mod tests {
         .unwrap();
         assert_eq!(su.pending_report().unwrap().state, "rolled_back");
         assert_eq!(su.handle("2.0.0", "1.0.0").unwrap(), Handled::Blocked);
-        assert_eq!(su.handle("2.1.0", "1.0.0").unwrap(), Handled::Requested);
         su.acknowledge_report();
         assert_eq!(su.pending_report(), None);
+        // Still not retried once the queen has the report.
+        assert_eq!(su.handle("2.0.0", "1.0.0").unwrap(), Handled::Blocked);
+        assert_eq!(su.handle("2.1.0", "1.0.0").unwrap(), Handled::Requested);
+    }
+
+    #[test]
+    fn a_build_target_matches_only_that_build_and_a_release_any_of_its_builds() {
+        let own = "0.1.0+264b52ac2d54";
+        assert_eq!(plan(Some(own), own, 0), Plan::Stay);
+        assert_eq!(plan(Some("0.1.0"), own, 0), Plan::Stay);
+        assert_eq!(plan(Some("0.1.0+b09df8bb1a0f"), own, 0), Plan::UpdateNow);
+        let dir = tempfile::tempdir().unwrap();
+        let su = SelfUpdate::new(dir.path().to_owned());
+        assert_eq!(su.handle("0.1.0", own).unwrap(), Handled::UpToDate);
+        // The health the updater waits for names the build it installed.
+        su.record_health(own, 5).unwrap();
+        assert_eq!(health::read(&su.health_path()).unwrap().version, own);
     }
 
     #[test]

@@ -1397,18 +1397,6 @@ impl Queen {
     /// The version `drone` should run: from the gated rollout when it is on,
     /// otherwise the configured target (report-only mode), otherwise no
     /// instruction.
-    /// The version drones are rolled out to: the configured target, or with
-    /// `rollout.follow_queen` the build this queen runs.
-    pub(crate) fn rollout_target(&self) -> Option<String> {
-        self.cfg.rollout_target_version.clone().or_else(|| {
-            self.cfg
-                .rollout
-                .follow_queen
-                .then(|| self.build.as_ref().map(|b| b.version().to_owned()))
-                .flatten()
-        })
-    }
-
     pub fn desired_version(&self, drone: &str) -> Option<String> {
         if self.cfg.rollout_target_version.is_none() && self.cfg.rollout.follow_queen {
             // Only what the gate decided: no drone is told anything before
@@ -1437,6 +1425,7 @@ impl Queen {
             return Ok(());
         }
         let stored = self.store.rollout_state().await?;
+        let target = self.settled_target(target, stored.as_ref(), now);
         let rows = self.store.drones().await?;
         let since = stored
             .as_ref()
@@ -1464,6 +1453,7 @@ impl Queen {
                 held: d.held(),
                 version: d.version.clone(),
                 version_since: d.version_since,
+                shared: d.trust == crate::classes::Trust::Shared,
             })
             .collect();
         let Some(previous) = self

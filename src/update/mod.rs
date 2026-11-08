@@ -267,6 +267,11 @@ pub struct UpdateResult {
 }
 
 impl UpdateResult {
+    /// The update did not leave the target running.
+    pub(crate) fn failed(&self) -> bool {
+        matches!(self.state.as_str(), "rolled_back" | "failed")
+    }
+
     pub fn from_outcome(target: &str, outcome: &Result<Outcome, UpdateError>, at: i64) -> Self {
         let (state, detail) = match outcome {
             Ok(Outcome::Updated { to, .. }) => ("installed", format!("updated to {to}")),
