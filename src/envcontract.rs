@@ -208,6 +208,18 @@ pub struct EnvFacts {
     /// root cgroup's `cpu.stat`, in permille.
     #[serde(default)]
     pub(crate) cpu_busy_pm: Option<u16>,
+    /// Linux PSI `memory some avg10`, in permille: the highest of the
+    /// drone's own view, its cgroup and its host view.
+    #[serde(default)]
+    pub mem_psi_some_avg10_pm: Option<u16>,
+    /// The node's `MemAvailable` (MiB) from a read-only host view; `None`
+    /// when the drone has none (see [`crate::probe::HOST_VIEW_DIR`]).
+    #[serde(default)]
+    pub host_mem_available_mib: Option<u64>,
+    /// The node's boot id from the host view: drones reporting the same key
+    /// share that node's memory.
+    #[serde(default)]
+    pub host_key: Option<String>,
     /// For each tool in [`PROBE_TOOLS`], the first line of its `--version`
     /// output, or `"missing"`; `None` when the drone did not measure it.
     #[serde(default)]
@@ -981,6 +993,9 @@ mod tests {
             cpu_psi_some_avg10_pm: Some(100),
             load_per_cpu_pm: None,
             cpu_busy_pm: None,
+            mem_psi_some_avg10_pm: None,
+            host_mem_available_mib: None,
+            host_key: None,
             tools: Some(tool_map(&[
                 ("git", "git version 2.45.0"),
                 ("gh", "gh version 2.50.0"),

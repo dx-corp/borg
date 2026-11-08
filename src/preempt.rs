@@ -212,6 +212,7 @@ mod tests {
             cpu_psi_pm: None,
             cpu_load_pm: None,
             cost_permille: crate::allocator::OWNED_COST_PERMILLE,
+            live: crate::allocator::LiveFacts::default(),
         }
     }
 

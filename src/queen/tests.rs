@@ -234,6 +234,7 @@ fn the_queued_family_picks_the_owned_host_that_runs_it_fastest() {
         cpu_psi_pm: None,
         cpu_load_pm: None,
         cost_permille: crate::allocator::OWNED_COST_PERMILLE,
+        live: crate::allocator::LiveFacts::default(),
     };
     let winner = |queued: &[(&str, u32)], family_aware: bool| {
         let mut by_key = BTreeMap::new();

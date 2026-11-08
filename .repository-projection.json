@@ -3,11 +3,11 @@
   "projection": "borg",
   "projectionSchemaVersion": 1,
   "sourceRepository": "dx-corp/mono",
-  "sourceSha": "873e4244467832e995801a6928f9dde1f5cc6353",
+  "sourceSha": "753358d46cd40038f122f75184370134a88e84c4",
   "destinationRepository": "dx-corp/borg",
   "priorProjectedBase": "f56d21d67bdc53e5f5a82d7ec5d615f3920d37c2",
   "definitionDigest": "78ba8d1b5794c261ff0afba6d99abc10b9297ea0dd94be4397fb1cbf63cf0c6e",
   "toolDigest": "4f92e4ef0348b5541563a122a469f4d0712148a8",
-  "contentDigest": "4d1d9e172f2386495d8ddd3adb5658c6acc2621b7c5651f38a7af536ba550a53",
+  "contentDigest": "6dce6238af85fd88df1491a01fecc9484895320d39a9e70ad25a0175e8535188",
   "publicationEligible": true
 }

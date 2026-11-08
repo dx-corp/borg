@@ -951,8 +951,11 @@ async fn job_and_run_endpoints_show_the_drone_and_its_host_load() {
 
 #[tokio::test]
 async fn admission_falls_back_to_load_without_psi_and_light_only_sheds_main_heavy() {
+    // The tiers themselves, without hysteresis: 828 then 540 would otherwise
+    // hold `closed` until pressure falls under 80% of `psi_hard_pm`.
     let h = Harness::start(json!({"admission": {
-        "psi_soft_pm": 300, "psi_light_only_pm": 500, "psi_hard_pm": 600, "facts_max_age_secs": 180}}))
+        "psi_soft_pm": 300, "psi_light_only_pm": 500, "psi_hard_pm": 600, "facts_max_age_secs": 180,
+        "hysteresis_pm": 0}}))
     .await;
     let token = h.enroll("no-psi").await;
     let now = OffsetDateTime::now_utc().unix_timestamp();

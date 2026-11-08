@@ -353,26 +353,9 @@ pub struct Queen {
     /// permille) from recent heartbeats; admission reads their mean over
     /// `admission.facts_max_age_secs`. See [`pressure_window_mean`].
     cpu_pressure: std::sync::Mutex<BTreeMap<String, VecDeque<(i64, u16)>>>,
-}
-
-/// Samples kept per drone: 10 s heartbeats over a 180 s window need 18.
-const CPU_PRESSURE_SAMPLES: usize = 64;
-
-/// The mean of the samples observed within `max_age_secs` of `now`, rounded
-/// to permille, or `None` without one. A drone reports `some avg10`, a 10 s
-/// window that a reclaim scan, container teardown or a git fetch pushes past
-/// the thresholds for one or two heartbeats; the queen samples it once a
-/// tick, so a drone with nothing running could flip to `light_only` or
-/// `closed` on a burst (10/23 explain history: gha-heavy-pve50-1 changed
-/// state at nearly every 300 s tick). Admission answers whether the host is
-/// oversubscribed for minutes, so it reads the window mean.
-fn pressure_window_mean(samples: &[(i64, u16)], now: i64, max_age_secs: i64) -> Option<u16> {
-    let fresh = samples
-        .iter()
-        .filter(|(at, _)| (0..=max_age_secs).contains(&(now - at)))
-        .map(|&(_, pm)| u64::from(pm.min(1000)));
-    let (sum, n) = fresh.fold((0u64, 0u64), |(s, n), pm| (s + pm, n + 1));
-    (n > 0).then(|| u16::try_from((sum + n / 2) / n).unwrap_or(1000))
+    /// Per drone, the admission state its last pass settled in; the next pass
+    /// relaxes from it only past the hysteresis margin.
+    admission_prev: std::sync::Mutex<BTreeMap<String, AdmissionState>>,
 }
 
 /// The full label set a JIT runner is registered with: the labels GitHub
@@ -557,6 +540,7 @@ impl Queen {
             tick_lock: tokio::sync::Mutex::new(()),
             watch: std::sync::Mutex::new(FleetWatch::default()),
             cpu_pressure: std::sync::Mutex::new(BTreeMap::new()),
+            admission_prev: std::sync::Mutex::new(BTreeMap::new()),
             burst: std::sync::Mutex::new(BurstSim::default()),
             gce: None,
             control_token_hash: None,
@@ -709,30 +693,6 @@ impl Queen {
         &self.cfg
     }
 
-    /// Record a heartbeat's CPU pressure reading for the admission window.
-    /// Without a reading nothing is recorded: the window then empties and
-    /// admission falls back to the load estimate.
-    pub(crate) fn note_cpu_pressure(&self, drone: &str, observed_at: i64, psi_pm: Option<u16>) {
-        let Some(pm) = psi_pm else { return };
-        let mut all = self.cpu_pressure.lock().expect("cpu pressure lock");
-        let samples = all.entry(drone.to_owned()).or_default();
-        if samples.back().is_some_and(|&(at, _)| at >= observed_at) {
-            return;
-        }
-        samples.push_back((observed_at, pm));
-        while samples.len() > CPU_PRESSURE_SAMPLES {
-            samples.pop_front();
-        }
-    }
-
-    /// The drone's admission pressure: the mean of its readings within
-    /// `max_age_secs`, see [`pressure_window_mean`].
-    fn cpu_pressure_mean(&self, drone: &str, now: i64, max_age_secs: i64) -> Option<u16> {
-        let all = self.cpu_pressure.lock().expect("cpu pressure lock");
-        let samples: Vec<(i64, u16)> = all.get(drone)?.iter().copied().collect();
-        pressure_window_mean(&samples, now, max_age_secs)
-    }
-
     /// The pull-request turns this pass; see [`PrTurn`].
     fn pr_turn(&self) -> PrTurn {
         let Some(f) = &self.cfg.pr_fairness else {
@@ -862,6 +822,7 @@ impl Queen {
                         .or(f.cpu_psi_some_avg10_pm);
                     state.cpu_load_pm =
                         crate::allocator::load_pressure_pm(f.load_per_cpu_pm, f.cpu_busy_pm);
+                    state.live = self.live_facts(&d.name, cap, f, a);
                 }
                 state.profiles = placement_profiles(
                     &profiles,
@@ -1239,6 +1200,7 @@ impl Queen {
             }
         }
 
+        self.note_admission(&allocation.admission);
         self.update_snapshot(|s| {
             s.last_tick_at = Some(now_ts);
             s.last_error = mint_error.as_ref().map(|e| format!("mint failed: {e}"));
@@ -1714,8 +1676,7 @@ impl Queen {
                     .filter(|d| {
                         d.accepting
                             && d.trust.admits(u.scope)
-                            && AdmissionState::of(d.admission_pressure_pm(), admission)
-                                .admits(u.class, u.scope)
+                            && d.admission(admission).admits(u.class, u.scope)
                             && !d.blocked_classes.contains(&u.class)
                             && max_slots(d, self.cfg.classes.spec(u.class)) > 0
                             && (d.bids.is_empty()
@@ -2981,8 +2942,11 @@ impl Queen {
     }
 }
 
+mod admission;
 mod build;
 mod families;
+#[cfg(test)]
+use admission::pressure_window_mean;
 pub use build::QueenBuild;
 use families::{families_by_class, placement_profiles};
 

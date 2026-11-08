@@ -16,6 +16,7 @@ fn host(id: &str) -> DroneState {
         cpu_load_pm: None,
         trust: Trust::Shared,
         cost_permille: OWNED_COST_PERMILLE,
+        live: LiveFacts::default(),
     }
 }
 
@@ -184,6 +185,9 @@ fn light_only_sheds_pr_and_main_medium_heavy_but_keeps_light_main_and_deploy() {
         psi_soft_pm: 300,
         psi_light_only_pm: 500,
         psi_hard_pm: 600,
+        mem_psi_light_only_pm: 100,
+        mem_psi_hard_pm: 250,
+        hysteresis_pm: 200,
     };
     let of = |p| AdmissionState::of(Some(p), Some(t));
     assert_eq!(of(299), AdmissionState::Open);
@@ -1006,6 +1010,7 @@ fn never_over_grants_across_a_demand_sweep() {
             cpu_load_pm: None,
             trust: Trust::Shared,
             cost_permille: OWNED_COST_PERMILLE,
+            live: LiveFacts::default(),
         },
         DroneState {
             id: "c".into(),
@@ -1021,6 +1026,7 @@ fn never_over_grants_across_a_demand_sweep() {
             cpu_load_pm: None,
             trust: Trust::Shared,
             cost_permille: OWNED_COST_PERMILLE,
+            live: LiveFacts::default(),
         },
     ];
     for lm in 0..3 {
@@ -1761,6 +1767,9 @@ fn pr_turn_obeys_admission_and_the_scope_filter() {
         psi_soft_pm: 300,
         psi_light_only_pm: 500,
         psi_hard_pm: 600,
+        mem_psi_light_only_pm: 100,
+        mem_psi_hard_pm: 250,
+        hysteresis_pm: 200,
     });
     let a = allocate(&i);
     assert_eq!(count(&a, Class::Heavy, Scope::Pr), 0);
@@ -1770,4 +1779,215 @@ fn pr_turn_obeys_admission_and_the_scope_filter() {
     let a = allocate_scope(&i, Scope::Main);
     assert_eq!(count(&a, Class::Heavy, Scope::Pr), 0);
     assert_eq!(count(&a, Class::Heavy, Scope::Main), 1);
+}
+
+fn thresholds() -> AdmissionThresholds {
+    AdmissionThresholds {
+        psi_soft_pm: 300,
+        psi_light_only_pm: 500,
+        psi_hard_pm: 600,
+        mem_psi_light_only_pm: 100,
+        mem_psi_hard_pm: 250,
+        hysteresis_pm: 200,
+    }
+}
+
+#[test]
+fn admission_tightens_at_once_and_relaxes_only_past_the_hysteresis_margin() {
+    let t = Some(thresholds());
+    let settle = |cpu, prev| AdmissionState::settle(Some(cpu), None, prev, t);
+    // Rising pressure takes effect on the first pass.
+    assert_eq!(
+        settle(500, Some(AdmissionState::Open)),
+        AdmissionState::LightOnly
+    );
+    // Just under light-only (500) but above 80% of it (400): stays light-only.
+    assert_eq!(
+        settle(450, Some(AdmissionState::LightOnly)),
+        AdmissionState::LightOnly
+    );
+    // Under 400 it relaxes one step: still over 80% of soft (240).
+    assert_eq!(
+        settle(390, Some(AdmissionState::LightOnly)),
+        AdmissionState::PrBlocked
+    );
+    assert_eq!(
+        settle(230, Some(AdmissionState::PrBlocked)),
+        AdmissionState::Open
+    );
+    // Without a previous state there is nothing to hold.
+    assert_eq!(settle(450, None), AdmissionState::PrBlocked);
+    // Admission off: always open.
+    assert_eq!(
+        AdmissionState::settle(Some(900), Some(900), Some(AdmissionState::Closed), None),
+        AdmissionState::Open
+    );
+}
+
+#[test]
+fn memory_pressure_sheds_heavy_work_then_closes_the_drone() {
+    let t = Some(thresholds());
+    let mem = |p| AdmissionState::settle(Some(0), Some(p), None, t);
+    assert_eq!(mem(99), AdmissionState::Open);
+    assert_eq!(mem(100), AdmissionState::LightOnly);
+    assert_eq!(mem(250), AdmissionState::Closed);
+    // The stricter of CPU and memory wins.
+    assert_eq!(
+        AdmissionState::settle(Some(300), Some(120), None, t),
+        AdmissionState::LightOnly
+    );
+
+    let mut i = input(
+        &[
+            (Class::Heavy, Scope::Main, 1),
+            (Class::Light, Scope::Main, 1),
+        ],
+        vec![host("a")],
+    );
+    i.admission = t;
+    i.drones[0].live.mem_psi_pm = Some(150);
+    let a = allocate(&i);
+    assert_eq!(count(&a, Class::Heavy, Scope::Main), 0);
+    assert_eq!(count(&a, Class::Light, Scope::Main), 1);
+    assert_eq!(a.admission[0].mem_psi_pm, Some(150));
+}
+
+/// The class sizes the live queen runs (`config/borg/queen.json`): light
+/// 2 GiB, medium 8 GiB, heavy 14 GiB.
+fn queen_classes() -> Classes {
+    let spec = |mem_mib, vcpu, docker| ClassSpec {
+        mem_mib,
+        vcpu,
+        docker,
+    };
+    Classes {
+        light: spec(2048, 1, false),
+        medium: spec(8192, 2, true),
+        heavy: spec(14336, 4, true),
+        ..Classes::default()
+    }
+}
+
+fn queen_input(demand: &[(Class, Scope, u32)], drones: Vec<DroneState>) -> AllocatorInput {
+    AllocatorInput {
+        classes: queen_classes(),
+        ..input(demand, drones)
+    }
+}
+
+#[test]
+fn memory_in_use_beyond_commitments_shrinks_the_room() {
+    // 28 GiB budget, nothing leased, but 16 GiB already in use: no heavy
+    // (14 GiB) fits in the 12 GiB really free, a medium does.
+    let mut busy = host("a");
+    busy.live.mem_used_mib = Some(16 * 1024);
+    let a = allocate(&queen_input(
+        &[
+            (Class::Heavy, Scope::Main, 1),
+            (Class::Medium, Scope::Main, 1),
+        ],
+        vec![busy.clone()],
+    ));
+    assert_eq!(count(&a, Class::Heavy, Scope::Main), 0);
+    assert_eq!(count(&a, Class::Medium, Scope::Main), 1);
+    let heavy = a
+        .decisions
+        .iter()
+        .find(|d| d.class == Class::Heavy)
+        .expect("a heavy decision");
+    assert!(
+        heavy.candidates[0]
+            .rejection_reasons
+            .contains(&Rejection::Memory)
+    );
+
+    // A running heavy lease using less than its class is still charged its
+    // class: the room is the budget less 14 GiB, as without live facts.
+    let mut i = queen_input(&[(Class::Medium, Scope::Main, 2)], vec![host("a")]);
+    i.drones[0].live.mem_used_mib = Some(3 * 1024);
+    i.leases = vec![ActiveLease {
+        drone_id: "a".into(),
+        class: Class::Heavy,
+        scope: Scope::Main,
+        state: LeaseState::Running,
+    }];
+    assert_eq!(count(&allocate(&i), Class::Medium, Scope::Main), 1);
+}
+
+fn on_node(id: &str, available_mib: u64) -> DroneState {
+    let mut d = host(id);
+    d.live.mem_used_mib = Some(0);
+    d.live.host = Some(HostMemory {
+        key: "node-1".into(),
+        available_mib,
+        reserve_mib: 4096,
+    });
+    d
+}
+
+#[test]
+fn drones_on_one_node_share_its_free_memory() {
+    // Two 28 GiB containers on a node with 20 GiB available and a 4 GiB
+    // reserve: 16 GiB to share, so one heavy job, not two.
+    let a = allocate(&queen_input(
+        &[(Class::Heavy, Scope::Main, 2)],
+        vec![on_node("a", 20 * 1024), on_node("b", 20 * 1024)],
+    ));
+    assert_eq!(count(&a, Class::Heavy, Scope::Main), 1);
+    let second = a
+        .decisions
+        .iter()
+        .filter(|d| d.class == Class::Heavy)
+        .nth(1)
+        .expect("a second heavy decision");
+    assert!(second.candidates.iter().all(|c| {
+        c.rejection_reasons.contains(&Rejection::HostMemory) && c.room.mem_mib == 2 * 1024
+    }));
+
+    // The lowest reading of the node wins.
+    let a = allocate(&queen_input(
+        &[(Class::Heavy, Scope::Main, 1)],
+        vec![on_node("a", 30 * 1024), on_node("b", 17 * 1024)],
+    ));
+    assert_eq!(count(&a, Class::Heavy, Scope::Main), 0);
+
+    // A heavy lease on "a" that uses 2 GiB so far may still grow by 12 GiB;
+    // that growth is owed first: 28 - 4 reserve - 12 leaves 12 GiB, too
+    // little for another heavy job on "b".
+    let mut i = queen_input(
+        &[(Class::Heavy, Scope::Main, 1)],
+        vec![on_node("a", 28 * 1024), on_node("b", 28 * 1024)],
+    );
+    i.drones[0].live.mem_used_mib = Some(2 * 1024);
+    i.leases = vec![ActiveLease {
+        drone_id: "a".into(),
+        class: Class::Heavy,
+        scope: Scope::Main,
+        state: LeaseState::Running,
+    }];
+    assert_eq!(count(&allocate(&i), Class::Heavy, Scope::Main), 0);
+    // Different nodes do not share.
+    i.drones[1].live.host = Some(HostMemory {
+        key: "node-2".into(),
+        available_mib: 30 * 1024,
+        reserve_mib: 4096,
+    });
+    assert_eq!(count(&allocate(&i), Class::Heavy, Scope::Main), 1);
+}
+
+#[test]
+fn shared_node_memory_bounds_idle_slots() {
+    let idle = idle_after(
+        &[on_node("a", 20 * 1024), on_node("b", 20 * 1024)],
+        &[],
+        &queen_classes(),
+        None,
+    );
+    let heavy = idle
+        .iter()
+        .find(|c| c.class == Class::Heavy)
+        .expect("heavy idle");
+    // Each drone alone has room for 2, but their node's 16 GiB holds 1.
+    // Burst demand and the starvation alarm read this figure.
+    assert_eq!(heavy.idle_slots, 1);
 }
