@@ -209,15 +209,15 @@ pub struct EnvFacts {
     #[serde(default)]
     pub(crate) cpu_busy_pm: Option<u16>,
     /// Linux PSI `memory some avg10`, in permille: the highest of the
-    /// drone's own view, its cgroup and its host view.
+    /// drone's own view, its cgroup and its node (`host_metrics_url`).
     #[serde(default)]
     pub mem_psi_some_avg10_pm: Option<u16>,
-    /// The node's `MemAvailable` (MiB) from a read-only host view; `None`
-    /// when the drone has none (see [`crate::probe::HOST_VIEW_DIR`]).
+    /// The node's `MemAvailable` (MiB) from its `node_exporter`; `None`
+    /// without `host_metrics_url` (see [`crate::drone::hostview`]).
     #[serde(default)]
     pub host_mem_available_mib: Option<u64>,
-    /// The node's boot id from the host view: drones reporting the same key
-    /// share that node's memory.
+    /// The node's name and boot time: drones reporting the same key share
+    /// that node's memory.
     #[serde(default)]
     pub host_key: Option<String>,
     /// For each tool in [`PROBE_TOOLS`], the first line of its `--version`

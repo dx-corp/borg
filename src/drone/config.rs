@@ -242,6 +242,12 @@ pub struct DroneConfig {
     pub max_leases: Option<u32>,
     #[serde(default = "default_reserve")]
     pub reserve_mem_mib: u64,
+    /// The node's Prometheus `node_exporter` (`http://<node>:9100/metrics`)
+    /// for a drone in a container, which lxcfs keeps from seeing the node's
+    /// memory and pressure; see [`crate::drone::hostview`]. Never written when
+    /// unset, so an older drone can still read a config this one wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_metrics_url: Option<String>,
     /// Number of slot directories (`<work_root>/slot-<N>`) leases run in. A
     /// lease takes the lowest free slot, so its path never contains the lease
     /// id and a reused slot has an identical path. Also the most leases that
@@ -339,6 +345,11 @@ impl DroneConfig {
 
     pub fn validate(&self) -> Result<(), DroneConfigError> {
         let bad = |m: &str| Err(DroneConfigError::Invalid(m.to_owned()));
+        if let Some(u) = &self.host_metrics_url
+            && !(u.starts_with("http://") || u.starts_with("https://"))
+        {
+            return bad("host_metrics_url must be http(s)");
+        }
         let https = self.queen_url.starts_with("https://");
         let http = self.queen_url.starts_with("http://");
         let scheme_ok = https || (http && self.allow_insecure);
@@ -562,6 +573,27 @@ mod tests {
         let with = BASE.replace('}', r#","max_vcpu":8,"max_mem_mib":24576}"#);
         let caps = DroneConfig::from_json(&with).unwrap().host_caps();
         assert_eq!((caps.max_vcpu, caps.max_mem_mib), (Some(8), Some(24576)));
+    }
+
+    #[test]
+    fn host_metrics_url_is_http_and_never_written_when_unset() {
+        let c = DroneConfig::from_json(BASE).unwrap();
+        assert_eq!(c.host_metrics_url, None);
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("host_metrics_url"), "{json}");
+        let url = BASE.replace(
+            '}',
+            r#","host_metrics_url":"http://192.0.2.1:9101/metrics"}"#,
+        );
+        assert_eq!(
+            DroneConfig::from_json(&url)
+                .unwrap()
+                .host_metrics_url
+                .as_deref(),
+            Some("http://192.0.2.1:9101/metrics")
+        );
+        let bad = BASE.replace('}', r#","host_metrics_url":"file:///proc/meminfo"}"#);
+        assert!(DroneConfig::from_json(&bad).is_err());
     }
 
     #[test]

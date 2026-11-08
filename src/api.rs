@@ -106,7 +106,10 @@ fn sanitize_facts(f: &EnvFacts, now: i64) -> EnvFacts {
     out.cpu_psi_some_avg10_pm = out.cpu_psi_some_avg10_pm.map(|p| p.min(1000));
     out.mem_psi_some_avg10_pm = out.mem_psi_some_avg10_pm.map(|p| p.min(1000));
     out.host_key = out.host_key.filter(|k| {
-        !k.is_empty() && k.len() <= 64 && k.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        !k.is_empty()
+            && k.len() <= 64
+            && k.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
     });
     for fact in out.capabilities.values_mut() {
         fact.observed_at = fact.observed_at.min(now);

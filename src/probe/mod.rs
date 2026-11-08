@@ -85,45 +85,24 @@ pub fn probe_at(host: &dyn Host, work_root: &Path) -> Capacity {
 /// Build-environment facts that need no tooling: memory available and CPU
 /// pressure. Sent on every heartbeat; the admission rule reads the pressure.
 pub fn env_facts(host: &dyn Host, now: i64) -> EnvFacts {
-    let host_mem = meminfo_available_mib(host, &Path::new(HOST_VIEW_DIR).join("meminfo"));
     EnvFacts {
         observed_at: now,
         mem_available_mib: mem_available_mib(host),
         cpu_psi_some_avg10_pm: cpu_psi_pm(host),
         load_per_cpu_pm: load_per_cpu_pm(host),
         mem_psi_some_avg10_pm: mem_psi_pm(host),
-        host_mem_available_mib: host_mem,
-        host_key: host_mem.and(host_key(host)),
         ..EnvFacts::default()
     }
 }
 
-/// Where a container drone finds read-only bind mounts of its node's
-/// `/proc/meminfo`, `/proc/pressure` and `/proc/sys/kernel/random/boot_id`.
-/// lxcfs gives a container its own `/proc/meminfo` and `/proc/pressure`, so
-/// without these it cannot see what the node's other guests use.
-pub const HOST_VIEW_DIR: &str = "/var/lib/borg-host";
-
-/// The node's boot id from the host view: lowercase hex and dashes only.
-fn host_key(host: &dyn Host) -> Option<String> {
-    let id = host.read_to_string(&Path::new(HOST_VIEW_DIR).join("boot_id"))?;
-    let id = id.trim();
-    (!id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
-        .then(|| id.to_ascii_lowercase())
-}
-
-/// The highest `memory some avg10` in permille of the drone's view, its
-/// cgroup and its host view.
+/// The higher `memory some avg10` in permille of the drone's view and its
+/// cgroup. A container's node is read separately; see
+/// [`crate::drone::hostview`].
 fn mem_psi_pm(host: &dyn Host) -> Option<u16> {
-    let host_view = Path::new(HOST_VIEW_DIR).join("pressure/memory");
-    [
-        Path::new("/proc/pressure/memory"),
-        Path::new("/sys/fs/cgroup/memory.pressure"),
-        host_view.as_path(),
-    ]
-    .iter()
-    .filter_map(|path| parse_psi_some_avg10_pm(&host.read_to_string(path)?))
-    .max()
+    ["/proc/pressure/memory", "/sys/fs/cgroup/memory.pressure"]
+        .iter()
+        .filter_map(|path| parse_psi_some_avg10_pm(&host.read_to_string(Path::new(path))?))
+        .max()
 }
 
 /// The 1-minute load average per usable CPU, in permille.
@@ -638,49 +617,18 @@ mod tests {
     }
 
     #[test]
-    fn a_container_reports_its_node_through_the_host_view() {
-        // lxcfs: the container's own view says 27 GiB free and no pressure.
+    fn memory_pressure_is_the_higher_of_the_drone_and_its_cgroup() {
         let mut h = linux();
-        h.files.insert(
-            "/proc/meminfo",
-            "MemTotal: 29360128 kB\nMemAvailable: 28522113 kB\n",
-        );
+        assert_eq!(env_facts(&h, 7).mem_psi_some_avg10_pm, None);
         h.files
             .insert("/proc/pressure/memory", "some avg10=0.00 avg60=0\n");
-        let alone = env_facts(&h, 7);
-        assert_eq!(alone.mem_available_mib, Some(27_853));
-        assert_eq!(alone.mem_psi_some_avg10_pm, Some(0));
-        assert_eq!((alone.host_mem_available_mib, alone.host_key), (None, None));
-
-        // The node's own files, bind-mounted read-only, tell the truth.
         h.files.insert(
-            "/var/lib/borg-host/meminfo",
-            "MemTotal: 97517568 kB\nMemAvailable: 17825792 kB\n",
-        );
-        h.files.insert(
-            "/var/lib/borg-host/pressure/memory",
+            "/sys/fs/cgroup/memory.pressure",
             "some avg10=6.18 avg60=3.11 avg300=3.44 total=1\nfull avg10=3.38\n",
         );
-        h.files.insert(
-            "/var/lib/borg-host/boot_id",
-            "3F04FEDF-3e64-45dc-977a-e4913107d6cf\n",
-        );
         let f = env_facts(&h, 7);
-        assert_eq!(f.mem_available_mib, Some(27_853));
-        assert_eq!(f.host_mem_available_mib, Some(17_408));
         assert_eq!(f.mem_psi_some_avg10_pm, Some(62));
-        assert_eq!(
-            f.host_key.as_deref(),
-            Some("3f04fedf-3e64-45dc-977a-e4913107d6cf")
-        );
-
-        // A key that is not a boot id is dropped; so is a key without memory.
-        h.files.insert("/var/lib/borg-host/boot_id", "../../etc\n");
-        assert_eq!(env_facts(&h, 7).host_key, None);
-        h.files.remove("/var/lib/borg-host/meminfo");
-        h.files
-            .insert("/var/lib/borg-host/boot_id", "3f04fedf-3e64\n");
-        assert_eq!(env_facts(&h, 7).host_key, None);
+        assert_eq!((f.host_mem_available_mib, f.host_key), (None, None));
     }
 
     const MEMINFO_28G: &str = "MemTotal:       29360128 kB\nMemFree: 1 kB\n";

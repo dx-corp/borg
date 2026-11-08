@@ -453,6 +453,12 @@ pub fn advance(
             continue;
         };
         if !on_target(d) {
+            // A drone that went silent before reporting the target never ran
+            // it: a burst drone retired mid-rollout is not evidence against
+            // the new version.
+            if !d.fresh {
+                continue;
+            }
             if overdue {
                 halt.get_or_insert(format!(
                     "{n} did not report {target} within {}s of being told",
@@ -571,7 +577,9 @@ pub fn advance(
             st.phase = Phase::Complete;
             events.push(format!("rollout of {target} complete"));
         } else {
-            let eligible: Vec<&DroneView> = drones.iter().filter(|d| !d.held).collect();
+            // Only drones that can update now: a silent one would only stall
+            // the wave until it timed out.
+            let eligible: Vec<&DroneView> = drones.iter().filter(|d| d.fresh && !d.held).collect();
             let pct = usize::try_from(s.waves_pct[next]).unwrap_or(100);
             let want = (eligible.len() * pct).div_ceil(100);
             let mut extra: Vec<&str> = eligible
@@ -891,6 +899,39 @@ mod tests {
                 .unwrap()
                 .contains("quarantined")
         );
+    }
+
+    #[test]
+    fn silent_drones_are_neither_told_nor_waited_for() {
+        let (mut f, st) = promoted_to_wave();
+        // "a-gone" sorts first, so a wave would pick it before l2.
+        let mut gone = drone("a-gone", "linux", OLD, 0);
+        gone.fresh = false;
+        f.push(gone);
+        let jobs: Vec<Outcome> = (0..6)
+            .map(|i| job("l1", 150 + i, OutcomeKind::Ok))
+            .collect();
+        // Wave 2 is 50% of the 5 fresh drones: 3, and never the silent one.
+        let b = step(241, Some(st), &f, &jobs);
+        assert_eq!((b.state.phase, b.state.wave), (Phase::Wave, 1));
+        assert_eq!(b.state.members, ["l1", "m1", "l2"]);
+        // A member told, then silent without ever reporting the target, is
+        // skipped rather than halting the rollout past the update timeout.
+        let mut told = b.state.clone();
+        told.members.push("a-gone".into());
+        let mut updated = f.clone();
+        set_version(&mut updated, &["l2"], NEW, 250);
+        let c = step(241 + 1000, Some(told), &updated, &jobs);
+        assert_ne!(c.state.phase, Phase::Halted, "{:?}", c.state.halted_reason);
+        // One that reported the target and then went silent still halts.
+        let mut quiet = f.clone();
+        set_version(&mut quiet, &["l2"], NEW, 250);
+        quiet
+            .iter_mut()
+            .filter(|d| d.name == "l2")
+            .for_each(|d| d.fresh = false);
+        let d = step(241 + 1000, Some(b.state), &quiet, &jobs);
+        assert_eq!(d.state.phase, Phase::Halted);
     }
 
     #[test]
