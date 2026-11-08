@@ -1092,7 +1092,7 @@ pub struct Status {
     queen: Option<crate::queen::QueenBuild>,
     /// Cost-aware placement (owned hosts before burst): where grants went
     /// and, in dry-run, where they would have gone.
-    pub placement: crate::placement::PlacementView,
+    placement: crate::placement::PlacementView,
     pub rollout: RolloutStatus,
     pub warm_floors: Vec<crate::allocator::WarmFloor>,
     pub pressure: Vec<ClassPressure>,

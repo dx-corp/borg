@@ -63,7 +63,7 @@ pub struct UpdateConfig {
     /// swap (the queen's `/etc/borg/queen.json`). Absent: no check. Never
     /// written as `null`, so older updaters still read a drone's file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_check: Option<PathBuf>,
+    pub(crate) config_check: Option<PathBuf>,
 }
 
 fn default_bin() -> PathBuf {

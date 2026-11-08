@@ -52,7 +52,7 @@ pub struct RolloutSettings {
     /// queen itself runs, so a queen self-update carries the fleet with it
     /// through the same gate. The previous version is then the one the fleet
     /// was on when that rollout started.
-    pub follow_queen: bool,
+    pub(crate) follow_queen: bool,
     /// OSes that each need a canary host, as reported by the drone probe.
     pub canary_oses: Vec<String>,
     /// Successful jobs each canary must complete on the target.
