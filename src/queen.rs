@@ -114,7 +114,7 @@ pub struct Snapshot {
     pub(super) burst: Option<BurstView>,
     /// Cost-aware placement: running totals of where grants went and, in
     /// dry-run, where they would have gone.
-    pub placement: crate::placement::PlacementView,
+    pub(crate) placement: crate::placement::PlacementView,
 }
 
 /// The burst rule's memory and the fleet it made (simulated in dry-run,
