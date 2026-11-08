@@ -380,6 +380,7 @@ impl Drone {
                 cache_free,
             )
             .blocked();
+        self.measure_version().await;
         let defer = self.after_heartbeat(&req, resp.desired_version.as_deref());
         if let Some(credential) = resp.mirror_credential {
             self.caches.set_mirror_credential(credential);
@@ -545,6 +546,20 @@ impl Drone {
         }))
     }
 
+    /// Measure the running build once (the startup sweep normally has), so
+    /// self-update never waits on the sweep having run first.
+    async fn measure_version(&self) {
+        if self.reported_version.get().is_some() {
+            return;
+        }
+        let version = tokio::task::spawn_blocking(selfupdate::running_build_version)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+        let _ = self.reported_version.set(version);
+    }
+
     /// What a successful heartbeat means for self-update: the queen has the
     /// updater's report, the running binary is demonstrably working, and the
     /// queen may want another version (older ones included). Returns true when
@@ -557,8 +572,8 @@ impl Drone {
         // The build version (`0.1.0+<hash>`), as reported to the queen: the
         // updater waits for health evidence from exactly the build it
         // installed, and the queen's target names that build.
-        // Before the startup sweep has measured it, decide nothing: the bare
-        // package version would never match a build target.
+        // `measure_version` ran just before; without a measurement decide
+        // nothing, since the bare package version never matches a build.
         let Some(own) = self.reported_version.get().map(String::as_str) else {
             return false;
         };
