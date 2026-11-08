@@ -247,7 +247,7 @@ pub struct DroneConfig {
     /// memory and pressure. Older drones can still read the config when this
     /// field is unset because it is omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_metrics_url: Option<String>,
+    pub(super) host_metrics_url: Option<String>,
     /// Number of slot directories (`<work_root>/slot-<N>`) leases run in. A
     /// lease takes the lowest free slot, so its path never contains the lease
     /// id and a reused slot has an identical path. Also the most leases that
