@@ -332,7 +332,10 @@ fn compare(s: &RolloutSettings, label: &str, new: &Observed, control: &Observed)
             }
         ),
     }];
-    if have_control && new.jobs > 0 {
+    // One job's own test failure is not a success rate: the new version is
+    // judged on as many jobs as the control needs. Host failures above still
+    // count from the first job.
+    if have_control && new.jobs >= s.min_baseline_jobs {
         let floor = control.success_pm().saturating_sub(s.max_success_drop_pm);
         checks.push(Check {
             name: "success_rate",
@@ -899,6 +902,24 @@ mod tests {
                 .unwrap()
                 .contains("quarantined")
         );
+    }
+
+    #[test]
+    fn one_failed_job_does_not_halt_a_canary_but_a_failing_sample_does() {
+        let mut f = fleet();
+        let a = step(100, None, &f, &[]);
+        set_version(&mut f, &["l1", "m1"], NEW, 105);
+        // Control: other drones mostly succeed since the stage began.
+        let mut jobs: Vec<Outcome> = (0..8)
+            .map(|i| job("l2", 106 + i, OutcomeKind::Ok))
+            .collect();
+        jobs.push(job("l1", 110, OutcomeKind::Other));
+        let b = step(120, Some(a.state.clone()), &f, &jobs);
+        assert_ne!(b.state.phase, Phase::Halted, "{:?}", b.state.halted_reason);
+        // Four failures on l1 (the minimum sample) still halt.
+        jobs.extend((0..3).map(|i| job("l1", 111 + i, OutcomeKind::Other)));
+        let c = step(130, Some(a.state), &f, &jobs);
+        assert_eq!(c.state.phase, Phase::Halted, "{:?}", c.checks);
     }
 
     #[test]
