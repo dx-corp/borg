@@ -174,6 +174,30 @@ pub(crate) fn previous_for(
         .map(|(v, _)| v.to_owned())
 }
 
+/// The target a pass works toward when the target follows the queen's own
+/// build. Every borg merge restarts the queen on a new build, and starting a
+/// fresh rollout on each one restarted the canary stage before it could
+/// finish. So a rollout in progress keeps its target until it completes or
+/// halts, or until the newer build has run `after_secs` (`build_age_secs`;
+/// unknown counts as old enough).
+pub(crate) fn settled_target(
+    target: String,
+    stored: Option<&RolloutState>,
+    build_age_secs: Option<i64>,
+    after_secs: i64,
+) -> String {
+    match stored {
+        Some(s)
+            if s.target != target
+                && matches!(s.phase, Phase::Canary | Phase::Wave)
+                && build_age_secs.is_some_and(|age| age < after_secs) =>
+        {
+            s.target.clone()
+        }
+        _ => target,
+    }
+}
+
 /// The persisted state of one rollout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutState {
@@ -202,6 +226,10 @@ pub struct DroneView {
     pub version: Option<String>,
     /// When the queen first saw the drone report `version`.
     pub version_since: Option<i64>,
+    /// Runs shared CI work ([`crate::classes::Trust::Shared`]). Canaries are
+    /// chosen among these first: a deploy-only drone runs few jobs, so it
+    /// proves little and stalls the canary stage.
+    pub shared: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -372,8 +400,8 @@ pub fn advance(
             let pick = drones
                 .iter()
                 .filter(|d| d.fresh && !d.held && d.os == *os && !chosen.contains(&d.name))
-                .map(|d| d.name.clone())
-                .min();
+                .min_by_key(|d| (!d.shared, d.name.as_str()))
+                .map(|d| d.name.clone());
             match pick {
                 Some(name) => {
                     events.push(format!("canary for {os}: {name}"));
@@ -611,6 +639,7 @@ mod tests {
 
     fn drone(name: &str, os: &str, version: &str, since: i64) -> DroneView {
         DroneView {
+            shared: true,
             name: name.into(),
             os: os.into(),
             fresh: true,
@@ -862,6 +891,44 @@ mod tests {
                 .unwrap()
                 .contains("quarantined")
         );
+    }
+
+    #[test]
+    fn canaries_come_from_shared_drones_before_deploy_only_ones() {
+        let mut fleet = fleet();
+        let mut deploy = drone("a-deploy", "linux", OLD, 0);
+        deploy.shared = false;
+        fleet.push(deploy.clone());
+        let a = step(1000, None, &fleet, &[]);
+        assert!(
+            a.state.canaries.iter().all(|c| c != "a-deploy"),
+            "{:?}",
+            a.state.canaries
+        );
+        // With nothing shared left, a deploy-only drone still serves.
+        let a = step(1000, None, &[deploy], &[]);
+        assert_eq!(a.state.canaries, vec!["a-deploy".to_owned()]);
+    }
+
+    #[test]
+    fn a_rollout_in_flight_keeps_its_target_until_done_or_the_new_build_is_an_hour_old() {
+        let fleet = fleet();
+        let canary = step(1000, None, &fleet, &[]).state;
+        assert_eq!(canary.phase, Phase::Canary);
+        let hold = |stored: &RolloutState, age| {
+            settled_target("0.1.0+newer".into(), Some(stored), age, 3600)
+        };
+        assert_eq!(hold(&canary, Some(60)), canary.target);
+        assert_eq!(hold(&canary, Some(3600)), "0.1.0+newer");
+        assert_eq!(hold(&canary, None), "0.1.0+newer");
+        for phase in [Phase::Complete, Phase::Halted] {
+            let done = RolloutState {
+                phase,
+                ..canary.clone()
+            };
+            assert_eq!(hold(&done, Some(60)), "0.1.0+newer");
+        }
+        assert_eq!(settled_target("x".into(), None, Some(0), 3600), "x");
     }
 
     #[test]

@@ -350,6 +350,37 @@ pub struct AdmissionSettings {
     pub psi_hard_pm: u16,
     /// A drone's reported pressure older than this counts as unknown.
     pub facts_max_age_secs: i64,
+    /// From this `memory some avg10` (permille; the higher of what the drone
+    /// sees and its host view) a drone takes only light main and deploy work.
+    #[serde(default = "default_mem_psi_light_only_pm")]
+    mem_psi_light_only_pm: u16,
+    /// From this memory pressure a drone takes no new grant.
+    #[serde(default = "default_mem_psi_hard_pm")]
+    mem_psi_hard_pm: u16,
+    /// A drone leaves a restrictive admission state only once its pressure is
+    /// this far below the threshold (permille of it), so it does not flap.
+    #[serde(default = "default_hysteresis_pm")]
+    hysteresis_pm: u16,
+    /// Memory kept free on a node whose drones report a host view, for the
+    /// node's other guests (MiB). One fleet-wide value, not per host.
+    #[serde(default = "default_host_reserve_mem_mib")]
+    pub(crate) host_reserve_mem_mib: u64,
+}
+
+fn default_mem_psi_light_only_pm() -> u16 {
+    100
+}
+
+fn default_mem_psi_hard_pm() -> u16 {
+    250
+}
+
+fn default_hysteresis_pm() -> u16 {
+    200
+}
+
+fn default_host_reserve_mem_mib() -> u64 {
+    4096
 }
 
 impl AdmissionSettings {
@@ -358,6 +389,9 @@ impl AdmissionSettings {
             psi_soft_pm: self.psi_soft_pm,
             psi_light_only_pm: self.psi_light_only_pm.unwrap_or(self.psi_hard_pm),
             psi_hard_pm: self.psi_hard_pm,
+            mem_psi_light_only_pm: self.mem_psi_light_only_pm,
+            mem_psi_hard_pm: self.mem_psi_hard_pm,
+            hysteresis_pm: self.hysteresis_pm,
         }
     }
 
@@ -374,6 +408,17 @@ impl AdmissionSettings {
         }
         if self.facts_max_age_secs <= 0 {
             return Err("admission.facts_max_age_secs must be positive".to_owned());
+        }
+        if self.mem_psi_light_only_pm == 0
+            || self.mem_psi_light_only_pm > self.mem_psi_hard_pm
+            || self.mem_psi_hard_pm > 1000
+        {
+            return Err(
+                "admission needs 0 < mem_psi_light_only_pm <= mem_psi_hard_pm <= 1000".to_owned(),
+            );
+        }
+        if self.hysteresis_pm >= 1000 {
+            return Err("admission.hysteresis_pm must be below 1000".to_owned());
         }
         Ok(())
     }

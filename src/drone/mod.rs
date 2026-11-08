@@ -222,9 +222,12 @@ impl Drone {
         let wiper = self.credwipe.clone();
         let reported = Arc::clone(&self.reported_version);
         let swept = tokio::task::spawn_blocking(move || {
-            if let Some(v) = selfupdate::running_build_version() {
-                let _ = reported.set(v);
-            }
+            // Set even when the binary cannot be hashed, so self-update,
+            // which waits for this, still runs on the package version.
+            let _ = reported.set(
+                selfupdate::running_build_version()
+                    .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned()),
+            );
             let dirs = sweep_work_root(fs_ops.as_ref(), &work_root);
             let docker = cleanup_docker(exec.as_ref(), &docker, Scope::AnyLease);
             if let Some(w) = wiper {
@@ -377,6 +380,7 @@ impl Drone {
                 cache_free,
             )
             .blocked();
+        self.measure_version().await;
         let defer = self.after_heartbeat(&req, resp.desired_version.as_deref());
         if let Some(credential) = resp.mirror_credential {
             self.caches.set_mirror_credential(credential);
@@ -542,6 +546,20 @@ impl Drone {
         }))
     }
 
+    /// Measure the running build once (the startup sweep normally has), so
+    /// self-update never waits on the sweep having run first.
+    async fn measure_version(&self) {
+        if self.reported_version.get().is_some() {
+            return;
+        }
+        let version = tokio::task::spawn_blocking(selfupdate::running_build_version)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+        let _ = self.reported_version.set(version);
+    }
+
     /// What a successful heartbeat means for self-update: the queen has the
     /// updater's report, the running binary is demonstrably working, and the
     /// queen may want another version (older ones included). Returns true when
@@ -551,7 +569,14 @@ impl Drone {
         let Some(su) = &self.selfupdate else {
             return false;
         };
-        let own = env!("CARGO_PKG_VERSION");
+        // The build version (`0.1.0+<hash>`), as reported to the queen: the
+        // updater waits for health evidence from exactly the build it
+        // installed, and the queen's target names that build.
+        // `measure_version` ran just before; without a measurement decide
+        // nothing, since the bare package version never matches a build.
+        let Some(own) = self.reported_version.get().map(String::as_str) else {
+            return false;
+        };
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         if let Err(e) = su.record_health(own, now) {
             tracing::warn!("write health record: {e}");

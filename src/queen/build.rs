@@ -1,9 +1,15 @@
-//! What the running queen is (`/status` `queen`) and the health record the
-//! self-updater waits for after a swap.
+//! What the running queen is (`/status` `queen`), the health record the
+//! self-updater waits for after a swap, and the rollout target that follows
+//! the queen's own build.
 
 use serde::Serialize;
 
 use super::Queen;
+use crate::rollout::RolloutState;
+
+/// A rollout in progress adopts the queen's newer build once that build has
+/// run this long; see [`Queen::settled_target`].
+const RETARGET_AFTER_SECS: i64 = 3600;
 
 /// What this queen process runs, for `/status` and the updater.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -33,6 +39,11 @@ impl QueenBuild {
     pub(super) fn version(&self) -> &str {
         &self.version
     }
+
+    /// When this queen process started on the build.
+    fn started_at(&self) -> i64 {
+        self.started_at
+    }
 }
 
 impl Queen {
@@ -45,6 +56,37 @@ impl Queen {
 
     pub(crate) fn build(&self) -> Option<&QueenBuild> {
         self.build.as_ref()
+    }
+
+    /// The version drones are rolled out to: the configured target, or with
+    /// `rollout.follow_queen` the build this queen runs.
+    pub(crate) fn rollout_target(&self) -> Option<String> {
+        self.cfg.rollout_target_version.clone().or_else(|| {
+            self.cfg
+                .rollout
+                .follow_queen
+                .then(|| self.build.as_ref().map(|b| b.version().to_owned()))
+                .flatten()
+        })
+    }
+
+    /// The target this pass, held while a rollout is in flight when the
+    /// target only follows the queen's own build; see
+    /// [`crate::rollout::settled_target`]. A configured target applies at once.
+    pub(super) fn settled_target(
+        &self,
+        target: String,
+        stored: Option<&RolloutState>,
+        now: i64,
+    ) -> String {
+        if self.cfg.rollout_target_version.is_some() || !self.cfg.rollout.follow_queen {
+            return target;
+        }
+        let build_age = self
+            .build
+            .as_ref()
+            .map(|b| now.saturating_sub(b.started_at()));
+        crate::rollout::settled_target(target, stored, build_age, RETARGET_AFTER_SECS)
     }
 
     /// After a pass that succeeded, tell the updater this binary works: write

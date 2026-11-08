@@ -24,7 +24,9 @@
 //!    carved dynamically: the same drone can end up as one heavy, two medium
 //!    or several light slots depending on what is queued.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +99,50 @@ pub struct DroneState {
     /// goes to idle owned hosts first. See [`cost_term`].
     #[serde(default = "owned_cost")]
     pub(crate) cost_permille: u32,
+    /// What the drone measured about memory right now, set by the queen from
+    /// fresh facts. Empty: the drone is sized by its budget alone.
+    #[serde(default)]
+    pub(crate) live: LiveFacts,
+}
+
+/// A drone's measured memory facts, which size it beyond its budget:
+///
+/// - Memory is charged at the larger of what its leases committed (their
+///   class sizes) and what is in use now, so a job that outgrows its class,
+///   or anything else running in the container, shrinks the room.
+/// - Drones that share one kernel (several containers on one Proxmox node)
+///   also draw on one pool: the node's available memory, less a reserve, less
+///   the growth their leases may still make (committed minus in use). Two
+///   drones cannot each admit a heavy job into the same free memory.
+/// - Memory pressure feeds admission next to CPU pressure, and the state a
+///   drone settled in last pass gives admission its hysteresis.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveFacts {
+    /// Memory in use on the drone as it sees it (`MemTotal - MemAvailable`),
+    /// MiB; `None` when not measured or stale.
+    #[serde(default)]
+    pub(crate) mem_used_mib: Option<u64>,
+    /// The node memory this drone shares; `None` without a host view.
+    #[serde(default)]
+    pub(crate) host: Option<HostMemory>,
+    /// `memory some avg10`, permille: the highest of what the drone sees and
+    /// its host view.
+    #[serde(default)]
+    pub(crate) mem_psi_pm: Option<u16>,
+    /// The admission state this drone settled in on the previous pass.
+    #[serde(default)]
+    pub(crate) admission_prev: Option<AdmissionState>,
+}
+
+/// One node's memory as a drone on it reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostMemory {
+    /// Drones reporting the same key share the pool (the node's boot id).
+    pub(crate) key: String,
+    /// The node's `MemAvailable`, MiB.
+    pub(crate) available_mib: u64,
+    /// Kept free on the node for its other guests, MiB.
+    pub(crate) reserve_mib: u64,
 }
 
 /// The cost of an owned host, permille.
@@ -140,6 +186,33 @@ pub struct AdmissionThresholds {
     /// `psi_hard_pm` it has no effect.
     pub(crate) psi_light_only_pm: u16,
     pub psi_hard_pm: u16,
+    /// From this `memory some avg10` only light main and deploy grants.
+    pub(crate) mem_psi_light_only_pm: u16,
+    /// From this memory pressure no new grant.
+    pub(crate) mem_psi_hard_pm: u16,
+    /// A drone leaves a restrictive state only once its pressure is this far
+    /// (permille of each threshold) below the threshold that put it there.
+    pub(crate) hysteresis_pm: u16,
+}
+
+impl AdmissionThresholds {
+    /// The same thresholds lowered by the hysteresis margin, never to 0.
+    fn lowered(self) -> Self {
+        let keep = 1000 - u32::from(self.hysteresis_pm.min(999));
+        let low = |t: u16| {
+            u16::try_from(u32::from(t) * keep / 1000)
+                .unwrap_or(t)
+                .max(1)
+        };
+        Self {
+            psi_soft_pm: low(self.psi_soft_pm),
+            psi_light_only_pm: low(self.psi_light_only_pm),
+            psi_hard_pm: low(self.psi_hard_pm),
+            mem_psi_light_only_pm: low(self.mem_psi_light_only_pm),
+            mem_psi_hard_pm: low(self.mem_psi_hard_pm),
+            hysteresis_pm: self.hysteresis_pm,
+        }
+    }
 }
 
 /// What a drone may be granted given its CPU pressure.
@@ -181,6 +254,64 @@ impl AdmissionState {
         }
     }
 
+    /// Order by how much is shed: open < pr_blocked < light_only < closed.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::PrBlocked => 1,
+            Self::LightOnly => 2,
+            Self::Closed => 3,
+        }
+    }
+
+    fn stricter(self, other: Self) -> Self {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    fn looser(self, other: Self) -> Self {
+        if other.rank() < self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// The state for CPU pressure `cpu` and memory pressure `mem` alone.
+    fn raw(cpu: Option<u16>, mem: Option<u16>, t: AdmissionThresholds) -> Self {
+        let by_mem = match mem {
+            Some(p) if p >= t.mem_psi_hard_pm => Self::Closed,
+            Some(p) if p >= t.mem_psi_light_only_pm => Self::LightOnly,
+            _ => Self::Open,
+        };
+        Self::of(cpu, Some(t)).stricter(by_mem)
+    }
+
+    /// The state a drone settles in this pass. Rising pressure takes effect
+    /// at once; a drone relaxes from `prev` only as far as thresholds lowered
+    /// by the hysteresis margin allow, so pressure hovering at a threshold
+    /// does not flip it every pass.
+    pub(crate) fn settle(
+        cpu: Option<u16>,
+        mem: Option<u16>,
+        prev: Option<Self>,
+        t: Option<AdmissionThresholds>,
+    ) -> Self {
+        let Some(t) = t else {
+            return Self::Open;
+        };
+        let raw = Self::raw(cpu, mem, t);
+        match prev {
+            Some(prev) if prev.rank() > raw.rank() => {
+                raw.stricter(prev.looser(Self::raw(cpu, mem, t.lowered())))
+            }
+            _ => raw,
+        }
+    }
+
     pub(crate) fn admits(self, class: Class, scope: Scope) -> bool {
         match self {
             Self::Open => true,
@@ -198,6 +329,16 @@ impl DroneState {
     pub(crate) fn admission_pressure_pm(&self) -> Option<u16> {
         self.cpu_psi_pm.or(self.cpu_load_pm)
     }
+
+    /// This pass's admission state; see [`AdmissionState::settle`].
+    pub(crate) fn admission(&self, t: Option<AdmissionThresholds>) -> AdmissionState {
+        AdmissionState::settle(
+            self.admission_pressure_pm(),
+            self.live.mem_psi_pm,
+            self.live.admission_prev,
+            t,
+        )
+    }
 }
 
 /// One drone's admission state this pass.
@@ -210,6 +351,9 @@ pub struct DroneAdmission {
     /// `None`.
     #[serde(default)]
     pub(crate) cpu_load_pm: Option<u16>,
+    /// Memory pressure, permille; see [`LiveFacts::mem_psi_pm`].
+    #[serde(default)]
+    pub(crate) mem_psi_pm: Option<u16>,
 }
 
 impl DroneState {
@@ -232,6 +376,7 @@ impl DroneState {
             cpu_load_pm: None,
             trust: Trust::Shared,
             cost_permille: OWNED_COST_PERMILLE,
+            live: LiveFacts::default(),
         }
     }
 }
@@ -393,6 +538,8 @@ pub enum Rejection {
     Environment,
     Docker,
     Memory,
+    /// The drone has room but its node's shared free memory does not.
+    HostMemory,
     Vcpu,
     LeaseCap,
     Reserved,
@@ -580,10 +727,15 @@ pub fn free_slots(drone: &DroneState, room: &Room, spec: &ClassSpec) -> u32 {
     u32::try_from(by_mem.min(by_cpu).min(by_cap)).unwrap_or(u32::MAX)
 }
 
+/// Free memory one node's drones share this pass; see [`LiveFacts`].
+type Pool = Rc<Cell<u64>>;
+
 /// Remaining room on a drone while allocating.
 struct Free<'a> {
     drone: &'a DroneState,
     mem_mib: u64,
+    /// The node pool this drone draws on too, if it shares one.
+    pool: Option<Pool>,
     vcpu: u32,
     leases_left: Option<u32>,
     in_flight: u32,
@@ -732,6 +884,8 @@ impl Free<'_> {
         }
         if self.mem_mib < spec.mem_mib {
             reasons.push(Rejection::Memory);
+        } else if self.mem_room() < spec.mem_mib {
+            reasons.push(Rejection::HostMemory);
         }
         if self.vcpu < spec.vcpu {
             reasons.push(Rejection::Vcpu);
@@ -754,7 +908,7 @@ impl Free<'_> {
                 leases_left: self.drone.max_leases,
             },
             room: Room {
-                mem_mib: self.mem_mib,
+                mem_mib: self.mem_room(),
                 vcpu: self.vcpu,
                 leases_left: self.leases_left,
             },
@@ -778,11 +932,18 @@ impl Free<'_> {
         }
     }
 
+    /// Memory a new lease may take: the drone's room, and its node's pool.
+    fn mem_room(&self) -> u64 {
+        self.pool
+            .as_ref()
+            .map_or(self.mem_mib, |p| p.get().min(self.mem_mib))
+    }
+
     fn fits(&self, spec: &ClassSpec) -> bool {
         self.drone.accepting
             && self.admission != AdmissionState::Closed
             && (!spec.docker || self.drone.docker)
-            && self.mem_mib >= spec.mem_mib
+            && self.mem_room() >= spec.mem_mib
             && self.vcpu >= spec.vcpu
             && self.leases_left != Some(0)
     }
@@ -790,7 +951,7 @@ impl Free<'_> {
     /// Could this drone ever hold `spec` if it were empty?
     /// Whole leases of `spec` the remaining room holds.
     fn slots(&self, spec: &ClassSpec) -> u32 {
-        let by_mem = self.mem_mib / spec.mem_mib.max(1);
+        let by_mem = self.mem_room() / spec.mem_mib.max(1);
         let by_cpu = u64::from(self.vcpu / spec.vcpu.max(1));
         let by_cap = self.leases_left.map_or(u64::MAX, u64::from);
         u32::try_from(by_mem.min(by_cpu).min(by_cap)).unwrap_or(u32::MAX)
@@ -807,6 +968,9 @@ impl Free<'_> {
 
     fn take(&mut self, spec: &ClassSpec) {
         self.mem_mib = self.mem_mib.saturating_sub(spec.mem_mib);
+        if let Some(p) = &self.pool {
+            p.set(p.get().saturating_sub(spec.mem_mib));
+        }
         self.vcpu = self.vcpu.saturating_sub(spec.vcpu);
         self.leases_left = self.leases_left.map(|n| n.saturating_sub(1));
     }
@@ -825,20 +989,64 @@ fn free_by_drone<'a>(
         free.entry(drone.id.as_str()).or_insert(Free {
             drone,
             mem_mib: drone.mem_mib,
+            pool: None,
             vcpu: drone.vcpu,
             leases_left: drone.max_leases,
             in_flight: 0,
-            admission: AdmissionState::of(drone.admission_pressure_pm(), admission),
+            admission: drone.admission(admission),
             granted: BTreeMap::new(),
         });
     }
+    let mut committed: BTreeMap<&str, u64> = BTreeMap::new();
     for lease in leases {
         if let Some(f) = free.get_mut(lease.drone_id.as_str()) {
-            f.take(classes.spec(lease.class));
+            let spec = classes.spec(lease.class);
+            f.take(spec);
             f.in_flight += 1;
+            *committed.entry(f.drone.id.as_str()).or_default() += spec.mem_mib;
         }
     }
+    charge_live_memory(&mut free, &committed);
     free
+}
+
+/// Apply [`LiveFacts`] to rooms already net of their leases' class sizes:
+/// charge each drone the larger of committed and used memory, and join drones
+/// on one node to a pool of its free memory less its reserve and the growth
+/// their leases may still make.
+fn charge_live_memory(free: &mut BTreeMap<&str, Free<'_>>, committed: &BTreeMap<&str, u64>) {
+    let mut pools: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for f in free.values_mut() {
+        let held = committed.get(f.drone.id.as_str()).copied().unwrap_or(0);
+        let used = f.drone.live.mem_used_mib;
+        if let Some(used) = used {
+            f.mem_mib = f
+                .mem_mib
+                .min(f.drone.mem_mib.saturating_sub(used.max(held)));
+        }
+        if let Some(h) = &f.drone.live.host {
+            // A drone without a reading owes its whole commitment.
+            let growth = held.saturating_sub(used.unwrap_or(0));
+            let free_now = h.available_mib.saturating_sub(h.reserve_mib);
+            let entry = pools.entry(h.key.clone()).or_insert((free_now, 0));
+            // Readings arrive at different times; the lowest is the safe one.
+            entry.0 = entry.0.min(free_now);
+            entry.1 = entry.1.saturating_add(growth);
+        }
+    }
+    let shared: BTreeMap<String, Pool> = pools
+        .into_iter()
+        .map(|(key, (free_now, growth))| (key, Rc::new(Cell::new(free_now.saturating_sub(growth)))))
+        .collect();
+    for f in free.values_mut() {
+        f.pool = f
+            .drone
+            .live
+            .host
+            .as_ref()
+            .and_then(|h| shared.get(&h.key))
+            .cloned();
+    }
 }
 
 /// Idle slots of `class` across `free`. Spare room counts only where any
@@ -846,14 +1054,24 @@ fn free_by_drone<'a>(
 /// CPU pressure, or blocking the class by its environment, has no idle slot
 /// for this purpose.
 fn class_idle(free: &BTreeMap<&str, Free<'_>>, class: Class, spec: &ClassSpec) -> u32 {
-    free.values()
-        .filter(|f| {
-            f.fits(spec)
-                && !f.drone.blocked_classes.contains(&class)
-                && Scope::ALL.iter().all(|s| f.admission.admits(class, *s))
-        })
-        .map(|f| f.slots(spec))
-        .fold(0u32, u32::saturating_add)
+    // A node pool is drawn down as its drones are counted, so its memory is
+    // not offered once per drone.
+    let mut pools: BTreeMap<*const Cell<u64>, u64> = BTreeMap::new();
+    let mut idle = 0u32;
+    for f in free.values().filter(|f| {
+        f.fits(spec)
+            && !f.drone.blocked_classes.contains(&class)
+            && Scope::ALL.iter().all(|s| f.admission.admits(class, *s))
+    }) {
+        let mut slots = f.slots(spec);
+        if let Some(p) = &f.pool {
+            let left = pools.entry(Rc::as_ptr(p)).or_insert_with(|| p.get());
+            slots = slots.min(u32::try_from(*left / spec.mem_mib.max(1)).unwrap_or(u32::MAX));
+            *left = left.saturating_sub(u64::from(slots) * spec.mem_mib);
+        }
+        idle = idle.saturating_add(slots);
+    }
+    idle
 }
 
 /// Idle slots per class once `leases` hold their room, by the same rule the
@@ -911,17 +1129,17 @@ fn place(
         for (id, f) in free.iter() {
             let candidate = f.candidate(input, class, scope, level, reserved.get(*id).copied());
             if let Some(score) = candidate.score {
-                let rank = (std::cmp::Reverse(score), f.mem_mib - spec.mem_mib, *id);
+                let rank = (std::cmp::Reverse(score), f.mem_room() - spec.mem_mib, *id);
                 let beats = |held: Option<(i64, u64, &str)>| {
                     held.is_none_or(|(s, mem, name)| rank < (std::cmp::Reverse(s), mem, name))
                 };
                 if beats(best) {
                     second = best;
                     runner_up = winning_candidate.take();
-                    best = Some((score, f.mem_mib - spec.mem_mib, *id));
+                    best = Some((score, f.mem_room() - spec.mem_mib, *id));
                     winning_candidate = Some(candidate.clone());
                 } else if beats(second) {
-                    second = Some((score, f.mem_mib - spec.mem_mib, *id));
+                    second = Some((score, f.mem_room() - spec.mem_mib, *id));
                     runner_up = Some(candidate.clone());
                 }
             }
@@ -1137,6 +1355,7 @@ fn allocate_inner(
                 state: f.admission,
                 cpu_psi_pm: f.drone.cpu_psi_pm,
                 cpu_load_pm: f.drone.cpu_load_pm,
+                mem_psi_pm: f.drone.live.mem_psi_pm,
             })
             .collect(),
         promote,
