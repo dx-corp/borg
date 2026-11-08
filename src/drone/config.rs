@@ -244,8 +244,8 @@ pub struct DroneConfig {
     pub reserve_mem_mib: u64,
     /// The node's Prometheus `node_exporter` (`http://<node>:9100/metrics`)
     /// for a drone in a container, which lxcfs keeps from seeing the node's
-    /// memory and pressure; see [`crate::drone::hostview`]. Never written when
-    /// unset, so an older drone can still read a config this one wrote.
+    /// memory and pressure. Older drones can still read the config when this
+    /// field is unset because it is omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_metrics_url: Option<String>,
     /// Number of slot directories (`<work_root>/slot-<N>`) leases run in. A
