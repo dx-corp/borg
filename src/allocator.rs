@@ -294,7 +294,7 @@ impl AdmissionState {
     /// at once; a drone relaxes from `prev` only as far as thresholds lowered
     /// by the hysteresis margin allow, so pressure hovering at a threshold
     /// does not flip it every pass.
-    pub(crate) fn settle(
+    fn settle(
         cpu: Option<u16>,
         mem: Option<u16>,
         prev: Option<Self>,
@@ -326,11 +326,11 @@ impl AdmissionState {
 
 impl DroneState {
     /// The pressure admission uses: PSI when measured, else the load estimate.
-    pub(crate) fn admission_pressure_pm(&self) -> Option<u16> {
+    fn admission_pressure_pm(&self) -> Option<u16> {
         self.cpu_psi_pm.or(self.cpu_load_pm)
     }
 
-    /// This pass's admission state; see [`AdmissionState::settle`].
+    /// This pass's admission state, including the pressure hysteresis.
     pub(crate) fn admission(&self, t: Option<AdmissionThresholds>) -> AdmissionState {
         AdmissionState::settle(
             self.admission_pressure_pm(),
@@ -353,7 +353,7 @@ pub struct DroneAdmission {
     pub(crate) cpu_load_pm: Option<u16>,
     /// Memory pressure, permille; see [`LiveFacts::mem_psi_pm`].
     #[serde(default)]
-    pub(crate) mem_psi_pm: Option<u16>,
+    mem_psi_pm: Option<u16>,
 }
 
 impl DroneState {
