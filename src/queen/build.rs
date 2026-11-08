@@ -36,7 +36,7 @@ impl QueenBuild {
 
     /// The build version (`0.1.0+<12 hex>`), the rollout target with
     /// `rollout.follow_queen`.
-    pub(super) fn version(&self) -> &str {
+    fn version(&self) -> &str {
         &self.version
     }
 

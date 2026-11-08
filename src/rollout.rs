@@ -229,7 +229,7 @@ pub struct DroneView {
     /// Runs shared CI work ([`crate::classes::Trust::Shared`]). Canaries are
     /// chosen among these first: a deploy-only drone runs few jobs, so it
     /// proves little and stalls the canary stage.
-    pub shared: bool,
+    pub(crate) shared: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
