@@ -14,6 +14,7 @@ pub mod credwipe;
 pub mod docker_reclaim;
 pub mod exec;
 pub mod fsops;
+pub(crate) mod hostview;
 pub mod install;
 pub mod invariants;
 pub mod jobuser;
@@ -93,6 +94,8 @@ pub struct Drone {
     slots: Arc<Slots>,
     /// Self-update hand-off; present when `state_dir` is configured.
     selfupdate: Option<SelfUpdate>,
+    /// The node's own figures, for a drone in a container; see [`hostview`].
+    host_view: Option<hostview::HostView>,
     /// The queen wants another version: stop taking leases until idle.
     update_wanted: AtomicBool,
     /// The last tools probe, reused for a minute.
@@ -167,9 +170,15 @@ impl Drone {
             reclaim::Commands::new(Arc::clone(&exec), setpriv),
         );
         let standbys = Standbys::load(cfg.state_dir.clone());
+        let host_view = cfg.host_metrics_url.as_deref().and_then(|url| {
+            hostview::HostView::new(url)
+                .map_err(|e| tracing::warn!("host view {url}: {e}"))
+                .ok()
+        });
         Self {
             cfg,
             selfupdate,
+            host_view,
             update_wanted: AtomicBool::new(false),
             invariant_failures: Mutex::new(Vec::new()),
             network_probe: Arc::default(),
@@ -293,6 +302,17 @@ impl Drone {
             status: 0,
         })?;
         env_facts.cache_dir_free_bytes = cache_free;
+        if let Some(view) = &self.host_view {
+            let now_ms =
+                i64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+                    .unwrap_or(i64::MAX);
+            if let Some(node) = view.read(now_ms).await {
+                env_facts.host_mem_available_mib = Some(node.available_mib);
+                env_facts.host_key = Some(node.key);
+                env_facts.mem_psi_some_avg10_pm =
+                    env_facts.mem_psi_some_avg10_pm.max(node.mem_psi_pm);
+            }
+        }
         // Host invariants (see `invariants`): any broken one means jobs
         // would fail late, so take none and say why.
         let disk_blocked = crate::envcontract::disk_admission(

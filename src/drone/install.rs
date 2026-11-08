@@ -847,6 +847,7 @@ impl Installer<'_> {
             max_mem_mib: o.max_mem_mib,
             max_leases: o.max_leases,
             reserve_mem_mib: crate::allocator::HostCaps::default().reserve_mem_mib,
+            host_metrics_url: None,
             slots: None,
             state_dir: Some(self.layout.data.clone()),
             job_user: self.job_user().map(|name| JobUser {
