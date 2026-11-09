@@ -8,10 +8,15 @@
 //! [`run_cycle`].
 //!
 //! What it removes, cheapest first (tiers):
-//! 1. `incremental/` directories under cargo target directories (regenerable);
+//! 1. `incremental/` directories under cargo target directories (regenerable),
+//!    a static runner's old `_diag` logs and regenerable CI temp entries;
 //! 2. whole cargo target directories;
-//! 3. regenerable cache directories (per-slot CI tool homes);
-//! 4. git worktrees.
+//! 3. regenerable cache directories (per-slot CI tool homes) and whole
+//!    build-cache slots (`<cache_root>/<namespace>/slots/<slot>` and the
+//!    other entries of a job namespace under `cache_root`), least recently
+//!    used first;
+//! 4. a static GitHub runner's idle checkouts, tool cache and user caches;
+//! 5. git worktrees.
 //!
 //! Docker state (unused images, stopped containers, build cache, dangling
 //! volumes) is a separate tier with its own keep rules; see
@@ -22,13 +27,29 @@
 //!   it frees the oldest eligible items first until usage is projected at or
 //!   below `low_water_pct`. An item is eligible once it has been untouched for
 //!   `min_age_secs` (6 hours). At or above `critical_pct` the age drops to
-//!   `critical_min_age_secs`.
+//!   `critical_min_age_secs`. A build-cache slot is regenerable and its use is
+//!   recorded by the drone, so under pressure it is eligible after
+//!   `critical_min_age_secs` and when critical at any age: slots go least
+//!   recently used first until free space is back at the target, so the disk
+//!   never fills while admission still works. A slot a live lease holds is
+//!   busy and never goes (`ReclaimHost::probe`).
+//! * **Cap.** `cache_slot_cap_gib` (0: none) bounds the slots of one cache
+//!   (`<cache_root>/<namespace>`) together; above it the least recently used
+//!   slots go in any mode.
 //! * **Hygiene.** Below the high-water mark only items untouched for
 //!   `idle_max_age_secs` (7 days; 0 turns it off) are removed.
 //! * **Admission.** Free space below the queen's disk-admission floor means
 //!   the drone takes no jobs, whatever the percentage: that counts as
 //!   critical (a 291 GB disk at 80% still has the 10 GiB floor free, but a
 //!   small one does not).
+//! * **Free-space target.** A box can declare its own floor
+//!   (`free_floor_gib`: dev-desktop's is cargo-slot's 25 GiB build floor,
+//!   below which cargo-slot refuses to start a build). The effective floor is
+//!   the larger of that and the queen's admission floor, and the target is
+//!   twice the floor (one floor of headroom, so the next build does not drop
+//!   the disk back under it). Free space below the target is pressure, below
+//!   the floor critical, whatever the percentage: on an 810 GiB disk 90% use
+//!   still leaves 81 GiB, on a 100 GiB disk 80% leaves only 20.
 //!
 //! What it never removes (checked immediately before each deletion, so state
 //! that changed since the scan is respected; an unreadable or unknown state
@@ -47,7 +68,7 @@
 //! becomes a [`DeletionRecord`] (path, size, reason, outcome) that
 //! the drone logs and reports to the queen in its heartbeat.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -64,8 +85,25 @@ pub enum Kind {
     Worktree,
     /// A regenerable cache directory (a CI slot's tool home).
     CacheDir,
+    /// A whole build-cache slot: `<cache_root>/<namespace>/slots/<slot>`, or
+    /// another entry of a job namespace under `cache_root` (a publish
+    /// target directory, a weekly shared cache). Regenerable; evicted least
+    /// recently used first.
+    CacheSlot,
     /// A checkout in an idle static GitHub runner's `_work`.
     RunnerWork,
+    /// A static runner's tool cache (`_work/_tool`: the toolchains
+    /// `setup-*` actions download). Regenerable.
+    RunnerToolCache,
+    /// A cache a static runner's tools keep in its user's home
+    /// (`.cache/go-build`, `.npm`, `.pnpm-store`, `go/pkg/mod/cache`).
+    RunnerUserCache,
+    /// A static runner's `_diag` directory; only its log files older than
+    /// `runner_diag_max_age_secs` go, never the directory.
+    RunnerDiag,
+    /// A regenerable temp entry a CI tool left in `/tmp` (`go-build*`,
+    /// `trivy-*`, …).
+    TmpEntry,
     /// A container image no container uses.
     DockerImage,
     /// A stopped container.
@@ -83,7 +121,12 @@ impl Kind {
             Self::CargoTarget => "cargo_target",
             Self::Worktree => "worktree",
             Self::CacheDir => "cache_dir",
+            Self::CacheSlot => "cache_slot",
             Self::RunnerWork => "runner_work",
+            Self::RunnerToolCache => "runner_tool_cache",
+            Self::RunnerUserCache => "runner_user_cache",
+            Self::RunnerDiag => "runner_diag",
+            Self::TmpEntry => "tmp_entry",
             Self::DockerImage => "docker_image",
             Self::DockerContainer => "docker_container",
             Self::DockerBuildCache => "docker_build_cache",
@@ -137,9 +180,27 @@ pub struct ReclaimSettings {
     pub max_deletions_per_cycle: u32,
     /// Seconds between cycles.
     pub interval_secs: u64,
-    /// With default roots, also reclaim the `_work` checkouts of static
-    /// GitHub runners on this host while their runner has no job.
+    /// This box's own free-space floor in GiB (0: only the queen's admission
+    /// floor). Set it to the floor of the build tool the box runs, e.g.
+    /// cargo-slot's `CARGO_MIN_FREE_GB` (25) on dev-desktop. Reclaim keeps
+    /// free space at or above twice the effective floor ([`Self::floor_bytes`]).
+    pub free_floor_gib: u64,
+    /// Cap on the build-cache slots of one cache (`<cache_root>/<namespace>`)
+    /// together, in GiB; above it the least recently used slots go in any
+    /// mode. 0: no cap, slots go only by pressure and hygiene.
+    pub cache_slot_cap_gib: u64,
+    /// With default roots, also reclaim what the static GitHub runners on
+    /// this host leave: their `_work` checkouts, tool caches and user caches
+    /// while the runner has no job, their old `_diag` logs, and regenerable
+    /// CI temp entries in `/tmp`.
     pub(crate) static_runner_work: bool,
+    /// A static runner's `_diag` log files older than this go, in any mode
+    /// (0: never). The runner writes a new log per job and never reads an
+    /// old one.
+    pub runner_diag_max_age_secs: u64,
+    /// A regenerable CI temp entry in `/tmp` untouched this long goes below
+    /// high water (0: never by age alone; pressure ages still apply).
+    pub tmp_max_age_secs: u64,
     /// The Docker tier.
     pub(crate) docker: DockerReclaimSettings,
 }
@@ -232,13 +293,35 @@ impl Default for ReclaimSettings {
             idle_max_age_secs: 7 * 24 * 3600,
             max_deletions_per_cycle: 50,
             interval_secs: 600,
+            free_floor_gib: 0,
+            cache_slot_cap_gib: 0,
             static_runner_work: true,
+            runner_diag_max_age_secs: 24 * 3600,
+            tmp_max_age_secs: 24 * 3600,
             docker: DockerReclaimSettings::default(),
         }
     }
 }
 
 impl ReclaimSettings {
+    /// The default for a reclaim-only drone on a host where people build by
+    /// hand: dry run, Docker tier off, until the host's own block is set.
+    pub(crate) fn for_shared_host() -> Self {
+        let mut s = Self {
+            dry_run: true,
+            ..Self::default()
+        };
+        s.docker.enabled = false;
+        s
+    }
+
+    /// The effective free-space floor: the larger of this box's own
+    /// (`free_floor_gib`) and `admission_floor_bytes` (the queen's; 0 when
+    /// unknown). Reclaim's target is twice this.
+    pub fn floor_bytes(&self, admission_floor_bytes: u64) -> u64 {
+        admission_floor_bytes.max(self.free_floor_gib.saturating_mul(1 << 30))
+    }
+
     /// The block installs wrote before reclaim was on by default: off, dry
     /// run, no roots, default thresholds.
     pub(crate) fn is_legacy_default(&self) -> bool {
@@ -262,6 +345,12 @@ impl ReclaimSettings {
         }
         if self.critical_min_age_secs > self.min_age_secs {
             return Err("reclaim critical_min_age_secs may not exceed min_age_secs".into());
+        }
+        if self.free_floor_gib > 1024 {
+            return Err("reclaim free_floor_gib is at most 1024".into());
+        }
+        if self.cache_slot_cap_gib > 65_536 {
+            return Err("reclaim cache_slot_cap_gib is at most 65536".into());
         }
         if self.max_deletions_per_cycle == 0 || self.interval_secs == 0 {
             return Err(
@@ -288,8 +377,13 @@ pub struct Candidate {
     pub size_bytes: u64,
     /// Seconds since anything in it was modified or used.
     pub idle_secs: u64,
-    /// For an `incremental/`, the target directory that contains it.
+    /// The candidate that contains this one (an `incremental/`'s target
+    /// directory, a slot's target or tool home), so bytes freed inside it are
+    /// not counted twice when it goes too.
     pub within: Option<PathBuf>,
+    /// For a build-cache slot, the cache it belongs to
+    /// (`<cache_root>/<namespace>`); `cache_slot_cap_gib` applies per cache.
+    pub cache: Option<PathBuf>,
 }
 
 /// What the safety probe found. Anything the probe could not determine must be
@@ -416,9 +510,15 @@ pub struct Cycle {
     pub usage_pct_before: u8,
     /// Projected after the deletions (exact when not a dry run).
     pub usage_pct_after: u8,
+    /// Free bytes the cycle saw before deleting anything.
+    pub free_bytes_before: u64,
+    /// The effective free-space floor it worked to ([`ReclaimSettings::floor_bytes`]).
+    pub floor_bytes: u64,
     pub records: Vec<DeletionRecord>,
     /// Candidates kept, by reason.
     pub kept: BTreeMap<String, u32>,
+    /// Deletions (or would-be deletions in a dry run), by kind.
+    pub evicted: BTreeMap<String, u32>,
     pub reclaimed_bytes: u64,
     pub would_reclaim_bytes: u64,
     pub errors: u32,
@@ -438,9 +538,20 @@ pub struct ReclaimStats {
     pub last_run_errors: u32,
     /// Disk usage the last run saw.
     pub usage_pct: Option<u8>,
+    /// Free bytes the last run saw (the tightest filesystem it reclaims).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    /// The effective free-space floor of the last run; reclaim keeps free
+    /// space at or above twice this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_bytes: Option<u64>,
     pub last_run_mode: Option<Mode>,
     /// Candidates the last run kept, by reason.
     pub kept: BTreeMap<String, u32>,
+    /// What the last run deleted (or would have, dry run), by kind; the
+    /// build-cache slots it evicted show as `cache_slot`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub evicted: BTreeMap<String, u32>,
     /// Audit entries created since the previous heartbeat; the queen stores
     /// them and ignores any it already has (by `seq`). Only
     /// `Kind::is_wire_v1` kinds.
@@ -472,8 +583,11 @@ impl ReclaimStats {
         self.last_run_would_reclaim_bytes = cycle.would_reclaim_bytes;
         self.last_run_errors = cycle.errors;
         self.usage_pct = Some(cycle.usage_pct_before);
+        self.free_bytes = Some(cycle.free_bytes_before);
+        self.floor_bytes = Some(cycle.floor_bytes);
         self.last_run_mode = Some(cycle.mode);
         self.kept = cycle.kept.clone();
+        self.evicted = cycle.evicted.clone();
         self.push_records(&cycle.records);
     }
 
@@ -497,6 +611,9 @@ impl ReclaimStats {
         self.last_run_errors = self.last_run_errors.saturating_add(cycle.errors);
         for (k, v) in &cycle.kept {
             *self.kept.entry(format!("docker: {k}")).or_default() += v;
+        }
+        for (k, v) in &cycle.evicted {
+            *self.evicted.entry(k.clone()).or_default() += v;
         }
         self.push_records(&cycle.records);
     }
@@ -525,10 +642,10 @@ impl ReclaimStats {
 
 fn tier(k: Kind) -> u8 {
     match k {
-        Kind::CargoIncremental => 0,
+        Kind::CargoIncremental | Kind::RunnerDiag | Kind::TmpEntry => 0,
         Kind::CargoTarget => 1,
-        Kind::CacheDir => 2,
-        Kind::RunnerWork => 3,
+        Kind::CacheDir | Kind::CacheSlot => 2,
+        Kind::RunnerWork | Kind::RunnerToolCache | Kind::RunnerUserCache => 3,
         Kind::Worktree => 4,
         // The Docker tier orders its own work.
         Kind::DockerImage | Kind::DockerContainer | Kind::DockerBuildCache | Kind::DockerVolume => {
@@ -553,13 +670,16 @@ fn hours(secs: u64) -> String {
     }
 }
 
-/// The mode for this disk state when the drone stops taking jobs below
-/// `floor_bytes` free: below the floor is critical.
+/// The mode for this disk state with `floor_bytes` the effective free-space
+/// floor ([`ReclaimSettings::floor_bytes`]): below the floor is critical,
+/// below twice the floor (the target) is pressure.
 pub(crate) fn mode_for_floor(s: &ReclaimSettings, disk: &Disk, floor_bytes: u64) -> Mode {
     let u = disk.usage_pct();
     if u >= s.critical_pct || (floor_bytes > 0 && disk.free_bytes < floor_bytes) {
         Mode::Critical
-    } else if u >= s.high_water_pct {
+    } else if u >= s.high_water_pct
+        || (floor_bytes > 0 && disk.free_bytes < floor_bytes.saturating_mul(2))
+    {
         Mode::Pressure
     } else if s.idle_max_age_secs > 0 {
         Mode::Hygiene
@@ -576,40 +696,178 @@ pub fn order(
     usage_pct: u8,
     cands: &[Candidate],
 ) -> Vec<(Candidate, String)> {
-    let min_age = match mode {
-        Mode::Critical => s.critical_min_age_secs,
-        Mode::Pressure => s.min_age_secs,
-        Mode::Hygiene => s.idle_max_age_secs,
-        Mode::Idle => return Vec::new(),
-    };
+    order_for(
+        s,
+        mode,
+        &format!("disk {usage_pct}% >= {}% high water", s.high_water_pct),
+        cands,
+    )
+}
+
+/// The minimum idle age for a candidate of `kind` in `mode`; `None` when
+/// nothing of that kind is eligible. A build-cache slot is regenerable and
+/// its last use is recorded, so under pressure it waits only the critical
+/// age and when critical none: the least recently used slots go until free
+/// space is back at the target, before admission fails for want of disk.
+fn min_age_for(s: &ReclaimSettings, mode: Mode, kind: Kind) -> Option<u64> {
+    match (mode, kind) {
+        (Mode::Idle, _) => None,
+        // Old diagnostics logs go by their own age whatever the disk looks
+        // like; nothing reads them.
+        (_, Kind::RunnerDiag) => {
+            (s.runner_diag_max_age_secs > 0).then_some(s.runner_diag_max_age_secs)
+        }
+        (Mode::Critical, Kind::CacheSlot) => Some(0),
+        (Mode::Pressure, Kind::CacheSlot) => Some(s.critical_min_age_secs),
+        (Mode::Critical, _) => Some(s.critical_min_age_secs),
+        (Mode::Pressure, _) => Some(s.min_age_secs),
+        (Mode::Hygiene, Kind::TmpEntry) => (s.tmp_max_age_secs > 0).then_some(s.tmp_max_age_secs),
+        (Mode::Hygiene, _) => Some(s.idle_max_age_secs),
+    }
+}
+
+/// Oldest first within a tier: the least recently used goes before the
+/// more recently used, then the larger before the smaller.
+fn lru(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    tier(a.kind)
+        .cmp(&tier(b.kind))
+        .then(b.idle_secs.cmp(&a.idle_secs))
+        .then(b.size_bytes.cmp(&a.size_bytes))
+        .then(a.path.cmp(&b.path))
+}
+
+/// [`order`] with the pressure reason spelled out by the caller (the disk
+/// percentage, or free space under the target).
+fn order_for(
+    s: &ReclaimSettings,
+    mode: Mode,
+    pressure: &str,
+    cands: &[Candidate],
+) -> Vec<(Candidate, String)> {
     let mut out: Vec<(Candidate, String)> = cands
         .iter()
-        .filter(|c| c.idle_secs >= min_age)
-        .map(|c| {
-            let why = match mode {
-                Mode::Hygiene => format!(
-                    "idle {} (>= {} hygiene limit)",
-                    hours(c.idle_secs),
-                    hours(min_age)
-                ),
-                _ => format!(
-                    "disk {usage_pct}% >= {}% high water ({mode:?}); idle {} (>= {})",
-                    s.high_water_pct,
-                    hours(c.idle_secs),
-                    hours(min_age)
-                ),
-            };
-            (c.clone(), why)
+        .filter_map(|c| {
+            let min_age = min_age_for(s, mode, c.kind)?;
+            (c.idle_secs >= min_age).then(|| {
+                let why = match (mode, c.kind) {
+                    (Mode::Hygiene, _) => format!(
+                        "idle {} (>= {} hygiene limit)",
+                        hours(c.idle_secs),
+                        hours(min_age)
+                    ),
+                    (_, Kind::CacheSlot) => format!(
+                        "{pressure} ({mode:?}); least recently used, idle {}",
+                        hours(c.idle_secs)
+                    ),
+                    _ => format!(
+                        "{pressure} ({mode:?}); idle {} (>= {})",
+                        hours(c.idle_secs),
+                        hours(min_age)
+                    ),
+                };
+                (c.clone(), why)
+            })
         })
         .collect();
-    out.sort_by(|(a, _), (b, _)| {
-        tier(a.kind)
-            .cmp(&tier(b.kind))
-            .then(b.idle_secs.cmp(&a.idle_secs))
-            .then(b.size_bytes.cmp(&a.size_bytes))
-            .then(a.path.cmp(&b.path))
-    });
+    out.sort_by(|(a, _), (b, _)| lru(a, b));
     out
+}
+
+/// One cycle's deletions: the safety re-probe, the audit record and the
+/// byte accounting shared by the pressure pass and the cap pass.
+struct Deletions<'a> {
+    host: &'a dyn ReclaimHost,
+    settings: &'a ReclaimSettings,
+    cycle: &'a mut Cycle,
+    seq: &'a mut u64,
+    now: i64,
+    /// Bytes freed (or, dry run, that would be).
+    freed: u64,
+    /// Bytes already freed inside a containing candidate, so a later deletion
+    /// of the whole directory is not counted twice.
+    freed_within: BTreeMap<PathBuf, u64>,
+    count: u32,
+    /// Paths removed this cycle (or that would be), so a later pass does not
+    /// try them again or count them as present.
+    gone: BTreeSet<PathBuf>,
+}
+
+impl Deletions<'_> {
+    fn capped(&self) -> bool {
+        self.count >= self.settings.max_deletions_per_cycle
+    }
+
+    /// Try to remove `c` for `eligible`; the bytes credited when it went (or
+    /// would have gone), `None` when it was kept or the deletion failed.
+    fn attempt(&mut self, c: &Candidate, eligible: &str) -> Option<u64> {
+        if self.gone.iter().any(|g| c.path.starts_with(g)) {
+            return None;
+        }
+        // Re-probe now, not at scan time.
+        let safety = self.host.probe(c);
+        if let Some(why) = safety.blocker(c.kind) {
+            *self.cycle.kept.entry(why).or_default() += 1;
+            return None;
+        }
+        let already = self.freed_within.get(&c.path).copied().unwrap_or(0);
+        let size = c.size_bytes.saturating_sub(already);
+        let reason = format!(
+            "{eligible}; {} {}; tier {}",
+            c.kind.as_str(),
+            gib(size),
+            tier(c.kind) + 1
+        );
+        *self.seq += 1;
+        let mut rec = DeletionRecord {
+            seq: *self.seq,
+            at: self.now,
+            path: c.path.display().to_string(),
+            kind: c.kind,
+            size_bytes: size,
+            reason,
+            outcome: Outcome::WouldDelete,
+            error: None,
+        };
+        if self.settings.dry_run {
+            self.cycle.would_reclaim_bytes = self.cycle.would_reclaim_bytes.saturating_add(size);
+        } else {
+            match self.host.delete(c) {
+                Ok(bytes) => {
+                    rec.outcome = Outcome::Deleted;
+                    // What the host says it freed, but never more than the
+                    // estimate net of what an earlier deletion already took.
+                    rec.size_bytes = bytes.min(size);
+                    self.cycle.reclaimed_bytes =
+                        self.cycle.reclaimed_bytes.saturating_add(rec.size_bytes);
+                }
+                Err(e) => {
+                    rec.outcome = Outcome::Failed;
+                    rec.error = Some(e);
+                    self.cycle.errors += 1;
+                    self.cycle.records.push(rec);
+                    return None;
+                }
+            }
+        }
+        let credited = if self.settings.dry_run {
+            size
+        } else {
+            rec.size_bytes
+        };
+        self.freed = self.freed.saturating_add(credited);
+        self.count += 1;
+        if let Some(parent) = &c.within {
+            *self.freed_within.entry(parent.clone()).or_default() += credited;
+        }
+        *self
+            .cycle
+            .evicted
+            .entry(c.kind.as_str().to_owned())
+            .or_default() += 1;
+        self.gone.insert(c.path.clone());
+        self.cycle.records.push(rec);
+        Some(credited)
+    }
 }
 
 /// Run one cycle. `seq` numbers the audit records (it is advanced). Returns
@@ -622,103 +880,106 @@ pub fn run_cycle(
 ) -> Result<Cycle, String> {
     let disk = host.disk()?;
     let before = disk.usage_pct();
-    let mode = mode_for_floor(settings, &disk, host.admission_floor_bytes());
+    let floor = settings.floor_bytes(host.admission_floor_bytes());
+    let mode = mode_for_floor(settings, &disk, floor);
     let mut cycle = Cycle {
         mode,
         usage_pct_before: before,
         usage_pct_after: before,
+        free_bytes_before: disk.free_bytes,
+        floor_bytes: floor,
         records: Vec::new(),
         kept: BTreeMap::new(),
+        evicted: BTreeMap::new(),
         reclaimed_bytes: 0,
         would_reclaim_bytes: 0,
         errors: 0,
     };
-    if mode == Mode::Idle {
+    let cap = settings.cache_slot_cap_gib.saturating_mul(1 << 30);
+    if mode == Mode::Idle && cap == 0 {
         return Ok(cycle);
     }
     let cands = host.scan(&settings.roots)?;
-    // Under pressure, free until usage is projected at or below low water.
-    // Hygiene has no byte target: it removes everything that is old enough.
+    // Under pressure, free until usage is projected at or below low water
+    // (when the percentage is what crossed high water) and free space is
+    // back at the target. Hygiene has no byte target: it removes everything
+    // that is old enough.
+    let pct_target = if before >= settings.high_water_pct {
+        disk.used()
+            .saturating_sub(disk.total_bytes / 100 * u64::from(settings.low_water_pct))
+    } else {
+        0
+    };
     let target_free = match mode {
         Mode::Hygiene => u64::MAX,
-        _ => disk
-            .used()
-            .saturating_sub(disk.total_bytes / 100 * u64::from(settings.low_water_pct))
-            // Below the admission floor, at least back above it (with the
-            // same margin again, so the next job does not drop it back).
-            .max(
-                host.admission_floor_bytes()
-                    .saturating_mul(2)
-                    .saturating_sub(disk.free_bytes),
-            ),
+        Mode::Idle => 0,
+        _ => pct_target
+            // Below the target, at least back to it: the floor plus the
+            // same margin again, so the next build does not drop it back.
+            .max(floor.saturating_mul(2).saturating_sub(disk.free_bytes)),
     };
-    let mut freed: u64 = 0;
-    // Bytes already freed inside a target directory (its incremental/), so a
-    // later deletion of the whole directory is not counted twice.
-    let mut freed_within: BTreeMap<PathBuf, u64> = BTreeMap::new();
-    let mut deletions = 0u32;
-
-    for (c, eligible) in order(settings, mode, before, &cands) {
-        if freed >= target_free || deletions >= settings.max_deletions_per_cycle {
+    let pressure = if floor > 0 && disk.free_bytes < floor.saturating_mul(2) {
+        format!(
+            "free {} < {} target (2 x {} floor)",
+            gib(disk.free_bytes),
+            gib(floor.saturating_mul(2)),
+            gib(floor)
+        )
+    } else {
+        format!("disk {before}% >= {}% high water", settings.high_water_pct)
+    };
+    let mut run = Deletions {
+        host,
+        settings,
+        cycle: &mut cycle,
+        seq,
+        now,
+        freed: 0,
+        freed_within: BTreeMap::new(),
+        count: 0,
+        gone: BTreeSet::new(),
+    };
+    for (c, eligible) in order_for(settings, mode, &pressure, &cands) {
+        if run.freed >= target_free || run.capped() {
             break;
         }
-        // Re-probe now, not at scan time.
-        let safety = host.probe(&c);
-        if let Some(why) = safety.blocker(c.kind) {
-            *cycle.kept.entry(why).or_default() += 1;
-            continue;
+        run.attempt(&c, &eligible);
+    }
+    // The cap: each cache's slots together stay under it, least recently
+    // used going first, whatever the disk looks like.
+    if cap > 0 {
+        let mut by_cache: BTreeMap<PathBuf, Vec<&Candidate>> = BTreeMap::new();
+        for c in cands.iter().filter(|c| c.kind == Kind::CacheSlot) {
+            if let Some(cache) = &c.cache
+                && !run.gone.iter().any(|g| c.path.starts_with(g))
+            {
+                by_cache.entry(cache.clone()).or_default().push(c);
+            }
         }
-        let already = freed_within.get(&c.path).copied().unwrap_or(0);
-        let size = c.size_bytes.saturating_sub(already);
-        let reason = format!(
-            "{eligible}; {} {}; tier {}",
-            c.kind.as_str(),
-            gib(size),
-            tier(c.kind) + 1
-        );
-        *seq += 1;
-        let mut rec = DeletionRecord {
-            seq: *seq,
-            at: now,
-            path: c.path.display().to_string(),
-            kind: c.kind,
-            size_bytes: size,
-            reason,
-            outcome: Outcome::WouldDelete,
-            error: None,
-        };
-        if settings.dry_run {
-            cycle.would_reclaim_bytes = cycle.would_reclaim_bytes.saturating_add(size);
-        } else {
-            match host.delete(&c) {
-                Ok(bytes) => {
-                    rec.outcome = Outcome::Deleted;
-                    // What the host says it freed, but never more than the
-                    // estimate net of what an earlier deletion already took.
-                    rec.size_bytes = bytes.min(size);
-                    cycle.reclaimed_bytes = cycle.reclaimed_bytes.saturating_add(rec.size_bytes);
+        for (cache, mut slots) in by_cache {
+            let mut total: u64 = slots.iter().map(|c| c.size_bytes).sum();
+            if total <= cap {
+                continue;
+            }
+            slots.sort_by(|a, b| lru(a, b));
+            for c in slots {
+                if total <= cap || run.capped() {
+                    break;
                 }
-                Err(e) => {
-                    rec.outcome = Outcome::Failed;
-                    rec.error = Some(e);
-                    cycle.errors += 1;
-                    cycle.records.push(rec);
-                    continue;
+                let eligible = format!(
+                    "cache {} holds {} > {} cap; least recently used, idle {}",
+                    cache.display(),
+                    gib(total),
+                    gib(cap),
+                    hours(c.idle_secs)
+                );
+                if run.attempt(c, &eligible).is_some() {
+                    total = total.saturating_sub(c.size_bytes);
                 }
             }
         }
-        let credited = if settings.dry_run {
-            size
-        } else {
-            rec.size_bytes
-        };
-        freed = freed.saturating_add(credited);
-        deletions += 1;
-        if let Some(parent) = &c.within {
-            *freed_within.entry(parent.clone()).or_default() += credited;
-        }
-        cycle.records.push(rec);
     }
+    let freed = run.freed;
     let after_used = disk.used().saturating_sub(freed);
     cycle.usage_pct_after = if disk.total_bytes == 0 {
         0
@@ -789,6 +1050,7 @@ mod tests {
             size_bytes: gib * GIB,
             idle_secs: idle_h * H,
             within: None,
+            cache: None,
         }
     }
 
@@ -859,6 +1121,96 @@ mod tests {
         assert!(c.reclaimed_bytes >= 20 * GIB, "{}", c.reclaimed_bytes);
         assert!(c.usage_pct_after <= 70, "{}", c.usage_pct_after);
         assert_eq!(c.usage_pct_before, 90);
+    }
+
+    #[test]
+    fn a_box_floor_makes_a_large_disk_reclaim_back_to_twice_the_floor() {
+        // dev-desktop: 810 GiB at 95% leaves 40 GiB; cargo-slot refuses builds
+        // under 25 GiB, so the target is 50 GiB free whatever the percentage.
+        let s = ReclaimSettings {
+            free_floor_gib: 25,
+            critical_pct: 99,
+            high_water_pct: 98,
+            low_water_pct: 50,
+            ..ReclaimSettings::default()
+        };
+        let f = Fake::new(
+            810,
+            770,
+            vec![
+                cand("/t/a", Kind::CargoTarget, 6, 50),
+                cand("/t/b", Kind::CargoTarget, 6, 40),
+                cand("/t/c", Kind::CargoTarget, 6, 30),
+                cand("/t/d", Kind::CargoTarget, 6, 20),
+            ],
+        );
+        let c = run(&f, &live(s.clone()));
+        assert_eq!(c.mode, Mode::Pressure);
+        assert_eq!((c.free_bytes_before, c.floor_bytes), (40 * GIB, 25 * GIB));
+        // 10 GiB short of the 50 GiB target: the two oldest go, no more.
+        let gone: Vec<String> = f
+            .deleted
+            .borrow()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(gone, ["/t/a", "/t/b"]);
+        assert!(
+            c.records[0]
+                .reason
+                .contains("free 40.0 GiB < 50.0 GiB target"),
+            "{}",
+            c.records[0].reason
+        );
+        // Under the floor itself it is critical (1h minimum age).
+        let f = Fake::new(810, 790, vec![cand("/t/young", Kind::CargoTarget, 6, 2)]);
+        let c = run(&f, &live(s.clone()));
+        assert_eq!(c.mode, Mode::Critical);
+        assert_eq!(f.deleted.borrow().len(), 1);
+        // At the target: hygiene, the young directory stays.
+        let f = Fake::new(810, 700, vec![cand("/t/young", Kind::CargoTarget, 6, 2)]);
+        assert_eq!(run(&f, &live(s.clone())).mode, Mode::Hygiene);
+        assert!(f.deleted.borrow().is_empty());
+        // The queen's admission floor counts when it is the larger one.
+        assert_eq!(s.floor_bytes(40 * GIB), 40 * GIB);
+        assert_eq!(s.floor_bytes(0), 25 * GIB);
+        assert_eq!(ReclaimSettings::default().floor_bytes(0), 0);
+        assert!(
+            ReclaimSettings {
+                free_floor_gib: 2000,
+                ..ReclaimSettings::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn stats_carry_the_free_space_and_floor_of_the_last_run() {
+        let s = ReclaimSettings {
+            free_floor_gib: 25,
+            ..ReclaimSettings::default()
+        };
+        let f = Fake::new(100, 20, Vec::new());
+        let c = run(&f, &live(s.clone()));
+        let mut stats = ReclaimStats::default();
+        stats.absorb(&s, 1000, &c);
+        assert_eq!(
+            (stats.free_bytes, stats.floor_bytes),
+            (Some(80 * GIB), Some(25 * GIB))
+        );
+        // An old queen that never heard of the fields still reads the stats,
+        // and stats from an old drone read as unknown.
+        let wire = serde_json::to_value(&stats).unwrap();
+        assert_eq!(wire["free_bytes"], 80 * GIB);
+        let old: ReclaimStats = serde_json::from_value(serde_json::json!({
+            "enabled": true, "dry_run": false, "reclaimed_bytes_total": 0,
+            "last_run_at": null, "last_run_reclaimed_bytes": 0,
+            "last_run_would_reclaim_bytes": 0, "last_run_errors": 0,
+            "usage_pct": 50, "last_run_mode": null, "kept": {}
+        }))
+        .unwrap();
+        assert_eq!((old.free_bytes, old.floor_bytes), (None, None));
     }
 
     #[test]
@@ -1126,5 +1478,228 @@ mod tests {
             .usage_pct(),
             0
         );
+    }
+
+    fn slot(path: &str, cache: &str, gib: u64, idle_h: u64) -> Candidate {
+        Candidate {
+            cache: Some(PathBuf::from(cache)),
+            ..cand(path, Kind::CacheSlot, gib, idle_h)
+        }
+    }
+
+    #[test]
+    fn critical_evicts_build_cache_slots_least_recently_used_first_whatever_their_age() {
+        // 100 GiB disk with 2 GiB free under a 10 GiB floor: critical, and
+        // the target is back to 20 GiB free, so 18 GiB must go.
+        let mut f = Fake::new(
+            100,
+            98,
+            vec![
+                slot("/c/ci/slots/a", "/c/ci", 8, 0),
+                slot("/c/ci/slots/b", "/c/ci", 8, 2),
+                slot("/c/ci/slots/held", "/c/ci", 30, 5),
+                slot("/c/ci/slots/c", "/c/ci", 8, 1),
+                // Not a slot: the usual critical age still applies.
+                cand("/t/young", Kind::CargoTarget, 40, 0),
+            ],
+        );
+        f.safety.insert(
+            PathBuf::from("/c/ci/slots/held"),
+            Safety {
+                busy: true,
+                ..Safety::default()
+            },
+        );
+        let s = ReclaimSettings {
+            free_floor_gib: 10,
+            ..live(ReclaimSettings::default())
+        };
+        let c = run(&f, &s);
+        assert_eq!(c.mode, Mode::Critical);
+        let order: Vec<String> = f
+            .deleted
+            .borrow()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        // The held slot is skipped (busy), then least recently used first;
+        // the slot used this hour goes too because the floor is not met
+        // without it; the young target directory never qualifies.
+        assert_eq!(order, ["/c/ci/slots/b", "/c/ci/slots/c", "/c/ci/slots/a"]);
+        assert_eq!(c.kept.get("busy"), Some(&1));
+        assert_eq!(c.evicted.get("cache_slot"), Some(&3));
+        assert!(c.reclaimed_bytes >= 18 * GIB, "{}", c.reclaimed_bytes);
+    }
+
+    #[test]
+    fn pressure_takes_a_slot_only_after_the_critical_age_and_hygiene_after_a_week() {
+        let items = vec![
+            slot("/c/ci/slots/fresh", "/c/ci", 10, 0),
+            slot("/c/ci/slots/hour", "/c/ci", 10, 1),
+        ];
+        // 90% of 100 GiB: pressure. Only the slot idle for the critical age
+        // (1 h) is eligible; the usual 6 h minimum does not apply to slots.
+        let f = Fake::new(100, 90, items.clone());
+        let c = run(&f, &live(ReclaimSettings::default()));
+        assert_eq!(c.mode, Mode::Pressure);
+        assert_eq!(
+            f.deleted.borrow().as_slice(),
+            [PathBuf::from("/c/ci/slots/hour")]
+        );
+        // Below high water a slot is hygiene like anything else: a week.
+        let f = Fake::new(100, 50, items);
+        let c = run(&f, &live(ReclaimSettings::default()));
+        assert_eq!(c.mode, Mode::Hygiene);
+        assert!(f.deleted.borrow().is_empty());
+        let f = Fake::new(100, 50, vec![slot("/c/ci/slots/old", "/c/ci", 10, 24 * 8)]);
+        run(&f, &live(ReclaimSettings::default()));
+        assert_eq!(
+            f.deleted.borrow().as_slice(),
+            [PathBuf::from("/c/ci/slots/old")]
+        );
+    }
+
+    #[test]
+    fn a_cache_cap_evicts_that_cache_s_least_recently_used_slots_in_any_mode() {
+        // 50% used, hygiene off: an idle disk. Cache /c/ci holds 14 GiB
+        // against a 10 GiB cap; /c/pub holds 4 GiB and is left alone.
+        let mut f = Fake::new(
+            100,
+            50,
+            vec![
+                slot("/c/ci/slots/a", "/c/ci", 6, 1),
+                slot("/c/ci/slots/b", "/c/ci", 6, 3),
+                slot("/c/ci/slots/held", "/c/ci", 2, 9),
+                slot("/c/pub/platform-api", "/c/pub", 4, 48),
+                // A target inside a slot that goes is not tried on its own.
+                Candidate {
+                    within: Some(PathBuf::from("/c/ci/slots/b")),
+                    ..cand("/c/ci/slots/b/cargo-target/w", Kind::CargoTarget, 5, 3)
+                },
+            ],
+        );
+        f.safety.insert(
+            PathBuf::from("/c/ci/slots/held"),
+            Safety {
+                busy: true,
+                ..Safety::default()
+            },
+        );
+        let s = ReclaimSettings {
+            idle_max_age_secs: 0,
+            cache_slot_cap_gib: 10,
+            ..live(ReclaimSettings::default())
+        };
+        let c = run(&f, &s);
+        assert_eq!(c.mode, Mode::Idle);
+        // The held slot is skipped and counted; the least recently used of
+        // the rest goes and the cache is under its cap, so /a stays.
+        assert_eq!(
+            f.deleted.borrow().as_slice(),
+            [PathBuf::from("/c/ci/slots/b")]
+        );
+        assert_eq!(c.kept.get("busy"), Some(&1));
+        assert_eq!(c.evicted.get("cache_slot"), Some(&1));
+        assert!(
+            c.records
+                .iter()
+                .any(|r| r.reason.contains("holds 14.0 GiB > 10.0 GiB cap")),
+            "{:?}",
+            c.records
+        );
+        // Without a cap the idle disk reclaims nothing.
+        let f = Fake::new(100, 50, vec![slot("/c/ci/slots/b", "/c/ci", 6, 3)]);
+        let s = ReclaimSettings {
+            idle_max_age_secs: 0,
+            ..live(ReclaimSettings::default())
+        };
+        assert!(run(&f, &s).records.is_empty());
+        assert!(
+            ReclaimSettings {
+                cache_slot_cap_gib: 70_000,
+                ..ReclaimSettings::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    /// Old diagnostics logs go by their own age in every mode and never by
+    /// the hygiene age; a temp entry waits the temp age below high water and
+    /// the pressure ages above it; both are the cheapest tier.
+    #[test]
+    fn runner_diagnostics_and_temp_entries_go_by_their_own_ages() {
+        let items = vec![
+            cand("/home/r1/actions-runner/_diag", Kind::RunnerDiag, 1, 30),
+            cand("/home/r2/actions-runner/_diag", Kind::RunnerDiag, 1, 12),
+            cand("/tmp/go-build1", Kind::TmpEntry, 2, 30),
+            cand("/tmp/go-build2", Kind::TmpEntry, 2, 12),
+            cand(
+                "/home/r1/actions-runner/_work/_tool",
+                Kind::RunnerToolCache,
+                7,
+                30,
+            ),
+        ];
+        let f = Fake::new(100, 50, items.clone());
+        let c = run(&f, &live(ReclaimSettings::default()));
+        assert_eq!(c.mode, Mode::Hygiene);
+        assert_eq!(
+            f.deleted.borrow().as_slice(),
+            [
+                PathBuf::from("/tmp/go-build1"),
+                PathBuf::from("/home/r1/actions-runner/_diag")
+            ],
+            "a day old, not the 12 h ones; the tool cache waits the hygiene week"
+        );
+        assert_eq!(c.evicted.get("runner_diag"), Some(&1));
+        // Under pressure the 12 h entries qualify by the 6 h pressure age,
+        // and the tool cache by it too; the 12 h diag still waits its day.
+        let f = Fake::new(100, 90, items.clone());
+        let c = run(&f, &live(ReclaimSettings::default()));
+        assert_eq!(c.mode, Mode::Pressure);
+        let got: Vec<String> = f
+            .deleted
+            .borrow()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        // Same tier, same age: the larger first.
+        assert_eq!(
+            got,
+            [
+                "/tmp/go-build1",
+                "/home/r1/actions-runner/_diag",
+                "/tmp/go-build2",
+                "/home/r1/actions-runner/_work/_tool"
+            ]
+        );
+        // Both ages at 0 turn them off below high water.
+        let f = Fake::new(100, 50, items);
+        let s = ReclaimSettings {
+            runner_diag_max_age_secs: 0,
+            tmp_max_age_secs: 0,
+            ..live(ReclaimSettings::default())
+        };
+        assert!(run(&f, &s).records.is_empty());
+    }
+
+    #[test]
+    fn stats_report_the_last_run_s_evictions_by_kind() {
+        let f = Fake::new(
+            100,
+            96,
+            vec![
+                cand("/t/a", Kind::CargoTarget, 10, 2),
+                slot("/c/ci/slots/a", "/c/ci", 10, 0),
+            ],
+        );
+        let c = run(&f, &live(ReclaimSettings::default()));
+        let mut stats = ReclaimStats::default();
+        stats.absorb(&ReclaimSettings::default(), 1000, &c);
+        assert_eq!(stats.evicted.get("cargo_target"), Some(&1));
+        assert_eq!(stats.evicted.get("cache_slot"), Some(&1));
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["evicted"]["cache_slot"], 1);
     }
 }

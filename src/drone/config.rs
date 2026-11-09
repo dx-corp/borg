@@ -290,6 +290,13 @@ pub struct DroneConfig {
     /// homes and unused Docker state; on by default. See [`crate::reclaim`].
     #[serde(default)]
     pub reclaim: crate::reclaim::ReclaimSettings,
+    /// `false` makes a reclaim-only drone: it heartbeats, self-updates,
+    /// reclaims and reports its disk to the queen, but never takes a lease
+    /// (it always reports `accepting: false`). For shared build hosts where
+    /// people and agents build by hand, such as dev-desktop, so their
+    /// cleanup is borg's and shows in `/status` and Prometheus.
+    #[serde(default = "default_true")]
+    pub accept_leases: bool,
     /// Removal of credentials CI jobs left in home directories; on by
     /// default. See [`crate::drone::credwipe`].
     #[serde(default)]
@@ -304,6 +311,9 @@ pub struct DroneConfig {
 const DEFAULT_SLOTS: u32 = 16;
 const MAX_SLOTS: u32 = 256;
 
+fn default_true() -> bool {
+    true
+}
 fn default_docker() -> String {
     "docker".to_owned()
 }
@@ -679,6 +689,18 @@ FOO = "bar"
         ] {
             assert!(DroneConfig::from_json(&with(bad)).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn leases_are_accepted_unless_the_host_is_reclaim_only() {
+        let base = r#"{"queen_url":"https://q.example","runner_dir":"/r","work_root":"/w","cache_root":"/c""#;
+        assert!(
+            DroneConfig::from_json(&format!("{base}}}"))
+                .unwrap()
+                .accept_leases
+        );
+        let only = DroneConfig::from_json(&format!(r#"{base},"accept_leases":false}}"#)).unwrap();
+        assert!(!only.accept_leases);
     }
 
     #[test]

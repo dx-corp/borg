@@ -54,12 +54,17 @@ impl Slots {
         })
     }
 
-    /// `(slot, lease id)` for every held slot.
-    pub fn assignments(&self) -> Vec<(usize, String)> {
+    /// `(slot, lease id)` for every held slot, or `None` when ownership is unavailable.
+    pub fn try_assignments(&self) -> Option<Vec<(usize, String)>> {
         self.held
             .lock()
+            .ok()
             .map(|h| h.iter().map(|(i, l)| (*i, l.clone())).collect())
-            .unwrap_or_default()
+    }
+
+    /// `(slot, lease id)` for every held slot.
+    pub fn assignments(&self) -> Vec<(usize, String)> {
+        self.try_assignments().unwrap_or_default()
     }
 }
 
@@ -99,6 +104,22 @@ mod tests {
         let c = slots.acquire("c").unwrap();
         assert_eq!(c.index(), 0, "the freed low slot, not slot 2");
         assert_eq!(slots.assignments().len(), 2);
+    }
+
+    #[test]
+    fn unavailable_ownership_is_not_an_empty_assignment_list() {
+        let slots = Slots::new(1);
+        let _a = slots.acquire("a").unwrap();
+        let poison = Arc::clone(&slots);
+        assert!(
+            std::thread::spawn(move || {
+                let _held = poison.held.lock().unwrap();
+                panic!("poison the ownership table");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(slots.try_assignments().is_none());
     }
 
     #[test]

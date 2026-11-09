@@ -97,6 +97,15 @@ pub struct JanitorSettings {
     /// are never cancelled.
     #[serde(default)]
     pub(crate) superseded_push_branches: Vec<String>,
+    /// Workflows, by file path (`.github/workflows/platform-ci.yml`) or name,
+    /// whose push runs on `superseded_push_branches` may be superseded. Empty
+    /// means every workflow. Delivery workflows (image publication,
+    /// promotion) must not be listed: their runs are not a batch verdict,
+    /// each commit has its own concurrency group, and their own supersession
+    /// and catch-up jobs only run if the run is left to finish (2026-11-09: a
+    /// red publish run was cancelled before its catch-up re-dispatch ran).
+    #[serde(default)]
+    pub(crate) superseded_push_workflows: Vec<String>,
     /// Repositories the janitor passes over. Default: every queen `repos`
     /// entry. Set it when the queen watches repositories (for alias lanes)
     /// whose runs must not be deduplicated or superseded by these generic
@@ -830,6 +839,7 @@ impl QueenConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classes::Scope;
 
     const MIN: &str = r#"{"github":{"org":"example-org","app_id":"1"},"repos":["example-org/app"],"db_path":"/tmp/q.db"}"#;
 
@@ -1111,13 +1121,23 @@ mod tests {
             )
         };
         let ok = with(r#"{"after_secs":600,"max_per_pass":1,"min_victim_age_secs":60}"#).unwrap();
-        assert_eq!(ok.preemption.unwrap().after_secs, 600);
+        let p = ok.preemption.unwrap();
+        assert_eq!(p.after_secs, 600);
+        // Every scope may preempt unless the config narrows it.
+        assert_eq!(p.for_scopes, Scope::ALL.to_vec());
+        let deploy = with(
+            r#"{"after_secs":60,"max_per_pass":1,"min_victim_age_secs":60,"for_scopes":["deploy"]}"#,
+        )
+        .unwrap();
+        assert_eq!(deploy.preemption.unwrap().for_scopes, vec![Scope::Deploy]);
         for bad in [
             r#"{"after_secs":0,"max_per_pass":1,"min_victim_age_secs":60}"#,
             r#"{"after_secs":600,"max_per_pass":0,"min_victim_age_secs":60}"#,
             r#"{"after_secs":600,"max_per_pass":1,"min_victim_age_secs":0}"#,
             r#"{"after_secs":600,"max_per_pass":1}"#,
             r#"{"after_secs":600,"max_per_pass":1,"min_victim_age_secs":60,"nope":1}"#,
+            r#"{"after_secs":600,"max_per_pass":1,"min_victim_age_secs":60,"for_scopes":[]}"#,
+            r#"{"after_secs":600,"max_per_pass":1,"min_victim_age_secs":60,"for_scopes":["release"]}"#,
         ] {
             assert!(with(bad).is_err(), "{bad}");
         }

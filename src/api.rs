@@ -972,6 +972,12 @@ pub struct DroneStatus {
     /// any but `disk` is); empty when all hold or not reported.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     host_invariant_failures: Vec<crate::envcontract::InvariantFailure>,
+    /// Memory pressure (`some avg10`, permille) the drone last reported: the
+    /// node's when it has a host view, else its own; absent when unknown.
+    /// A node's memory stall is what resets it (a homelab node, 2026-11-06
+    /// and 2026-11-08), so this is alerted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mem_psi_pm: Option<u16>,
     /// The build environment contract as it stands for this drone; absent when
     /// the contract is off.
     pub contract: Option<ContractStatus>,
@@ -1352,6 +1358,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
                 .as_ref()
                 .map(|f| f.host_invariant_failures.clone())
                 .unwrap_or_default(),
+            mem_psi_pm: d.env_facts.as_ref().and_then(|f| f.mem_psi_some_avg10_pm),
             admission: snap
                 .admission
                 .iter()
@@ -2224,6 +2231,21 @@ pub fn render_metrics(status: &Status) -> String {
             .collect(),
     );
     gauge(
+        "borg_drone_mem_psi_pm",
+        "Memory pressure the drone last reported (`some avg10`, permille): its node's when it has a host view, else its own; absent when unknown.",
+        status
+            .drones
+            .iter()
+            .filter(|d| d.fresh)
+            .filter_map(|d| {
+                Some((
+                    format!("drone=\"{}\"", label_value(&d.name)),
+                    f64::from(d.mem_psi_pm?),
+                ))
+            })
+            .collect(),
+    );
+    gauge(
         "borg_drone_active_leases",
         "Leases each drone reports running.",
         status
@@ -2430,6 +2452,19 @@ pub fn render_metrics(status: &Status) -> String {
         "Disk usage the drone's last reclaim cycle saw.",
         reclaim_rows(&|r| r.usage_pct.map(f64::from)),
     );
+    #[allow(clippy::cast_precision_loss, reason = "byte counts far below 2^52")]
+    {
+        gauge(
+            "borg_reclaim_free_bytes",
+            "Free bytes on the tightest filesystem the drone's last reclaim cycle saw.",
+            reclaim_rows(&|r| r.free_bytes.map(|b| b as f64)),
+        );
+        gauge(
+            "borg_reclaim_floor_bytes",
+            "The drone's effective free-space floor (the larger of its own and the queen's admission floor); reclaim keeps free space at or above twice this.",
+            reclaim_rows(&|r| r.floor_bytes.map(|b| b as f64)),
+        );
+    }
     gauge(
         "borg_reclaim_errors",
         "Deletions that failed in the drone's last reclaim cycle.",

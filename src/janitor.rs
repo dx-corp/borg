@@ -3,7 +3,15 @@
 //! were closed or merged (any workflow once a pull-request read credential is
 //! configured; `closed_pr_workflows` without one), and queued push runs on
 //! listed branches that a newer run of the same workflow supersedes
-//! (`superseded_push_branches`).
+//! (`superseded_push_branches`). A superseded push run that already started
+//! (one of its jobs is running or has concluded, even while GitHub still
+//! reports the run `queued` because every other job waits for a runner) is
+//! the batch verdict for every push since the previous one; it is cancelled
+//! only once one of its jobs has failed: its verdict is final,
+//! and on a branch whose workflow keeps one running run per concurrency
+//! group (platform-ci on main) it would otherwise hold the group for hours
+//! while every newer push waits and is replaced unstarted (2026-11-08: a
+//! 15:30Z main run, red since 15:57Z, held main CI until 17:25Z).
 //!
 //! A push to a pull request branch makes every run of the older commit
 //! pointless, but GitHub keeps them queued and they occupy runner demand. Two
@@ -98,8 +106,9 @@ pub struct PassReport {
     pub would_cancel: u32,
     /// Runs left for a later pass by the per-pass cap.
     pub deferred: u32,
-    /// Superseded push runs left alone because one of their jobs is running.
-    /// GitHub shows a run as `queued` while any job waits for a runner.
+    /// Superseded push runs left alone because one of their jobs started
+    /// (running or concluded) and none failed. GitHub shows a run as
+    /// `queued` while any job waits for a runner.
     pub started_push: u32,
     /// Runs left alone when a fresh status, head or active child job
     /// contradicted the listing used to select them.
@@ -514,10 +523,17 @@ impl Janitor {
         let mut runs = self.list_runs(repo, "queued", event).await?;
         if st.cancel_running || st.dedupe_same_sha {
             runs.extend(self.list_runs(repo, "in_progress", event).await?);
-            // A run that started between the two listings appears in both.
-            runs.sort_by_key(|r| r.id);
-            runs.dedup_by_key(|r| r.id);
         }
+        if !st.superseded_push_branches.is_empty() {
+            // A push run waiting for its concurrency group is `pending`, not
+            // `queued`: without this listing the newest main tip is invisible
+            // and a red holder is never superseded (2026-11-08 22:45Z: the
+            // merged fix waited behind the red run it fixed).
+            runs.extend(self.list_runs(repo, "pending", event).await?);
+        }
+        // A run that changed state between the listings appears in several.
+        runs.sort_by_key(|r| r.id);
+        runs.dedup_by_key(|r| r.id);
         let mut stale = BTreeSet::new();
         let mut heads: BTreeMap<u64, Option<String>> = BTreeMap::new();
         let mut branches = BranchPulls::default();
@@ -606,33 +622,34 @@ impl Janitor {
                 .await;
             tally(report, budget, repo, run.id, kind, outcome);
         }
-        for (run, newer) in superseded_pushes(&runs, &st.superseded_push_branches) {
+        for (run, newer) in superseded_pushes(
+            &runs,
+            &st.superseded_push_branches,
+            &st.superseded_push_workflows,
+        ) {
             report.superseded_push += 1;
             stale.insert(run.id);
             if *budget == 0 {
                 report.deferred += 1;
                 continue;
             }
-            match self.has_running_job(repo, run.id).await {
-                Ok(false) => {}
-                Ok(true) => {
-                    report.started_push += 1;
-                    continue;
-                }
+            let jobs = match self.job_states(repo, run.id).await {
+                Ok(j) => j,
                 Err(e) => {
                     tracing::warn!("janitor: {repo} run {}: {e}", run.id);
                     report.errors += 1;
                     continue;
                 }
-            }
-            let why = format!(
-                "on {}: superseded by run {newer}",
-                run.head_branch.as_deref().unwrap_or("?")
-            );
+            };
+            let Some((why, kind)) = superseded_push_action(run, newer, jobs, st.cancel_running)
+            else {
+                report.started_push += 1;
+                continue;
+            };
             let outcome = self
                 .cancel_if_unchanged(repo, run, &why, self.settings.dry_run)
                 .await;
-            tally(report, budget, repo, run.id, Kind::Stale, outcome);
+            tally(report, budget, repo, run.id, kind, outcome);
         }
         if st.dedupe_same_sha {
             for (run, kept) in surplus(&runs, &stale) {
@@ -645,7 +662,7 @@ impl Janitor {
                     continue;
                 }
                 // A waiting sibling can keep the workflow queued after jobs start.
-                match self.has_running_job(repo, run.id).await {
+                match self.has_started_job(repo, run.id).await {
                     Ok(false) => {}
                     Ok(true) => {
                         report.raced += 1;
@@ -755,9 +772,16 @@ impl Janitor {
     }
 
     /// Cancel `run` unless a fresh read shows its status or head changed.
-    /// Whether any job of `run` is running. A run reads `queued` while one job
-    /// waits for a runner, even when others have started.
-    async fn has_running_job(&self, repo: &str, run: u64) -> Result<bool, GithubError> {
+    /// Whether any job of `run` started (running or concluded). A run reads
+    /// `queued` while one job waits for a runner, even when others have
+    /// started or finished.
+    async fn has_started_job(&self, repo: &str, run: u64) -> Result<bool, GithubError> {
+        Ok(self.job_states(repo, run).await?.started)
+    }
+
+    /// Whether any latest-attempt job of `run` is running, and whether any
+    /// concluded `failure`.
+    async fn job_states(&self, repo: &str, run: u64) -> Result<JobStates, GithubError> {
         #[derive(Deserialize)]
         struct Jobs {
             jobs: Vec<Job>,
@@ -765,21 +789,33 @@ impl Janitor {
         #[derive(Deserialize)]
         struct Job {
             status: String,
+            #[serde(default)]
+            conclusion: Option<String>,
         }
+        let mut out = JobStates::default();
         for page in 1..=MAX_PAGES {
             let jobs: Jobs = self
                 .get(&format!(
                     "/repos/{repo}/actions/runs/{run}/jobs?filter=latest&per_page=100&page={page}"
                 ))
                 .await?;
-            if jobs.jobs.iter().any(|j| j.status == "in_progress") {
-                return Ok(true);
-            }
+            // A job that is running or has concluded means the run holds its
+            // concurrency group: on a starved fleet the first job finishes
+            // and every other job waits for a runner, with GitHub still
+            // reporting the run as `queued` and no job `in_progress`.
+            out.started |= jobs
+                .jobs
+                .iter()
+                .any(|j| j.status == "in_progress" || j.status == "completed");
+            out.failed |= jobs
+                .jobs
+                .iter()
+                .any(|j| j.conclusion.as_deref() == Some("failure"));
             if jobs.jobs.len() < 100 {
                 break;
             }
         }
-        Ok(false)
+        Ok(out)
     }
 
     async fn cancel_if_unchanged(
@@ -818,7 +854,7 @@ impl Janitor {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Stale,
     Running,
@@ -910,15 +946,58 @@ fn now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
-/// Queued `push` runs on `branches`, each with the id of the newest queued or
-/// running run of the same workflow on the same branch, when that newer run
-/// is on another commit.
-fn superseded_pushes<'a>(runs: &'a [Run], branches: &[String]) -> Vec<(&'a Run, u64)> {
+/// What a run's latest-attempt jobs are doing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct JobStates {
+    /// A job is running or has concluded: the run holds its concurrency
+    /// group even while GitHub reports it `queued` (every remaining job is
+    /// waiting for a runner).
+    started: bool,
+    failed: bool,
+}
+
+/// Whether to cancel a superseded push run, why, and how to count it: a run
+/// with no job started yet goes; a started one only with `cancel_running` and
+/// once a job failed (its verdict is final and it only holds the concurrency
+/// group). A started run that is still green is the batch verdict for every
+/// push since the previous one and is never cancelled here.
+fn superseded_push_action(
+    run: &Run,
+    newer: u64,
+    jobs: JobStates,
+    cancel_running: bool,
+) -> Option<(String, Kind)> {
+    let branch = run.head_branch.as_deref().unwrap_or("?");
+    let started = run.status == "in_progress" || jobs.started;
+    match (started, jobs.failed && cancel_running) {
+        (false, _) => Some((
+            format!("on {branch}: superseded by run {newer}"),
+            Kind::Stale,
+        )),
+        (true, true) => Some((
+            format!("on {branch}: superseded by run {newer} and already failed"),
+            Kind::Running,
+        )),
+        (true, false) => None,
+    }
+}
+
+/// Queued, running and pending `push` runs on `branches` (of `workflows`,
+/// by path or name, when that list is not empty), each with the id of the
+/// newest such run of the same workflow on the same branch, when that newer
+/// run is on another commit. A run waiting for its concurrency group is
+/// `pending`; it is the newest tip the holder is compared against.
+fn superseded_pushes<'a>(
+    runs: &'a [Run],
+    branches: &[String],
+    workflows: &[String],
+) -> Vec<(&'a Run, u64)> {
     let mut newest: BTreeMap<(u64, &str), &Run> = BTreeMap::new();
     let on_branch = |r: &&'a Run| {
         r.event == "push"
-            && matches!(r.status.as_str(), "queued" | "in_progress")
+            && matches!(r.status.as_str(), "queued" | "in_progress" | "pending")
             && r.head_branch.as_ref().is_some_and(|b| branches.contains(b))
+            && (workflows.is_empty() || workflows.iter().any(|w| *w == r.path || *w == r.name))
     };
     for run in runs.iter().filter(on_branch) {
         let key = (
@@ -932,7 +1011,6 @@ fn superseded_pushes<'a>(runs: &'a [Run], branches: &[String]) -> Vec<(&'a Run, 
     }
     runs.iter()
         .filter(on_branch)
-        .filter(|r| r.status == "queued")
         .filter_map(|r| {
             let n = newest[&(r.workflow_id, r.head_branch.as_deref().unwrap_or_default())];
             (n.id > r.id && n.head_sha != r.head_sha).then_some((r, n.id))
@@ -1000,20 +1078,87 @@ mod tests {
         let runs = [
             run(1, 1, "queued", "push", "a", &[]),
             run(2, 1, "in_progress", "push", "b", &[]),
-            run(3, 1, "queued", "push", "c", &[]),
+            // The newest tip waits for the concurrency group: `pending`.
+            run(3, 1, "pending", "push", "c", &[]),
             run(4, 2, "queued", "push", "c", &[]),
             run(5, 2, "queued", "push", "c", &[]),
             run(6, 3, "queued", "pull_request", "a", &[9]),
             run(7, 3, "queued", "pull_request", "b", &[9]),
         ];
-        let mut got: Vec<_> = superseded_pushes(&runs, &["main".into()])
+        let mut got: Vec<_> = superseded_pushes(&runs, &["main".into()], &[])
             .into_iter()
             .map(|(r, n)| (r.id, n))
             .collect();
         got.sort_unstable();
-        // Run 2 is running (never cancelled); run 4 shares run 5's commit.
-        assert_eq!(got, [(1, 3)]);
-        assert!(superseded_pushes(&runs, &["release".into()]).is_empty());
+        // Run 2 is running (superseded_push_action decides); run 4 shares run
+        // 5's commit.
+        assert_eq!(got, [(1, 3), (2, 3)]);
+        assert!(superseded_pushes(&runs, &["release".into()], &[]).is_empty());
+    }
+
+    /// With `superseded_push_workflows` set, only those workflows' push runs
+    /// are superseded (by path or by name); a delivery workflow outside the
+    /// list is never touched, however many newer runs it has.
+    #[test]
+    fn only_listed_workflows_push_runs_are_superseded() {
+        let mut ci_old = run(1, 1, "queued", "push", "a", &[]);
+        ci_old.path = ".github/workflows/platform-ci.yml".into();
+        let mut ci_new = run(2, 1, "pending", "push", "b", &[]);
+        ci_new.path = ".github/workflows/platform-ci.yml".into();
+        let mut publish_old = run(3, 2, "in_progress", "push", "a", &[]);
+        publish_old.path = ".github/workflows/publish.yml".into();
+        publish_old.name = "Publish Images".into();
+        let mut publish_new = run(4, 2, "queued", "push", "b", &[]);
+        publish_new.path = ".github/workflows/publish.yml".into();
+        publish_new.name = "Publish Images".into();
+        let runs = [ci_old, ci_new, publish_old, publish_new];
+        let ids = |workflows: &[String]| -> Vec<u64> {
+            let mut v: Vec<u64> = superseded_pushes(&runs, &["main".into()], workflows)
+                .into_iter()
+                .map(|(r, _)| r.id)
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(ids(&[]), [1, 3], "no list: every workflow, as before");
+        assert_eq!(ids(&[".github/workflows/platform-ci.yml".into()]), [1]);
+        assert_eq!(ids(&["Publish Images".into()]), [3], "names match too");
+        assert!(ids(&["other.yml".into()]).is_empty());
+    }
+
+    #[test]
+    fn a_started_superseded_push_run_is_cancelled_only_once_it_failed() {
+        let queued = run(1, 1, "queued", "push", "a", &[]);
+        let running = run(2, 1, "in_progress", "push", "b", &[]);
+        let idle = JobStates::default();
+        let busy = JobStates {
+            started: true,
+            failed: false,
+        };
+        let red = JobStates {
+            started: true,
+            failed: true,
+        };
+        // Not started: superseded is enough.
+        assert_eq!(
+            superseded_push_action(&queued, 3, idle, false).map(|(_, k)| k),
+            Some(Kind::Stale)
+        );
+        // A queued run whose first job started, or finished while every
+        // other job waits for a runner, is started: it holds the group.
+        assert_eq!(superseded_push_action(&queued, 3, busy, true), None);
+        assert_eq!(superseded_push_action(&queued, 3, busy, false), None);
+        // Started and still green: its verdict may still pass; keep it.
+        assert_eq!(superseded_push_action(&running, 3, busy, true), None);
+        // Started and red: cancel, counted as running, with the reason.
+        let (why, kind) = superseded_push_action(&running, 3, red, true).unwrap();
+        assert_eq!(kind, Kind::Running);
+        assert!(
+            why.ends_with("superseded by run 3 and already failed"),
+            "{why}"
+        );
+        // Without cancel_running a started run is never cancelled.
+        assert_eq!(superseded_push_action(&running, 3, red, false), None);
     }
 
     #[test]

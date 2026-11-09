@@ -770,7 +770,7 @@ impl Queen {
         if let Err(e) = self.assess_health(now_ts).await {
             tracing::warn!("health assessment failed: {e}");
         }
-        if let Err(e) = self.advance_rollout(now_ts).await {
+        if let Err(e) = self.advance_rollout(now_ts, &active).await {
             tracing::warn!("rollout pass failed: {e}");
         }
         let profiles = self.profiles(now_ts).await;
@@ -1379,7 +1379,7 @@ impl Queen {
 
     /// One pass of the quorum rollout gate (only when both the target and
     /// `rollout.previous_version` are configured).
-    async fn advance_rollout(&self, now: i64) -> Result<(), QueenError> {
+    async fn advance_rollout(&self, now: i64, active: &[LeaseRow]) -> Result<(), QueenError> {
         let Some(target) = self.rollout_target() else {
             return Ok(());
         };
@@ -1389,16 +1389,10 @@ impl Queen {
         let stored = self.store.rollout_state().await?;
         let target = self.settled_target(target, stored.as_ref(), now);
         let rows = self.store.drones().await?;
-        let since = stored
-            .as_ref()
-            .filter(|s| s.target == target)
-            .map_or(now.saturating_sub(86_400), |s| s.started_at);
-        let outcomes: Vec<Outcome> = self
-            .store
-            .telemetry_since(since, MAX_REPORT_ROWS)
-            .await?
+        let busy_drones: HashSet<&str> = active
             .iter()
-            .filter_map(outcome_of)
+            .filter(|lease| lease.state != LeaseStatus::Standby)
+            .map(|lease| lease.drone.as_str())
             .collect();
         let views: Vec<DroneView> = rows
             .iter()
@@ -1413,9 +1407,11 @@ impl Queen {
                     .last_heartbeat
                     .is_some_and(|t| now - t <= self.cfg.drone_stale_secs),
                 held: d.held(),
+                has_active_leases: busy_drones.contains(d.name.as_str()),
                 version: d.version.clone(),
                 version_since: d.version_since,
                 shared: d.trust == crate::classes::Trust::Shared,
+                runs_jobs: d.accepting,
             })
             .collect();
         let Some(previous) = self
@@ -1425,8 +1421,22 @@ impl Queen {
             .clone()
             .or_else(|| crate::rollout::previous_for(&target, stored.as_ref(), &views))
         else {
+            // A reset can leave no baseline when all fresh drones already run
+            // the target. Clear the old view and its heartbeat instructions.
+            self.update_snapshot(|s| s.rollout = None);
             return Ok(());
         };
+        let since = stored
+            .as_ref()
+            .filter(|s| s.target == target)
+            .map_or(now.saturating_sub(86_400), |s| s.started_at);
+        let outcomes: Vec<Outcome> = self
+            .store
+            .telemetry_since(since, MAX_REPORT_ROWS)
+            .await?
+            .iter()
+            .filter_map(outcome_of)
+            .collect();
         let adv = advance(
             now,
             &self.cfg.rollout,
@@ -1436,8 +1446,13 @@ impl Queen {
             &views,
             &outcomes,
         );
-        if stored.as_ref() != Some(&adv.state) {
-            self.store.save_rollout_state(&adv.state, now).await?;
+        if stored.as_ref() != Some(&adv.state)
+            && !self
+                .store
+                .save_rollout_state_if_current(stored.as_ref(), &adv.state, now)
+                .await?
+        {
+            return Ok(());
         }
         for e in &adv.events {
             tracing::warn!("rollout: {e}");
@@ -2160,7 +2175,7 @@ impl Queen {
         now: i64,
     ) -> Result<Vec<LeaseRow>, QueenError> {
         let mut still_active = Vec::new();
-        for lease in self.store.active_leases().await? {
+        for mut lease in self.store.active_leases().await? {
             let runner = ours.get(lease.runner_name.as_str());
             let overdue = now - lease.created_at > self.cfg.lease_max_secs;
             let standby = lease.state == LeaseStatus::Standby;
@@ -2178,6 +2193,7 @@ impl Queen {
                         self.store
                             .set_state(&lease.id, LeaseStatus::Running, now)
                             .await?;
+                        lease.state = LeaseStatus::Running;
                     }
                     still_active.push(lease);
                 }

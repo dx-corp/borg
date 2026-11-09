@@ -1372,6 +1372,35 @@ impl Store {
         Ok(())
     }
 
+    /// Do not overwrite an operator's reset or halt during a rollout pass.
+    pub(crate) async fn save_rollout_state_if_current(
+        &self,
+        expected: Option<&RolloutState>,
+        next: &RolloutState,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let row = sqlx::query_scalar::<_, String>("SELECT state FROM rollout_state WHERE id = 1")
+            .fetch_optional(&mut *tx)
+            .await?;
+        let stored: Option<RolloutState> = row.as_deref().map(from_text).transpose()?;
+        if stored.as_ref() != expected {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query(
+            "INSERT OR REPLACE INTO rollout_state (id, state, updated_at) VALUES (1, ?, ?)",
+        )
+        .bind(to_text(next)?)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Forget the current rollout; the next pass starts it over.
     pub async fn clear_rollout_state(&self) -> Result<(), StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
