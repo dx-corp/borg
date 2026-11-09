@@ -343,6 +343,46 @@ async fn owner_lease_cap_is_advertised_and_respected() {
 }
 
 #[tokio::test]
+async fn a_reclaim_only_drone_heartbeats_but_never_takes_a_lease() {
+    let rig = Rig::new().await;
+    rig.install_runner("touch $OUT/started");
+    let drone = rig.drone(json!({"accept_leases": false}));
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let run = tokio::spawn(drone.run(async move {
+        let _ = stop_rx.await;
+    }));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while rig
+        .h
+        .queen
+        .store()
+        .drones()
+        .await
+        .unwrap()
+        .iter()
+        .all(|d| d.capacity.is_none())
+    {
+        assert!(tokio::time::Instant::now() < deadline, "drone registered");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    rig.h.queue_job(1, "borg-ci-light", 1);
+    // Several queen passes and heartbeats: still no lease.
+    for _ in 0..3 {
+        rig.h.tick().await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+    }
+    let status = rig.h.status().await;
+    assert_eq!(status["drones"][0]["accepting"], false);
+    assert!(!rig.path("out/started").exists(), "no job ran");
+    assert_eq!(rig.lease_state().await, ["pending=0 running=0"]);
+    stop_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn shutdown_stops_taking_leases_and_lets_the_running_job_finish() {
     let rig = Rig::new().await;
     rig.install_runner("touch $OUT/started\nsleep 2\ntouch $OUT/finished");

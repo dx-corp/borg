@@ -696,6 +696,10 @@ struct InstallArgs {
     /// Do not install the self-update units.
     #[arg(long)]
     no_self_update: bool,
+    /// Reclaim-only drone: heartbeats, self-updates, reclaims disk and
+    /// reports it, never takes a lease (shared hosts where people build by hand).
+    #[arg(long)]
+    reclaim_only: bool,
     /// Print what would change without changing anything.
     #[arg(long)]
     dry_run: bool,
@@ -1146,6 +1150,7 @@ fn install_drone(a: InstallArgs) -> Result<()> {
         binary: std::env::current_exe().context("locate this binary")?,
         dry_run: a.dry_run,
         drain_timeout_secs: 3600,
+        reclaim_only: a.reclaim_only,
         git_mirrors: a.git_mirrors,
         git_remote_base: a.git_remote_base,
         update_manifest_url: a.update_manifest_url,

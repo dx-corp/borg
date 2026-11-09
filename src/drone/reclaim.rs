@@ -18,9 +18,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+
 use crate::drone::config::DroneConfig;
 use crate::drone::docker_reclaim::{self, DockerCli};
 use crate::drone::exec::Exec;
+use crate::drone::slots::{Slots, slot_dir};
 use crate::reclaim::{
     Candidate, Cycle, Disk, Kind, Mode, ReclaimHost, ReclaimSettings, ReclaimStats, Root, Safety,
     run_cycle,
@@ -64,6 +67,7 @@ const SHARED_TARGET_DIRS: &[&str] = &[
 fn default_roots(
     homes: &[PathBuf],
     ci_slots: &[PathBuf],
+    namespaces: &[PathBuf],
     exists: impl Fn(&Path) -> bool,
 ) -> Vec<Root> {
     let mut out = Vec::new();
@@ -93,9 +97,125 @@ fn default_roots(
     for d in ci_slots {
         push(d.clone(), Kind::CargoTarget);
         push(d.clone(), Kind::CacheDir);
+        // And each whole slot, least recently used first, once the finer
+        // pieces are not enough (borg-deploy-2 reached 99% on 2026-11-09
+        // with twelve slots all used within the hour, none eligible).
+        push(d.clone(), Kind::CacheSlot);
+    }
+    // A job namespace's other entries (`mono-publish/platform-api`,
+    // `mono-publish/bazel`, `mono-ci/hawk-shared`: 131 GB on borg-deploy-2
+    // that no root covered) are slots of that cache too.
+    for ns in namespaces {
+        push(ns.clone(), Kind::CacheSlot);
     }
     out
 }
+
+/// `<cache_root>/<namespace>` directories jobs create for themselves
+/// (`platform-ci.yml` writes under `$BORG_CACHE_ROOT/mono-ci`, publish under
+/// `mono-publish`): every directory under `cache_root` that is not one of
+/// the drone's own managed cache kinds or its git mirrors.
+fn namespace_roots(cfg: &DroneConfig) -> Vec<PathBuf> {
+    let managed: BTreeSet<&str> = crate::drone::caches::kinds::Kind::ALL
+        .iter()
+        .map(|k| k.name())
+        .chain(std::iter::once("git"))
+        .collect();
+    let mut out: Vec<PathBuf> = std::fs::read_dir(&cfg.cache_root)
+        .map(|it| {
+            it.filter_map(Result::ok)
+                .filter(|e| e.path().is_dir())
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    !name.starts_with('.') && !managed.contains(name.as_ref())
+                })
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Subdirectories of a static runner user's home that its tools fill and
+/// re-create on demand.
+const RUNNER_USER_CACHES: &[&str] = &[".cache/go-build", ".npm", ".pnpm-store", "go/pkg/mod/cache"];
+
+/// The roots a host's static GitHub runners give reclaim: each runner's
+/// `_work` checkouts, its tool cache and `_diag` logs, the caches in its
+/// user's home, and `/tmp` once there is any runner at all (internal-runner-
+/// burst-01 reached 98% on 2026-11-09 with 6.9 GB of `_work/_tool`, 4.8 GB of
+/// `go-build` and 5.6 GB of `_diag` per runner, none of them a root).
+fn static_runner_roots(runners: &[crate::drone::credwipe::StaticRunner]) -> Vec<Root> {
+    let mut out = Vec::new();
+    for r in runners {
+        out.push(Root {
+            path: r.root.join("_work"),
+            kind: Kind::RunnerWork,
+        });
+        out.push(Root {
+            path: r.root.join("_work/_tool"),
+            kind: Kind::RunnerToolCache,
+        });
+        out.push(Root {
+            path: r.root.join("_diag"),
+            kind: Kind::RunnerDiag,
+        });
+        if let Some(home) = &r.home {
+            for c in RUNNER_USER_CACHES {
+                out.push(Root {
+                    path: home.join(c),
+                    kind: Kind::RunnerUserCache,
+                });
+            }
+        }
+    }
+    if !runners.is_empty() {
+        out.push(Root {
+            path: PathBuf::from("/tmp"),
+            kind: Kind::TmpEntry,
+        });
+    }
+    out
+}
+
+/// The CI cache slot key of lease slot `index`: `platform-ci.yml`
+/// (`SET_CARGO_TARGET_DIR`) keys a job's retained build output by
+/// `sha256(RUNNER_TOOL_CACHE)`, and the runner's tool cache is `_work/_tool`
+/// under the runner root, which borg clones into the lease's slot directory.
+/// So the slot a lease holds is `<cache_root>/<namespace>/slots/<this key>`,
+/// and a reused lease slot keeps its cache slot. Checked against
+/// borg-deploy-2's twelve slot directories on 2026-11-09.
+pub(crate) fn cache_slot_key(work_root: &Path, index: usize) -> String {
+    let tool_cache = format!("{}/_work/_tool", slot_dir(work_root, index).display());
+    hex::encode(Sha256::digest(tool_cache.as_bytes()))
+}
+
+/// The slot (`<...>/slots/<key>`) that contains `path`, if any: the path up
+/// to and including the component after a `slots` component.
+fn slot_containing(path: &Path) -> Option<PathBuf> {
+    let mut acc = PathBuf::new();
+    let mut after_slots = false;
+    for c in path.components() {
+        acc.push(c);
+        if after_slots {
+            return Some(acc);
+        }
+        after_slots = c.as_os_str() == "slots";
+    }
+    None
+}
+
+/// The slot key of the slot that contains `path`, if any.
+fn slot_key_of(path: &Path) -> Option<String> {
+    slot_containing(path).and_then(|s| s.file_name().map(|n| n.to_string_lossy().into_owned()))
+}
+
+/// Name of the file a drone touches in a slot when a lease that holds it
+/// starts and ends; its modification time is the slot's last use
+/// (`NEWEST_SLOT` reads it by the same name).
+const SLOT_USE_STAMP: &str = ".borg-last-used";
 
 /// `<cache_root>/<namespace>/slots` directories: the per-job CI cache slots
 /// whose `cargo-target/<week>` directories reclaim may remove. Namespaces are
@@ -320,6 +440,29 @@ const LIST_TARGETS: &str = r#"find "$1" -mindepth 2 -maxdepth 4 -name .rustc_inf
 /// A static runner's checkouts: `_work/<repo>`. The runner's own `_tool`,
 /// `_actions`, `_temp`, `_update` and `_PipelineMapping` stay.
 const LIST_RUNNER_WORK: &str = r#"find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '_*' -printf '%p\n' 2>/dev/null; echo .done"#;
+/// Build-cache slots: each directory under a `<ns>/slots` root, or each entry
+/// of a namespace root other than its `slots` directory.
+const LIST_SLOTS: &str = r#"find "$1" -mindepth 1 -maxdepth 1 -type d ! -name slots ! -name '.*' -printf '%p\n' 2>/dev/null; echo .done"#;
+/// A slot's last use: the drone's stamp when it has one, else the newest
+/// modification time inside it.
+const NEWEST_SLOT: &str = r#"if [ -e "$1/.borg-last-used" ]; then stat -c %Y -- "$1/.borg-last-used"; else find "$1" -maxdepth 3 -printf '%T@\n' 2>/dev/null | sort -n | tail -1; fi"#;
+/// A root that is itself the candidate (a runner's tool cache, a user cache,
+/// a `_diag` directory).
+const LIST_SELF: &str = r#"[ -d "$1" ] && printf '%s\n' "$1"; echo .done"#;
+/// Regenerable temp entries CI tools leave in `/tmp`. An allowlist, not
+/// everything old: a `/tmp` entry of unknown origin may be a socket
+/// directory or a lock a daemon owns.
+const LIST_TMP: &str = r#"find "$1" -mindepth 1 -maxdepth 1 \( -type d \( -name 'go-build*' -o -name 'getter*' -o -name 'trivy-*' -o -name 'rustdoctest*' -o -name 'maestro-pack-smoke-*' -o -name 'cargo-install*' -o -name '.*.node-gyp' \) -o -type f -name 'actions-runner-linux-x64-*.tar.gz' \) -printf '%p\n' 2>/dev/null; echo .done"#;
+/// `find` over a `_diag` directory's files older than `age_secs`, ending in
+/// `action` (`-printf '%s\n'` to size them, `-delete` to remove them).
+fn diag_old_files(age_secs: u64, action: &str) -> String {
+    format!(r#"find "$1" -type f -mmin +{} {action}"#, age_secs / 60)
+}
+
+/// Age of the oldest log file in a `_diag` directory (unix secs of its
+/// modification), so the candidate's idle age says whether anything is
+/// old enough to go.
+const DIAG_OLDEST: &str = r#"find "$1" -type f -printf '%T@\n' 2>/dev/null | sort -n | head -1"#;
 /// Per-slot tool homes: `<slots>/<slot>/mise-home`.
 const LIST_CACHE_DIRS: &str = r#"find "$1" -mindepth 2 -maxdepth 2 -type d -name mise-home -printf '%p\n' 2>/dev/null; echo .done"#;
 const LIST_INCREMENTAL: &str = r#"find "$1" -mindepth 2 -maxdepth 3 -type d -name incremental -prune -printf '%p\n' 2>/dev/null; echo .done"#;
@@ -354,26 +497,32 @@ pub struct LiveHost<'a> {
     /// Any path on the filesystem the group shares.
     anchor: PathBuf,
     now: i64,
-    /// Below this idle age a candidate is never eligible, so its size is not
-    /// measured.
+    /// Below this idle age a non-slot candidate is never eligible, so its size
+    /// is not measured. Critical mode can evict a cache slot at any age.
     size_floor_secs: u64,
     sizes: &'a Mutex<HashMap<PathBuf, (i64, u64)>>,
     /// Common git dir of each worktree probed, for `worktree prune`.
     common: Mutex<HashMap<PathBuf, PathBuf>>,
     /// The queen's disk admission floor (0 when unknown).
     floor: u64,
-    /// Leases the drone is running now: a CI slot's tool home is busy
-    /// while any lease runs (its tools execute from there without holding
-    /// a file open, so the process scan cannot see them).
+    /// Leases the drone is running now: a CI slot's tool home or a shared
+    /// namespace cache is busy while any lease runs (its tools execute from
+    /// there without holding a file open, so the process scan cannot see them).
     leases: &'a Mutex<HashSet<String>>,
+    /// Authoritative lease-slot ownership, read again at every deletion probe.
+    slots: &'a Slots,
+    work_root: &'a Path,
+    /// `_diag` log files older than this are what a `runner_diag` candidate
+    /// measures and removes.
+    diag_max_age_secs: u64,
 }
 
 impl LiveHost<'_> {
-    fn newest(&self, path: &Path, worktree: bool) -> Option<i64> {
-        let script = if worktree {
-            NEWEST_WORKTREE
-        } else {
-            NEWEST_ANY
+    fn newest(&self, path: &Path, kind: Kind) -> Option<i64> {
+        let script = match kind {
+            Kind::Worktree => NEWEST_WORKTREE,
+            Kind::CacheSlot => NEWEST_SLOT,
+            _ => NEWEST_ANY,
         };
         let out = self.cmd.sh(path, PROBE_SECS, script).ok()?;
         out.trim()
@@ -382,10 +531,19 @@ impl LiveHost<'_> {
             .and_then(|s| s.parse::<i64>().ok())
     }
 
-    fn candidate(&self, path: PathBuf, kind: Kind, within: Option<PathBuf>) -> Option<Candidate> {
-        let newest = self.newest(&path, kind == Kind::Worktree)?;
+    fn candidate(
+        &self,
+        path: PathBuf,
+        kind: Kind,
+        within: Option<PathBuf>,
+        cache: Option<PathBuf>,
+    ) -> Option<Candidate> {
+        if kind == Kind::RunnerDiag {
+            return self.diag_candidate(path);
+        }
+        let newest = self.newest(&path, kind)?;
         let idle_secs = u64::try_from(self.now.saturating_sub(newest)).unwrap_or(0);
-        let size_bytes = if idle_secs < self.size_floor_secs {
+        let size_bytes = if kind != Kind::CacheSlot && idle_secs < self.size_floor_secs {
             0
         } else {
             let cached = self
@@ -416,7 +574,60 @@ impl LiveHost<'_> {
             size_bytes,
             idle_secs,
             within,
+            cache,
         })
+    }
+
+    /// A `_diag` directory: idle is the age of its oldest log file and size
+    /// the bytes of the files old enough to go. No file: no candidate.
+    fn diag_candidate(&self, path: PathBuf) -> Option<Candidate> {
+        let oldest: i64 = self
+            .cmd
+            .sh(&path, PROBE_SECS, DIAG_OLDEST)
+            .ok()?
+            .trim()
+            .split('.')
+            .next()?
+            .parse()
+            .ok()?;
+        let idle_secs = u64::try_from(self.now.saturating_sub(oldest)).unwrap_or(0);
+        let size_bytes = if idle_secs < self.diag_max_age_secs {
+            0
+        } else {
+            let out = self
+                .cmd
+                .sh(
+                    &path,
+                    PROBE_SECS,
+                    &diag_old_files(self.diag_max_age_secs, "-printf '%s\\n'"),
+                )
+                .ok()?;
+            out.lines()
+                .filter_map(|l| l.trim().parse::<u64>().ok())
+                .sum()
+        };
+        Some(Candidate {
+            path,
+            kind: Kind::RunnerDiag,
+            size_bytes,
+            idle_secs,
+            within: None,
+            cache: None,
+        })
+    }
+
+    /// Whether `path` lies inside a slot a running lease holds now.
+    fn in_held_slot(&self, path: &Path) -> Result<bool, String> {
+        let assignments = self
+            .slots
+            .try_assignments()
+            .ok_or_else(|| "slot ownership unavailable".to_owned())?;
+        let Some(key) = slot_key_of(path) else {
+            return Ok(false);
+        };
+        Ok(assignments
+            .into_iter()
+            .any(|(index, _)| cache_slot_key(self.work_root, index) == key))
     }
 
     fn busy(&self, path: &Path) -> Result<bool, String> {
@@ -522,8 +733,22 @@ impl ReclaimHost for LiveHost<'_> {
                 Kind::Worktree => LIST_WORKTREES,
                 Kind::CacheDir => LIST_CACHE_DIRS,
                 Kind::RunnerWork => LIST_RUNNER_WORK,
+                Kind::CacheSlot => LIST_SLOTS,
+                Kind::RunnerToolCache | Kind::RunnerUserCache | Kind::RunnerDiag => LIST_SELF,
+                Kind::TmpEntry => LIST_TMP,
                 _ => LIST_TARGETS,
             };
+            // A slot's cache is its namespace: the root itself, or the
+            // parent of a `slots` root.
+            let cache = (root.kind == Kind::CacheSlot).then(|| {
+                if root.path.file_name().is_some_and(|n| n == "slots") {
+                    root.path
+                        .parent()
+                        .map_or_else(|| root.path.clone(), Path::to_path_buf)
+                } else {
+                    root.path.clone()
+                }
+            });
             let found = match self
                 .cmd
                 .sh(&root.path, PROBE_SECS, script)
@@ -543,13 +768,19 @@ impl ReclaimHost for LiveHost<'_> {
                         .and_then(|o| listed(&o))
                         .unwrap_or_default();
                     for i in incr {
-                        if let Some(c) = self.candidate(i, Kind::CargoIncremental, Some(p.clone()))
+                        if let Some(c) =
+                            self.candidate(i, Kind::CargoIncremental, Some(p.clone()), None)
                         {
                             out.push(c);
                         }
                     }
                 }
-                if let Some(c) = self.candidate(p, root.kind, None) {
+                // A target or tool home inside a slot is within that slot,
+                // so the slot's own deletion is credited net of it.
+                let within = (root.kind != Kind::CacheSlot)
+                    .then(|| slot_containing(&p).filter(|s| *s != p))
+                    .flatten();
+                if let Some(c) = self.candidate(p, root.kind, within, cache.clone()) {
                     out.push(c);
                 }
             }
@@ -563,7 +794,15 @@ impl ReclaimHost for LiveHost<'_> {
             s.unknown = Some("gone".into());
             return s;
         }
-        if c.kind == Kind::RunnerWork {
+        if c.kind == Kind::RunnerDiag {
+            // Only log files older than the age go; the runner writes a new
+            // log per job and holds only the current ones open.
+            return s;
+        }
+        if matches!(
+            c.kind,
+            Kind::RunnerWork | Kind::RunnerToolCache | Kind::RunnerUserCache
+        ) {
             // The runner's job may sit between steps with no process inside
             // `_work`; its `Runner.Worker` lives for the whole job.
             match self.runner_job_running(&c.path) {
@@ -578,7 +817,19 @@ impl ReclaimHost for LiveHost<'_> {
                 }
             }
         }
-        if c.kind == Kind::CacheDir {
+        match self.in_held_slot(&c.path) {
+            Ok(false) => {}
+            Ok(true) => {
+                s.busy = true;
+                return s;
+            }
+            Err(e) => {
+                s.unknown = Some(e);
+                return s;
+            }
+        }
+        if c.kind == Kind::CacheDir || (c.kind == Kind::CacheSlot && slot_key_of(&c.path).is_none())
+        {
             match self.leases.lock() {
                 Ok(l) if l.is_empty() => {}
                 Ok(_) => {
@@ -611,6 +862,14 @@ impl ReclaimHost for LiveHost<'_> {
     }
 
     fn delete(&self, c: &Candidate) -> Result<u64, String> {
+        if c.kind == Kind::RunnerDiag {
+            self.cmd.sh(
+                &c.path,
+                DELETE_SECS,
+                &diag_old_files(self.diag_max_age_secs, "-delete"),
+            )?;
+            return Ok(c.size_bytes);
+        }
         let common = if c.kind == Kind::Worktree {
             Some(
                 self.common
@@ -664,9 +923,19 @@ fn merge(into: &mut Option<Cycle>, c: Cycle) {
     }
     acc.usage_pct_before = acc.usage_pct_before.max(c.usage_pct_before);
     acc.usage_pct_after = acc.usage_pct_after.max(c.usage_pct_after);
+    // Report the tightest filesystem: the least free space above (or the
+    // most below) its target of twice the floor.
+    let headroom = |c: &Cycle| i128::from(c.free_bytes_before) - 2 * i128::from(c.floor_bytes);
+    if headroom(&c) < headroom(&*acc) {
+        acc.free_bytes_before = c.free_bytes_before;
+        acc.floor_bytes = c.floor_bytes;
+    }
     acc.records.extend(c.records);
     for (k, v) in c.kept {
         *acc.kept.entry(k).or_default() += v;
+    }
+    for (k, v) in c.evicted {
+        *acc.evicted.entry(k).or_default() += v;
     }
     acc.reclaimed_bytes = acc.reclaimed_bytes.saturating_add(c.reclaimed_bytes);
     acc.would_reclaim_bytes = acc
@@ -686,12 +955,26 @@ pub struct Reclaimer {
     docker_bin: String,
     /// Leases the drone is running (shared with the drone).
     leases: Arc<Mutex<HashSet<String>>>,
+    /// The lease slots (shared with the drone): which are in use says which
+    /// cache slots a live lease holds.
+    slots: Arc<Slots>,
+    work_root: PathBuf,
+    cache_root: PathBuf,
     /// The queen's disk admission floor (shared with the drone).
     floor: Arc<AtomicU64>,
     stats: Mutex<ReclaimStats>,
     seq: Mutex<u64>,
     sizes: Mutex<HashMap<PathBuf, (i64, u64)>>,
+    /// Woken when disk admission is blocked, so a cycle runs now instead of
+    /// at the next tick.
+    kick: tokio::sync::Notify,
+    /// When the last cycle finished (unix secs); a kick within
+    /// [`KICK_MIN_GAP_SECS`] of it is folded into the next tick.
+    last_run: AtomicU64,
 }
+
+/// Shortest gap between a kicked cycle and the one before it.
+const KICK_MIN_GAP_SECS: u64 = 60;
 
 impl Reclaimer {
     /// `None` when reclaim is off or the host is not Linux.
@@ -699,6 +982,7 @@ impl Reclaimer {
         cfg: &DroneConfig,
         exec: Arc<dyn Exec>,
         leases: Arc<Mutex<HashSet<String>>>,
+        slots: Arc<Slots>,
         floor: Arc<AtomicU64>,
     ) -> Option<Arc<Self>> {
         let settings = cfg.reclaim.clone();
@@ -717,18 +1001,19 @@ impl Reclaimer {
         let roots = if settings.roots.is_empty() {
             // Checked as the directory's owner: a private home hides its
             // build directories from the drone itself.
-            let mut roots = default_roots(&host_homes(cfg), &ci_slot_roots(cfg), |p| {
-                cmd.sh(p, PROBE_SECS, r#"test -d "$1""#).is_ok()
-            });
+            let mut roots = default_roots(
+                &host_homes(cfg),
+                &ci_slot_roots(cfg),
+                &namespace_roots(cfg),
+                |p| cmd.sh(p, PROBE_SECS, r#"test -d "$1""#).is_ok(),
+            );
             // Static GitHub runners sharing the host (internal-runner-burst-01
             // ran eight, 14-21 GB of `_work` each on 2026-11-01).
             if settings.static_runner_work {
-                for w in crate::drone::credwipe::static_runner_work_dirs(&cmd) {
-                    if cmd.sh(&w, PROBE_SECS, r#"test -d "$1""#).is_ok() {
-                        roots.push(Root {
-                            path: w,
-                            kind: Kind::RunnerWork,
-                        });
+                let runners = crate::drone::credwipe::static_runners(&cmd);
+                for r in static_runner_roots(&runners) {
+                    if cmd.sh(&r.path, PROBE_SECS, r#"test -d "$1""#).is_ok() {
+                        roots.push(r);
                     }
                 }
             }
@@ -763,10 +1048,52 @@ impl Reclaimer {
             cmd,
             docker_bin: cfg.docker_bin.clone(),
             leases,
+            slots,
+            work_root: cfg.work_root.clone(),
+            cache_root: cfg.cache_root.clone(),
             floor,
             seq: Mutex::new(seq),
             sizes: Mutex::new(HashMap::new()),
+            kick: tokio::sync::Notify::new(),
+            last_run: AtomicU64::new(0),
         }))
+    }
+
+    /// Run a cycle now (disk admission is blocked): the drone takes no job
+    /// until free space is back above the floor, and the next tick may be
+    /// ten minutes away.
+    pub(super) fn kick(&self) {
+        self.kick.notify_one();
+    }
+
+    /// Record that lease slot `index` is in use now: the drone touches the
+    /// use stamp of the cache slot that lease holds under every namespace,
+    /// as the slot's owner. Called when a lease starts and when it ends, so
+    /// the stamp is the slot's last use and LRU eviction has a clock that
+    /// does not depend on what the job happened to write.
+    pub(super) async fn note_slot_use(self: &Arc<Self>, index: usize) {
+        let me = Arc::clone(self);
+        let _ = tokio::task::spawn_blocking(move || me.stamp_slot(index)).await;
+    }
+
+    fn stamp_slot(&self, index: usize) {
+        let key = cache_slot_key(&self.work_root, index);
+        let Ok(namespaces) = std::fs::read_dir(&self.cache_root) else {
+            return;
+        };
+        for ns in namespaces.filter_map(Result::ok) {
+            let slot = ns.path().join("slots").join(&key);
+            if !slot.is_dir() {
+                continue;
+            }
+            if let Err(e) = self.cmd.sh(
+                &slot,
+                PROBE_SECS,
+                &format!(r#"touch -- "$1/{SLOT_USE_STAMP}""#),
+            ) {
+                tracing::debug!("reclaim: slot use stamp {}: {e}", slot.display());
+            }
+        }
     }
 
     /// Stats for the next heartbeat, with the audit entries not yet sent.
@@ -810,6 +1137,9 @@ impl Reclaimer {
                 common: Mutex::new(HashMap::new()),
                 floor: self.floor.load(Ordering::Relaxed),
                 leases: &self.leases,
+                slots: &self.slots,
+                work_root: &self.work_root,
+                diag_max_age_secs: self.settings.runner_diag_max_age_secs,
             };
             let settings = ReclaimSettings {
                 roots,
@@ -853,6 +1183,10 @@ impl Reclaimer {
         if self.settings.docker.enabled {
             self.run_docker(now);
         }
+        self.last_run.store(
+            u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0),
+            Ordering::Relaxed,
+        );
     }
 
     /// The Docker tier, on the filesystem holding Docker's data root.
@@ -914,7 +1248,8 @@ impl Reclaimer {
         }
     }
 
-    /// Run a cycle shortly after start and then every `interval_secs`.
+    /// Run a cycle shortly after start and then every `interval_secs`, or
+    /// sooner when [`Self::kick`] says admission is blocked.
     pub(super) fn spawn(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let me = Arc::clone(self);
         tokio::spawn(async move {
@@ -923,7 +1258,19 @@ impl Reclaimer {
                 tokio::time::interval(Duration::from_secs(me.settings.interval_secs.max(60)));
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                every.tick().await;
+                // Both arms are cancel-safe: a tick or a notification that
+                // loses the race is kept for the next iteration.
+                let kicked = tokio::select! {
+                    _ = every.tick() => false,
+                    () = me.kick.notified() => true,
+                };
+                if kicked {
+                    let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp())
+                        .unwrap_or(0);
+                    if now.saturating_sub(me.last_run.load(Ordering::Relaxed)) < KICK_MIN_GAP_SECS {
+                        continue;
+                    }
+                }
                 let run = Arc::clone(&me);
                 if let Err(e) = tokio::task::spawn_blocking(move || run.run_once()).await {
                     tracing::warn!("reclaim run panicked: {e}");
@@ -946,6 +1293,8 @@ mod tests {
             "/srv/devdata/worktrees",
             "/srv/devdata/slots",
             "/var/lib/borg-job/cache/mono-ci/slots",
+            "/var/lib/borg-job/cache/mono-ci",
+            "/var/lib/borg-job/cache/mono-publish",
         ]
         .into_iter()
         .map(PathBuf::from)
@@ -953,6 +1302,10 @@ mod tests {
         let roots = default_roots(
             &[PathBuf::from("/home/dev")],
             &[PathBuf::from("/var/lib/borg-job/cache/mono-ci/slots")],
+            &[
+                PathBuf::from("/var/lib/borg-job/cache/mono-ci"),
+                PathBuf::from("/var/lib/borg-job/cache/mono-publish"),
+            ],
             |p| present.contains(p),
         );
         let got: Vec<(String, &str)> = roots
@@ -976,8 +1329,468 @@ mod tests {
                     "/var/lib/borg-job/cache/mono-ci/slots".to_owned(),
                     "cache_dir"
                 ),
+                (
+                    "/var/lib/borg-job/cache/mono-ci/slots".to_owned(),
+                    "cache_slot"
+                ),
+                ("/var/lib/borg-job/cache/mono-ci".to_owned(), "cache_slot"),
+                (
+                    "/var/lib/borg-job/cache/mono-publish".to_owned(),
+                    "cache_slot"
+                ),
             ]
         );
+    }
+
+    /// The key `platform-ci.yml` derives from `RUNNER_TOOL_CACHE`
+    /// (`sha256sum` of the path, no newline), as the slot directories on
+    /// borg-deploy-2 showed for lease slots 0 and 11 (work root
+    /// `/var/lib/borg-job/work`).
+    #[test]
+    fn cache_slot_key_is_the_ci_workflow_s_sha256_of_the_runner_tool_cache() {
+        let work = Path::new("/var/lib/borg-job/work");
+        assert_eq!(
+            cache_slot_key(work, 0),
+            "717a4f03b9a1252141ee84e5c48ef23629e03521a7dc5f21f579e422f0a904b4"
+        );
+        assert_eq!(
+            cache_slot_key(work, 11),
+            "a91e0ad44e01ff286fa99de3ddddc5901e9fd4cd044294c502fe7ea7f513ecf3"
+        );
+        let slot = PathBuf::from("/var/lib/borg-job/cache/mono-ci/slots/abc");
+        assert_eq!(
+            slot_containing(&slot.join("cargo-target/2026-W46")),
+            Some(slot.clone())
+        );
+        assert_eq!(slot_containing(&slot), Some(slot.clone()));
+        assert_eq!(slot_key_of(&slot.join("mise-home")).as_deref(), Some("abc"));
+        assert_eq!(
+            slot_containing(Path::new("/var/lib/borg-job/cache/mono-ci/slots")),
+            None
+        );
+        assert_eq!(
+            slot_containing(Path::new("/var/lib/borg-job/cache/mono-publish/bazel")),
+            None
+        );
+    }
+
+    /// Each slot under a `slots` root and each entry of a namespace root is a
+    /// candidate; the `slots` directory itself and dot entries are not. A
+    /// slot's last use is its stamp when the drone left one, else what it
+    /// holds.
+    #[test]
+    fn slot_listing_and_last_use_follow_the_stamp() {
+        use crate::drone::exec::SystemExec;
+        let tmp = tempfile::tempdir().unwrap();
+        let ns = tmp.path().canonicalize().unwrap().join("mono-ci");
+        for d in [
+            "slots/aaa/cargo-target/2026-W46/debug",
+            "slots/bbb/mise-home",
+            "slots/.hidden",
+            "hawk-shared/2026-W46",
+            "tools/sccache",
+        ] {
+            std::fs::create_dir_all(ns.join(d)).unwrap();
+        }
+        let cmd = Commands::new(Arc::new(SystemExec), "setpriv".into());
+        let slots = listed(&cmd.sh(&ns.join("slots"), 30, LIST_SLOTS).unwrap()).unwrap();
+        assert_eq!(slots, vec![ns.join("slots/aaa"), ns.join("slots/bbb")]);
+        let entries = listed(&cmd.sh(&ns, 30, LIST_SLOTS).unwrap()).unwrap();
+        assert_eq!(entries, vec![ns.join("hawk-shared"), ns.join("tools")]);
+        // Without a stamp the newest file inside dates the slot.
+        let fresh = cmd.sh(&ns.join("slots/aaa"), 30, NEWEST_SLOT).unwrap();
+        let fresh: i64 = fresh.trim().split('.').next().unwrap().parse().unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        assert!((now - fresh).abs() < 120, "{fresh} vs {now}");
+        // With a stamp, the stamp is the last use, whatever the files say.
+        let stamp = ns.join("slots/aaa").join(SLOT_USE_STAMP);
+        std::fs::write(&stamp, "").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&stamp)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let stamped = cmd.sh(&ns.join("slots/aaa"), 30, NEWEST_SLOT).unwrap();
+        assert_eq!(stamped.trim(), "1700000000");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_cache_slots_are_sized_once_and_critical_stops_at_the_target() {
+        use crate::drone::exec::{Output, SystemExec};
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountDu(AtomicUsize);
+        impl Exec for CountDu {
+            fn run(&self, program: &str, args: &[&str]) -> std::io::Result<Output> {
+                if args.iter().any(|a| a.contains("du -sxk")) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+                SystemExec.run(program, args)
+            }
+        }
+
+        struct TestHost<'a> {
+            live: LiveHost<'a>,
+            disk: Disk,
+            floor: u64,
+        }
+        impl ReclaimHost for TestHost<'_> {
+            fn disk(&self) -> Result<Disk, String> {
+                Ok(self.disk)
+            }
+            fn admission_floor_bytes(&self) -> u64 {
+                self.floor
+            }
+            fn scan(&self, roots: &[Root]) -> Result<Vec<Candidate>, String> {
+                self.live.scan(roots)
+            }
+            fn probe(&self, c: &Candidate) -> Safety {
+                self.live.probe(c)
+            }
+            fn delete(&self, c: &Candidate) -> Result<u64, String> {
+                self.live.delete(c)
+            }
+        }
+
+        const MIB: u64 = 1 << 20;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let slots_root = root.join("mono-ci/slots");
+        for name in ["a", "b", "c"] {
+            let slot = slots_root.join(name);
+            std::fs::create_dir_all(&slot).unwrap();
+            std::fs::write(slot.join("data"), vec![b'x'; (4 * MIB) as usize]).unwrap();
+        }
+        let exec = Arc::new(CountDu(AtomicUsize::new(0)));
+        let cmd = Commands::new(exec.clone(), "setpriv".into());
+        let sizes = Mutex::new(HashMap::new());
+        let leases = Mutex::new(HashSet::new());
+        let slots = Slots::new(4);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let live = LiveHost {
+            cmd: &cmd,
+            anchor: root,
+            now,
+            size_floor_secs: 3600,
+            sizes: &sizes,
+            common: Mutex::new(HashMap::new()),
+            floor: 0,
+            leases: &leases,
+            slots: &slots,
+            work_root: Path::new("/w"),
+            diag_max_age_secs: 86_400,
+        };
+        let roots = [Root {
+            path: slots_root.clone(),
+            kind: Kind::CacheSlot,
+        }];
+        let found = live.scan(&roots).unwrap();
+        assert_eq!(found.len(), 3);
+        assert!(found.iter().all(|c| c.idle_secs < 3600));
+        assert!(found.iter().all(|c| c.size_bytes > 0));
+        live.scan(&roots).unwrap();
+        assert_eq!(exec.0.load(Ordering::Relaxed), 3, "repeat scans reuse du");
+
+        let settings = ReclaimSettings {
+            roots: roots.to_vec(),
+            high_water_pct: 100,
+            low_water_pct: 99,
+            critical_pct: 100,
+            idle_max_age_secs: 0,
+            ..ReclaimSettings::default()
+        };
+        let ordered = crate::reclaim::order(&settings, Mode::Critical, 0, &found);
+        let target_bytes = ordered
+            .iter()
+            .take(2)
+            .map(|(c, _)| c.size_bytes)
+            .sum::<u64>();
+        let host = TestHost {
+            live,
+            disk: Disk {
+                total_bytes: target_bytes * 4,
+                free_bytes: target_bytes - 2,
+            },
+            floor: target_bytes - 1,
+        };
+        let cycle = run_cycle(&host, &settings, now, &mut 0).unwrap();
+        assert_eq!(cycle.mode, Mode::Critical);
+        assert_eq!(
+            cycle.records.len(),
+            2,
+            "the measured target needs two slots"
+        );
+        assert_eq!(cycle.reclaimed_bytes, target_bytes);
+        assert_eq!(std::fs::read_dir(slots_root).unwrap().count(), 1);
+        assert_eq!(exec.0.load(Ordering::Relaxed), 3);
+    }
+
+    /// Each static runner gives its checkouts, tool cache, diagnostics and
+    /// the caches of its user's home; `/tmp` once for the host; a runner
+    /// with no known home gives no user caches; no runner, no roots.
+    #[test]
+    fn static_runner_roots_cover_each_runner_and_tmp_once() {
+        use crate::drone::credwipe::StaticRunner;
+        let runners = [
+            StaticRunner {
+                unit: "actions.runner.dx-corp.gce-internal-01-1.service".into(),
+                root: "/home/runner1/actions-runner".into(),
+                user: Some("runner1".into()),
+                home: Some("/home/runner1".into()),
+            },
+            StaticRunner {
+                unit: "actions.runner.dx-corp.gce-internal-01-2.service".into(),
+                root: "/home/runner2/actions-runner".into(),
+                user: None,
+                home: None,
+            },
+        ];
+        let got: Vec<(String, &str)> = static_runner_roots(&runners)
+            .iter()
+            .map(|r| (r.path.display().to_string(), r.kind.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "/home/runner1/actions-runner/_work".to_owned(),
+                    "runner_work"
+                ),
+                (
+                    "/home/runner1/actions-runner/_work/_tool".to_owned(),
+                    "runner_tool_cache"
+                ),
+                (
+                    "/home/runner1/actions-runner/_diag".to_owned(),
+                    "runner_diag"
+                ),
+                (
+                    "/home/runner1/.cache/go-build".to_owned(),
+                    "runner_user_cache"
+                ),
+                ("/home/runner1/.npm".to_owned(), "runner_user_cache"),
+                ("/home/runner1/.pnpm-store".to_owned(), "runner_user_cache"),
+                (
+                    "/home/runner1/go/pkg/mod/cache".to_owned(),
+                    "runner_user_cache"
+                ),
+                (
+                    "/home/runner2/actions-runner/_work".to_owned(),
+                    "runner_work"
+                ),
+                (
+                    "/home/runner2/actions-runner/_work/_tool".to_owned(),
+                    "runner_tool_cache"
+                ),
+                (
+                    "/home/runner2/actions-runner/_diag".to_owned(),
+                    "runner_diag"
+                ),
+                ("/tmp".to_owned(), "tmp_entry"),
+            ]
+        );
+        assert!(static_runner_roots(&[]).is_empty());
+    }
+
+    /// A `_diag` candidate is dated by its oldest log, sized by the logs
+    /// older than the age, and its deletion removes only those: the current
+    /// log stays. `/tmp` offers only the regenerable CI entries.
+    #[test]
+    fn diag_logs_go_by_age_only_and_tmp_offers_regenerable_entries_only() {
+        use crate::drone::exec::SystemExec;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let diag = root.join("actions-runner/_diag");
+        std::fs::create_dir_all(&diag).unwrap();
+        std::fs::write(diag.join("Runner_old.log"), vec![b'x'; 1000]).unwrap();
+        std::fs::write(diag.join("Worker_now.log"), vec![b'y'; 500]).unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(diag.join("Runner_old.log"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let cmd = Commands::new(Arc::new(SystemExec), "setpriv".into());
+        let sizes = Mutex::new(HashMap::new());
+        let leases = Mutex::new(HashSet::new());
+        let slots = Slots::new(4);
+        let host = LiveHost {
+            cmd: &cmd,
+            anchor: root.clone(),
+            now: time::OffsetDateTime::now_utc().unix_timestamp(),
+            size_floor_secs: 0,
+            sizes: &sizes,
+            common: Mutex::new(HashMap::new()),
+            floor: 0,
+            leases: &leases,
+            slots: &slots,
+            work_root: Path::new("/w"),
+            diag_max_age_secs: 86_400,
+        };
+        let found = host
+            .scan(&[Root {
+                path: diag.clone(),
+                kind: Kind::RunnerDiag,
+            }])
+            .unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        let c = &found[0];
+        assert_eq!(
+            (c.path.clone(), c.kind, c.size_bytes),
+            (diag.clone(), Kind::RunnerDiag, 1000)
+        );
+        assert!(
+            c.idle_secs > 86_400,
+            "dated by the oldest log: {}",
+            c.idle_secs
+        );
+        assert!(host.probe(c).blocker(c.kind).is_none(), "never busy");
+        assert_eq!(host.delete(c).unwrap(), 1000);
+        assert!(!diag.join("Runner_old.log").exists());
+        assert!(
+            diag.join("Worker_now.log").exists(),
+            "the current log stays"
+        );
+        assert!(diag.exists(), "the directory stays");
+
+        let t = root.join("tmp");
+        for d in [
+            "go-build123",
+            "trivy-abc",
+            "systemd-private-x",
+            "tmux-1000",
+            ".X11-unix",
+        ] {
+            std::fs::create_dir_all(t.join(d)).unwrap();
+        }
+        std::fs::write(t.join("actions-runner-linux-x64-2.3.tar.gz"), "").unwrap();
+        std::fs::write(t.join("notes.txt"), "").unwrap();
+        let listed_entries = listed(&cmd.sh(&t, 30, LIST_TMP).unwrap()).unwrap();
+        assert_eq!(
+            listed_entries,
+            vec![
+                t.join("actions-runner-linux-x64-2.3.tar.gz"),
+                t.join("go-build123"),
+                t.join("trivy-abc")
+            ]
+        );
+    }
+
+    /// A lease that starts while a long scan is paused owns its slot by the
+    /// immediate pre-delete probe, even with no process inside the slot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_slot_guard_acquired_after_scan_is_busy_at_the_predelete_probe() {
+        use crate::drone::exec::SystemExec;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let work_root = Path::new("/w");
+        let slots_root = root.join("mono-ci/slots");
+        let key = cache_slot_key(work_root, 0);
+        let slot = slots_root.join(&key);
+        let other = slots_root.join(cache_slot_key(work_root, 1));
+        std::fs::create_dir_all(slot.join("cargo-target/2026-W46")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let cmd = Commands::new(Arc::new(SystemExec), "setpriv".into());
+        let sizes = Mutex::new(HashMap::new());
+        let leases = Mutex::new(HashSet::new());
+        let slots = Slots::new(4);
+        let host = LiveHost {
+            cmd: &cmd,
+            anchor: root,
+            now: time::OffsetDateTime::now_utc().unix_timestamp(),
+            size_floor_secs: 0,
+            sizes: &sizes,
+            common: Mutex::new(HashMap::new()),
+            floor: 0,
+            leases: &leases,
+            slots: &slots,
+            work_root,
+            diag_max_age_secs: 86_400,
+        };
+        let found = host
+            .scan(&[Root {
+                path: slots_root,
+                kind: Kind::CacheSlot,
+            }])
+            .unwrap();
+        let held = found.iter().find(|c| c.path == slot).unwrap();
+        let unrelated = found.iter().find(|c| c.path == other).unwrap();
+
+        let pause = slots.acquire("paused-lease").unwrap();
+        assert_eq!(pause.index(), 0);
+        leases.lock().unwrap().insert("paused-lease".into());
+        assert_eq!(
+            host.probe(held),
+            Safety {
+                busy: true,
+                ..Safety::default()
+            }
+        );
+        let target = Candidate {
+            path: slot.join("cargo-target/2026-W46"),
+            kind: Kind::CargoTarget,
+            size_bytes: 1,
+            idle_secs: 0,
+            within: None,
+            cache: None,
+        };
+        assert!(host.probe(&target).busy);
+        let free = host.probe(unrelated);
+        assert!(!free.busy && free.unknown.is_none(), "{free:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shared_publish_cache_is_busy_throughout_any_lease() {
+        use crate::drone::exec::SystemExec;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let namespace = root.join("mono-publish");
+        let publish = namespace.join("platform-api");
+        std::fs::create_dir_all(publish.join("cargo-target")).unwrap();
+        let cmd = Commands::new(Arc::new(SystemExec), "setpriv".into());
+        let sizes = Mutex::new(HashMap::new());
+        let leases = Mutex::new(HashSet::new());
+        let slots = Slots::new(1);
+        let host = LiveHost {
+            cmd: &cmd,
+            anchor: root,
+            now: time::OffsetDateTime::now_utc().unix_timestamp(),
+            size_floor_secs: 0,
+            sizes: &sizes,
+            common: Mutex::new(HashMap::new()),
+            floor: 0,
+            leases: &leases,
+            slots: &slots,
+            work_root: Path::new("/w"),
+            diag_max_age_secs: 86_400,
+        };
+        let found = host
+            .scan(&[Root {
+                path: namespace,
+                kind: Kind::CacheSlot,
+            }])
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, publish);
+
+        leases.lock().unwrap().insert("active-lease".into());
+        assert_eq!(
+            host.probe(&found[0]),
+            Safety {
+                busy: true,
+                ..Safety::default()
+            },
+            "an active lease is busy without an open process in the cache"
+        );
+        leases.lock().unwrap().clear();
+        let idle = host.probe(&found[0]);
+        assert!(!idle.busy && idle.unknown.is_none(), "{idle:?}");
     }
 
     #[test]
@@ -1106,7 +1919,10 @@ mod tests {
             mode,
             usage_pct_before: before,
             usage_pct_after: before,
+            free_bytes_before: u64::from(100 - before) << 30,
+            floor_bytes: 10 << 30,
             records: Vec::new(),
+            evicted: BTreeMap::new(),
             kept: BTreeMap::from([("busy".to_owned(), 1)]),
             reclaimed_bytes: bytes,
             would_reclaim_bytes: 0,
@@ -1118,6 +1934,9 @@ mod tests {
         let acc = acc.unwrap();
         assert_eq!(acc.mode, Mode::Pressure);
         assert_eq!(acc.usage_pct_before, 90);
+        // The 10 GiB free filesystem is the tighter one (target 20 GiB).
+        assert_eq!(acc.free_bytes_before, 10 << 30);
+        assert_eq!(acc.floor_bytes, 10 << 30);
         assert_eq!(acc.reclaimed_bytes, 12);
         assert_eq!(acc.kept["busy"], 2);
     }
@@ -1180,6 +1999,7 @@ mod tests {
         let cmd = Commands::new(Arc::new(SystemExec), "setpriv".into());
         let sizes = Mutex::new(HashMap::new());
         let leases = Mutex::new(HashSet::new());
+        let slots = Slots::new(4);
         let host = LiveHost {
             cmd: &cmd,
             anchor: root.clone(),
@@ -1189,6 +2009,9 @@ mod tests {
             common: Mutex::new(HashMap::new()),
             floor: 0,
             leases: &leases,
+            slots: &slots,
+            work_root: Path::new("/w"),
+            diag_max_age_secs: 86_400,
         };
         let roots = [Root {
             path: wts.clone(),
@@ -1211,6 +2034,7 @@ mod tests {
             size_bytes: 0,
             idle_secs: 0,
             within: None,
+            cache: None,
         };
         assert_eq!(
             host.probe(&main_cand).protected.as_deref(),

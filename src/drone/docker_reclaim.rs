@@ -632,13 +632,19 @@ pub(crate) fn run(
 ) -> Result<Cycle, String> {
     let s = input.settings;
     let before = input.disk.usage_pct();
+    // The queen's admission floor only: a box's own build floor
+    // (`free_floor_gib`) is about its build filesystems, and Docker often
+    // has a small volume of its own (30 GiB on dev-desktop).
     let mode = crate::reclaim::mode_for_floor(s, &input.disk, input.floor_bytes);
     let mut cycle = Cycle {
         mode,
         usage_pct_before: before,
         usage_pct_after: before,
+        free_bytes_before: input.disk.free_bytes,
+        floor_bytes: input.floor_bytes,
         records: Vec::new(),
         kept: BTreeMap::new(),
+        evicted: BTreeMap::new(),
         reclaimed_bytes: 0,
         would_reclaim_bytes: 0,
         errors: 0,

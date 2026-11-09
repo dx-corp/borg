@@ -3,7 +3,13 @@
 //! Demand of a `(class, scope)` that the allocator could not place and that has
 //! waited at least `after_secs` may displace a running lease of a strictly
 //! lower-priority scope, provided freeing that lease leaves its drone room for
-//! the starving class. Priority is the [`Scope`] ordering: smaller outranks.
+//! the starving class and the drone could then take it (accepting, and its
+//! [`Trust`] admits the starving scope). Priority is the [`Scope`] ordering:
+//! smaller outranks. `for_scopes` narrows which starving scopes may preempt at
+//! all, so a fleet can let deploy demand reclaim a deploy-trust drone from main
+//! CI without main demand cancelling pull-request jobs.
+//!
+//! [`Trust`]: crate::classes::Trust
 
 use std::collections::BTreeSet;
 
@@ -14,7 +20,7 @@ use crate::allocator::{
 };
 use crate::classes::{Class, Classes, Scope};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreemptSettings {
     /// Starving demand must have waited this long.
@@ -23,6 +29,14 @@ pub struct PreemptSettings {
     pub max_per_pass: u32,
     /// A lease younger than this is never cancelled.
     pub min_victim_age_secs: u64,
+    /// Starving demand of these scopes may preempt; other scopes only wait.
+    /// Default: every scope.
+    #[serde(default = "all_scopes")]
+    pub for_scopes: Vec<Scope>,
+}
+
+fn all_scopes() -> Vec<Scope> {
+    Scope::ALL.to_vec()
 }
 
 impl PreemptSettings {
@@ -33,7 +47,14 @@ impl PreemptSettings {
                     .to_owned(),
             );
         }
+        if self.for_scopes.is_empty() {
+            return Err("preemption for_scopes must name at least one scope".to_owned());
+        }
         Ok(())
+    }
+
+    fn preempts_for(&self, scope: Scope) -> bool {
+        self.for_scopes.contains(&scope)
     }
 }
 
@@ -77,11 +98,23 @@ pub struct PreemptInput<'a> {
 /// Capacity held by each lease: `Some(i)` marks `running[i]`.
 type Held = Vec<(Option<usize>, ActiveLease)>;
 
-/// Whether `running[i]`'s drone could hold a `class` lease once it is gone.
-fn frees_room_for(input: &PreemptInput<'_>, held: &Held, i: usize, class: Class) -> bool {
+/// Whether `running[i]`'s drone could hold a `class` lease of `scope` once it
+/// is gone: it must still take leases, its trust must admit the scope (a
+/// shared drone never runs deploy work, so cancelling there frees nothing the
+/// starving demand can use), and the remaining room must fit the class.
+fn frees_room_for(
+    input: &PreemptInput<'_>,
+    held: &Held,
+    i: usize,
+    class: Class,
+    scope: Scope,
+) -> bool {
     let Some(drone) = input.drones.iter().find(|d| d.id == input.running[i].drone) else {
         return false;
     };
+    if !drone.accepting || !drone.trust.admits(scope) {
+        return false;
+    }
     let rest: Vec<ActiveLease> = held
         .iter()
         .filter(|(c, _)| *c != Some(i))
@@ -116,7 +149,7 @@ pub fn select(input: &PreemptInput<'_>) -> Vec<Victim> {
     let mut starving: Vec<(Scope, Class)> = input
         .unmet
         .iter()
-        .filter(|u| u.count > 0)
+        .filter(|u| u.count > 0 && s.preempts_for(u.scope))
         .filter(|u| {
             input.queue_ages.iter().any(|a| {
                 a.class == u.class && a.scope == u.scope && a.oldest_age_secs >= s.after_secs
@@ -139,7 +172,7 @@ pub fn select(input: &PreemptInput<'_>) -> Vec<Victim> {
             .running
             .iter()
             .enumerate()
-            .any(|(i, r)| r.preempted && frees_room_for(input, &held, i, class));
+            .any(|(i, r)| r.preempted && frees_room_for(input, &held, i, class, scope));
         if covered {
             continue;
         }
@@ -152,7 +185,7 @@ pub fn select(input: &PreemptInput<'_>) -> Vec<Victim> {
                     && !picked.contains(i)
                     && r.scope > scope
                     && input.now - r.started_at >= min_age
-                    && frees_room_for(input, &held, *i, class)
+                    && frees_room_for(input, &held, *i, class, scope)
             })
             .min_by(|(_, a), (_, b)| {
                 b.scope
@@ -194,7 +227,13 @@ mod tests {
             after_secs: 600,
             max_per_pass: 1,
             min_victim_age_secs: 60,
+            for_scopes: Scope::ALL.to_vec(),
         }
+    }
+
+    fn trusted(mut d: DroneState, trust: crate::classes::Trust) -> DroneState {
+        d.trust = trust;
+        d
     }
 
     fn drone(id: &str, mem_mib: u64, vcpu: u32) -> DroneState {
@@ -390,6 +429,60 @@ mod tests {
     }
 
     #[test]
+    fn only_listed_scopes_preempt() {
+        use crate::classes::Trust;
+        let deploy_only = PreemptSettings {
+            for_scopes: vec![Scope::Deploy],
+            ..settings()
+        };
+        // Main demand starving against a Pr lease: with every scope listed it
+        // preempts; limited to deploy it waits like any other demand.
+        let shared = [sized_for("host-a", Class::Medium, 1)];
+        let pr = [run("a", "host-a", Class::Medium, Scope::Pr, 0)];
+        let main_demand = starving(&[MEDIUM_MAIN], 9000);
+        assert_eq!(pick(&settings(), &shared, &pr, &main_demand), ["a"]);
+        assert!(pick(&deploy_only, &shared, &pr, &main_demand).is_empty());
+        // Deploy demand still reclaims a deploy-trust drone from main CI.
+        let deploy = [trusted(sized_for("dep", Class::Heavy, 1), Trust::Deploy)];
+        let main = [run("m", "dep", Class::Heavy, Scope::Main, 0)];
+        let deploy_demand = starving(&[(Class::Heavy, Scope::Deploy)], 9000);
+        assert_eq!(pick(&deploy_only, &deploy, &main, &deploy_demand), ["m"]);
+    }
+
+    #[test]
+    fn deploy_demand_never_cancels_a_lease_on_a_drone_that_cannot_run_deploy_work() {
+        use crate::classes::Trust;
+        // A shared drone running a Pr job: freeing it gives deploy nothing.
+        let shared = [sized_for("host-a", Class::Heavy, 1)];
+        let pr = [run("a", "host-a", Class::Heavy, Scope::Pr, 0)];
+        let demand = starving(&[(Class::Heavy, Scope::Deploy)], 9000);
+        assert!(pick(&settings(), &shared, &pr, &demand).is_empty());
+        // The same lease on a deploy-trust drone is the victim.
+        let deploy = [trusted(sized_for("host-a", Class::Heavy, 1), Trust::Deploy)];
+        let main = [run("a", "host-a", Class::Heavy, Scope::Main, 0)];
+        assert_eq!(pick(&settings(), &deploy, &main, &demand), ["a"]);
+        // A cancellation under way on a shared drone does not cover deploy
+        // demand either, so the deploy-trust drone's lease is still taken.
+        let both = [
+            sized_for("shared", Class::Heavy, 1),
+            trusted(sized_for("dep", Class::Heavy, 1), Trust::Deploy),
+        ];
+        let mut stopping = run("s", "shared", Class::Heavy, Scope::Pr, 0);
+        stopping.preempted = true;
+        let running = [stopping, run("d", "dep", Class::Heavy, Scope::Main, 0)];
+        assert_eq!(pick(&settings(), &both, &running, &demand), ["d"]);
+    }
+
+    #[test]
+    fn a_drone_that_stopped_accepting_is_not_freed() {
+        let mut d = sized_for("host-a", Class::Medium, 1);
+        d.accepting = false;
+        let running = [run("a", "host-a", Class::Medium, Scope::Pr, 0)];
+        let demand = starving(&[MEDIUM_MAIN], 9000);
+        assert!(pick(&settings(), &[d], &running, &demand).is_empty());
+    }
+
+    #[test]
     fn settings_reject_zero_values() {
         assert!(settings().validate().is_ok());
         for bad in [
@@ -403,6 +496,10 @@ mod tests {
             },
             PreemptSettings {
                 min_victim_age_secs: 0,
+                ..settings()
+            },
+            PreemptSettings {
+                for_scopes: vec![],
                 ..settings()
             },
         ] {

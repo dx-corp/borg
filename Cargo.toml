@@ -54,6 +54,10 @@ aws-lc-rs = "1.18"
 base64 = "0.22"
 tempfile = "3.14"
 
+# Used when Borg is checked out as a standalone repository.
+[patch.crates-io]
+libsqlite3-sys = { path = "sqlite-compat" }
+
 [lints.rust]
 non_ascii_idents = "deny"
 unsafe_code = "forbid"

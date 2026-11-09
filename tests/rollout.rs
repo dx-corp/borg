@@ -213,6 +213,106 @@ async fn host_failures_on_a_canary_halt_the_rollout_and_roll_every_drone_back() 
 }
 
 #[tokio::test]
+async fn a_rollout_reset_clears_the_halt_when_the_fleet_is_already_on_target() {
+    let r = Rig::new(json!({
+        "drone_stale_secs": 1_000_000_000,
+        "rollout": {"follow_queen": true, "canary_oses": ["linux"], "update_timeout_secs": 300}
+    }))
+    .await;
+    let target = r.h.status().await["queen"]["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    r.tick(0).await;
+    r.tick(301).await;
+    assert_eq!(r.phase().await, "halted");
+
+    for drone in ["l1", "l2", "m1"] {
+        r.beat(drone, &target).await;
+    }
+    r.h.queen.store().clear_rollout_state().await.unwrap();
+    r.tick(302).await;
+
+    assert_eq!(r.phase().await, "none");
+    assert_eq!(r.desired("l1", &target).await, None);
+    assert!(
+        !r.h.metrics()
+            .await
+            .contains("borg_rollout_phase{phase=\"halted\"} 1")
+    );
+
+    r.beat("l1", "1.0.0").await;
+    r.tick(303).await;
+    assert_eq!(r.phase().await, "canary");
+    assert_eq!(r.desired("l1", "1.0.0").await, Some(target));
+}
+
+#[tokio::test]
+async fn a_rollout_gives_the_canary_its_full_update_window_after_the_lease_drains() {
+    let mut cfg = gated();
+    cfg["rollout"]["canary_oses"] = json!(["linux"]);
+    let r = Rig::new(cfg).await;
+    let runner = "borg-l1-draining";
+    r.h.state().runners.push(json!({
+        "id": 91, "name": runner, "status": "online", "busy": true, "labels": []
+    }));
+    r.h.queen
+        .store()
+        .insert_lease(&LeaseRow {
+            id: "draining".into(),
+            drone: "l1".into(),
+            class: Class::Light,
+            scope: Scope::Pr,
+            labels: vec![],
+            runner_name: runner.into(),
+            runner_id: 91,
+            jit_config: None,
+            state: LeaseStatus::Running,
+            created_at: r.base,
+            expires_at: r.base + 900,
+        })
+        .await
+        .unwrap();
+
+    r.tick(0).await;
+    assert_eq!(r.desired("l1", "1.0.0").await.as_deref(), Some("2.0.0"));
+    r.tick(301).await;
+    assert_eq!(r.phase().await, "canary");
+    assert!(
+        r.h.status().await["rollout"]["gate"]["waiting"]
+            .as_str()
+            .unwrap()
+            .contains("drain")
+    );
+
+    r.h.state().runners = vec![json!({
+        "id": 92, "name": "borg-l1-standby", "status": "online", "busy": false, "labels": []
+    })];
+    r.h.queen
+        .store()
+        .insert_lease(&LeaseRow {
+            id: "standby".into(),
+            drone: "l1".into(),
+            class: Class::Light,
+            scope: Scope::Deploy,
+            labels: vec![],
+            runner_name: "borg-l1-standby".into(),
+            runner_id: 92,
+            jit_config: None,
+            state: LeaseStatus::Standby,
+            created_at: r.base + 302,
+            expires_at: r.base + 900,
+        })
+        .await
+        .unwrap();
+    r.tick(302).await;
+    r.tick(602).await;
+    assert_eq!(r.phase().await, "canary");
+    r.tick(603).await;
+    assert_eq!(r.phase().await, "halted");
+}
+
+#[tokio::test]
 async fn without_a_previous_version_the_target_is_only_reported_and_everyone_is_told_it() {
     let r = Rig::new(json!({
         "drone_stale_secs": 1_000_000_000,

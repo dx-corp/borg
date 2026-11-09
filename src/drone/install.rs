@@ -105,6 +105,10 @@ pub struct InstallOptions {
     /// Skip the "must be root" check (tests, `--root` staging).
     pub skip_root_check: bool,
     pub drain_timeout_secs: u64,
+    /// Install a reclaim-only drone (`accept_leases: false`): it reclaims
+    /// and reports, and never runs jobs. A reinstall keeps the host's
+    /// choice unless this is set.
+    pub reclaim_only: bool,
     /// Repositories (`owner/name`) to mirror on the host.
     pub git_mirrors: Vec<String>,
     /// Remote base for mirrors; the drone default (`https://github.com`) if none.
@@ -816,18 +820,44 @@ impl Installer<'_> {
         let on_disk = std::fs::read_to_string(self.on_disk(&self.layout.config()))
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        // A reclaim-only host stays one across reinstalls.
+        let accept_leases = !o.reclaim_only
+            && on_disk
+                .as_ref()
+                .and_then(|v| v.get("accept_leases"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+        // A reclaim-only drone runs on a host where people build by hand
+        // (their worktrees, containers and credentials live there). Without a
+        // block of its own it starts in dry run with the Docker tier off, and
+        // it never wipes credentials: the static runner homes credential
+        // wipe clears can be a person's own home. On 2026-11-08 a first
+        // `--reclaim-only` install on such a host started live with Docker
+        // and credential wipe on until its block was put in place.
         let reclaim = on_disk
             .as_ref()
             .and_then(|v| v.get("reclaim").cloned())
             .and_then(|r| serde_json::from_value::<crate::reclaim::ReclaimSettings>(r).ok())
             .filter(|r| !r.is_legacy_default())
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                if accept_leases {
+                    crate::reclaim::ReclaimSettings::default()
+                } else {
+                    crate::reclaim::ReclaimSettings::for_shared_host()
+                }
+            });
         // The same for the credential wipe block.
         let credential_wipe = on_disk
             .as_ref()
             .and_then(|v| v.get("credential_wipe").cloned())
             .and_then(|r| serde_json::from_value(r).ok())
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                if accept_leases {
+                    crate::drone::credwipe::CredentialWipeSettings::default()
+                } else {
+                    crate::drone::credwipe::CredentialWipeSettings::off()
+                }
+            });
         let cfg = DroneConfig {
             queen_url: o.queen_url.clone(),
             token_file: Some(self.layout.token_file()),
@@ -861,6 +891,7 @@ impl Installer<'_> {
             job_started_hook: o.job_started_hook.clone(),
             job_completed_hook: o.job_completed_hook.clone(),
             reclaim,
+            accept_leases,
             credential_wipe,
             host_invariants: on_disk
                 .as_ref()
@@ -1094,6 +1125,7 @@ mod tests {
             no_self_update: false,
             skip_root_check: true,
             drain_timeout_secs: 3600,
+            reclaim_only: false,
             git_mirrors: vec!["example-org/app".into()],
             git_remote_base: None,
         }
@@ -1176,6 +1208,34 @@ mod tests {
         ] {
             assert!(plist.contains(s), "{s}");
         }
+    }
+
+    #[test]
+    fn a_reclaim_only_install_starts_dry_run_without_docker_or_credential_wipe() {
+        let e = env();
+        let x = FakeExec::default();
+        x.on("getent group docker", "docker:x:999:");
+        x.fail("systemctl is-enabled --quiet borg-drone.service");
+        x.fail("id -u borg");
+        x.fail("id -u borg-job");
+        let o = InstallOptions {
+            reclaim_only: true,
+            ..opts(&e)
+        };
+        install(&o, &with_downloads(x)).unwrap();
+        let path = e.root.join("etc/borg/drone.json");
+        let cfg = DroneConfig::from_json(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!cfg.accept_leases);
+        assert!(cfg.reclaim.enabled && cfg.reclaim.dry_run);
+        assert!(!cfg.reclaim.docker.enabled);
+        assert_eq!(
+            cfg.credential_wipe,
+            crate::drone::credwipe::CredentialWipeSettings::off()
+        );
+        // A plain reinstall keeps it reclaim-only, with the same safe blocks.
+        install(&opts(&e), &with_downloads(exec())).unwrap();
+        let again = DroneConfig::from_json(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!again.accept_leases && again.reclaim.dry_run && !again.reclaim.docker.enabled);
     }
 
     #[test]

@@ -154,10 +154,12 @@ impl Drone {
         let disk_floor = Arc::new(AtomicU64::new(
             crate::envcontract::DEFAULT_MIN_DISK_FREE_BYTES,
         ));
+        let slots = Slots::new(slot_count);
         let reclaimer = reclaim::Reclaimer::new(
             &cfg,
             Arc::clone(&exec),
             Arc::clone(&held),
+            Arc::clone(&slots),
             Arc::clone(&disk_floor),
         );
         let setpriv = cfg
@@ -195,7 +197,7 @@ impl Drone {
             job_exec,
             fs_ops,
             caches,
-            slots: Slots::new(slot_count),
+            slots,
             held,
             standbys,
             preempts: Preempts::default(),
@@ -321,6 +323,11 @@ impl Drone {
             cache_free,
         )
         .blocked();
+        if disk_blocked && let Some(r) = &self.reclaimer {
+            // Evict the least recently used build-cache slots now, not at
+            // the next ten-minute tick: no job is admitted until then.
+            r.kick();
+        }
         let failures = if self.cfg.host_invariants.enabled {
             let mut f =
                 invariants::fast_checks(self.host.as_ref(), capacity.docker_usable, disk_blocked);
@@ -517,6 +524,7 @@ impl Drone {
             proc_root: Arc::clone(&self.proc_root),
             caches: Arc::clone(&self.caches),
             credwipe: self.credwipe.clone(),
+            reclaimer: self.reclaimer.clone(),
             slot,
             held,
         };
@@ -704,7 +712,7 @@ impl Drone {
                     if tokio::time::Instant::now() < retry_at {
                         continue;
                     }
-                    match self.heartbeat_once(true, &mut tasks).await {
+                    match self.heartbeat_once(self.cfg.accept_leases, &mut tasks).await {
                         Ok(_) => {
                             failures = 0;
                             last_ok_at = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -770,6 +778,7 @@ struct LeaseContext {
     proc_root: Arc<Path>,
     caches: Arc<Caches>,
     credwipe: Option<Arc<credwipe::CredWiper>>,
+    reclaimer: Option<Arc<reclaim::Reclaimer>>,
     /// Dropped before `held`, so the slot is free whenever the id is.
     slot: SlotGuard,
     held: HeldGuard,
@@ -812,6 +821,11 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     // Refresh stale git mirrors and learn the shared cache environment. Cache
     // trouble never blocks a job; it just runs without the speedup.
     let slot = ctx.slot.index();
+    // The build-cache slot this lease holds is in use from now until the
+    // lease ends: reclaim never evicts it meanwhile and orders it last after.
+    if let Some(r) = &ctx.reclaimer {
+        r.note_slot_use(slot).await;
+    }
     let lease_dir = slot_dir(&ctx.cfg.work_root, slot);
     let mut extra_env = ctx.cfg.runner_environment();
     extra_env.extend(ctx.caches.prepare_lease(&lease_dir).await);
@@ -838,6 +852,9 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     )
     .await;
     let host_end = sample_host(&ctx).await;
+    if let Some(r) = &ctx.reclaimer {
+        r.note_slot_use(slot).await;
+    }
     let host = Some(crate::hostdiag::LeaseHostReport {
         start: host_start,
         end: host_end,

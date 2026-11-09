@@ -604,12 +604,52 @@ by default) counts as **critical** whatever the percentage, and a pressure cycle
 then frees at least back to twice the floor. CI slot tool homes
 (`<cache_root>/<ns>/slots/<slot>/mise-home`) are a `cache_dir` tier between
 cargo targets and worktrees; one is busy while the drone runs any lease, because
-tools execute from it without holding a file open. With default roots and
+tools execute from it without holding a file open.
+
+**Build-cache slots** (`cache_slot`, the same tier). Jobs keep their retained
+build output under a namespace of `cache_root` they name themselves:
+`platform-ci.yml` writes `mono-ci/slots/<sha256(RUNNER_TOOL_CACHE)>/cargo-target/<week>`
+and `mono-ci/hawk-shared/<week>`, publish writes `mono-publish/<service>/cargo-target`
+and `mono-publish/bazel`. Every directory under `cache_root` that is not one of
+the drone's managed cache kinds (or `git`) is such a namespace; each
+`slots/<slot>` and each other entry of the namespace is one slot, and the slot
+is the unit of eviction. The runner's tool cache is `_work/_tool` under the
+lease's slot directory, so the drone knows which cache slot lease slot `N`
+holds (`drone::reclaim::cache_slot_key`) and touches `.borg-last-used` in it
+when the lease starts and ends: that stamp is the slot's last use (with no
+stamp, the newest file inside). A slot of a lease slot in use is **busy**, and
+so is anything inside it, whether or not a process has a file open there at
+that instant. Eviction is least recently used first: under pressure a slot is
+eligible after `critical_min_age_secs` (1 h, not the 6 h other kinds wait),
+and when critical at any age, until free space is back at twice the floor, so
+the disk does not fill while admission still works. A heartbeat that finds
+disk admission blocked runs a cycle at once (at most one a minute) instead of
+waiting for the next `interval_secs` tick. `cache_slot_cap_gib` (default 0,
+none) bounds the slots of one namespace together; above it the least recently
+used go in any mode. The heartbeat's `reclaim.evicted` (and so `/status`)
+counts the last run's deletions by kind. (borg-deploy-2 reached 99% on
+2026-11-09 with twelve slots up to 55 GB each all used within the hour, 81 GB
+of a week-old publish target and 36 GB of publish bazel cache outside every
+root; reclaim deleted nothing and two CI runs failed with `No space left on
+device` and a linker bus error.) With default roots and
 `static_runner_work` (default on), the `_work/<repo>` checkouts of static GitHub
 runners on the host (`actions.runner.*` units, `<WorkingDirectory>/_work`) are a
 `runner_work` tier between tool homes and worktrees; one is busy while that
-runner's `Runner.Worker` runs, and the runner's `_tool`, `_actions`, `_temp`,
-`_update` and `_PipelineMapping` are never candidates. Audit records of the newer
+runner's `Runner.Worker` runs, and the runner's `_actions`, `_temp`, `_update`
+and `_PipelineMapping` are never candidates. The same setting makes borg own the
+rest of a static runner host's hygiene: each runner's tool cache
+(`_work/_tool`, `runner_tool_cache`) and the caches its user's tools keep in the
+home (`.cache/go-build`, `.npm`, `.pnpm-store`, `go/pkg/mod/cache`,
+`runner_user_cache`) are the same tier as its checkouts and busy under the same
+rule; its `_diag` directory (`runner_diag`) loses only log files older than
+`runner_diag_max_age_secs` (1 day) in any mode, never the directory or the
+current log; and regenerable CI temp entries in `/tmp` (`tmp_entry`: `go-build*`,
+`getter*`, `trivy-*`, `rustdoctest*`, `maestro-pack-smoke-*`, `cargo-install*`,
+`.*.node-gyp`, runner tarballs; an allowlist, because an unknown `/tmp` entry may
+be a daemon's socket directory) go after `tmp_max_age_secs` (1 day) below high
+water and by the pressure ages above it. (internal-runner-burst-01 reached 98% on
+2026-11-09 with about 26 GB per runner in `_diag`, `go-build` and `_work/_tool`,
+none of them a root.) Audit records of the newer
 kinds (`cache_dir`, `runner_work`, `docker_*`) travel in `reclaim.recent_ext`, which a queen
 older than them ignores instead of rejecting the heartbeat.
 
@@ -901,13 +941,29 @@ reach:
   reading the pulls API. Keep it for the workflows that matter most when the
   read credential is missing; do not list a workflow that runs on the `closed`
   event (teardown, cleanup): its runs look the same.
+* `superseded_push_workflows`: workflow paths or names whose push runs the
+  rule below may supersede; empty means every workflow. List the CI verdict
+  workflow (`.github/workflows/platform-ci.yml`) and nothing that delivers:
+  Publish Images and the promotion workflows run one concurrency group per
+  commit, supersede themselves at job start and re-dispatch what they lost at
+  the end of the run, so cancelling one of their red runs loses that catch-up
+  (2026-11-09: platform-api went unpublished for thirteen hours).
 * `superseded_push_branches`: branch names, for example `["main"]`. A queued
-  `push` run on one of them is cancelled when a newer queued or running run of
-  the same workflow on the same branch is on another commit. Running push runs
-  are never cancelled, so the branch always finishes its newest started run.
-  GitHub reports a run as `queued` while any of its jobs waits for a runner, so
-  the janitor also reads the run's jobs and keeps the run when one is running
-  (`started_push`).
+  `push` run on one of them is cancelled when a newer queued, running or
+  pending run of the same workflow on the same branch is on another commit
+  (a run waiting for its concurrency group is `pending`, so the janitor lists
+  that status too; otherwise the newest tip is invisible to it). A started push run
+  is kept while it can still pass (`started_push`): it is the batch verdict for
+  every push since the previous completed run. GitHub reports a run as
+  `queued` while any of its jobs waits for a runner, so the janitor reads the
+  run's jobs: one job running or concluded means started, even when no job is
+  running at that moment (on a starved fleet the scope job finishes and every
+  other job waits). With `cancel_running`, a started superseded push run is
+  cancelled once one of its jobs has failed. Its verdict is final, and a
+  workflow that keeps one running run per concurrency group (platform-ci on
+  main) would otherwise hold the group while every newer push waits and is
+  replaced before it starts. On 2026-11-08 a 15:30Z main run, red since 15:57Z,
+  held main CI until 17:25Z this way.
 * `repos`: the repositories a pass covers, a subset of the queen's `repos`.
   Default: all of them. Set it when the queen also watches repositories only to
   serve their alias lanes (for example a deploy repository): `dedupe_same_sha`
@@ -1365,6 +1421,32 @@ Check `/status`: `borg-deploy-1` is `fresh`, `accepting`, `trust:
 deploy-only`, and `queued_deploy` falls as leases start. Neither the queen
 config nor the queen binary changes.
 
+#### Lending a deploy drone to main CI
+
+A deploy drone that sits mostly idle can carry main-scope CI without delaying
+deploys by combining three existing settings; nothing new is configured per
+job:
+
+1. `--trust deploy` instead of `deploy-only` on the drone (`borg drone
+   install` is idempotent; rerun it with the new flag). The queen then places
+   main demand there too; pull-request demand still never is.
+2. [Standby runners](#standby-runners-and-deploy-fail-open) are the deploy
+   floor: with `"standby": {"classes": ["medium", "heavy"], "per_drone": 1}`
+   every deploy drone keeps one warm medium and one warm heavy runner that
+   hold their room, so the first deploy job of each class starts at once and
+   main CI can only use what is left.
+3. [Preemption](#preemption) limited to deploy demand, `"preemption":
+   {"after_secs": 60, "max_per_pass": 1, "min_victim_age_secs": 60,
+   "for_scopes": ["deploy"]}`, cancels one main lease on the deploy drone when
+   a further deploy job has waited a minute and the standby is taken; the
+   cancelled job is re-run by the requeuer. Main demand itself still never
+   preempts pull requests.
+
+Deploy demand is placed before main in every pass, and the
+[starvation guard](#starvation-guard) holds the drone for aged deploy demand
+so no smaller main lease refills it. Keep one drone `deploy-only` if a
+dedicated promotion box is wanted; lend the larger one.
+
 ### Starvation guard
 
 When demand for a class has waited longer than `starvation_after_secs`, the
@@ -1408,14 +1490,20 @@ Off unless the queen config has a `preemption` block:
 `after_secs` is how long the oldest queued job of a `(class, scope)` must have
 waited, `max_per_pass` caps cancellations in one queen pass, and
 `min_victim_age_secs` is how long a job must have been running before it can be
-cancelled. All three must be greater than 0.
+cancelled. All three must be greater than 0. `for_scopes` (default every
+scope) lists the starving scopes that may preempt; `["deploy"]` lets deploy
+demand reclaim a `deploy`-trust drone from main CI while main demand keeps
+waiting for pull-request jobs instead of cancelling them. It must not be empty.
 
 When demand the allocator could not place has waited `after_secs`, the queen
 cancels one running lease whose scope ranks strictly below the starving
 demand's scope (a `pr` lease for `main` demand; the order is the `Scope`
-order). It only picks a lease whose drone could hold the starving class once
-that lease's resources are freed, and only a lease whose in-progress job GitHub
-reports on its runner, since the job's start time sets its age. Among the
+order). It only picks a lease whose drone could then take the starving demand:
+the drone is accepting, its trust admits the starving scope (a shared drone's
+`pr` lease is never cancelled for `deploy` demand, which could not run there),
+and the room left once that lease's resources are freed holds the starving
+class. It only picks a lease whose in-progress job GitHub reports on its
+runner, since the job's start time sets its age. Among the
 candidates it takes the lowest-priority scope, then the smallest class, then the
 most recently started lease. A lease that is already being cancelled counts as
 covering the starving demand, so one starving job cancels one lease, not one per

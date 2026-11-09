@@ -707,6 +707,7 @@ async fn reclaim_reports_are_audited_once_and_shown_in_status_and_metrics() {
             "last_run_at": 100, "last_run_reclaimed_bytes": total,
             "last_run_would_reclaim_bytes": 0, "last_run_errors": 1,
             "usage_pct": 91, "last_run_mode": "pressure",
+            "free_bytes": 42_949_672_960u64, "floor_bytes": 26_843_545_600u64,
             "kept": {"busy": 2}, "recent": entries
         }})
     };
@@ -733,6 +734,10 @@ async fn reclaim_reports_are_audited_once_and_shown_in_status_and_metrics() {
     assert_eq!(events[1]["path"], "/srv/devdata/cargo-target/old-branch");
     assert_eq!(events[1]["outcome"], "deleted");
     assert_eq!(status["drones"][0]["reclaim"]["usage_pct"], 91);
+    assert_eq!(
+        status["drones"][0]["reclaim"]["free_bytes"],
+        42_949_672_960u64
+    );
     assert_eq!(status["drones"][0]["reclaim"]["recent"], json!([]));
 
     let metrics = h.metrics().await;
@@ -740,6 +745,8 @@ async fn reclaim_reports_are_audited_once_and_shown_in_status_and_metrics() {
         "borg_reclaim_bytes_total{drone=\"devbox\"} 5368709120",
         "borg_reclaim_disk_usage_percent{drone=\"devbox\"} 91",
         "borg_reclaim_errors{drone=\"devbox\"} 1",
+        "borg_reclaim_free_bytes{drone=\"devbox\"} 42949672960",
+        "borg_reclaim_floor_bytes{drone=\"devbox\"} 26843545600",
     ] {
         assert!(metrics.contains(line), "missing {line}\n{metrics}");
     }
@@ -1628,6 +1635,30 @@ async fn job_listing_reads_runs_concurrently_and_keeps_run_order() {
     let peak = h.state().jobs_max_inflight;
     assert!(peak > 1, "jobs listings overlap (peak {peak})");
     assert!(peak <= 8, "at most eight listings at once (peak {peak})");
+}
+
+#[tokio::test]
+async fn a_drone_s_memory_pressure_is_shown_and_exported() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": {"observed_at": now, "mem_psi_some_avg10_pm": 420}}),
+    )
+    .await;
+    assert!(
+        h.metrics()
+            .await
+            .contains("borg_drone_mem_psi_pm{drone=\"d1\"} 420"),
+        "{}",
+        h.metrics().await
+    );
+    assert_eq!(h.status().await["drones"][0]["mem_psi_pm"], 420);
+    // Unknown: no series.
+    h.heartbeat_with(&token, json!({"env_facts": {"observed_at": now}}))
+        .await;
+    assert!(!h.metrics().await.contains("borg_drone_mem_psi_pm{"));
 }
 
 #[tokio::test]

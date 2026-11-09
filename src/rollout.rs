@@ -19,7 +19,8 @@
 //!
 //! Checks, evaluated every pass against a control group (the drones still on the
 //! previous version, same period):
-//! * **update**: a told drone must report the target within `update_timeout_secs`;
+//! * **update**: a told drone must report the target within `update_timeout_secs`
+//!   of the queen seeing its active leases finish;
 //! * **heartbeat health**: drones on the target stay fresh and out of
 //!   quarantine;
 //! * **host failures**: the host-failure rate on the target may not exceed the
@@ -35,7 +36,7 @@
 //! resets it or the target changes. The module is pure: the caller supplies the
 //! clock, the fleet view and the job outcomes, and persists the returned state.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -63,7 +64,7 @@ pub struct RolloutSettings {
     pub wave_jobs: u32,
     /// Minimum duration of a wave.
     pub soak_secs: u64,
-    /// How long a told drone has to report the target (and heartbeat).
+    /// How long a told drone has to report the target after its active leases drain.
     pub update_timeout_secs: u64,
     pub max_host_failure_increase_pm: u32,
     pub max_success_drop_pm: u32,
@@ -212,6 +213,9 @@ pub struct RolloutState {
     pub wave: usize,
     pub started_at: i64,
     pub stage_started_at: i64,
+    /// When the queen first saw each updating drone without active leases.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub update_started_at: BTreeMap<String, i64>,
     pub halted_reason: Option<String>,
 }
 
@@ -223,6 +227,8 @@ pub struct DroneView {
     pub fresh: bool,
     /// Quarantined or otherwise not schedulable.
     pub held: bool,
+    /// Work already granted to this drone, excluding unused standby runners.
+    pub(crate) has_active_leases: bool,
     pub version: Option<String>,
     /// When the queen first saw the drone report `version`.
     pub version_since: Option<i64>,
@@ -230,6 +236,10 @@ pub struct DroneView {
     /// chosen among these first: a deploy-only drone runs few jobs, so it
     /// proves little and stalls the canary stage.
     pub(crate) shared: bool,
+    /// Takes leases now. A canary must run jobs to prove anything, so a
+    /// reclaim-only drone (dev-desktop) or one that stopped accepting is
+    /// never picked; it still updates with the waves.
+    pub(crate) runs_jobs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -379,6 +389,7 @@ pub fn advance(
                 wave: 0,
                 started_at: now,
                 stage_started_at: now,
+                update_started_at: BTreeMap::new(),
                 halted_reason: None,
             }
         }
@@ -402,7 +413,9 @@ pub fn advance(
         for os in s.canary_oses.iter().skip(st.canaries.len()) {
             let pick = drones
                 .iter()
-                .filter(|d| d.fresh && !d.held && d.os == *os && !chosen.contains(&d.name))
+                .filter(|d| {
+                    d.fresh && !d.held && d.runs_jobs && d.os == *os && !chosen.contains(&d.name)
+                })
                 .min_by_key(|d| (!d.shared, d.name.as_str()))
                 .map(|d| d.name.clone());
             match pick {
@@ -462,9 +475,15 @@ pub fn advance(
             if !d.fresh {
                 continue;
             }
-            if overdue {
+            if d.has_active_leases {
+                st.update_started_at.remove(n);
+                wait.get_or_insert(format!("waiting for {n} to drain its active leases"));
+                continue;
+            }
+            let started_at = *st.update_started_at.entry(n.clone()).or_insert(now);
+            if now.saturating_sub(started_at) > timeout {
                 halt.get_or_insert(format!(
-                    "{n} did not report {target} within {}s of being told",
+                    "{n} did not report {target} within {}s after draining its active leases",
                     s.update_timeout_secs
                 ));
             } else {
@@ -648,13 +667,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_drone_that_takes_no_leases_is_never_the_canary() {
+        let s = settings();
+        let fleet = [
+            DroneView {
+                runs_jobs: false,
+                ..drone("a-dev-desktop", "linux", "0.1.0+old", 0)
+            },
+            drone("b", "linux", "0.1.0+old", 0),
+        ];
+        let a = advance(10, &s, "0.1.0+old", "0.1.0+new", None, &fleet, &[]);
+        assert_eq!(a.state.canaries, ["b"]);
+        // With only a reclaim-only drone there is no canary yet.
+        let a = advance(10, &s, "0.1.0+old", "0.1.0+new", None, &fleet[..1], &[]);
+        assert!(a.state.canaries.is_empty());
+        assert!(a.waiting.is_some());
+    }
+
     fn drone(name: &str, os: &str, version: &str, since: i64) -> DroneView {
         DroneView {
             shared: true,
+            runs_jobs: true,
             name: name.into(),
             os: os.into(),
             fresh: true,
             held: false,
+            has_active_leases: false,
             version: Some(version.into()),
             version_since: Some(since),
         }
@@ -1064,6 +1103,7 @@ mod tests {
             wave: 0,
             started_at: 0,
             stage_started_at: 0,
+            update_started_at: BTreeMap::new(),
             halted_reason: None,
         };
         // The same rollout keeps the previous it started with, whatever the

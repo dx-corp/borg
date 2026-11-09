@@ -66,6 +66,16 @@ pub struct CredentialWipeSettings {
     interval_secs: u64,
 }
 
+impl CredentialWipeSettings {
+    /// Off: for reclaim-only drones, whose host's homes belong to people.
+    pub(crate) fn off() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for CredentialWipeSettings {
     fn default() -> Self {
         Self {
@@ -211,9 +221,23 @@ fn runner_units(listing: &str) -> Vec<String> {
         .collect()
 }
 
-/// The `_work` directory of every static GitHub runner unit on the host
-/// (`<WorkingDirectory>/_work`).
-pub(crate) fn static_runner_work_dirs(cmd: &Commands) -> Vec<PathBuf> {
+/// A static GitHub Actions runner unit on this host (`actions.runner.*`):
+/// where it runs and as whom, so reclaim can find its work, tool cache,
+/// diagnostics logs and the caches its user's tools keep in the home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StaticRunner {
+    pub unit: String,
+    /// The unit's `WorkingDirectory` (the runner install, e.g.
+    /// `/home/runner1/actions-runner`).
+    pub root: PathBuf,
+    /// The unit's `User`, when it is a plain user.
+    pub user: Option<String>,
+    /// That user's home, when `getent passwd` has one.
+    pub home: Option<PathBuf>,
+}
+
+/// Every static GitHub runner unit on the host, with its root, user and home.
+pub(crate) fn static_runners(cmd: &Commands) -> Vec<StaticRunner> {
     let exec = cmd.exec();
     let Ok(out) = exec.run(
         "systemctl",
@@ -229,22 +253,39 @@ pub(crate) fn static_runner_work_dirs(cmd: &Commands) -> Vec<PathBuf> {
     ) else {
         return Vec::new();
     };
-    let mut dirs: Vec<PathBuf> = runner_units(&out.stdout)
-        .iter()
+    let mut runners: Vec<StaticRunner> = runner_units(&out.stdout)
+        .into_iter()
         .filter_map(|unit| {
             let wd = exec
                 .run(
                     "systemctl",
-                    &["show", "-p", "WorkingDirectory", "--value", unit],
+                    &["show", "-p", "WorkingDirectory", "--value", &unit],
                 )
                 .ok()?;
             let wd = wd.stdout.trim();
-            (wd.starts_with('/') && wd != "/").then(|| Path::new(wd).join("_work"))
+            if !wd.starts_with('/') || wd == "/" {
+                return None;
+            }
+            let user = exec
+                .run("systemctl", &["show", "-p", "User", "--value", &unit])
+                .ok()
+                .map(|u| u.stdout.trim().to_owned())
+                .filter(|u| plain_user(u));
+            let home = user.as_deref().and_then(|u| {
+                let pw = exec.run("getent", &["passwd", u]).ok()?;
+                pw.success.then(|| passwd_home(&pw.stdout)).flatten()
+            });
+            Some(StaticRunner {
+                unit,
+                root: PathBuf::from(wd),
+                user,
+                home,
+            })
         })
         .collect();
-    dirs.sort();
-    dirs.dedup();
-    dirs
+    runners.sort_by(|a, b| a.root.cmp(&b.root).then(a.unit.cmp(&b.unit)));
+    runners.dedup_by(|a, b| a.root == b.root);
+    runners
 }
 
 /// The home field of a `getent passwd` line.
@@ -739,6 +780,78 @@ mod tests {
         assert_eq!(passwd_home("bad"), None);
         assert!(
             plain_user("runner1") && !plain_user("root") && !plain_user("a b") && !plain_user("")
+        );
+    }
+
+    /// `static_runners` reads each unit's working directory, user and home
+    /// through systemctl and getent; a unit with no absolute working
+    /// directory is skipped, one whose user is not a plain user keeps its
+    /// root with no user or home, and two units sharing a root are one.
+    #[test]
+    fn static_runners_carry_root_user_and_home() {
+        use crate::drone::exec::{Exec, Output};
+        struct Fake;
+        impl Exec for Fake {
+            fn run(&self, program: &str, args: &[&str]) -> std::io::Result<Output> {
+                let ok = |stdout: &str| {
+                    Ok(Output {
+                        success: true,
+                        stdout: stdout.to_owned(),
+                    })
+                };
+                let call = format!("{program} {}", args.join(" "));
+                if call.starts_with("systemctl list-units") {
+                    return ok(
+                        "actions.runner.dx-corp.gce-internal-01-1.service loaded active running x\n\
+                               actions.runner.dx-corp.gce-internal-01-2.service loaded active running x\n\
+                               actions.runner.dx-corp.odd.service loaded active running x\n\
+                               actions.runner.dx-corp.bare.service loaded active running x\n",
+                    );
+                }
+                if let Some(unit) = call.strip_prefix("systemctl show -p WorkingDirectory --value ")
+                {
+                    return ok(match unit {
+                        "actions.runner.dx-corp.gce-internal-01-1.service" => {
+                            "/home/runner1/actions-runner"
+                        }
+                        "actions.runner.dx-corp.gce-internal-01-2.service" => {
+                            "/home/runner2/actions-runner"
+                        }
+                        "actions.runner.dx-corp.odd.service" => "/home/runner2/actions-runner",
+                        _ => "",
+                    });
+                }
+                if let Some(unit) = call.strip_prefix("systemctl show -p User --value ") {
+                    return ok(match unit {
+                        "actions.runner.dx-corp.gce-internal-01-1.service" => "runner1",
+                        "actions.runner.dx-corp.gce-internal-01-2.service" => "root",
+                        _ => "",
+                    });
+                }
+                if call == "getent passwd runner1" {
+                    return ok("runner1:x:1001:1001::/home/runner1:/bin/bash");
+                }
+                ok("")
+            }
+        }
+        let cmd = Commands::new(std::sync::Arc::new(Fake), "setpriv".into());
+        let runners = static_runners(&cmd);
+        assert_eq!(
+            runners,
+            [
+                StaticRunner {
+                    unit: "actions.runner.dx-corp.gce-internal-01-1.service".into(),
+                    root: "/home/runner1/actions-runner".into(),
+                    user: Some("runner1".into()),
+                    home: Some("/home/runner1".into()),
+                },
+                StaticRunner {
+                    unit: "actions.runner.dx-corp.gce-internal-01-2.service".into(),
+                    root: "/home/runner2/actions-runner".into(),
+                    user: None,
+                    home: None,
+                },
+            ]
         );
     }
 }
