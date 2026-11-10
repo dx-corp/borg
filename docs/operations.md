@@ -1423,6 +1423,12 @@ config nor the queen binary changes.
 
 #### Lending a deploy drone to main CI
 
+Lent main leases are interruptible: deployment demand can cancel them even
+when their CI workflow is healthy. Use `deploy-only` on deployment hosts when
+main CI must finish without deployment preemption, and place main CI on shared
+drones. This preserves deployment priority and standby capacity. The deployed
+fleet policy is recorded in `dx-corp/iac`, stack `45-promotion-runner`.
+
 A deploy drone that sits mostly idle can carry main-scope CI without delaying
 deploys by combining three existing settings; nothing new is configured per
 job:
@@ -1702,8 +1708,9 @@ jobs run as the drone's own account and the drone logs a warning.
 `"deploy-only"`. A `deploy-only` drone serves deploy-scope leases and nothing
 else: no main, no pull-request work, no work units. The drone
 reports it in every heartbeat and `/status` shows it per drone. The queen
-places deploy demand only on `deploy` drones, never places pull-request demand
-or work units on them, and may place main demand on either. Set it on the
+places deploy demand on `deploy` and `deploy-only` drones, never places
+pull-request demand or work units on either, and places main demand on
+`shared` or `deploy` drones. Set it on the
 host, for example `"trust": "deploy"` in `drone.json` or
 `borg drone install --trust deploy`; nothing is set on the queen. A deploy
 drone should be a host that no pull-request job has touched, since the
