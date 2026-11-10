@@ -7,10 +7,6 @@ use serde::Serialize;
 use super::Queen;
 use crate::rollout::RolloutState;
 
-/// A rollout in progress adopts the queen's newer build once that build has
-/// run this long; see [`Queen::settled_target`].
-const RETARGET_AFTER_SECS: i64 = 3600;
-
 /// What this queen process runs, for `/status` and the updater.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueenBuild {
@@ -38,11 +34,6 @@ impl QueenBuild {
     /// `rollout.follow_queen`.
     fn version(&self) -> &str {
         &self.version
-    }
-
-    /// When this queen process started on the build.
-    fn started_at(&self) -> i64 {
-        self.started_at
     }
 }
 
@@ -73,20 +64,11 @@ impl Queen {
     /// The target this pass, held while a rollout is in flight when the
     /// target only follows the queen's own build; see
     /// [`crate::rollout::settled_target`]. A configured target applies at once.
-    pub(super) fn settled_target(
-        &self,
-        target: String,
-        stored: Option<&RolloutState>,
-        now: i64,
-    ) -> String {
+    pub(super) fn settled_target(&self, target: String, stored: Option<&RolloutState>) -> String {
         if self.cfg.rollout_target_version.is_some() || !self.cfg.rollout.follow_queen {
             return target;
         }
-        let build_age = self
-            .build
-            .as_ref()
-            .map(|b| now.saturating_sub(b.started_at()));
-        crate::rollout::settled_target(target, stored, build_age, RETARGET_AFTER_SECS)
+        crate::rollout::settled_target(target, stored)
     }
 
     /// After a pass that succeeded, tell the updater this binary works: write

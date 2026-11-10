@@ -1,6 +1,7 @@
 use crate::support;
 
 use borg::classes::{Class, Scope};
+use borg::rollout::{Phase, RolloutState};
 use borg::store::{LeaseRow, LeaseStatus};
 use borg::telemetry::{Conclusion, FailureClass, JobTelemetry};
 use serde_json::{Value, json};
@@ -368,4 +369,95 @@ async fn a_queen_that_follows_its_own_build_rolls_drones_to_it_through_the_gate(
         };
         assert_eq!(rig.desired(d, "1.0.0").await.as_deref(), Some(want), "{d}");
     }
+}
+
+#[tokio::test]
+async fn a_new_queen_finishes_the_persisted_rollout_before_starting_its_own() {
+    let mut r = Rig::new(json!({
+        "drone_stale_secs": 1_000_000_000,
+        "rollout": {"follow_queen": true, "canary_oses": ["linux"],
+                    "canary_jobs": 2, "waves_pct": [50, 100], "wave_jobs": 2,
+                    "soak_secs": 7200, "min_baseline_jobs": 100}
+    }))
+    .await;
+    let queen = r.h.status().await["queen"]["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // A newer queen has restarted while the previous build is in its final wave.
+    let observing = RolloutState {
+        target: "2.0.0".into(),
+        previous: "1.0.0".into(),
+        phase: Phase::Wave,
+        canaries: vec!["l1".into()],
+        members: r.tokens.iter().map(|(name, _)| name.clone()).collect(),
+        wave: 1,
+        started_at: r.base - 100,
+        stage_started_at: r.base,
+        update_started_at: Default::default(),
+        halted_reason: None,
+    };
+    r.h.queen
+        .store()
+        .save_rollout_state(&observing, r.base)
+        .await
+        .unwrap();
+    for d in ["l1", "l2", "m1"] {
+        r.beat(d, "2.0.0").await;
+    }
+    r.job("l1", 10, true).await;
+    r.job("l2", 11, true).await;
+
+    for offset in [3600, 7199] {
+        r.tick(offset).await;
+        assert_eq!(r.phase().await, "wave");
+        assert_eq!(
+            r.h.queen.store().rollout_state().await.unwrap(),
+            Some(observing.clone())
+        );
+        for d in ["l1", "l2", "m1"] {
+            assert_eq!(r.desired(d, "2.0.0").await.as_deref(), Some("2.0.0"));
+        }
+    }
+    r.tick(7200).await;
+    assert_eq!(r.phase().await, "complete");
+    assert_eq!(
+        r.h.status().await["rollout"]["gate"]["state"]["target"],
+        "2.0.0"
+    );
+    assert!(
+        r.h.status().await["rollout"]["log"][0][1]
+            .as_str()
+            .unwrap()
+            .contains("2.0.0 complete")
+    );
+
+    r.tick(7201).await;
+    let state = r.h.queen.store().rollout_state().await.unwrap().unwrap();
+    assert_eq!(state.phase, Phase::Canary);
+    assert_eq!(state.target, queen);
+    assert_eq!(state.previous, "2.0.0");
+    assert_eq!(r.desired("l1", "2.0.0").await, Some(queen));
+    assert_eq!(r.desired("l2", "2.0.0").await.as_deref(), Some("2.0.0"));
+}
+
+#[tokio::test]
+async fn an_explicit_target_still_replaces_an_active_rollout_immediately() {
+    let mut cfg = gated();
+    cfg["rollout"]["follow_queen"] = json!(true);
+    let r = Rig::new(cfg).await;
+    r.tick(0).await;
+    let mut previous = r.h.queen.store().rollout_state().await.unwrap().unwrap();
+    previous.target = "1.5.0".into();
+    r.h.queen
+        .store()
+        .save_rollout_state(&previous, r.base)
+        .await
+        .unwrap();
+
+    r.tick(1).await;
+    let state = r.h.queen.store().rollout_state().await.unwrap().unwrap();
+    assert_eq!(state.target, "2.0.0");
+    assert_eq!(state.phase, Phase::Canary);
+    assert_eq!(r.desired("l1", "1.0.0").await.as_deref(), Some("2.0.0"));
 }
