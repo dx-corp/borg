@@ -713,6 +713,10 @@ otherwise. State is persisted; see `rollout` in `/status` and
 With `"rollout": {"follow_queen": true}` and no `rollout_target_version`, the
 target is the build the queen runs (`/status` `queen.version`), so a queen
 self-update carries the drones with it through the same canary and wave gate.
+A queen self-update during a canary or wave keeps the persisted rollout target
+until it completes or halts, including every wave's observation period. The next
+pass then adopts the current queen build. An explicit `rollout_target_version`
+still overrides the active rollout immediately.
 The previous version (what a halt rolls back to) is fixed when each rollout
 starts: the last rollout's target if it completed, its previous otherwise, or
 with no history the version most fresh drones run. No drone is told a

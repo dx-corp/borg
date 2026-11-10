@@ -179,22 +179,11 @@ pub(crate) fn previous_for(
 /// build. Every borg merge restarts the queen on a new build, and starting a
 /// fresh rollout on each one restarted the canary stage before it could
 /// finish. So a rollout in progress keeps its target until it completes or
-/// halts, or until the newer build has run `after_secs` (`build_age_secs`;
-/// unknown counts as old enough).
-pub(crate) fn settled_target(
-    target: String,
-    stored: Option<&RolloutState>,
-    build_age_secs: Option<i64>,
-    after_secs: i64,
-) -> String {
+/// halts, including every wave's observation period. The next pass then
+/// adopts the current queen build.
+pub(crate) fn settled_target(target: String, stored: Option<&RolloutState>) -> String {
     match stored {
-        Some(s)
-            if s.target != target
-                && matches!(s.phase, Phase::Canary | Phase::Wave)
-                && build_age_secs.is_some_and(|age| age < after_secs) =>
-        {
-            s.target.clone()
-        }
+        Some(s) if matches!(s.phase, Phase::Canary | Phase::Wave) => s.target.clone(),
         _ => target,
     }
 }
@@ -1012,24 +1001,26 @@ mod tests {
     }
 
     #[test]
-    fn a_rollout_in_flight_keeps_its_target_until_done_or_the_new_build_is_an_hour_old() {
+    fn a_rollout_in_flight_keeps_its_target_until_done() {
         let fleet = fleet();
         let canary = step(1000, None, &fleet, &[]).state;
         assert_eq!(canary.phase, Phase::Canary);
-        let hold = |stored: &RolloutState, age| {
-            settled_target("0.1.0+newer".into(), Some(stored), age, 3600)
-        };
-        assert_eq!(hold(&canary, Some(60)), canary.target);
-        assert_eq!(hold(&canary, Some(3600)), "0.1.0+newer");
-        assert_eq!(hold(&canary, None), "0.1.0+newer");
+        let hold = |stored: &RolloutState| settled_target("0.1.0+newer".into(), Some(stored));
+        for phase in [Phase::Canary, Phase::Wave] {
+            let active = RolloutState {
+                phase,
+                ..canary.clone()
+            };
+            assert_eq!(hold(&active), active.target);
+        }
         for phase in [Phase::Complete, Phase::Halted] {
             let done = RolloutState {
                 phase,
                 ..canary.clone()
             };
-            assert_eq!(hold(&done, Some(60)), "0.1.0+newer");
+            assert_eq!(hold(&done), "0.1.0+newer");
         }
-        assert_eq!(settled_target("x".into(), None, Some(0), 3600), "x");
+        assert_eq!(settled_target("x".into(), None), "x");
     }
 
     #[test]

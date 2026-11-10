@@ -1387,7 +1387,7 @@ impl Queen {
             return Ok(());
         }
         let stored = self.store.rollout_state().await?;
-        let target = self.settled_target(target, stored.as_ref(), now);
+        let target = self.settled_target(target, stored.as_ref());
         let rows = self.store.drones().await?;
         let busy_drones: HashSet<&str> = active
             .iter()
