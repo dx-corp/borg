@@ -432,7 +432,16 @@ pub fn advance(
             .as_deref()
             .is_some_and(|v| same_release(v, target))
     };
-    let since_of = |n: &str| by_name(n).and_then(|d| d.version_since).unwrap_or(i64::MAX);
+    // Since when `n` has run the target. A member that was told but still
+    // runs another version has run it never: its jobs on the old build are
+    // not evidence about the new one (a deploy drone told mid-drain once
+    // halted a rollout with failures from hours before it was told).
+    let since_of = |n: &str| {
+        by_name(n)
+            .filter(|&d| on_target(d))
+            .and_then(|d| d.version_since)
+            .unwrap_or(i64::MAX)
+    };
     let timeout = i64::try_from(s.update_timeout_secs).unwrap_or(i64::MAX);
     let overdue = now.saturating_sub(st.stage_started_at) > timeout;
 
@@ -845,6 +854,44 @@ mod tests {
         // A halted rollout stays halted, whatever happens next.
         let b = step(10_000, Some(a.state.clone()), &f, &[]);
         assert_eq!(b.state, a.state);
+    }
+
+    #[test]
+    fn a_told_member_still_on_the_old_version_is_not_judged_as_the_new_one() {
+        let (mut f, st) = promoted_to_wave();
+        let ok: Vec<Outcome> = (0..6)
+            .map(|i| job("l1", 150 + i, OutcomeKind::Ok))
+            .collect();
+        let b = step(241, Some(st), &f, &ok);
+        assert_eq!(b.state.members, ["l1", "m1", "l2"]);
+        // l2 is told but still drains on OLD, which it has run since 0, and
+        // its jobs on OLD fail (its own workload, a bad day): no halt.
+        let mut jobs = ok.clone();
+        jobs.extend((0..8).map(|i| job("l2", 100 + i * 10, OutcomeKind::Other)));
+        jobs.extend((0..4).map(|i| job("l3", 245 + i, OutcomeKind::Ok)));
+        f.iter_mut()
+            .find(|d| d.name == "l2")
+            .unwrap()
+            .has_active_leases = true;
+        let c = step(250, Some(b.state.clone()), &f, &jobs);
+        assert_eq!(c.state.phase, Phase::Wave, "{:?}", c.state.halted_reason);
+        assert_eq!(c.new_group.jobs, 6, "only l1's jobs on NEW count");
+        // Once l2 runs NEW, its failures on NEW do count.
+        f.iter_mut()
+            .find(|d| d.name == "l2")
+            .unwrap()
+            .has_active_leases = false;
+        set_version(&mut f, &["l2"], NEW, 255);
+        jobs.extend((0..8).map(|i| job("l2", 260 + i, OutcomeKind::Other)));
+        let d = step(270, Some(b.state), &f, &jobs);
+        assert_eq!(d.state.phase, Phase::Halted);
+        assert!(
+            d.state
+                .halted_reason
+                .as_deref()
+                .unwrap()
+                .contains("success_rate")
+        );
     }
 
     #[test]
