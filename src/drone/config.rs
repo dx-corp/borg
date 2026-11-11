@@ -296,7 +296,7 @@ pub struct DroneConfig {
     /// people and agents build by hand, such as dev-desktop, so their
     /// cleanup is borg's and shows in `/status` and Prometheus.
     #[serde(default = "default_true")]
-    pub accept_leases: bool,
+    pub(crate) accept_leases: bool,
     /// Removal of credentials CI jobs left in home directories; on by
     /// default. See [`crate::drone::credwipe`].
     #[serde(default)]
