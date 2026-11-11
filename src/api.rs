@@ -86,6 +86,12 @@ pub struct HeartbeatRequest {
     /// Work units the drone currently holds; acknowledges new ones.
     #[serde(default)]
     pub active_units: Vec<String>,
+    /// The drone runs work units (it has the drone half of
+    /// [`crate::units`]). The queen places units only on drones that say so,
+    /// so during a rollout older drones are never given a unit they would
+    /// leave unstarted.
+    #[serde(default)]
+    pub runs_units: bool,
     /// Facts about the drone's build environment; see [`crate::envcontract`].
     #[serde(default)]
     pub env_facts: Option<EnvFacts>,
@@ -690,6 +696,7 @@ async fn heartbeat(
         .await?;
     store.set_extra_labels(&drone, &req.extra_labels).await?;
     store.set_trust(&drone, req.trust).await?;
+    store.set_runs_units(&drone, req.runs_units).await?;
     store.set_bids(&drone, &sanitize_bids(&req.bids)).await?;
     if let Some(facts) = &req.env_facts {
         let facts = sanitize_facts(facts, now);
@@ -944,6 +951,8 @@ pub struct DroneStatus {
     pub disk_admission: crate::envcontract::DiskAdmission,
     /// `shared` or `deploy`: which scopes the drone may run.
     pub trust: Trust,
+    /// The drone runs work units; only such drones are given one.
+    pub runs_units: bool,
     pub hostname: Option<String>,
     pub kind: Option<crate::probe::HostKind>,
     pub vcpu: Option<u32>,
@@ -1335,6 +1344,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             accepting: d.accepting && !disk.blocked(),
             disk_admission: disk,
             trust: d.trust,
+            runs_units: d.runs_units,
             hostname: d.capacity.as_ref().map(|c| c.hostname.clone()),
             kind: d.capacity.as_ref().map(|c| c.kind),
             vcpu: d.capacity.as_ref().map(|c| c.vcpu),

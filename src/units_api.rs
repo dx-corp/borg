@@ -2,9 +2,10 @@
 //!
 //! Clients (bearer: client token): `POST /v1/units`, `GET /v1/units/{id}`,
 //! `GET /v1/units/{id}/log?from=N&wait=S`, `POST /v1/units/{id}/cancel`.
-//! Drones (bearer: drone token): `POST /v1/units/{id}/log?offset=N` and
-//! `POST /v1/units/{id}/result`; units reach a drone in its heartbeat
-//! response.
+//! Drones (bearer: drone token): `POST /v1/units/{id}/log?offset=N`,
+//! `GET /v1/units/{id}/bundle` and `POST /v1/units/{id}/result`; units reach
+//! a drone in its heartbeat response. The drone side is
+//! [`crate::drone::units`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -295,7 +296,17 @@ async fn append_log(
 pub struct UnitResult {
     pub exit_code: i32,
     pub duration_secs: u64,
+    /// Set when the drone did not run the command to completion (it could
+    /// not get the tree, the unit timed out or was cancelled): the unit fails
+    /// with this reason instead of finishing, so no exit code of the drone's
+    /// making is ever taken for the command's verdict and the client falls
+    /// back. Absent from older drones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
+
+/// Longest failure reason kept from a drone.
+const MAX_FAILURE_CHARS: usize = 300;
 
 async fn result(
     State(queen): State<Arc<Queen>>,
@@ -305,7 +316,22 @@ async fn result(
 ) -> Result<StatusCode, ApiError> {
     enabled(&queen)?;
     let drone = authenticate(&queen, &headers).await?;
-    drone_owns(&queen, &drone, &id).await?;
+    let unit = drone_owns(&queen, &drone, &id).await?;
+    if let Some(reported) = &req.failure {
+        let reported: String = reported
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(MAX_FAILURE_CHARS)
+            .collect();
+        // A cancelled unit keeps the reason its canceller gave
+        // (`superseded by ...`).
+        let why = unit
+            .failure
+            .filter(|_| unit.cancel_requested)
+            .unwrap_or(reported);
+        queen.store().fail_unit(&id, &why, now()).await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
     if queen
         .store()
         .finish_unit(&id, &drone, req.exit_code, req.duration_secs, now())

@@ -465,6 +465,10 @@ impl Exec for AllButDocker {
             SystemExec.run(program, args)
         }
     }
+
+    fn run_input(&self, program: &str, args: &[&str], input: &[u8]) -> io::Result<Output> {
+        SystemExec.run_input(program, args, input)
+    }
 }
 
 fn git(args: &[&str]) -> String {
@@ -1186,4 +1190,389 @@ fn read_dir_prefixed(dir: &Path, prefix: &str) -> Vec<String> {
         .collect();
     v.sort();
     v.into_iter().map(|(_, s)| s).collect()
+}
+
+/// A queen with work units on, a client token, an origin repository at
+/// `example-org/app` holding `hello.txt`, and the tree of its `main`.
+struct UnitRig {
+    rig: Rig,
+    client: String,
+    base: PathBuf,
+    work: PathBuf,
+    tree: String,
+}
+
+impl UnitRig {
+    async fn new() -> Self {
+        let rig = Rig::with_queen(json!({"units": {"enabled": true}})).await;
+        let client = borg::enroll::new_token();
+        rig.h
+            .queen
+            .store()
+            .enroll_client("agent", &borg::enroll::hash_token(&client), 0)
+            .await
+            .unwrap();
+        fs::create_dir_all(rig.path("out")).unwrap();
+        let (base, work) = origin(rig.dir.path());
+        fs::write(work.join("hello.txt"), "hello from the tree\n").unwrap();
+        git(&["-C", work.to_str().unwrap(), "add", "hello.txt"]);
+        commit(&work, "two");
+        let tree = git(&["-C", work.to_str().unwrap(), "rev-parse", "HEAD^{tree}"]);
+        Self {
+            rig,
+            client,
+            base,
+            work,
+            tree,
+        }
+    }
+
+    /// A drone that really runs git and the unit's command (docker is only
+    /// recorded), with no configured mirror: the unit's repository gets one
+    /// on demand from the origin.
+    fn drone(&self, extra: Value) -> Drone {
+        let mut cfg = json!({
+            "caches": {"git": {"remote_base": self.base.to_str().unwrap()}},
+            "preempt_grace_secs": 1,
+        });
+        for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+            cfg[k] = v;
+        }
+        self.rig
+            .drone_with(cfg, Arc::new(AllButDocker(RecordingExec::default())))
+    }
+
+    async fn submit(&self, script: &str, extra: Value) -> String {
+        let mut body = json!({
+            "repo": "example-org/app", "tree_sha": self.tree, "argv": ["sh", "-c", script],
+            "platform": "linux-x86_64", "class": "light",
+        });
+        for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+            body[k] = v;
+        }
+        let r = self
+            .rig
+            .h
+            .http
+            .post(format!("{}/v1/units", self.rig.h.url))
+            .bearer_auth(&self.client)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 201);
+        let v: Value = r.json().await.unwrap();
+        v["unit_id"].as_str().unwrap().to_owned()
+    }
+
+    async fn unit(&self, id: &str) -> borg::units::Unit {
+        self.rig.h.queen.store().unit(id).await.unwrap().unwrap()
+    }
+
+    async fn log(&self, id: &str) -> String {
+        let bytes = self
+            .rig
+            .h
+            .queen
+            .store()
+            .read_unit_log(id, 0, 1 << 20)
+            .await
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Register the drone, submit, place, and start the unit on the drone.
+    async fn start(
+        &self,
+        drone: &Drone,
+        tasks: &mut JoinSet<()>,
+        script: &str,
+        extra: Value,
+    ) -> String {
+        drone.heartbeat_once(true, tasks).await.unwrap();
+        let id = self.submit(script, extra).await;
+        self.rig.h.tick().await;
+        assert_eq!(
+            drone.heartbeat_once(true, tasks).await.unwrap(),
+            1,
+            "the unit starts"
+        );
+        assert_eq!(
+            drone.unit_ids(),
+            std::slice::from_ref(&id),
+            "listed from admission on"
+        );
+        id
+    }
+
+    /// Wait for a file the unit's command writes.
+    async fn wait_for(&self, path: &Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_unit_runs_from_the_mirror_streams_its_log_and_finishes_with_a_receipt() {
+    let u = UnitRig::new().await;
+    let drone = u.drone(json!({}));
+    let mut tasks = JoinSet::new();
+    let (up, go) = (u.rig.path("out/up"), u.rig.path("out/go"));
+    let script = format!(
+        "cat hello.txt; echo \"unit=$BORG_UNIT_ID slot=$BORG_SLOT\"; git rev-parse HEAD^{{tree}}; pwd; \
+         echo \"target=$CARGO_TARGET_DIR home=$HOME\"; echo to-stderr >&2; touch {up}; \
+         while [ ! -f {go} ]; do sleep 0.05; done; echo done",
+        up = up.display(),
+        go = go.display()
+    );
+    let id = u.start(&drone, &mut tasks, &script, json!({})).await;
+
+    u.wait_for(&up).await;
+    // While it runs: the next heartbeat acknowledges it, and it holds slot 0.
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    assert_eq!(u.unit(&id).await.state, borg::units::UnitState::Running);
+    assert_eq!(drone.slot_assignments(), [(0, id.clone())]);
+    fs::write(&go, "").unwrap();
+    drain(&mut tasks).await;
+
+    let unit = u.unit(&id).await;
+    assert_eq!(
+        (unit.state, unit.exit_code, unit.drone.as_deref()),
+        (borg::units::UnitState::Done, Some(0), Some("d1"))
+    );
+    assert!(unit.receipt().unwrap().verifies());
+    let log = u.log(&id).await;
+    assert!(log.starts_with("hello from the tree\n"), "{log}");
+    assert!(log.contains(&format!("unit={id} slot=0")), "{log}");
+    assert!(
+        log.contains(&u.tree),
+        "HEAD is a commit of the unit's tree: {log}"
+    );
+    let checkout = u.rig.path("work/slot-0/_work/app/app");
+    assert!(
+        log.contains(&checkout.display().to_string()),
+        "checked out where a CI job's checkout is: {log}"
+    );
+    assert!(
+        log.contains("to-stderr") && log.ends_with("done\n"),
+        "{log}"
+    );
+    let target = log
+        .lines()
+        .find_map(|l| l.strip_prefix("target="))
+        .and_then(|l| l.split(' ').next())
+        .unwrap()
+        .to_owned();
+    assert!(
+        target.starts_with(&u.rig.path("cache/app-ci/slots/").display().to_string())
+            && target.contains("/cargo-target/"),
+        "{target}"
+    );
+    assert!(
+        Path::new(&target).is_dir(),
+        "the retained target outlives the unit"
+    );
+    assert!(
+        log.contains(&format!(
+            "home={}",
+            u.rig.path("work/slot-0/_home").display()
+        )),
+        "{log}"
+    );
+    assert!(
+        u.rig.path("cache/git/example-org/app.git/HEAD").exists(),
+        "the mirror was made on demand and survives the unit"
+    );
+    assert!(!u.rig.path("work/slot-0").exists(), "slot cleaned up");
+    assert!(drone.unit_ids().is_empty() && drone.slot_assignments().is_empty());
+}
+
+#[tokio::test]
+async fn a_failing_command_is_the_verdict_and_gets_no_receipt() {
+    let u = UnitRig::new().await;
+    let drone = u.drone(json!({}));
+    let mut tasks = JoinSet::new();
+    let id = u
+        .start(&drone, &mut tasks, "echo boom; exit 3", json!({}))
+        .await;
+    drain(&mut tasks).await;
+    let unit = u.unit(&id).await;
+    assert_eq!(
+        (unit.state, unit.exit_code),
+        (borg::units::UnitState::Done, Some(3))
+    );
+    assert!(unit.receipt().is_none());
+    assert_eq!(u.log(&id).await, "boom\n");
+}
+
+#[tokio::test]
+async fn a_cancelled_unit_is_stopped_and_fails_without_an_exit_code_verdict() {
+    let u = UnitRig::new().await;
+    let drone = u.drone(json!({}));
+    let mut tasks = JoinSet::new();
+    let up = u.rig.path("out/up");
+    // Ignores SIGINT, so only the kill after the grace period ends it.
+    let script = format!("trap '' INT; touch {}; sleep 300", up.display());
+    let id = u.start(&drone, &mut tasks, &script, json!({})).await;
+    u.wait_for(&up).await;
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    assert_eq!(u.unit(&id).await.state, borg::units::UnitState::Running);
+
+    let r = u
+        .rig
+        .h
+        .http
+        .post(format!("{}/v1/units/{id}/cancel", u.rig.h.url))
+        .bearer_auth(&u.client)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 204);
+    // The next heartbeat carries `cancel_units`.
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(60), drain(&mut tasks))
+        .await
+        .expect("the cancelled unit stops");
+    let unit = u.unit(&id).await;
+    assert_eq!(
+        (unit.state, unit.failure.as_deref(), unit.exit_code),
+        (borg::units::UnitState::Failed, Some("cancelled"), None)
+    );
+    assert!(drone.unit_ids().is_empty());
+}
+
+#[tokio::test]
+async fn a_unit_over_its_timeout_is_killed_and_fails() {
+    let u = UnitRig::new().await;
+    let drone = u.drone(json!({}));
+    let mut tasks = JoinSet::new();
+    let id = u
+        .start(
+            &drone,
+            &mut tasks,
+            "echo started; sleep 300",
+            json!({"timeout_secs": 1}),
+        )
+        .await;
+    tokio::time::timeout(Duration::from_secs(60), drain(&mut tasks))
+        .await
+        .expect("the timeout ends it");
+    let unit = u.unit(&id).await;
+    assert_eq!(
+        (unit.state, unit.failure.as_deref()),
+        (borg::units::UnitState::Failed, Some("timed out after 1s"))
+    );
+    let log = u.log(&id).await;
+    assert!(
+        log.starts_with("started\n") && log.contains("timed out after 1s"),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn an_unpublished_tree_arrives_in_the_clients_bundle() {
+    let u = UnitRig::new().await;
+    let w = u.work.to_str().unwrap();
+    fs::write(u.work.join("hello.txt"), "only in the bundle\n").unwrap();
+    git(&["-C", w, "add", "hello.txt"]);
+    git(&[
+        "-C",
+        w,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.test",
+        "commit",
+        "--quiet",
+        "-m",
+        "local",
+    ]);
+    let tree = git(&["-C", w, "rev-parse", "HEAD^{tree}"]);
+    let bundle = borg::run::build_bundle(&u.work, &tree).unwrap();
+
+    let drone = u.drone(json!({}));
+    let mut tasks = JoinSet::new();
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    let id = u
+        .submit("cat hello.txt", json!({"tree_sha": tree, "bundle": true}))
+        .await;
+    let r = u
+        .rig
+        .h
+        .http
+        .put(format!("{}/v1/units/{id}/bundle", u.rig.h.url))
+        .bearer_auth(&u.client)
+        .body(bundle)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 204);
+    u.rig.h.tick().await;
+    assert_eq!(drone.heartbeat_once(true, &mut tasks).await.unwrap(), 1);
+    drain(&mut tasks).await;
+    let unit = u.unit(&id).await;
+    assert_eq!(
+        (unit.state, unit.exit_code, unit.failure),
+        (borg::units::UnitState::Done, Some(0), None)
+    );
+    assert!(u.log(&id).await.ends_with("only in the bundle\n"));
+}
+
+#[tokio::test]
+async fn a_tree_the_drone_cannot_get_fails_the_unit_so_the_client_falls_back() {
+    let u = UnitRig::new().await;
+    let drone = u.drone(json!({}));
+    let mut tasks = JoinSet::new();
+    let missing = "0123456789abcdef0123456789abcdef01234567";
+    let id = u
+        .start(
+            &drone,
+            &mut tasks,
+            "echo never",
+            json!({"tree_sha": missing}),
+        )
+        .await;
+    drain(&mut tasks).await;
+    let unit = u.unit(&id).await;
+    assert_eq!(unit.state, borg::units::UnitState::Failed);
+    let why = unit.failure.unwrap();
+    assert!(
+        why.starts_with("could not get tree 0123456789ab of example-org/app"),
+        "{why}"
+    );
+    assert!(u.log(&id).await.contains(&why));
+    assert!(!u.rig.path("work/slot-0").exists());
+}
+
+#[tokio::test]
+async fn units_share_the_local_lease_cap_with_ci_leases() {
+    let u = UnitRig::new().await;
+    u.rig.install_runner("touch $OUT/lease-ran");
+    let drone = u.drone(json!({"max_leases": 1}));
+    let mut tasks = JoinSet::new();
+    let (up, go) = (u.rig.path("out/up"), u.rig.path("out/go"));
+    let script = format!(
+        "touch {}; while [ ! -f {} ]; do sleep 0.05; done",
+        up.display(),
+        go.display()
+    );
+    let id = u.start(&drone, &mut tasks, &script, json!({})).await;
+    u.wait_for(&up).await;
+    // The queen counts the unit against the drone, and the drone refuses a
+    // second job past its cap even if one were granted.
+    u.rig.h.queue_job(1, "borg-ci-light", 1);
+    u.rig.h.tick().await;
+    assert_eq!(drone.heartbeat_once(true, &mut tasks).await.unwrap(), 0);
+    assert_eq!(drone.slot_assignments(), [(0, id.clone())]);
+    fs::write(&go, "").unwrap();
+    drain(&mut tasks).await;
+    assert_eq!(u.unit(&id).await.exit_code, Some(0));
+    assert!(!u.rig.path("out/lease-ran").exists());
 }

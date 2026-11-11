@@ -21,6 +21,21 @@ pub enum ClientError {
     CaParse(reqwest::Error),
 }
 
+/// Upper bound for one bundle download.
+const BUNDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// What the queen did with a unit log append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogAppend {
+    /// The queen now holds this many bytes (it may cap the log below what was
+    /// sent).
+    Stored(u64),
+    /// The queen holds fewer bytes than the offset sent (409).
+    Gap,
+    /// The unit is not this drone's (404).
+    NotOurs,
+}
+
 pub struct QueenClient {
     http: reqwest::Client,
     base: String,
@@ -68,6 +83,95 @@ impl QueenClient {
             });
         }
         Ok(resp.json().await?)
+    }
+
+    /// `POST /v1/units/{id}/log?offset=N`: append `data` at `offset`.
+    pub async fn append_unit_log(
+        &self,
+        unit_id: &str,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<LogAppend, ClientError> {
+        let path = format!("/v1/units/{unit_id}/log");
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .bearer_auth(self.token.expose())
+            .query(&[("offset", offset)])
+            .body(data)
+            .send()
+            .await?;
+        match resp.status().as_u16() {
+            200..=299 => {
+                let body = resp.text().await?;
+                body.trim()
+                    .parse()
+                    .map(LogAppend::Stored)
+                    .map_err(|_| ClientError::Status { path, status: 200 })
+            }
+            409 => Ok(LogAppend::Gap),
+            404 => Ok(LogAppend::NotOurs),
+            status => Err(ClientError::Status { path, status }),
+        }
+    }
+
+    /// `GET /v1/units/{id}/bundle`: the client's git bundle for a tree that
+    /// is on no remote. Refused when larger than `max_bytes`.
+    pub async fn unit_bundle(&self, unit_id: &str, max_bytes: u64) -> Result<Vec<u8>, ClientError> {
+        let path = format!("/v1/units/{unit_id}/bundle");
+        let mut resp = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(self.token.expose())
+            // Bundles are bounded by the queen's `max_bundle_bytes` (64 MiB
+            // by default), more than the default request timeout allows for
+            // on a slow link.
+            .timeout(BUNDLE_TIMEOUT)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(ClientError::Status {
+                path,
+                status: resp.status().as_u16(),
+            });
+        }
+        let too_large = || ClientError::Status {
+            path: format!("{path} (over {max_bytes} bytes)"),
+            status: 413,
+        };
+        if resp.content_length().is_some_and(|n| n > max_bytes) {
+            return Err(too_large());
+        }
+        let mut data = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            data.extend_from_slice(&chunk);
+            if u64::try_from(data.len()).unwrap_or(u64::MAX) > max_bytes {
+                return Err(too_large());
+            }
+        }
+        Ok(data)
+    }
+
+    /// `POST /v1/units/{id}/result`. `Ok(false)`: the unit is no longer this
+    /// drone's (re-queued or gone), so retrying is pointless.
+    pub async fn report_unit(
+        &self,
+        unit_id: &str,
+        result: &crate::units_api::UnitResult,
+    ) -> Result<bool, ClientError> {
+        let path = format!("/v1/units/{unit_id}/result");
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .bearer_auth(self.token.expose())
+            .json(result)
+            .send()
+            .await?;
+        match resp.status().as_u16() {
+            200..=299 => Ok(true),
+            404 => Ok(false),
+            status => Err(ClientError::Status { path, status }),
+        }
     }
 
     pub async fn report_result(

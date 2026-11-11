@@ -2,7 +2,12 @@
 //! `<cache_root>/git/<owner>/<repo>.git`, refreshed on a timer and before a
 //! lease starts. Jobs learn the path from `BORG_GIT_MIRROR_<OWNER>_<REPO>`,
 //! set only while the mirror exists, so they can fall back to a plain clone.
+//!
+//! A work unit's repository gets a mirror on first use when it is not
+//! configured (same path, remote and credential rules), and the timer keeps
+//! it current from then on; see [`GitMirrors::unit_mirror`].
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +41,27 @@ pub fn mirror_var(repo: &str) -> String {
         })
         .collect();
     format!("{PREFIX}{body}")
+}
+
+/// Whether `repo` is a plain `owner/name` that is safe as a path below the
+/// git cache and in a remote URL: two components of ASCII letters, digits,
+/// `-`, `_` and `.`, neither `.` nor `..` nor starting with `-`. Repository
+/// names reach the drone from the queen, so they are checked here again.
+pub fn valid_repo(repo: &str) -> bool {
+    let part = |p: &str| {
+        !p.is_empty()
+            && p.len() <= 100
+            && p != "."
+            && p != ".."
+            && !p.starts_with('-')
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    let mut parts = repo.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(owner), Some(name), None) if part(owner) && part(name)
+    )
 }
 
 /// `<cache_root>/git/<owner>/<repo>.git`
@@ -166,11 +192,27 @@ struct Mirror {
     refreshed: Mutex<Option<Instant>>,
 }
 
+impl Mirror {
+    fn new(cache_root: &Path, remote_base: &str, repo: &str) -> Self {
+        Self {
+            repo: repo.to_owned(),
+            path: mirror_path(cache_root, repo),
+            url: remote_url(remote_base, repo),
+            refreshed: Mutex::new(None),
+        }
+    }
+}
+
 pub struct GitMirrors {
     git: String,
     exec: Arc<dyn Exec>,
     fs_ops: Arc<dyn FsOps>,
-    mirrors: Vec<Mirror>,
+    mirrors: Vec<Arc<Mirror>>,
+    /// Mirrors made for work units' repositories that are not configured.
+    /// Never advertised to leases: only configured mirrors are.
+    on_demand: std::sync::Mutex<BTreeMap<String, Arc<Mirror>>>,
+    cache_root: PathBuf,
+    remote_base: String,
     /// Fetch credentials apply only to an `https://` remote base.
     https: bool,
     /// The queen's latest token; memory only, replaced on each heartbeat.
@@ -190,18 +232,16 @@ impl GitMirrors {
         let mirrors = cfg
             .mirrors
             .iter()
-            .map(|repo| Mirror {
-                repo: repo.clone(),
-                path: mirror_path(cache_root, repo),
-                url: remote_url(&cfg.remote_base, repo),
-                refreshed: Mutex::new(None),
-            })
+            .map(|repo| Arc::new(Mirror::new(cache_root, &cfg.remote_base, repo)))
             .collect();
         Self {
             git: cfg.bin.clone(),
             exec,
             fs_ops,
             mirrors,
+            on_demand: std::sync::Mutex::new(BTreeMap::new()),
+            cache_root: cache_root.to_owned(),
+            remote_base: cfg.remote_base.clone(),
             https: cfg.remote_base.starts_with("https://"),
             credential: std::sync::Mutex::new(None),
             served: AtomicU64::new(0),
@@ -284,6 +324,43 @@ impl GitMirrors {
         for m in &self.mirrors {
             self.refresh(m, true).await;
         }
+        for m in self.on_demand_list() {
+            self.refresh(&m, true).await;
+        }
+    }
+
+    fn on_demand_list(&self) -> Vec<Arc<Mirror>> {
+        self.on_demand
+            .lock()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn git_bin(&self) -> &str {
+        &self.git
+    }
+
+    /// The bare mirror of a work unit's `repo`, refreshed first: always with
+    /// `force`, else unless it was refreshed in the last 15 seconds. A
+    /// repository that is not configured gets a mirror on first use, kept
+    /// current by the timer from then on. `None` for a name that is not a
+    /// plain `owner/name`. The mirror may still lack objects (a failed fetch);
+    /// the caller checks for the objects it needs.
+    pub async fn unit_mirror(&self, repo: &str, force: bool) -> Option<PathBuf> {
+        if !valid_repo(repo) {
+            return None;
+        }
+        let mirror = match self.mirrors.iter().find(|m| m.repo == repo) {
+            Some(m) => Arc::clone(m),
+            None => {
+                let mut extra = self.on_demand.lock().ok()?;
+                Arc::clone(extra.entry(repo.to_owned()).or_insert_with(|| {
+                    Arc::new(Mirror::new(&self.cache_root, &self.remote_base, repo))
+                }))
+            }
+        };
+        self.refresh(&mirror, force).await;
+        Some(mirror.path.clone())
     }
 
     /// Advertise only mirrors with a real branch ref. `git init --bare`
@@ -335,6 +412,55 @@ mod tests {
             remote_base: "https://git.example.test".to_owned(),
             ..GitCaches::default()
         }
+    }
+
+    #[test]
+    fn unit_repositories_must_be_plain_owner_and_name() {
+        for ok in ["dx-corp/mono", "example-org/app", "o/.github", "a_b/c.d"] {
+            assert!(valid_repo(ok), "{ok}");
+        }
+        for bad in [
+            "", "mono", "o/r/x", "../etc", "o/..", "./r", "o/-r", "o/r ", "o//r", "/o/r", "o/r\n",
+        ] {
+            assert!(!valid_repo(bad), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_unit_repository_gets_a_mirror_on_demand_that_the_timer_keeps_current() {
+        let root = tempfile::tempdir().unwrap();
+        let x = Arc::new(FakeExec::default());
+        let m = GitMirrors::new(&cfg(&[]), root.path(), x.clone(), Arc::new(LocalFs));
+        assert!(m.unit_mirror("../escape", false).await.is_none());
+        assert!(x.calls().is_empty(), "an unsafe name runs nothing");
+
+        let path = m.unit_mirror("example-org/app", false).await.unwrap();
+        assert_eq!(path, mirror_path(root.path(), "example-org/app"));
+        let p = path.display().to_string();
+        assert_eq!(x.calls()[0], format!("git init --bare --quiet {p}"));
+        assert!(
+            x.calls()[1].ends_with("https://git.example.test/example-org/app.git"),
+            "{:?}",
+            x.calls()
+        );
+        let after_first = x.calls().len();
+        m.unit_mirror("example-org/app", false).await.unwrap();
+        assert_eq!(x.calls().len(), after_first, "rate limited without force");
+        m.unit_mirror("example-org/app", true).await.unwrap();
+        assert!(x.calls().len() > after_first, "force refreshes");
+
+        let before_timer = x.calls().len();
+        m.refresh_all().await;
+        assert!(
+            x.calls()[before_timer..]
+                .iter()
+                .any(|c| c.contains(&p) && c.contains("fetch --prune")),
+            "the timer refreshes on-demand mirrors"
+        );
+        assert!(
+            m.env().is_empty(),
+            "on-demand mirrors are not advertised to leases"
+        );
     }
 
     #[test]

@@ -207,6 +207,11 @@ impl Caches {
         )
     }
 
+    /// The host git mirrors (work units get theirs from here).
+    pub fn git(&self) -> &GitMirrors {
+        &self.git
+    }
+
     /// Held for the whole life of a lease (refresh, run, cleanup).
     pub async fn begin_lease(&self) -> OwnedRwLockReadGuard<()> {
         Arc::clone(&self.gate).read_owned().await

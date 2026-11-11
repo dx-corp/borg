@@ -18,9 +18,11 @@
 //! * **Execution** is the drone's: it is told about a unit in its heartbeat
 //!   response (`units`), acknowledges it with `active_units`, appends log bytes
 //!   with `POST /v1/units/{id}/log?offset=N`, and ends it with
-//!   `POST /v1/units/{id}/result`. A unit that was never acknowledged is
-//!   re-queued after `lease_ttl_secs`; one on a silent drone is re-queued (up to
-//!   `max_attempts`); one over its timeout fails.
+//!   `POST /v1/units/{id}/result`: an exit code, or a `failure` when the drone
+//!   did not run the command to completion (see [`crate::drone::units`]). A
+//!   unit that was never acknowledged is re-queued after `lease_ttl_secs`; one
+//!   on a silent drone is re-queued (up to `max_attempts`); one over its
+//!   timeout fails.
 //! * **Logs** are stored in SQLite up to `max_log_bytes` and read by clients
 //!   with `GET /v1/units/{id}/log?from=N&wait=S` (long poll).
 //!

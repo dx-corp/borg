@@ -27,7 +27,7 @@ use crate::secret::Secret;
 const RSS_SAMPLE_EVERY: Duration = Duration::from_secs(2);
 
 /// The lease's private HOME, a child of the lease directory (removed with it).
-const LEASE_HOME: &str = "_home";
+pub(crate) const LEASE_HOME: &str = "_home";
 
 /// Files from the job user's own home that every lease HOME starts with. Only
 /// drone-written configuration belongs here (the Bazel cache rc), never
@@ -35,7 +35,11 @@ const LEASE_HOME: &str = "_home";
 const SEEDED_HOME_FILES: [&str; 1] = [".bazelrc"];
 
 /// Create a lease HOME and copy the drone-managed seed files into it.
-fn seed_lease_home(fs_ops: &dyn FsOps, user_home: &Path, lease_home: &Path) -> io::Result<()> {
+pub(crate) fn seed_lease_home(
+    fs_ops: &dyn FsOps,
+    user_home: &Path,
+    lease_home: &Path,
+) -> io::Result<()> {
     fs_ops.mkdir_p(lease_home)?;
     for name in SEEDED_HOME_FILES {
         if let Ok(content) = fs::read_to_string(user_home.join(name)) {
@@ -142,7 +146,7 @@ pub fn group_rss_kib(proc_root: &Path, pgid: u32) -> Option<u64> {
 
 /// `spawn`, retrying briefly on ETXTBSY: the script was hard-linked from an
 /// install another thread may still hold open for writing.
-async fn spawn_retrying(command: &mut Command) -> io::Result<tokio::process::Child> {
+pub(crate) async fn spawn_retrying(command: &mut Command) -> io::Result<tokio::process::Child> {
     const ETXTBSY: i32 = 26;
     let mut attempts = 0;
     loop {
@@ -172,8 +176,8 @@ pub async fn run_lease(
     spec: &RunSpec<'_>,
     exec: &dyn Exec,
     fs_ops: Arc<dyn FsOps>,
-    mut abort: tokio::sync::watch::Receiver<bool>,
-    mut preempt: tokio::sync::watch::Receiver<bool>,
+    abort: tokio::sync::watch::Receiver<bool>,
+    preempt: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<RunOutcome> {
     if !valid_lease_id(spec.lease_id) {
         return Err(io::Error::new(
@@ -249,8 +253,42 @@ pub async fn run_lease(
         // is killed through `exec` instead.
         .kill_on_drop(spec.job_user.is_none());
     let mut child = spawn_retrying(&mut command).await?;
-    let pgid = child.id();
+    supervise(
+        &mut child,
+        exec,
+        Limits {
+            max_job: spec.max_job,
+            preempt_grace: spec.preempt_grace,
+            proc_root: spec.proc_root,
+        },
+        abort,
+        preempt,
+    )
+    .await
+}
 
+/// How long a supervised process may run and how it is stopped.
+pub(crate) struct Limits<'a> {
+    pub max_job: Duration,
+    /// After a preempt signal the group gets SIGINT, then this long before it
+    /// is killed.
+    pub preempt_grace: Duration,
+    /// `/proc` (a different root is used by tests).
+    pub proc_root: &'a Path,
+}
+
+/// Wait for `child`, started in its own process group, to exit; kill the
+/// group on timeout or abort, interrupt it then kill it after the grace
+/// period on preempt, and reap whatever it left in the group. Signals go
+/// through `exec`, so a job running as the job user can be signalled.
+pub(crate) async fn supervise(
+    child: &mut tokio::process::Child,
+    exec: &dyn Exec,
+    spec: Limits<'_>,
+    mut abort: tokio::sync::watch::Receiver<bool>,
+    mut preempt: tokio::sync::watch::Receiver<bool>,
+) -> io::Result<RunOutcome> {
+    let pgid = child.id();
     let started = Instant::now();
     let deadline = tokio::time::sleep(spec.max_job);
     tokio::pin!(deadline);

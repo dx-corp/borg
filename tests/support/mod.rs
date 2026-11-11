@@ -836,7 +836,7 @@ impl Harness {
         self.http
             .post(format!("{}/v1/heartbeat", self.url))
             .bearer_auth(token)
-            .json(&json!({"capacity": capacity(), "active_leases": active}))
+            .json(&json!({"capacity": capacity(), "active_leases": active, "runs_units": true}))
             .send()
             .await
             .unwrap()
@@ -847,15 +847,17 @@ impl Harness {
         self.http
             .post(format!("{}/v1/heartbeat", self.url))
             .bearer_auth(token)
-            .json(&json!({"capacity": capacity(), "version": version}))
+            .json(&json!({"capacity": capacity(), "version": version, "runs_units": true}))
             .send()
             .await
             .unwrap()
     }
 
-    /// Heartbeat with extra request fields (e.g. `bids`) merged in.
+    /// Heartbeat with extra request fields (e.g. `bids`) merged in. Like
+    /// every harness heartbeat it says the drone runs units unless `extra`
+    /// says otherwise.
     pub async fn heartbeat_with(&self, token: &str, extra: Value) -> Value {
-        let mut body = json!({"capacity": capacity()});
+        let mut body = json!({"capacity": capacity(), "runs_units": true});
         for (k, v) in extra.as_object().cloned().unwrap_or_default() {
             body[k] = v;
         }
