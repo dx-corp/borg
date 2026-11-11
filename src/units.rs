@@ -67,6 +67,11 @@ pub struct UnitSettings {
     pub bundle_wait_secs: i64,
     /// Finished units and their logs are deleted after this long.
     pub keep_secs: i64,
+    /// Per drone, the unit classes it may run, e.g.
+    /// `{"wsl-desktop": ["light", "medium"]}` for a host that also builds by
+    /// hand. A drone that is not named runs any class. Runner leases are not
+    /// affected.
+    pub drone_classes: BTreeMap<String, Vec<Class>>,
 }
 
 impl Default for UnitSettings {
@@ -84,6 +89,7 @@ impl Default for UnitSettings {
             max_bundle_bytes: 64 << 20,
             bundle_wait_secs: 60,
             keep_secs: 7 * 86_400,
+            drone_classes: BTreeMap::new(),
         }
     }
 }
@@ -109,7 +115,25 @@ impl UnitSettings {
                     .into(),
             );
         }
+        for (drone, classes) in &self.drone_classes {
+            if drone.is_empty() || classes.is_empty() {
+                return Err(format!(
+                    "units.drone_classes: {drone:?} needs at least one class (leave a drone out to allow every class)"
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// The unit classes `drone` may not run under `drone_classes`.
+    pub fn disallowed_classes(&self, drone: &str) -> Vec<Class> {
+        match self.drone_classes.get(drone) {
+            Some(allowed) => Class::ALL
+                .into_iter()
+                .filter(|c| !allowed.contains(c))
+                .collect(),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -1098,6 +1122,26 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .contains("capacity_share_percent")
+        );
+    }
+
+    #[test]
+    fn drone_classes_allow_only_the_named_classes_and_reject_empty_lists() {
+        let s: UnitSettings = serde_json::from_value(serde_json::json!({
+            "drone_classes": {"wsl-desktop": ["light", "medium"]}
+        }))
+        .unwrap();
+        assert!(s.validate().is_ok());
+        assert_eq!(s.disallowed_classes("wsl-desktop"), [Class::Heavy]);
+        assert!(s.disallowed_classes("build-heavy-1").is_empty());
+        let empty: UnitSettings =
+            serde_json::from_value(serde_json::json!({"drone_classes": {"x": []}})).unwrap();
+        assert!(empty.validate().unwrap_err().contains("drone_classes"));
+        assert!(
+            serde_json::from_value::<UnitSettings>(
+                serde_json::json!({"drone_classes": {"x": ["huge"]}})
+            )
+            .is_err()
         );
     }
 
