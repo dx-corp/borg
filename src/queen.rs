@@ -264,6 +264,31 @@ fn placeable_unmet(
         .collect()
 }
 
+/// Runner demand plus the queued units no placement round could take, per
+/// `(class, scope)`. Units awaiting their bundle are not placeable yet and do
+/// not count.
+fn with_unit_demand(unmet: &[Unmet], queued: &[Unit]) -> Vec<Unmet> {
+    let mut by: BTreeMap<(Class, Scope), u32> = BTreeMap::new();
+    for u in unmet {
+        let n = by.entry((u.class, u.scope)).or_default();
+        *n = n.saturating_add(u.count);
+    }
+    for u in queued
+        .iter()
+        .filter(|u| u.state == UnitState::Queued && !u.awaiting_bundle)
+    {
+        let n = by.entry((u.class, u.scope)).or_default();
+        *n = n.saturating_add(1);
+    }
+    by.into_iter()
+        .map(|((class, scope), count)| Unmet {
+            class,
+            scope,
+            count,
+        })
+        .collect()
+}
+
 /// What `/status` shows of a gated rollout.
 #[derive(Debug, Clone, Serialize)]
 pub struct RolloutView {
@@ -998,6 +1023,17 @@ impl Queen {
         // Demand that idle non-borg runners will take is not borg's to wake
         // hosts for.
         let unmet_placeable = placeable_unmet(&allocation.unmet, &statics, &self.cfg.classes);
+        // Units still queued after both placement rounds are demand too. Burst
+        // used to see runner jobs only, so a window approved for agent gates
+        // drained its drone as `no_demand` while units waited.
+        let queued_units = match self.store.units_in(&[UnitState::Queued]).await {
+            Ok(units) => units,
+            Err(e) => {
+                tracing::warn!("queued unit read for burst demand failed: {e}");
+                Vec::new()
+            }
+        };
+        let burst_unmet = with_unit_demand(&unmet_placeable, &queued_units);
         let wake = self.wake_pass(now_ts, &unmet_placeable, &fresh_names).await;
         // `allocation.idle` is the room before this pass's grants. The jobs
         // still unmet compete only for what those grants left, so the capacity
@@ -1027,13 +1063,7 @@ impl Queen {
             )
             .await;
         let burst = self
-            .burst_pass(
-                now_ts,
-                &drone_rows,
-                &held_after,
-                &unmet_placeable,
-                &idle_after,
-            )
+            .burst_pass(now_ts, &drone_rows, &held_after, &burst_unmet, &idle_after)
             .await;
         let mut mint_error = None;
         let mut lease_error = None;

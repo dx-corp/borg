@@ -280,3 +280,88 @@ fn the_queued_family_picks_the_owned_host_that_runs_it_fastest() {
     // An unseen family falls back to the class profiles.
     assert_eq!(winner(&[("brand-new", 2)], true), "wsl-desktop");
 }
+
+fn queued_unit(class: Class, scope: Scope, state: UnitState, awaiting_bundle: bool) -> Unit {
+    Unit {
+        id: "u-test".to_owned(),
+        key: "k".to_owned(),
+        repo: "dx-corp/mono".to_owned(),
+        tree_sha: "0".repeat(40),
+        argv: vec!["cargo".to_owned(), "clippy".to_owned()],
+        platform: "linux-x86_64".to_owned(),
+        toolchain: "stable".to_owned(),
+        rust_toolchain: None,
+        class,
+        timeout_secs: 3600,
+        client: "mac-agents".to_owned(),
+        state,
+        drone: None,
+        attempt: 0,
+        created_at: 0,
+        leased_at: None,
+        started_at: None,
+        finished_at: None,
+        exit_code: None,
+        duration_secs: None,
+        cancel_requested: false,
+        failure: None,
+        log_bytes: 0,
+        awaiting_bundle,
+        bundle_bytes: 0,
+        scope,
+        supersede_key: None,
+        record: false,
+    }
+}
+
+#[test]
+fn queued_units_are_burst_demand() {
+    let unmet = vec![Unmet {
+        class: Class::Heavy,
+        scope: Scope::Main,
+        count: 2,
+    }];
+    let units = vec![
+        queued_unit(Class::Heavy, Scope::Main, UnitState::Queued, false),
+        queued_unit(Class::Heavy, Scope::Pr, UnitState::Queued, false),
+        queued_unit(Class::Heavy, Scope::Pr, UnitState::Queued, false),
+        // Not placeable yet, or already placed: no demand.
+        queued_unit(Class::Heavy, Scope::Pr, UnitState::Queued, true),
+        queued_unit(Class::Medium, Scope::Pr, UnitState::Leased, false),
+    ];
+    assert_eq!(
+        with_unit_demand(&unmet, &units),
+        vec![
+            Unmet {
+                class: Class::Heavy,
+                scope: Scope::Main,
+                count: 3
+            },
+            Unmet {
+                class: Class::Heavy,
+                scope: Scope::Pr,
+                count: 2
+            },
+        ]
+    );
+}
+
+#[test]
+fn no_units_leave_runner_demand_unchanged() {
+    let unmet = vec![
+        Unmet {
+            class: Class::Medium,
+            scope: Scope::Pr,
+            count: 4,
+        },
+        Unmet {
+            class: Class::Heavy,
+            scope: Scope::Main,
+            count: 1,
+        },
+    ];
+    let mut expected = unmet.clone();
+    expected.sort_by_key(|u| (u.class, u.scope));
+    assert_eq!(with_unit_demand(&unmet, &[]), expected);
+    assert!(with_unit_demand(&[], &[]).is_empty());
+}
