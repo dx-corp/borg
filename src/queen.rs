@@ -1437,6 +1437,7 @@ impl Queen {
                     .last_heartbeat
                     .is_some_and(|t| now - t <= self.cfg.drone_stale_secs),
                 held: d.held(),
+                maintenance: d.hold() == crate::health::Hold::Operator,
                 has_active_leases: busy_drones.contains(d.name.as_str()),
                 version: d.version.clone(),
                 version_since: d.version_since,
@@ -1696,6 +1697,8 @@ impl Queen {
                             u.rust_toolchain.as_deref(),
                             now,
                         );
+                        d.blocked_classes
+                            .extend(self.cfg.units.disallowed_classes(&d.id));
                         d
                     })
                     .collect();

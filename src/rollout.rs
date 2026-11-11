@@ -21,8 +21,11 @@
 //! previous version, same period):
 //! * **update**: a told drone must report the target within `update_timeout_secs`
 //!   of the queen seeing its active leases finish;
-//! * **heartbeat health**: drones on the target stay fresh and out of
-//!   quarantine;
+//! * **heartbeat health**: drones on the target stay fresh and out of health
+//!   quarantine. An operator's maintenance quarantine is not a verdict on the
+//!   version: a canary under maintenance is replaced by another host of its OS,
+//!   and a wave member under maintenance is skipped (neither waited for nor
+//!   judged) until it is released;
 //! * **host failures**: the host-failure rate on the target may not exceed the
 //!   control's by more than `max_host_failure_increase_pm`; with too little
 //!   control data an absolute cap applies;
@@ -216,6 +219,9 @@ pub struct DroneView {
     pub fresh: bool,
     /// Quarantined or otherwise not schedulable.
     pub held: bool,
+    /// Held by an operator (maintenance), not by health evidence. Such a hold
+    /// says nothing about the version the drone runs.
+    pub(crate) maintenance: bool,
     /// Work already granted to this drone, excluding unused standby runners.
     pub(crate) has_active_leases: bool,
     pub version: Option<String>,
@@ -395,6 +401,40 @@ pub fn advance(
         return done(st, events, None);
     }
 
+    // A canary an operator took out for maintenance proves nothing either way:
+    // replace it with another fresh, schedulable host of its OS, in place, so
+    // the canaries stay in `canary_oses` order. With none free it is kept and
+    // the stage waits (see the member checks).
+    if st.phase == Phase::Canary {
+        for i in 0..st.canaries.len() {
+            let name = st.canaries[i].clone();
+            let Some(old) = drones.iter().find(|d| d.name == name && d.maintenance) else {
+                continue;
+            };
+            let replacement = drones
+                .iter()
+                .filter(|d| {
+                    d.fresh
+                        && !d.held
+                        && d.runs_jobs
+                        && d.os == old.os
+                        && !st.canaries.contains(&d.name)
+                })
+                .min_by_key(|d| (!d.shared, d.name.as_str()))
+                .map(|d| d.name.clone());
+            if let Some(new) = replacement {
+                events.push(format!(
+                    "canary {name} is in maintenance; canary for {}: {new}",
+                    old.os
+                ));
+                st.update_started_at.remove(&name);
+                st.canaries[i] = new;
+                st.members = st.canaries.clone();
+                st.stage_started_at = now;
+            }
+        }
+    }
+
     // Canary selection: one fresh, schedulable host per OS, kept once chosen.
     if st.phase == Phase::Canary && st.canaries.len() < s.canary_oses.len() {
         let chosen: BTreeSet<String> = st.canaries.iter().cloned().collect();
@@ -466,6 +506,17 @@ pub fn advance(
         let Some(d) = by_name(n) else {
             continue;
         };
+        if d.maintenance {
+            // Not evidence about the version. A wave member is skipped until
+            // released; a canary that could not be replaced holds the stage.
+            if st.phase == Phase::Canary {
+                wait.get_or_insert(format!(
+                    "canary {n} is in maintenance and no other {} host is free to replace it",
+                    d.os
+                ));
+            }
+            continue;
+        }
         if !on_target(d) {
             // A drone that went silent before reporting the target never ran
             // it: a burst drone retired mid-rollout is not evidence against
@@ -489,6 +540,7 @@ pub fn advance(
             }
             continue;
         }
+        // Maintenance holds were skipped above: this is a health quarantine.
         if d.held {
             halt.get_or_insert(format!("{n} is quarantined on {target}"));
         } else if !d.fresh {
@@ -691,6 +743,7 @@ mod tests {
             os: os.into(),
             fresh: true,
             held: false,
+            maintenance: false,
             has_active_leases: false,
             version: Some(version.into()),
             version_since: Some(since),
@@ -976,6 +1029,88 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("quarantined")
+        );
+    }
+
+    fn set_maintenance(fleet: &mut [DroneView], name: &str) {
+        for d in fleet.iter_mut().filter(|d| d.name == name) {
+            d.held = true;
+            d.maintenance = true;
+        }
+    }
+
+    #[test]
+    fn a_canary_taken_out_for_maintenance_is_replaced_not_judged() {
+        let mut f = fleet();
+        let a = step(100, None, &f, &[]);
+        assert_eq!(a.state.canaries, ["l1", "m1"]);
+        set_version(&mut f, &["l1", "m1"], NEW, 105);
+        set_maintenance(&mut f, "l1");
+        let b = step(110, Some(a.state), &f, &[]);
+        assert_eq!(b.state.phase, Phase::Canary, "{:?}", b.state.halted_reason);
+        // Replaced in place by the next Linux host; the macOS canary stays.
+        assert_eq!(b.state.canaries, ["l2", "m1"]);
+        assert_eq!(b.state.members, ["l2", "m1"]);
+        assert!(
+            b.events.iter().any(|e| e.contains("l1 is in maintenance")),
+            "{:?}",
+            b.events
+        );
+        assert_eq!(desired_for(&b.state, "l1"), OLD);
+        assert_eq!(desired_for(&b.state, "l2"), NEW);
+        // A health quarantine on the target still halts.
+        let mut g = f.clone();
+        set_version(&mut g, &["l2"], NEW, 115);
+        g.iter_mut()
+            .filter(|d| d.name == "l2")
+            .for_each(|d| d.held = true);
+        let c = step(120, Some(b.state), &g, &[]);
+        assert_eq!(c.state.phase, Phase::Halted);
+        assert!(
+            c.state
+                .halted_reason
+                .as_deref()
+                .unwrap()
+                .contains("l2 is quarantined")
+        );
+    }
+
+    #[test]
+    fn a_canary_in_maintenance_with_no_replacement_holds_the_stage() {
+        let mut f: Vec<DroneView> = fleet()
+            .into_iter()
+            .filter(|d| d.name == "l1" || d.os == "macos")
+            .collect();
+        let a = step(100, None, &f, &[]);
+        set_version(&mut f, &["l1", "m1"], NEW, 105);
+        set_maintenance(&mut f, "l1");
+        // Long past the update timeout: still waiting, never halted.
+        let b = step(100 + 10_000, Some(a.state), &f, &[]);
+        assert_eq!(b.state.phase, Phase::Canary, "{:?}", b.state.halted_reason);
+        assert_eq!(b.state.canaries, ["l1", "m1"]);
+        assert!(
+            b.waiting
+                .as_deref()
+                .unwrap()
+                .contains("l1 is in maintenance")
+        );
+    }
+
+    #[test]
+    fn a_wave_member_in_maintenance_is_skipped_until_released() {
+        let (mut f, st) = promoted_to_wave();
+        let jobs: Vec<Outcome> = (0..6)
+            .map(|i| job("l1", 150 + i, OutcomeKind::Ok))
+            .collect();
+        let b = step(241, Some(st), &f, &jobs);
+        assert_eq!(b.state.members, ["l1", "m1", "l2"]);
+        // l2 never updates (it is in maintenance), far past the update timeout.
+        set_maintenance(&mut f, "l2");
+        let c = step(241 + 10_000, Some(b.state.clone()), &f, &jobs);
+        assert_ne!(c.state.phase, Phase::Halted, "{:?}", c.state.halted_reason);
+        assert!(
+            c.state.members.contains(&"l2".to_owned()),
+            "still told the target"
         );
     }
 

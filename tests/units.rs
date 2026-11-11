@@ -1804,3 +1804,35 @@ async fn units_go_only_to_drones_that_say_they_run_them() {
     let hb = r.beat(&new, &[]).await;
     assert_eq!(hb["units"][0]["unit_id"], id.as_str(), "{hb}");
 }
+
+#[tokio::test]
+async fn a_drone_runs_only_the_unit_classes_its_allowlist_names() {
+    let r = Rig::new(json!({"units": {
+        "enabled": true, "lease_ttl_secs": 100, "max_attempts": 2,
+        "drone_classes": {"d-small": ["light", "medium"]},
+    }}))
+    .await;
+    let small = r.drone("d-small").await;
+    let (_, heavy) = r
+        .submit(&r.unit(json!({"class": "heavy", "argv": ["cargo", "clippy"]})))
+        .await;
+    let heavy = heavy["unit_id"].as_str().unwrap().to_owned();
+    let (_, medium) = r.submit(&r.unit(json!({"class": "medium"}))).await;
+    let medium = medium["unit_id"].as_str().unwrap().to_owned();
+    r.tick(5).await;
+    let hb = r.beat(&small, &[]).await;
+    let granted: Vec<&str> = hb["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|g| g["unit_id"].as_str())
+        .collect();
+    assert_eq!(granted, [medium.as_str()], "{hb}");
+    assert_eq!(state_of(&r, &heavy).await, "queued");
+
+    // A drone the allowlist does not name takes any class.
+    let any = r.drone("d-any").await;
+    r.tick(10).await;
+    let hb = r.beat(&any, &[]).await;
+    assert_eq!(hb["units"][0]["unit_id"], heavy.as_str(), "{hb}");
+}

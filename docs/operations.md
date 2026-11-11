@@ -565,6 +565,11 @@ Drone protocol (bearer: drone token):
    falls back. A drone that stops a unit because it is shutting down sends
    nothing; the queen re-queues it.
 
+`units.drone_classes` limits the unit classes a named drone may run, for a host
+that also serves people (`{"wsl-desktop": ["light", "medium"]}` keeps heavy units
+off the desktop that hosts desk-build). A drone it does not name runs any class;
+runner leases are unaffected.
+
 Units are placed by the runner allocator (class capacity, owner caps, bids,
 profiles, quarantine and probation) on drones whose `<os>-<arch>` matches, using
 capacity left after CI runner demand. Among queued units the order is the one
