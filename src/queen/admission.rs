@@ -2,11 +2,29 @@
 //! averages, the state each drone settled in last pass (for hysteresis), and
 //! the live memory facts the allocator sizes drones by.
 
-use super::Queen;
+use std::collections::HashMap;
+
+use super::{Queen, platform_of};
 use crate::allocator::{AdmissionState, DroneAdmission, HostMemory, LiveFacts};
 use crate::config::AdmissionSettings;
 use crate::envcontract::EnvFacts;
 use crate::probe::Capacity;
+
+/// Whether drone `id` may be given a work unit for `platform`: it runs that
+/// platform and its last heartbeat said it runs units. An older drone build
+/// never says so and would leave the unit unstarted until it runs out of
+/// attempts, so a rollout's mixed fleet only places units on new drones.
+pub(super) fn unit_host(
+    id: &str,
+    capacities: &HashMap<String, Capacity>,
+    rows: &HashMap<&str, &crate::store::DroneRow>,
+    platform: &str,
+) -> bool {
+    capacities
+        .get(id)
+        .is_some_and(|c| platform_of(c) == platform)
+        && rows.get(id).is_some_and(|r| r.runs_units)
+}
 
 /// Samples kept per drone: 10 s heartbeats over a 180 s window need 18.
 const CPU_PRESSURE_SAMPLES: usize = 64;

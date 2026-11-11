@@ -87,21 +87,33 @@ impl JobExec {
     }
 }
 
-impl Exec for JobExec {
-    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+impl JobExec {
+    /// `setpriv ... -- program args...` arguments.
+    fn argv(&self, program: &str, args: &[&str]) -> Vec<String> {
         let mut argv = self.user.setpriv_args();
         argv.push(program.to_owned());
         argv.extend(args.iter().map(|a| (*a).to_owned()));
+        argv
+    }
+}
+
+impl Exec for JobExec {
+    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        let argv = self.argv(program, args);
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         self.inner.run(&self.user.priv_bin, &argv)
     }
 
     fn run_grouped(&self, program: &str, args: &[&str]) -> io::Result<Output> {
-        let mut argv = self.user.setpriv_args();
-        argv.push(program.to_owned());
-        argv.extend(args.iter().map(|a| (*a).to_owned()));
+        let argv = self.argv(program, args);
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         self.inner.run_grouped(&self.user.priv_bin, &argv)
+    }
+
+    fn run_input(&self, program: &str, args: &[&str], input: &[u8]) -> io::Result<Output> {
+        let argv = self.argv(program, args);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        self.inner.run_input(&self.user.priv_bin, &argv, input)
     }
 }
 

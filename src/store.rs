@@ -332,6 +332,9 @@ pub struct DroneRow {
     pub reclaim: Option<ReclaimStats>,
     /// The build environment the drone last reported.
     pub env_facts: Option<EnvFacts>,
+    /// The drone's last heartbeat said it runs work units. Drones older than
+    /// the drone half of units never say so and are never given one.
+    pub runs_units: bool,
 }
 
 impl DroneRow {
@@ -643,6 +646,7 @@ impl Store {
             "ALTER TABLE units ADD COLUMN record INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE clients ADD COLUMN max_scope TEXT NOT NULL DEFAULT 'pr'",
             "ALTER TABLE clients ADD COLUMN expires_at INTEGER",
+            "ALTER TABLE drones ADD COLUMN runs_units INTEGER NOT NULL DEFAULT 0",
         ] {
             // sqlx-runtime-query: one-off additive migration, no data involved
             if let Err(e) = sqlx::query(ddl).execute(&mut *conn).await
@@ -716,6 +720,17 @@ impl Store {
         Ok(())
     }
 
+    /// Whether the drone reports that it runs work units.
+    pub async fn set_runs_units(&self, name: &str, runs: bool) -> Result<(), StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        sqlx::query("UPDATE drones SET runs_units = ? WHERE name = ?")
+            .bind(i64::from(runs))
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// The trust the drone reports for itself.
     pub async fn set_trust(&self, name: &str, trust: Trust) -> Result<(), StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
@@ -765,7 +780,7 @@ impl Store {
     pub async fn drones(&self) -> Result<Vec<DroneRow>, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         let rows = sqlx::query(
-            "SELECT name, last_heartbeat, capacity, caps, accepting, cache_stats, quarantined, quarantine_reason, version, extra_labels, bids, quarantine_source, quarantined_at, probation_since, quarantine_strikes, health_cleared_at, version_since, reclaim, env_facts, trust FROM drones ORDER BY name",
+            "SELECT name, last_heartbeat, capacity, caps, accepting, cache_stats, quarantined, quarantine_reason, version, extra_labels, bids, quarantine_source, quarantined_at, probation_since, quarantine_strikes, health_cleared_at, version_since, reclaim, env_facts, trust, runs_units FROM drones ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -799,6 +814,7 @@ impl Store {
                         .transpose()?
                         .unwrap_or_default(),
                     trust: enum_from(&r.get::<String, _>("trust"))?,
+                    runs_units: r.get::<i64, _>("runs_units") != 0,
                     quarantine_source: r.get("quarantine_source"),
                     quarantined_at: r.get("quarantined_at"),
                     probation_since: r.get("probation_since"),

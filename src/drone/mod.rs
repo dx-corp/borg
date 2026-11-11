@@ -2,8 +2,10 @@
 //!
 //! It probes the host, heartbeats to the queen with its capacity and owner
 //! caps, and runs every lease the queen grants as an ephemeral runner in a
-//! private directory. Cleanup after each job is unconditional. On shutdown it
-//! stops accepting leases and lets in-flight jobs finish, up to a timeout.
+//! private directory, and every work unit it grants as a command (see
+//! [`units`]). Leases and units share the slots, the local lease cap and
+//! cleanup, which after each job is unconditional. On shutdown it stops
+//! accepting work and lets in-flight jobs finish, up to a timeout.
 
 pub mod caches;
 pub mod capabilities;
@@ -24,6 +26,7 @@ pub mod runner;
 pub mod selfupdate;
 pub mod slots;
 pub mod standby;
+pub mod units;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -54,20 +57,31 @@ const RESULT_ATTEMPTS: u32 = 20;
 
 type Held = Arc<Mutex<HashSet<String>>>;
 
-/// Per running lease, the switch the queen's `cancel_leases` flips.
+/// Per running lease or unit, the switch the queen's `cancel_leases` or
+/// `cancel_units` flips. Unit ids (`u-<hex>`) never collide with lease ids.
 type Preempts = Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>;
 
-/// Removes a lease id from the held set when its task ends, even by panic.
+/// Removes a lease or unit id from the held sets when its task ends, even by
+/// panic.
 struct HeldGuard {
     held: Held,
     preempts: Preempts,
+    /// The drone's unit ids, for a unit.
+    units: Option<Held>,
     id: String,
 }
 
 impl Drop for HeldGuard {
     fn drop(&mut self) {
+        // `held` first: an id briefly in `units` but not `held` is still
+        // reported as a unit, never as a lease.
         if let Ok(mut held) = self.held.lock() {
             held.remove(&self.id);
+        }
+        if let Some(units) = &self.units
+            && let Ok(mut units) = units.lock()
+        {
+            units.remove(&self.id);
         }
         if let Ok(mut preempts) = self.preempts.lock() {
             preempts.remove(&self.id);
@@ -84,7 +98,12 @@ pub struct Drone {
     job_exec: Arc<dyn Exec>,
     /// File operations on job-owned directories.
     fs_ops: Arc<dyn FsOps>,
+    /// Every lease and unit holding a slot: the local cap, reclaim, the
+    /// credential wipe and self-update all count both.
     held: Held,
+    /// The unit ids among `held`, reported as `active_units` from the moment
+    /// a unit is admitted until its result is delivered.
+    units: Held,
     /// Standby deploy runners held unstarted.
     standbys: Standbys,
     preempts: Preempts,
@@ -199,6 +218,7 @@ impl Drone {
             caches,
             slots,
             held,
+            units: Held::default(),
             standbys,
             preempts: Preempts::default(),
             abort,
@@ -217,6 +237,32 @@ impl Drone {
             .lock()
             .map(|h| h.iter().cloned().collect())
             .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    /// Units admitted and not yet reported (`active_units`).
+    pub fn unit_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .units
+            .lock()
+            .map(|h| h.iter().cloned().collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    /// Leases held (`active_leases`): the held ids that are not units. Lock
+    /// order is `held`, then `units`, as in [`Self::admit`], so a unit being
+    /// admitted is never reported as a lease.
+    fn lease_ids(&self) -> Vec<String> {
+        let Ok(held) = self.held.lock() else {
+            return Vec::new();
+        };
+        let Ok(units) = self.units.lock() else {
+            return Vec::new();
+        };
+        let mut ids: Vec<String> = held.difference(&units).cloned().collect();
         ids.sort();
         ids
     }
@@ -377,7 +423,7 @@ impl Drone {
             capacity,
             caps: self.cfg.host_caps(),
             accepting,
-            active_leases: self.held_ids(),
+            active_leases: self.lease_ids(),
             cache_stats: self.caches.stats(),
             version: Some(
                 self.reported_version
@@ -394,7 +440,11 @@ impl Drone {
                 .selfupdate
                 .as_ref()
                 .and_then(SelfUpdate::pending_report),
-            active_units: Vec::new(),
+            // Lists every admitted unit until its result is delivered: the
+            // first listing acknowledges it, and a running unit the queen
+            // stops hearing about is re-queued.
+            active_units: self.unit_ids(),
+            runs_units: true,
             env_facts: Some(env_facts),
         };
         let resp = self.client.heartbeat(&req).await?;
@@ -413,7 +463,7 @@ impl Drone {
             self.caches.set_mirror_credential(credential);
         }
         if let Ok(preempts) = self.preempts.lock() {
-            for id in &resp.cancel_leases {
+            for id in resp.cancel_leases.iter().chain(&resp.cancel_units) {
                 if let Some(tx) = preempts.get(id) {
                     let _ = tx.send(true);
                 }
@@ -428,6 +478,14 @@ impl Drone {
         let mut started = 0;
         for grant in resp.leases {
             if accepting && !defer && self.start_lease(grant, tasks) {
+                started += 1;
+            }
+        }
+        // Grants are resent until acknowledged; one already held is not
+        // started twice (`admit`). One left unstarted is re-queued by the
+        // queen after `lease_ttl_secs`.
+        for grant in resp.units {
+            if accepting && !defer && self.start_unit(grant, tasks) {
                 started += 1;
             }
         }
@@ -492,26 +550,43 @@ impl Drone {
     /// Claim a slot for `grant` and run it as a lease. Returns whether it
     /// started.
     fn start_lease(&self, grant: LeaseGrant, tasks: &mut JoinSet<()>) -> bool {
-        if !self.admit(&grant.lease_id) {
+        let Some(ctx) = self.claim(&grant.lease_id, false) else {
             return false;
+        };
+        tasks.spawn(handle_lease(ctx, grant));
+        true
+    }
+
+    /// Claim a slot for a work unit and run it. Returns whether it started.
+    fn start_unit(&self, grant: crate::units::UnitGrant, tasks: &mut JoinSet<()>) -> bool {
+        let Some(ctx) = self.claim(&grant.unit_id, true) else {
+            return false;
+        };
+        tasks.spawn(units::handle_unit(ctx, grant));
+        true
+    }
+
+    /// Admit `id` and give it a slot, a cancel switch and the shared job
+    /// machinery. `None` when it may not start now.
+    fn claim(&self, id: &str, unit: bool) -> Option<LeaseContext> {
+        if !self.admit(id, unit) {
+            return None;
         }
         let held = HeldGuard {
             held: Arc::clone(&self.held),
             preempts: Arc::clone(&self.preempts),
-            id: grant.lease_id.clone(),
+            units: unit.then(|| Arc::clone(&self.units)),
+            id: id.to_owned(),
         };
         let (preempt_tx, preempt) = tokio::sync::watch::channel(false);
         if let Ok(mut preempts) = self.preempts.lock() {
-            preempts.insert(grant.lease_id.clone(), preempt_tx);
+            preempts.insert(id.to_owned(), preempt_tx);
         }
-        let Some(slot) = self.slots.acquire(&grant.lease_id) else {
-            tracing::warn!(
-                "no free slot for lease {}; leaving it unstarted",
-                grant.lease_id
-            );
-            return false;
+        let Some(slot) = self.slots.acquire(id) else {
+            tracing::warn!("no free slot for {id}; leaving it unstarted");
+            return None;
         };
-        let ctx = LeaseContext {
+        Some(LeaseContext {
             cfg: Arc::clone(&self.cfg),
             host: Arc::clone(&self.host),
             cpu_meter: Arc::clone(&self.cpu_meter),
@@ -527,9 +602,7 @@ impl Drone {
             reclaimer: self.reclaimer.clone(),
             slot,
             held,
-        };
-        tasks.spawn(handle_lease(ctx, grant));
-        true
+        })
     }
 
     /// Probe container networking end to end now and every
@@ -649,9 +722,10 @@ impl Drone {
         }
     }
 
-    /// Whether a granted lease may start: well-formed, not already running,
-    /// and within the local lease cap. Claims the id if so.
-    fn admit(&self, lease_id: &str) -> bool {
+    /// Whether a granted lease or unit may start: well-formed, not already
+    /// running, and within the slots and local lease cap, which leases and
+    /// units share. Claims the id if so.
+    fn admit(&self, lease_id: &str, unit: bool) -> bool {
         if !valid_lease_id(lease_id) {
             tracing::warn!("ignoring lease with unsafe id");
             return false;
@@ -676,6 +750,13 @@ impl Drone {
         {
             tracing::warn!("at local lease cap; leaving lease {lease_id} unstarted");
             return false;
+        }
+        // Lock order `held` then `units` (see `lease_ids`).
+        if unit {
+            let Ok(mut units) = self.units.lock() else {
+                return false;
+            };
+            units.insert(lease_id.to_owned());
         }
         held.insert(lease_id.to_owned());
         true
@@ -814,6 +895,44 @@ async fn sample_host(ctx: &LeaseContext) -> Option<crate::hostdiag::HostSample> 
     .ok()
 }
 
+/// Remove what the lease or unit `id` left: its docker resources, its slot
+/// directory and, when it is the last job running, the job user's
+/// credentials.
+async fn cleanup_slot(ctx: &LeaseContext, id: &str) {
+    let (work_root, owned_id, slot_name, docker, exec, fs_ops) = (
+        ctx.cfg.work_root.clone(),
+        id.to_owned(),
+        slot_name(ctx.slot.index()),
+        ctx.cfg.docker_bin.clone(),
+        Arc::clone(&ctx.exec),
+        Arc::clone(&ctx.fs_ops),
+    );
+    // The job user's home is shared by every lease, so it is wiped only
+    // when this is the last lease running.
+    let last_lease = ctx.held.held.lock().is_ok_and(|h| h.len() <= 1);
+    let wiper = ctx.credwipe.clone().filter(|_| last_lease);
+    let cleaned = tokio::task::spawn_blocking(move || {
+        let docker = cleanup_docker(exec.as_ref(), &docker, Scope::Lease(&owned_id));
+        let dir = remove_lease_dir(fs_ops.as_ref(), &work_root, &slot_name);
+        if let Some(w) = wiper {
+            w.wipe_job_home();
+        }
+        (dir, docker)
+    })
+    .await;
+    match cleaned {
+        Ok((dir, docker)) => {
+            if let Err(e) = dir {
+                tracing::warn!("lease {id} work dir cleanup failed: {e}");
+            }
+            for err in docker.errors {
+                tracing::warn!("lease {id} docker cleanup: {err}");
+            }
+        }
+        Err(e) => tracing::warn!("lease {id} cleanup task failed: {e}"),
+    }
+}
+
 /// Run one lease, clean up unconditionally, report the result.
 async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     // Held for the whole lease: cache garbage collection waits for it.
@@ -861,38 +980,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     });
 
     // Runs whether the job passed, failed, timed out, was aborted or never started.
-    let (work_root, id, slot_name, docker, exec, fs_ops) = (
-        ctx.cfg.work_root.clone(),
-        grant.lease_id.clone(),
-        slot_name(slot),
-        ctx.cfg.docker_bin.clone(),
-        Arc::clone(&ctx.exec),
-        Arc::clone(&ctx.fs_ops),
-    );
-    // The job user's home is shared by every lease, so it is wiped only
-    // when this is the last lease running.
-    let last_lease = ctx.held.held.lock().is_ok_and(|h| h.len() <= 1);
-    let wiper = ctx.credwipe.clone().filter(|_| last_lease);
-    let cleaned = tokio::task::spawn_blocking(move || {
-        let docker = cleanup_docker(exec.as_ref(), &docker, Scope::Lease(&id));
-        let dir = remove_lease_dir(fs_ops.as_ref(), &work_root, &slot_name);
-        if let Some(w) = wiper {
-            w.wipe_job_home();
-        }
-        (dir, docker)
-    })
-    .await;
-    match cleaned {
-        Ok((dir, docker)) => {
-            if let Err(e) = dir {
-                tracing::warn!("lease {} work dir cleanup failed: {e}", grant.lease_id);
-            }
-            for err in docker.errors {
-                tracing::warn!("lease {} docker cleanup: {err}", grant.lease_id);
-            }
-        }
-        Err(e) => tracing::warn!("lease {} cleanup task failed: {e}", grant.lease_id),
-    }
+    cleanup_slot(&ctx, &grant.lease_id).await;
 
     // Between leases: let the caches re-measure and, if nothing else is
     // running, evict. Skipped by `maintain` itself while another lease holds

@@ -527,26 +527,43 @@ Client API (bearer: client token):
 
 Drone protocol (bearer: drone token):
 
+0. Say `runs_units: true` in every heartbeat request. The queen places units
+   only on drones that do, so older drone builds (which never send it) are
+   never given a unit during a rollout; `/status` shows it per drone.
 1. The heartbeat response carries `units: [{unit_id, repo, tree_sha, argv, class,
-   toolchain, timeout_secs, attempt}]` for units placed on this drone, and
-   `cancel_units: [id]`. Placed units are resent until acknowledged.
+   toolchain, timeout_secs, attempt, bundle_bytes}]` for units placed on this
+   drone, and `cancel_units: [id]`. Placed units are resent until acknowledged.
 2. Acknowledge by listing the unit id in `active_units` in the heartbeat request;
-   that starts the unit. Keep listing it while it runs. A running unit the drone
-   stops listing for 60 seconds is treated as lost and re-queued (up to
-   `units.max_attempts`).
-3. Run it: get `tree_sha` into the local git mirror (if `git cat-file -e
+   that starts the unit. Keep listing it while it runs and until its result is
+   delivered. A running unit the drone stops listing for 60 seconds is treated
+   as lost and re-queued (up to `units.max_attempts`).
+3. Run it: get `tree_sha` into the host git mirror of the unit's repository
+   (`<cache>/git/<owner>/<name>.git`; a repository that is not a configured
+   mirror gets one on first use, from the same remote base and with the queen's
+   mirror credential, and the timer keeps it current). If `git cat-file -e
    <tree>` fails and the grant has `bundle_bytes > 0`, fetch
    `GET /v1/units/{id}/bundle` and `git bundle unbundle` it into the mirror; its
-   prerequisite is a commit the mirror already has, and if that fails the unit
-   fails and the client runs locally), check the tree out into a slot directory
-   (`git clean` it first), run `argv` as the unprivileged job user with the same
-   isolation rules as CI jobs, and enforce `timeout_secs`.
+   prerequisite is a commit the mirror already has, so a failure refreshes the
+   mirror and tries once more. Check the tree out into an emptied slot at
+   `<slot>/_work/<name>/<name>`, where a CI job's checkout is, so path-keyed
+   compile caches are shared with CI. Run `argv` there as the unprivileged job
+   user with the same isolation rules as CI jobs (own process group, private
+   `HOME`, the lease's cache environment, `CARGO_TARGET_DIR` at the slot's
+   retained target `$BORG_CACHE_ROOT/<name>-ci/slots/<key>/cargo-target/<ISO
+   week>`), and enforce `timeout_secs` (capped by the drone's `max_job_secs`).
+   A unit counts against the drone's slots and `max_leases` like a lease.
 4. Stream output with `POST /v1/units/{id}/log?offset=N` (raw bytes; `N` is the
    byte offset of the first byte of the body). Repeating a chunk is harmless;
    `409` means the queen holds fewer than `N` bytes, so resend from its length
    (the `200` body of any append is the queen's length).
-5. Finish with `POST /v1/units/{id}/result` `{exit_code, duration_secs}`.
-   Idempotent. Stop and report on a `cancel_units` entry.
+5. Finish with `POST /v1/units/{id}/result` `{exit_code, duration_secs}` when the
+   command ran to completion; the exit code is the command's verdict.
+   Idempotent. When the drone did not run it to completion (it could not get
+   the tree, the unit timed out, or a `cancel_units` entry stopped it), send
+   `{exit_code, duration_secs, failure: "<why>"}` instead: the unit fails with
+   that reason (a cancelled unit keeps its canceller's reason) and the client
+   falls back. A drone that stops a unit because it is shutting down sends
+   nothing; the queen re-queues it.
 
 Units are placed by the runner allocator (class capacity, owner caps, bids,
 profiles, quarantine and probation) on drones whose `<os>-<arch>` matches, using

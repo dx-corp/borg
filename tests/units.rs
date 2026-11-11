@@ -1701,3 +1701,106 @@ async fn disabled_units_show_only_that_they_are_off() {
     assert_eq!(s["units"]["recent"], json!([]));
     assert!(!h.metrics().await.contains("borg_units{"));
 }
+
+#[tokio::test]
+async fn a_drone_reported_failure_fails_the_unit_and_a_cancelled_unit_keeps_its_reason() {
+    let r = Rig::new(json!({})).await;
+    let d = r.drone("d1").await;
+    let fail = |id: String, why: String| {
+        let r = &r;
+        let d = d.clone();
+        async move {
+            r.h.http
+                .post(format!("{}/v1/units/{id}/result", r.h.url))
+                .bearer_auth(&d)
+                .json(&json!({"exit_code": -1, "duration_secs": 4, "failure": why}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    let id = |v: &Value| v["unit_id"].as_str().unwrap().to_owned();
+
+    // The drone could not run it: failed with the drone's reason, without an
+    // exit code or a receipt, with control characters removed and capped.
+    let (_, plain) = r.submit(&r.unit(json!({}))).await;
+    let plain = id(&plain);
+    let (_, superseded) = r
+        .submit(&r.unit(json!({"argv": ["cargo", "test"], "supersede_key": "pr-1"})))
+        .await;
+    let superseded = id(&superseded);
+    r.tick(1).await;
+    r.beat(&d, &[]).await;
+    r.beat(&d, &[&plain, &superseded]).await;
+    assert_eq!(state_of(&r, &plain).await, "running");
+    assert_eq!(state_of(&r, &superseded).await, "running");
+    let long = format!("timed out\nafter 5s{}", "x".repeat(1000));
+    assert_eq!(fail(plain.clone(), long).await, 204);
+    let u = r.h.queen.store().unit(&plain).await.unwrap().unwrap();
+    assert_eq!(u.state.as_str(), "failed");
+    assert_eq!(u.exit_code, None);
+    assert!(u.receipt().is_none());
+    let why = u.failure.unwrap();
+    assert!(
+        why.starts_with("timed outafter 5s") && why.chars().count() == 300,
+        "{why}"
+    );
+
+    // Superseded while running: the drone stops it and reports `cancelled`,
+    // but the unit keeps the reason its canceller gave.
+    let (_, newer) = r
+        .submit(&r.unit(
+            json!({"argv": ["cargo", "test"], "tree_sha": "b".repeat(40), "supersede_key": "pr-1"}),
+        ))
+        .await;
+    assert_eq!(newer["superseded"], json!([superseded]));
+    assert_eq!(fail(superseded.clone(), "cancelled".into()).await, 204);
+    let u = r.h.queen.store().unit(&superseded).await.unwrap().unwrap();
+    assert_eq!(
+        (u.state.as_str(), u.failure.unwrap()),
+        ("failed", format!("superseded by {}", id(&newer)))
+    );
+
+    // Only the unit's own drone may end it.
+    let (_, other) = r.submit(&r.unit(json!({"argv": ["cargo", "doc"]}))).await;
+    let d2 = r.drone("d2").await;
+    let r2 =
+        r.h.http
+            .post(format!("{}/v1/units/{}/result", r.h.url, id(&other)))
+            .bearer_auth(&d2)
+            .json(&json!({"exit_code": -1, "duration_secs": 1, "failure": "nope"}))
+            .send()
+            .await
+            .unwrap();
+    assert_eq!(r2.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn units_go_only_to_drones_that_say_they_run_them() {
+    let r = Rig::new(json!({})).await;
+    // An older drone build never sends `runs_units`.
+    let old = r.h.enroll("d-old").await;
+    r.h.heartbeat_with(&old, json!({"runs_units": false})).await;
+    let (_, sub) = r.submit(&r.unit(json!({}))).await;
+    let id = sub["unit_id"].as_str().unwrap().to_owned();
+    r.tick(5).await;
+    let hb = r.h.heartbeat_with(&old, json!({"runs_units": false})).await;
+    assert!(hb["units"].as_array().unwrap().is_empty(), "{hb}");
+    assert_eq!(state_of(&r, &id).await, "queued");
+    let status = r.h.status().await;
+    let d = status["drones"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "d-old")
+        .unwrap();
+    assert_eq!(d["runs_units"], false);
+
+    // A drone that runs units gets it.
+    let new = r.drone("d-new").await;
+    r.tick(10).await;
+    let hb = r.beat(&new, &[]).await;
+    assert_eq!(hb["units"][0]["unit_id"], id.as_str(), "{hb}");
+}
