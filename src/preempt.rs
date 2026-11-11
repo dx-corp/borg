@@ -32,7 +32,7 @@ pub struct PreemptSettings {
     /// Starving demand of these scopes may preempt; other scopes only wait.
     /// Default: every scope.
     #[serde(default = "all_scopes")]
-    pub for_scopes: Vec<Scope>,
+    pub(crate) for_scopes: Vec<Scope>,
 }
 
 fn all_scopes() -> Vec<Scope> {

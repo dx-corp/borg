@@ -187,7 +187,7 @@ fn static_runner_roots(runners: &[crate::drone::credwipe::StaticRunner]) -> Vec<
 /// So the slot a lease holds is `<cache_root>/<namespace>/slots/<this key>`,
 /// and a reused lease slot keeps its cache slot. Checked against
 /// borg-deploy-2's twelve slot directories on 2026-11-09.
-pub(crate) fn cache_slot_key(work_root: &Path, index: usize) -> String {
+fn cache_slot_key(work_root: &Path, index: usize) -> String {
     let tool_cache = format!("{}/_work/_tool", slot_dir(work_root, index).display());
     hex::encode(Sha256::digest(tool_cache.as_bytes()))
 }

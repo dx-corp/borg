@@ -55,7 +55,7 @@ impl Slots {
     }
 
     /// `(slot, lease id)` for every held slot, or `None` when ownership is unavailable.
-    pub fn try_assignments(&self) -> Option<Vec<(usize, String)>> {
+    pub(crate) fn try_assignments(&self) -> Option<Vec<(usize, String)>> {
         self.held
             .lock()
             .ok()

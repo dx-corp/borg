@@ -184,11 +184,11 @@ pub struct ReclaimSettings {
     /// floor). Set it to the floor of the build tool the box runs, e.g.
     /// cargo-slot's `CARGO_MIN_FREE_GB` (25) on dev-desktop. Reclaim keeps
     /// free space at or above twice the effective floor ([`Self::floor_bytes`]).
-    pub free_floor_gib: u64,
+    pub(crate) free_floor_gib: u64,
     /// Cap on the build-cache slots of one cache (`<cache_root>/<namespace>`)
     /// together, in GiB; above it the least recently used slots go in any
     /// mode. 0: no cap, slots go only by pressure and hygiene.
-    pub cache_slot_cap_gib: u64,
+    pub(crate) cache_slot_cap_gib: u64,
     /// With default roots, also reclaim what the static GitHub runners on
     /// this host leave: their `_work` checkouts, tool caches and user caches
     /// while the runner has no job, their old `_diag` logs, and regenerable
@@ -197,10 +197,10 @@ pub struct ReclaimSettings {
     /// A static runner's `_diag` log files older than this go, in any mode
     /// (0: never). The runner writes a new log per job and never reads an
     /// old one.
-    pub runner_diag_max_age_secs: u64,
+    pub(crate) runner_diag_max_age_secs: u64,
     /// A regenerable CI temp entry in `/tmp` untouched this long goes below
     /// high water (0: never by age alone; pressure ages still apply).
-    pub tmp_max_age_secs: u64,
+    pub(crate) tmp_max_age_secs: u64,
     /// The Docker tier.
     pub(crate) docker: DockerReclaimSettings,
 }
@@ -318,7 +318,7 @@ impl ReclaimSettings {
     /// The effective free-space floor: the larger of this box's own
     /// (`free_floor_gib`) and `admission_floor_bytes` (the queen's; 0 when
     /// unknown). Reclaim's target is twice this.
-    pub fn floor_bytes(&self, admission_floor_bytes: u64) -> u64 {
+    fn floor_bytes(&self, admission_floor_bytes: u64) -> u64 {
         admission_floor_bytes.max(self.free_floor_gib.saturating_mul(1 << 30))
     }
 
@@ -383,7 +383,7 @@ pub struct Candidate {
     pub within: Option<PathBuf>,
     /// For a build-cache slot, the cache it belongs to
     /// (`<cache_root>/<namespace>`); `cache_slot_cap_gib` applies per cache.
-    pub cache: Option<PathBuf>,
+    pub(crate) cache: Option<PathBuf>,
 }
 
 /// What the safety probe found. Anything the probe could not determine must be
@@ -511,14 +511,14 @@ pub struct Cycle {
     /// Projected after the deletions (exact when not a dry run).
     pub usage_pct_after: u8,
     /// Free bytes the cycle saw before deleting anything.
-    pub free_bytes_before: u64,
+    pub(crate) free_bytes_before: u64,
     /// The effective free-space floor it worked to ([`ReclaimSettings::floor_bytes`]).
-    pub floor_bytes: u64,
+    pub(crate) floor_bytes: u64,
     pub records: Vec<DeletionRecord>,
     /// Candidates kept, by reason.
     pub kept: BTreeMap<String, u32>,
     /// Deletions (or would-be deletions in a dry run), by kind.
-    pub evicted: BTreeMap<String, u32>,
+    pub(crate) evicted: BTreeMap<String, u32>,
     pub reclaimed_bytes: u64,
     pub would_reclaim_bytes: u64,
     pub errors: u32,
@@ -540,18 +540,18 @@ pub struct ReclaimStats {
     pub usage_pct: Option<u8>,
     /// Free bytes the last run saw (the tightest filesystem it reclaims).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub free_bytes: Option<u64>,
+    pub(crate) free_bytes: Option<u64>,
     /// The effective free-space floor of the last run; reclaim keeps free
     /// space at or above twice this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub floor_bytes: Option<u64>,
+    pub(crate) floor_bytes: Option<u64>,
     pub last_run_mode: Option<Mode>,
     /// Candidates the last run kept, by reason.
     pub kept: BTreeMap<String, u32>,
     /// What the last run deleted (or would have, dry run), by kind; the
     /// build-cache slots it evicted show as `cache_slot`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub evicted: BTreeMap<String, u32>,
+    pub(crate) evicted: BTreeMap<String, u32>,
     /// Audit entries created since the previous heartbeat; the queen stores
     /// them and ignores any it already has (by `seq`). Only
     /// `Kind::is_wire_v1` kinds.
