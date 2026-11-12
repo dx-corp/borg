@@ -22,6 +22,7 @@ pub mod invariants;
 pub mod jobuser;
 pub mod pins;
 pub mod reclaim;
+pub(crate) mod registry_fault;
 pub mod runner;
 pub mod selfupdate;
 pub mod slots;
