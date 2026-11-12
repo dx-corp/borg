@@ -53,6 +53,7 @@ use crate::drone::caches::git::valid_repo;
 use crate::drone::cleanup::docker_prefix;
 use crate::drone::client::{LogAppend, QueenClient};
 use crate::drone::exec::Exec;
+use crate::drone::registry_fault;
 use crate::drone::runner::{LEASE_HOME, Limits, seed_lease_home, spawn_retrying, supervise};
 use crate::drone::slots::slot_dir;
 use crate::units::UnitGrant;
@@ -206,6 +207,100 @@ async fn run(ctx: &LeaseContext, grant: &UnitGrant, output: &Arc<Mutex<Output>>)
     };
 
     let env = unit_env(ctx, grant, &slot_dir).await;
+    let cargo_home = crate::drone::caches::kinds::Kind::Cargo.dir(&ctx.cfg.cache_root);
+    // A registry fault is the drone's, not the command's: repair it and run
+    // again, at most twice (evict the entries, then a private CARGO_HOME).
+    let mut env = env;
+    for attempt in 0..3 {
+        let mark = output_len(output);
+        let ended = execute(ctx, grant, &checkout, &env, output, started).await;
+        let Ended::Exited { exit_code, .. } = ended else {
+            return ended;
+        };
+        if exit_code == 0 {
+            return ended;
+        }
+        let found = registry_fault::faults(&output_since(output, mark));
+        if found.is_empty() {
+            return ended;
+        }
+        let (ours, foreign) = registry_fault::split(&found, &cargo_home);
+        if let Some(f) = foreign.first() {
+            return failed(format!(
+                "cargo could not use registry entry {f}, outside the drone's cargo cache (a host wrapper pinning CARGO_HOME?)"
+            ));
+        }
+        let shown = ours
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        match attempt {
+            0 => {
+                let (fs_ops, home, owned): (_, _, Vec<registry_fault::Fault>) = (
+                    Arc::clone(&ctx.fs_ops),
+                    cargo_home.clone(),
+                    ours.iter().map(|f| (*f).clone()).collect(),
+                );
+                let removed = tokio::task::spawn_blocking(move || {
+                    let refs: Vec<&registry_fault::Fault> = owned.iter().collect();
+                    registry_fault::evict(fs_ops.as_ref(), &home, &refs).len()
+                })
+                .await
+                .unwrap_or(0);
+                tracing::warn!(
+                    "unit {}: registry fault on {shown}; evicted {removed} entries",
+                    grant.unit_id
+                );
+                output_note(
+                    output,
+                    &format!(
+                        "[borg] cargo could not read {shown} from the drone's registry cache; evicted it, running again"
+                    ),
+                );
+            }
+            1 => {
+                // Still unreadable: leave the shared cache alone for this unit.
+                let private = slot_dir.join("cargo-home");
+                env.retain(|(k, _)| k != "CARGO_HOME");
+                env.push((
+                    "CARGO_HOME".to_owned(),
+                    private.to_string_lossy().into_owned(),
+                ));
+                tracing::warn!(
+                    "unit {}: registry fault on {shown} again; retrying with a private CARGO_HOME",
+                    grant.unit_id
+                );
+                output_note(
+                    output,
+                    &format!(
+                        "[borg] {shown} is still unreadable in the shared cargo cache; running again with a private CARGO_HOME"
+                    ),
+                );
+            }
+            _ => {
+                return failed(format!(
+                    "cargo could not read registry entry {shown} even with a private CARGO_HOME"
+                ));
+            }
+        }
+    }
+    failed("registry repair attempts exhausted".to_owned())
+}
+
+/// Run the unit's command once in `checkout` and say how it ended.
+async fn execute(
+    ctx: &LeaseContext,
+    grant: &UnitGrant,
+    checkout: &Path,
+    env: &[(String, String)],
+    output: &Arc<Mutex<Output>>,
+    started: Instant,
+) -> Ended {
+    let failed = |why: String| Ended::Failed {
+        why,
+        duration_secs: started.elapsed().as_secs(),
+    };
     let Some((program, args)) = command_line(ctx, &grant.argv) else {
         return failed("empty argv".to_owned());
     };
@@ -216,7 +311,7 @@ async fn run(ctx: &LeaseContext, grant: &UnitGrant, output: &Arc<Mutex<Output>>)
     let mut command = Command::new(&program);
     command
         .args(&args)
-        .current_dir(&checkout)
+        .current_dir(checkout)
         .envs(env.iter().map(|(k, v)| (k, v)))
         // Never hand the drone's own credential to job code.
         .env_remove("BORG_DRONE_TOKEN")
@@ -613,6 +708,19 @@ fn output_append(output: &Mutex<Output>, data: &[u8]) {
         return;
     }
     o.bytes.extend_from_slice(data);
+}
+
+/// Bytes of output so far.
+fn output_len(output: &Mutex<Output>) -> usize {
+    output.lock().map_or(0, |o| o.bytes.len())
+}
+
+/// Output from byte `mark` on, as text.
+fn output_since(output: &Mutex<Output>, mark: usize) -> String {
+    output.lock().map_or_else(
+        |_| String::new(),
+        |o| String::from_utf8_lossy(o.bytes.get(mark..).unwrap_or_default()).into_owned(),
+    )
 }
 
 /// A line of the drone's own, on a line of its own.

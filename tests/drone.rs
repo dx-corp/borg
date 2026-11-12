@@ -1576,3 +1576,89 @@ async fn units_share_the_local_lease_cap_with_ci_leases() {
     assert_eq!(u.unit(&id).await.exit_code, Some(0));
     assert!(!u.rig.path("out/lease-ran").exists());
 }
+
+#[tokio::test]
+async fn an_unreadable_crate_in_the_drones_registry_cache_is_evicted_and_the_unit_runs_again() {
+    let u = UnitRig::new().await;
+    let drone = u.drone(json!({}));
+    let mut tasks = JoinSet::new();
+    let bad = u.rig.path("cache/cargo/registry/cache/idx/bad-1.0.0.crate");
+    fs::create_dir_all(bad.parent().unwrap()).unwrap();
+    fs::write(&bad, "truncated").unwrap();
+    fs::create_dir_all(u.rig.path("cache/cargo/registry/src/idx/bad-1.0.0")).unwrap();
+    // Cargo's own error form, as long as the entry is there.
+    let script = "c=\"$CARGO_HOME/registry/cache/idx/bad-1.0.0.crate\"; \
+        if [ -f \"$c\" ]; then printf 'error: failed to open `%s`\\n\\nCaused by:\\n  unexpected end of file\\n' \"$c\" >&2; exit 101; fi; echo built";
+    let id = u.start(&drone, &mut tasks, script, json!({})).await;
+    drain(&mut tasks).await;
+    let unit = u.unit(&id).await;
+    assert_eq!(
+        (unit.state, unit.exit_code, unit.failure),
+        (borg::units::UnitState::Done, Some(0), None)
+    );
+    let log = u.log(&id).await;
+    assert!(
+        log.contains("evicted it, running again") && log.ends_with("built\n"),
+        "{log}"
+    );
+    assert!(!bad.exists());
+    assert!(
+        !u.rig
+            .path("cache/cargo/registry/src/idx/bad-1.0.0")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn a_registry_fault_outside_the_drones_cache_fails_the_unit_instead_of_a_false_red() {
+    let u = UnitRig::new().await;
+    let drone = u.drone(json!({}));
+    let mut tasks = JoinSet::new();
+    let script = "printf 'error: failed to open `/opt/toolchain/cargo/registry/cache/idx/bit-set-0.8.0.crate`\\n\\nCaused by:\\n  Permission denied (os error 13)\\n' >&2; exit 101";
+    let id = u.start(&drone, &mut tasks, script, json!({})).await;
+    drain(&mut tasks).await;
+    let unit = u.unit(&id).await;
+    assert_eq!(unit.state, borg::units::UnitState::Failed);
+    assert_eq!(
+        unit.exit_code, None,
+        "no exit code verdict for an infrastructure fault"
+    );
+    let why = unit.failure.unwrap();
+    assert!(why.contains("outside the drone's cargo cache"), "{why}");
+}
+
+#[tokio::test]
+async fn a_fault_the_eviction_does_not_cure_is_run_once_more_with_a_private_cargo_home() {
+    let u = UnitRig::new().await;
+    let drone = u.drone(json!({}));
+    let mut tasks = JoinSet::new();
+    let script = "case \"$CARGO_HOME\" in */cargo-home) echo built; exit 0;; esac; \
+        printf 'error: failed to verify the checksum of `stuck v1.0.0 (registry `crates-io`)`\\n' >&2; exit 101";
+    let id = u.start(&drone, &mut tasks, script, json!({})).await;
+    drain(&mut tasks).await;
+    let unit = u.unit(&id).await;
+    assert_eq!(
+        (unit.state, unit.exit_code),
+        (borg::units::UnitState::Done, Some(0))
+    );
+    let log = u.log(&id).await;
+    assert!(
+        log.contains("private CARGO_HOME") && log.ends_with("built\n"),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn a_real_build_failure_is_still_the_commands_verdict() {
+    let u = UnitRig::new().await;
+    let drone = u.drone(json!({}));
+    let mut tasks = JoinSet::new();
+    let script = "echo 'error[E0308]: mismatched types' >&2; echo 'error: could not compile `x`' >&2; exit 101";
+    let id = u.start(&drone, &mut tasks, script, json!({})).await;
+    drain(&mut tasks).await;
+    let unit = u.unit(&id).await;
+    assert_eq!(
+        (unit.state, unit.exit_code, unit.failure),
+        (borg::units::UnitState::Done, Some(101), None)
+    );
+}
