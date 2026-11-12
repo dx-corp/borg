@@ -297,6 +297,30 @@ impl Janitor {
                 continue;
             }
             report.promotion_considered += 1;
+            // Successors newest first: a successful one serves both rules, a
+            // started one only the pending rule.
+            let mut successors: Vec<(&Run, &Intent, bool)> = parsed_succeeded
+                .iter()
+                .map(|(r, i)| (*r, i, true))
+                .chain(parsed_started.iter().map(|(r, i)| (*r, i, false)))
+                .filter(|(r, i, _)| r.id > run.id && covers(i, &intent))
+                .collect();
+            successors.sort_by_key(|(r, _, _)| std::cmp::Reverse(r.id));
+            let Some(source) = p.source_repos.get(&intent.event) else {
+                if !successors.is_empty() {
+                    report.promotion_unprovable += 1;
+                }
+                continue;
+            };
+            // Only metadata-based keep decisions precede the live job read.
+            // A pending run may already have reached apply; the job guards
+            // below still decide whether it can yield to a started successor.
+            if !successors
+                .iter()
+                .any(|(_, _, success)| *success && stale || pending)
+            {
+                continue;
+            }
             let jobs = match self.promotion_jobs(repo, run.id).await {
                 Ok(jobs) => jobs,
                 Err(e) => {
@@ -316,22 +340,7 @@ impl Janitor {
             let entered_apply = jobs.iter().any(|j| {
                 j.name == p.apply_job && (executed(j) || ACTIVE.contains(&j.status.as_str()))
             });
-            // Successors newest first: a successful one serves both rules, a
-            // started one only the pending rule.
-            let mut successors: Vec<(&Run, &Intent, bool)> = parsed_succeeded
-                .iter()
-                .map(|(r, i)| (*r, i, true))
-                .chain(parsed_started.iter().map(|(r, i)| (*r, i, false)))
-                .filter(|(r, i, _)| r.id > run.id && covers(i, &intent))
-                .collect();
-            successors.sort_by_key(|(r, _, _)| std::cmp::Reverse(r.id));
             let superseded_rule = pending && !entered_apply;
-            let Some(source) = p.source_repos.get(&intent.event) else {
-                if !successors.is_empty() {
-                    report.promotion_unprovable += 1;
-                }
-                continue;
-            };
             let mut chosen = None;
             for (r, i, success) in successors {
                 if !(success && stale || superseded_rule) {
