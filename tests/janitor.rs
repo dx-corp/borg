@@ -680,6 +680,62 @@ fn ahead(h: &Harness, base: char, head: char) {
 }
 
 #[tokio::test]
+async fn metadata_ineligible_promotions_read_no_job_pages() {
+    for scenario in ["unmapped", "uncovered", "queued_successor", "stale_started"] {
+        let extra = if scenario == "unmapped" {
+            json!({"source_repos": {}})
+        } else {
+            json!({})
+        };
+        let h = Harness::start(promotions(false, extra)).await;
+        h.add_promotion_run(promo(
+            1,
+            if scenario == "stale_started" {
+                "in_progress"
+            } else {
+                "queued"
+            },
+            None,
+            'a',
+            "memory",
+            7 * 24 * 3600,
+        ));
+        h.add_promotion_run(promo(
+            2,
+            if scenario == "queued_successor" {
+                "queued"
+            } else {
+                "in_progress"
+            },
+            None,
+            'b',
+            if scenario == "uncovered" {
+                "grid"
+            } else {
+                "memory"
+            },
+            60,
+        ));
+        let r = h.janitor_pass().await;
+        assert_eq!(
+            (r.promotion_cancelled, r.errors),
+            (0, 0),
+            "{scenario}: {r:?}"
+        );
+        assert_eq!(r.promotion_unprovable, u32::from(scenario == "unmapped"));
+        let st = h.state();
+        for id in [1, 2] {
+            assert!(
+                !st.http_requests
+                    .contains_key(&format!("/repos/o/k8s/actions/runs/{id}/jobs")),
+                "{scenario}: job inventory for metadata-ineligible run {id}"
+            );
+        }
+        assert!(st.cancelled.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn a_pending_promotion_yields_to_a_started_newer_run_of_its_services() {
     let h = Harness::start(promotions(false, json!({}))).await;
     h.add_promotion_run(promo(1, "queued", None, 'a', "memory", 3600));
@@ -744,6 +800,14 @@ async fn two_receipts_before_apply_keep_only_the_newer() {
         "{r:?}"
     );
     assert_eq!(h.state().cancelled, [1]);
+    assert_eq!(
+        h.state()
+            .http_requests
+            .get("/repos/o/k8s/actions/runs/1/jobs")
+            .copied(),
+        Some(1),
+        "actionable metadata still requires the live mutation/apply job guards",
+    );
 }
 
 #[tokio::test]
