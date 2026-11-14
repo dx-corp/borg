@@ -1991,3 +1991,50 @@ fn shared_node_memory_bounds_idle_slots() {
     // Burst demand and the starvation alarm read this figure.
     assert_eq!(heavy.idle_slots, 1);
 }
+
+/// 2026-11-14: medium-deploy jobs queued for 8 h while platform-api publishes
+/// kept heavy-deploy demand queued. Room that frees on a deploy drone goes to
+/// the aged class whose oldest job waited longest, so the medium job gets it;
+/// heavy keeps first claim when its job is the older one
+/// (docs/formal/deploy_placement).
+#[test]
+fn the_longest_waiting_aged_deploy_class_takes_the_room_that_frees() {
+    let deploy = |id: &str| DroneState {
+        trust: Trust::Deploy,
+        ..host(id)
+    };
+    let setup = |heavy_age: u64, medium_age: u64| {
+        let mut i = input(
+            &[
+                (Class::Heavy, Scope::Deploy, 20),
+                (Class::Medium, Scope::Deploy, 6),
+            ],
+            vec![deploy("deploy-1"), deploy("deploy-2")],
+        );
+        // deploy-1 still builds; deploy-2's heavy lease just ended.
+        i.leases = vec![lease(
+            "deploy-1",
+            Class::Heavy,
+            Scope::Deploy,
+            LeaseState::Running,
+        )];
+        aged(&mut i, Class::Heavy, Scope::Deploy, heavy_age);
+        aged(&mut i, Class::Medium, Scope::Deploy, medium_age);
+        i
+    };
+
+    let starving_medium = setup(7_200, 29_820);
+    let a = allocate(&starving_medium);
+    assert!(count(&a, Class::Medium, Scope::Deploy) >= 1, "{a:?}");
+    assert_eq!(count(&a, Class::Heavy, Scope::Deploy), 0, "{a:?}");
+    assert_within_budget(&starving_medium, &a);
+
+    let older_heavy = setup(29_820, 7_200);
+    let a = allocate(&older_heavy);
+    assert_eq!(count(&a, Class::Heavy, Scope::Deploy), 1, "{a:?}");
+    assert_eq!(count(&a, Class::Medium, Scope::Deploy), 0, "{a:?}");
+
+    // Equal ages keep larger first.
+    let tie = setup(7_200, 7_200);
+    assert_eq!(count(&allocate(&tie), Class::Heavy, Scope::Deploy), 1);
+}
