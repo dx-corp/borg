@@ -1367,12 +1367,37 @@ fn allocate_inner(
         .map(|r| (r.drone_id.clone(), (r.class, r.scope)))
         .collect();
 
-    // Deploy keeps first claim. On shared hosts, reserve larger aged work
-    // across Main and PR before a smaller grant or PR turn can refill its
-    // draining host. Main stays first within a class, apart from its PR turn.
-    let placement_order = Class::ALL
+    // Deploy keeps first claim. Its aged classes go oldest queued job first,
+    // larger first on a tie: with larger first only, a heavy deploy queue that
+    // never empties takes every slot that frees before a medium deploy job is
+    // looked at, and the medium reservation is made again each pass after
+    // heavy has refilled the room (2026-11-14: medium-deploy queued 8 h behind
+    // platform-api publishes; formal: deploy_placement/Placement.MediumPlaced).
+    // On shared hosts, reserve larger aged work across Main and PR before a
+    // smaller grant or PR turn can refill its draining host. Main stays first
+    // within a class, apart from its PR turn.
+    // formal: begin deploy_placement/Placement.MediumPlaced
+    let oldest = |class, scope| {
+        input
+            .queue_ages
+            .iter()
+            .filter(|a| a.class == class && a.scope == scope)
+            .map(|a| a.oldest_age_secs)
+            .max()
+            .unwrap_or(0)
+    };
+    let mut deploy_order: Vec<Class> = Class::ALL.into_iter().rev().collect();
+    // Stable: equal ages (and every key that is not aged) keep larger first.
+    deploy_order.sort_by_key(|&class| {
+        std::cmp::Reverse(if aged(class, Scope::Deploy) {
+            oldest(class, Scope::Deploy)
+        } else {
+            0
+        })
+    });
+    // formal: end deploy_placement/Placement.MediumPlaced
+    let placement_order = deploy_order
         .into_iter()
-        .rev()
         .map(|class| (Scope::Deploy, class))
         .chain(
             Class::ALL
