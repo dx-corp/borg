@@ -98,17 +98,19 @@ impl Queen {
     }
 
     /// What fresh `facts` say about `drone`'s memory; see [`LiveFacts`].
+    /// `budget_mib` is the drone's memory budget (net of reserve and caps).
     pub(super) fn live_facts(
         &self,
-        drone: &str,
+        drone: &crate::store::DroneRow,
         cap: &Capacity,
         facts: &EnvFacts,
         settings: &AdmissionSettings,
+        budget_mib: u64,
     ) -> LiveFacts {
         LiveFacts {
-            mem_used_mib: facts
-                .mem_available_mib
-                .map(|a| cap.mem_mib.saturating_sub(a)),
+            mem_used_mib: facts.mem_available_mib.map(|a| {
+                used_within_budget(cap.mem_mib, a, drone.caps.reserve_mem_mib, budget_mib)
+            }),
             host: facts
                 .host_key
                 .clone()
@@ -119,7 +121,50 @@ impl Queen {
                     reserve_mib: settings.host_reserve_mem_mib,
                 }),
             mem_psi_pm: facts.mem_psi_some_avg10_pm,
-            admission_prev: self.admission_prev(drone),
+            admission_prev: self.admission_prev(&drone.name),
         }
+    }
+}
+
+/// Host memory in use that eats into a drone's budget. The reading is the
+/// whole host's (total less available), but a capped drone lends only part
+/// of the host: what the host uses up to the memory the budget leaves free
+/// beyond the OS reserve (`total - reserve - budget`) costs the budget
+/// nothing. An uncapped drone leaves nothing free, so all of it counts.
+/// (2026-11-16: wsl-desktop, 48 GiB VM, 15 GiB budget, 3.3 GiB of VM-wide use
+/// charged against the budget left 12 GiB, so a heavy job never fit.)
+pub(crate) fn used_within_budget(
+    total_mib: u64,
+    available_mib: u64,
+    reserve_mib: u64,
+    budget_mib: u64,
+) -> u64 {
+    let used = total_mib.saturating_sub(available_mib);
+    let slack = total_mib
+        .saturating_sub(reserve_mib)
+        .saturating_sub(budget_mib);
+    used.saturating_sub(slack)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::used_within_budget;
+
+    #[test]
+    fn a_capped_drone_is_charged_only_host_use_beyond_what_its_budget_leaves_free() {
+        // wsl-desktop on 2026-11-16: 48174 MiB VM, 2048 MiB reserve, 15360 MiB
+        // budget, 3323 MiB in use VM-wide. All of it fits in the 30766 MiB the
+        // budget leaves free, so the budget keeps its full room.
+        assert_eq!(used_within_budget(48174, 48174 - 3323, 2048, 15360), 0);
+        // Host use beyond that slack is charged: 34766 MiB in use, 4000 over.
+        assert_eq!(used_within_budget(48174, 48174 - 34766, 2048, 15360), 4000);
+    }
+
+    #[test]
+    fn an_uncapped_drone_is_charged_all_host_use_as_before() {
+        // Budget = total - reserve leaves no slack: the reading counts in full.
+        assert_eq!(used_within_budget(32768, 32768 - 9000, 2048, 30720), 9000);
+        // A reserve or cap larger than the host never underflows.
+        assert_eq!(used_within_budget(4096, 0, 8192, 30720), 4096);
     }
 }

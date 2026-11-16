@@ -847,7 +847,7 @@ impl Queen {
                         .or(f.cpu_psi_some_avg10_pm);
                     state.cpu_load_pm =
                         crate::allocator::load_pressure_pm(f.load_per_cpu_pm, f.cpu_busy_pm);
-                    state.live = self.live_facts(&d.name, cap, f, a);
+                    state.live = self.live_facts(d, cap, f, a, state.mem_mib);
                 }
                 state.profiles = placement_profiles(
                     &profiles,

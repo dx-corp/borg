@@ -89,9 +89,12 @@ pub struct Options<'a> {
     /// Where the pinned runner lives and who owns it; `None` skips runner updates.
     pub runner_dir: Option<&'a Path>,
     pub runner_owner: Option<&'a str>,
-    /// The service's config (the queen's `queen.json`): the downloaded binary
-    /// must pass `config check` on it before the service is stopped.
+    /// The service's config (the queen's `queen.json`, or the drone's
+    /// `drone.json` with `config_check_drone`): the downloaded binary must pass
+    /// `config check` on it before the service is stopped.
     pub config_check: Option<&'a Path>,
+    /// Check `config_check` as a drone config (`config check --drone`).
+    pub config_check_drone: bool,
 }
 
 /// Run an update against an already fetched manifest.
@@ -154,7 +157,7 @@ pub async fn run(
         )
         .await?;
         if let Some(config) = opts.config_check
-            && let Err(reason) = config_check(exec, &new_bin, config)
+            && let Err(reason) = config_check(exec, &new_bin, config, opts.config_check_drone)
         {
             let _ = std::fs::remove_file(&new_bin);
             return Err(UpdateError::ConfigCheck(reason));
@@ -212,9 +215,14 @@ pub async fn run(
 
 /// `<bin> config check <config>`: the new binary must accept the config the
 /// service will start with.
-fn config_check(exec: &dyn Exec, bin: &Path, config: &Path) -> Result<(), String> {
+fn config_check(exec: &dyn Exec, bin: &Path, config: &Path, drone: bool) -> Result<(), String> {
     let (bin, config) = (bin.to_string_lossy(), config.to_string_lossy());
-    match exec.run(&bin, &["config", "check", &config]) {
+    let args: &[&str] = if drone {
+        &["config", "check", "--drone", &config]
+    } else {
+        &["config", "check", &config]
+    };
+    match exec.run(&bin, args) {
         Ok(out) if out.success => Ok(()),
         Ok(out) => Err(format!("{config}: {}", out.stdout.trim())),
         Err(e) => Err(format!("run {bin}: {e}")),

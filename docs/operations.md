@@ -2010,6 +2010,12 @@ build is up to date and a periodic `borg update` changes nothing. With
 `config_check` set (the queen's `/etc/borg/queen.json`), the downloaded binary
 must pass `borg config check` on that file before the service is stopped; a
 rejection leaves everything as it was.
+A drone's updater does the same with the drone's own config
+(`drone_config`, written by `borg drone install`; for a drone-requested update
+on an older `update.json`, `/etc/borg/drone.json` when it exists), using
+`borg config check --drone`. A binary that cannot read the drone's config,
+for example a rollout's downgrade to a build that predates trust `pr-only`, is
+refused and the drone keeps running the version it has.
 
 ```text
 borg update --check          # what would change
