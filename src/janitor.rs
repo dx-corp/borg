@@ -18,6 +18,10 @@
 //! further opt-ins remove other waste: `cancel_running` also cancels
 //! superseded runs that already started, and `dedupe_same_sha` cancels queued
 //! duplicates of a run of the same workflow, commit, event and pull request.
+//! `dead_merge_queue_runs` cancels `merge_group` runs whose merge-queue
+//! branch (`gh-readonly-queue/...`) is gone (a 404 on the ref; any other
+//! answer keeps the run): the entry merged or left the queue, and jobs that
+//! never got a runner cannot run their own self-cancel step.
 //! Duplicate groups never include `workflow_dispatch` or `merge_group` runs,
 //! and a running duplicate is never cancelled, even when its workflow still
 //! reads `queued`. An unreadable jobs response also preserves the run. The
@@ -102,6 +106,9 @@ pub struct PassReport {
     pub duplicates: u32,
     /// Queued duplicates cancelled.
     pub dedup_cancelled: u32,
+    /// Merge-group runs whose merge-queue branch is gone
+    /// (`dead_merge_queue_runs`), queued or running.
+    pub dead_merge_group: u32,
     /// Runs that dry-run would have cancelled, of any kind.
     pub would_cancel: u32,
     /// Runs left for a later pass by the per-pass cap.
@@ -145,6 +152,7 @@ impl PassReport {
         self.cancelled_running += o.cancelled_running;
         self.duplicates += o.duplicates;
         self.dedup_cancelled += o.dedup_cancelled;
+        self.dead_merge_group += o.dead_merge_group;
         self.would_cancel += o.would_cancel;
         self.deferred += o.deferred;
         self.started_push += o.started_push;
@@ -517,6 +525,7 @@ impl Janitor {
     ) -> Result<(), GithubError> {
         let st = &self.settings;
         let all_events = st.dedupe_same_sha
+            || st.dead_merge_queue_runs
             || !st.closed_pr_workflows.is_empty()
             || !st.superseded_push_branches.is_empty();
         let event = (!all_events).then_some("pull_request");
@@ -651,6 +660,38 @@ impl Janitor {
                 .await;
             tally(report, budget, repo, run.id, kind, outcome);
         }
+        if st.dead_merge_queue_runs {
+            for (run, branch) in merge_queue_runs(&runs, st.cancel_running) {
+                if !self.same_repository(repo, run) {
+                    continue;
+                }
+                match self.branch_exists(repo, branch).await {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!("janitor: {repo} ref {branch}: {e}; run {} kept", run.id);
+                        report.errors += 1;
+                        continue;
+                    }
+                }
+                report.dead_merge_group += 1;
+                stale.insert(run.id);
+                if *budget == 0 {
+                    report.deferred += 1;
+                    continue;
+                }
+                let why = format!("merge queue branch {branch} is gone");
+                let kind = if run.status == "in_progress" {
+                    Kind::Running
+                } else {
+                    Kind::Stale
+                };
+                let outcome = self
+                    .cancel_if_unchanged(repo, run, &why, self.settings.dry_run)
+                    .await;
+                tally(report, budget, repo, run.id, kind, outcome);
+            }
+        }
         if st.dedupe_same_sha {
             for (run, kept) in surplus(&runs, &stale) {
                 report.duplicates += 1;
@@ -685,6 +726,17 @@ impl Janitor {
             }
         }
         Ok(())
+    }
+
+    /// Whether `branch` exists in `repo`: `Ok(false)` only on a 404, so an
+    /// unreadable ref keeps the run.
+    async fn branch_exists(&self, repo: &str, branch: &str) -> Result<bool, GithubError> {
+        let path = format!("/repos/{repo}/git/ref/heads/{branch}");
+        match self.get_contents::<serde_json::Value>(&path).await {
+            Ok(_) => Ok(true),
+            Err(GithubError::Status { status: 404, .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Whether `run`'s head is in `repo` itself (not a fork).
@@ -803,14 +855,9 @@ impl Janitor {
             // concurrency group: on a starved fleet the first job finishes
             // and every other job waits for a runner, with GitHub still
             // reporting the run as `queued` and no job `in_progress`.
-            out.started |= jobs
-                .jobs
-                .iter()
-                .any(|j| j.status == "in_progress" || j.status == "completed");
-            out.failed |= jobs
-                .jobs
-                .iter()
-                .any(|j| j.conclusion.as_deref() == Some("failure"));
+            for job in &jobs.jobs {
+                out.include(&job.status, job.conclusion.as_deref());
+            }
             if jobs.jobs.len() < 100 {
                 break;
             }
@@ -893,6 +940,24 @@ fn tally(
     }
 }
 
+/// Prefix of the branches GitHub's merge queue creates for each entry.
+const MERGE_QUEUE_PREFIX: &str = "gh-readonly-queue/";
+
+/// `merge_group` runs on a merge-queue branch that may be cancelled once that
+/// branch is gone: queued ones, and running ones with `cancel_running`.
+fn merge_queue_runs(runs: &[Run], cancel_running: bool) -> Vec<(&Run, &str)> {
+    runs.iter()
+        .filter(|r| r.event == "merge_group")
+        .filter(|r| r.status == "queued" || (cancel_running && r.status == "in_progress"))
+        .filter_map(|r| {
+            let branch = r.head_branch.as_deref()?;
+            branch
+                .starts_with(MERGE_QUEUE_PREFIX)
+                .then_some((r, branch))
+        })
+        .collect()
+}
+
 /// Runs to drop from each group of queued or running runs sharing workflow,
 /// head commit, event and pull requests, each with the id of the run kept: the
 /// lowest-id running run, else the lowest-id queued run. Dispatch payloads
@@ -949,11 +1014,21 @@ fn now() -> i64 {
 /// What a run's latest-attempt jobs are doing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct JobStates {
-    /// A job is running or has concluded: the run holds its concurrency
+    /// A job is running or concluded without an explicit skip: the run holds its concurrency
     /// group even while GitHub reports it `queued` (every remaining job is
     /// waiting for a runner).
     started: bool,
     failed: bool,
+}
+
+impl JobStates {
+    fn include(&mut self, status: &str, conclusion: Option<&str>) {
+        // Explicit skips never acquired a runner. Keep unknown completions
+        // conservative so they still protect work that may have started.
+        self.started |=
+            status == "in_progress" || (status == "completed" && conclusion != Some("skipped"));
+        self.failed |= conclusion == Some("failure");
+    }
 }
 
 /// Whether to cancel a superseded push run, why, and how to count it: a run
@@ -1159,6 +1234,50 @@ mod tests {
         );
         // Without cancel_running a started run is never cancelled.
         assert_eq!(superseded_push_action(&running, 3, red, false), None);
+    }
+
+    #[test]
+    fn skipped_jobs_do_not_pin_a_superseded_queued_push() {
+        let queued = run(1, 1, "queued", "push", "a", &[]);
+        let mut jobs = JobStates::default();
+        jobs.include("completed", Some("skipped"));
+        jobs.include("queued", None);
+
+        assert!(!jobs.started, "a skipped job never acquired a runner");
+        assert!(!jobs.failed);
+        assert_eq!(
+            superseded_push_action(&queued, 2, jobs, true).map(|(_, kind)| kind),
+            Some(Kind::Stale)
+        );
+    }
+
+    #[test]
+    fn skipped_siblings_preserve_actual_or_uncertain_work() {
+        let queued = run(1, 1, "queued", "push", "a", &[]);
+        for (status, conclusion) in [
+            ("in_progress", None),
+            ("in_progress", Some("skipped")),
+            ("completed", Some("success")),
+            ("completed", Some("neutral")),
+            ("completed", Some("cancelled")),
+            ("completed", Some("timed_out")),
+            ("completed", Some("unknown-conclusion")),
+            ("completed", None),
+            ("completed", Some("failure")),
+        ] {
+            let mut jobs = JobStates::default();
+            jobs.include("completed", Some("skipped"));
+            jobs.include(status, conclusion);
+
+            assert!(jobs.started, "{status} {conclusion:?}");
+            assert_eq!(jobs.failed, conclusion == Some("failure"));
+            assert_eq!(superseded_push_action(&queued, 2, jobs, false), None);
+            assert_eq!(
+                superseded_push_action(&queued, 2, jobs, true).map(|(_, kind)| kind),
+                (conclusion == Some("failure")).then_some(Kind::Running),
+                "{status} {conclusion:?}"
+            );
+        }
     }
 
     #[test]

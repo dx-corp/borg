@@ -54,6 +54,7 @@ async fn status_reports_free_capacity_next_to_theoretical_capacity() {
     for line in [
         "borg_drone_free_mem_mib{drone=\"d1\"} 4096",
         "borg_drone_free_slots{drone=\"d1\",class=\"heavy\"} 0",
+        "borg_drone_class_slots{drone=\"d1\",class=\"heavy\"} 1",
         "borg_class_free_slots{class=\"heavy\"} 0",
     ] {
         assert!(m.contains(line), "missing {line}\n{m}");

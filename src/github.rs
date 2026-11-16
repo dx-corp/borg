@@ -4,12 +4,12 @@
 //! which is exchanged for an installation token, which authorizes everything
 //! else. Drones only ever receive single-use JIT runner configs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use reqwest::{Method, RequestBuilder};
+use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use time::OffsetDateTime;
@@ -232,6 +232,37 @@ pub struct GithubClient {
     app_id: String,
     key: EncodingKey,
     auth: tokio::sync::Mutex<AuthState>,
+    /// The last body and ETag of every GET path, so a repeat read sends
+    /// `If-None-Match`; GitHub does not charge a 304 against the quota.
+    etags: std::sync::Mutex<HashMap<String, CachedGet>>,
+    /// Each repository's last complete jobs view, reused while quota is low.
+    last_jobs: std::sync::Mutex<HashMap<String, (i64, Vec<WorkflowJob>)>>,
+}
+
+struct CachedGet {
+    etag: String,
+    body: Vec<u8>,
+    used_at: i64,
+}
+
+/// Bound on remembered GET bodies; past it, entries unused for an hour go.
+const ETAG_CACHE_MAX: usize = 4096;
+const ETAG_IDLE_SECS: i64 = 3600;
+
+/// Below this share of the hourly quota (1/10), a repository's jobs view is
+/// refreshed at most every [`LOW_QUOTA_REFRESH_SECS`]; ticks in between reuse
+/// the last view so runner listing and JIT registration keep their budget.
+const LOW_QUOTA_DIVISOR: u64 = 10;
+const LOW_QUOTA_REFRESH_SECS: i64 = 180;
+
+/// Whether to reuse a jobs view of age `age` seconds instead of refreshing it.
+fn reuse_jobs_view(view: &RateLimitView, now: i64, age: i64) -> bool {
+    let (Some(limit), Some(remaining), Some(reset_at)) =
+        (view.limit, view.remaining, view.reset_at)
+    else {
+        return false;
+    };
+    reset_at > now && remaining < limit / LOW_QUOTA_DIVISOR && age < LOW_QUOTA_REFRESH_SECS
 }
 
 #[derive(serde::Serialize)]
@@ -301,6 +332,8 @@ impl GithubClient {
             app_id: app_id.to_owned(),
             key,
             auth: tokio::sync::Mutex::new(AuthState::default()),
+            etags: std::sync::Mutex::new(HashMap::new()),
+            last_jobs: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -427,13 +460,91 @@ impl GithubClient {
         Ok(self.request(method, path).bearer_auth(token.expose()))
     }
 
+    /// GET `path` conditionally: with a remembered ETag it sends
+    /// `If-None-Match`, and a 304 (free against the quota) reuses the
+    /// remembered body.
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, GithubError> {
-        let rb = self.authed(Method::GET, path).await?;
-        self.send(Method::GET, path, rb).await
+        let mut rb = self.authed(Method::GET, path).await?;
+        let known = self
+            .etags
+            .lock()
+            .ok()
+            .and_then(|m| m.get(path).map(|c| c.etag.clone()));
+        if let Some(etag) = &known {
+            rb = rb.header("If-None-Match", etag);
+        }
+        let resp = self.rate_limit.send(rb).await?;
+        let status = resp.status();
+        let now = unix_now();
+        if status == StatusCode::NOT_MODIFIED {
+            let body = self.etags.lock().ok().and_then(|mut m| {
+                m.get_mut(path).map(|c| {
+                    c.used_at = now;
+                    c.body.clone()
+                })
+            });
+            if let Some(body) = body {
+                self.rate_limit.count_get(true);
+                return serde_json::from_slice(&body)
+                    .map_err(|e| GithubError::Decode(format!("{path}: {e}")));
+            }
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(self.rate_limit.error("GET", path, status.as_u16(), &body));
+        }
+        self.rate_limit.count_get(false);
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let bytes = resp.bytes().await?;
+        let parsed =
+            serde_json::from_slice(&bytes).map_err(|e| GithubError::Decode(format!("{path}: {e}")));
+        if let (Some(etag), Ok(_), Ok(mut m)) = (etag, &parsed, self.etags.lock()) {
+            if m.len() >= ETAG_CACHE_MAX {
+                m.retain(|_, c| now - c.used_at < ETAG_IDLE_SECS);
+            }
+            if m.len() < ETAG_CACHE_MAX {
+                m.insert(
+                    path.to_owned(),
+                    CachedGet {
+                        etag,
+                        body: bytes.to_vec(),
+                        used_at: now,
+                    },
+                );
+            }
+        }
+        parsed
     }
 
     /// Jobs in queued and in-progress workflows, including their completed jobs.
+    ///
+    /// Every listing is a conditional GET, so runs whose jobs did not change
+    /// cost no quota. While quota is low the last view is reused for up to
+    /// `LOW_QUOTA_REFRESH_SECS`.
     pub async fn workflow_jobs(&self, repo: &str) -> Result<Vec<WorkflowJob>, GithubError> {
+        let now = unix_now();
+        let view = self.rate_limit.view();
+        let reused = self.last_jobs.lock().ok().and_then(|m| {
+            m.get(repo)
+                .filter(|(at, _)| reuse_jobs_view(&view, now, now - at))
+                .map(|(_, jobs)| jobs.clone())
+        });
+        if let Some(jobs) = reused {
+            self.rate_limit.count_reused_view();
+            return Ok(jobs);
+        }
+        let jobs = self.list_workflow_jobs(repo).await?;
+        if let Ok(mut m) = self.last_jobs.lock() {
+            m.insert(repo.to_owned(), (now, jobs.clone()));
+        }
+        Ok(jobs)
+    }
+
+    async fn list_workflow_jobs(&self, repo: &str) -> Result<Vec<WorkflowJob>, GithubError> {
         #[derive(Deserialize)]
         struct Runs {
             workflow_runs: Vec<RunRef>,
@@ -636,6 +747,30 @@ fn static_method(m: &Method) -> &'static str {
 mod job_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_jobs_view_is_reused_only_while_quota_is_low_and_the_view_is_young() {
+        let view = |remaining| RateLimitView {
+            limit: Some(15_000),
+            remaining: Some(remaining),
+            reset_at: Some(1_000),
+            ..RateLimitView::default()
+        };
+        assert!(reuse_jobs_view(&view(1_499), 500, 60));
+        assert!(!reuse_jobs_view(&view(1_500), 500, 60), "quota is not low");
+        assert!(
+            !reuse_jobs_view(&view(10), 500, LOW_QUOTA_REFRESH_SECS),
+            "view too old"
+        );
+        assert!(
+            !reuse_jobs_view(&view(10), 1_000, 60),
+            "the quota has reset"
+        );
+        assert!(
+            !reuse_jobs_view(&RateLimitView::default(), 500, 60),
+            "quota unknown"
+        );
+    }
 
     #[test]
     fn active_runs_missing_from_the_filtered_listings_are_polled() {

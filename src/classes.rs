@@ -71,9 +71,11 @@ impl Scope {
     }
 }
 
-/// How much a drone's host is trusted with deploy-path jobs. A deploy drone
-/// never runs a pull-request job or a work unit; a shared drone never runs a
-/// deploy job; a deploy-only drone runs nothing but deploy jobs.
+/// Which scopes a drone's host serves. A deploy drone never runs a
+/// pull-request job or a work unit; a shared drone never runs a deploy job; a
+/// deploy-only drone runs nothing but deploy jobs; a pr-only drone runs
+/// nothing but pull-request jobs, so main, merge-group and deploy demand can
+/// never take its capacity (a host reserved for pull-request checks).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Trust {
@@ -81,6 +83,7 @@ pub enum Trust {
     Shared,
     Deploy,
     DeployOnly,
+    PrOnly,
 }
 
 impl Trust {
@@ -89,22 +92,46 @@ impl Trust {
             Trust::Shared => "shared",
             Trust::Deploy => "deploy",
             Trust::DeployOnly => "deploy-only",
+            Trust::PrOnly => "pr-only",
         }
     }
 
+    // formal: begin trust_scopes/check_trust.admits
     /// Whether demand of `scope` may be placed on a drone of this trust.
     pub fn admits(self, scope: Scope) -> bool {
         match scope {
-            Scope::Deploy => self != Trust::Shared,
-            Scope::Main => self != Trust::DeployOnly,
-            Scope::Pr => self == Trust::Shared,
+            Scope::Deploy => matches!(self, Trust::Deploy | Trust::DeployOnly),
+            Scope::Main => matches!(self, Trust::Shared | Trust::Deploy),
+            Scope::Pr => matches!(self, Trust::Shared | Trust::PrOnly),
         }
     }
+    // formal: end trust_scopes/check_trust.admits
 
+    // formal: begin trust_scopes/check_trust.serves_deploy
     /// Whether drones of this trust hold standby deploy runners.
     pub fn serves_deploy(self) -> bool {
-        self != Trust::Shared
+        self.admits(Scope::Deploy)
     }
+    // formal: end trust_scopes/check_trust.serves_deploy
+
+    // formal: begin trust_scopes/check_trust.runs_units
+    /// Whether work units (agent-submitted commands) may run on drones of this
+    /// trust, within the scopes [`Trust::admits`]. Every trust but pr-only: a
+    /// pr-only host is reserved for pull-request checks.
+    pub fn runs_units(self) -> bool {
+        self != Trust::PrOnly
+    }
+    // formal: end trust_scopes/check_trust.runs_units
+
+    // formal: begin trust_scopes/check_trust.carries_main_label
+    /// Whether a pull-request runner minted on a drone of this trust also
+    /// carries the bare (main) class label. A shared drone's pull-request
+    /// runner does, so its capacity also drains main jobs; a pr-only drone's
+    /// does not, so GitHub can hand it nothing but pull-request jobs.
+    pub fn pr_runner_carries_main_label(self) -> bool {
+        self != Trust::PrOnly
+    }
+    // formal: end trust_scopes/check_trust.carries_main_label
 }
 
 /// What an alias label stands for: a bare class name (main scope) or an object
@@ -313,20 +340,30 @@ impl Classes {
     /// carry only the `-deploy` label, so GitHub can hand them nothing but
     /// deploy jobs. Alias labels ride on the runners whose scope they name.
     pub fn runner_labels(&self, class: Class, scope: Scope) -> Vec<String> {
+        self.runner_labels_for(class, scope, Trust::Shared)
+    }
+
+    /// [`Classes::runner_labels`] for a runner minted on a drone of `trust`.
+    /// A pr-only drone's pull-request runner carries only the `-pr` label and
+    /// no main alias, so no main or merge-group job can take it.
+    pub fn runner_labels_for(&self, class: Class, scope: Scope, trust: Trust) -> Vec<String> {
+        let main_too = trust.pr_runner_carries_main_label();
         let mut labels = match scope {
             Scope::Deploy => vec![self.job_label(class, Scope::Deploy)],
             Scope::Main => vec![self.job_label(class, Scope::Main)],
-            Scope::Pr => vec![
+            Scope::Pr if main_too => vec![
                 self.job_label(class, Scope::Main),
                 self.job_label(class, Scope::Pr),
             ],
+            Scope::Pr => vec![self.job_label(class, Scope::Pr)],
         };
         labels.extend(
             self.aliases
                 .iter()
                 .filter(|&(_, a)| {
                     let (c, s) = a.target();
-                    c == class && (s == scope || (s == Scope::Main && scope == Scope::Pr))
+                    c == class
+                        && (s == scope || (main_too && s == Scope::Main && scope == Scope::Pr))
                 })
                 .map(|(l, _)| l.clone()),
         );
@@ -569,6 +606,41 @@ mod tests {
         assert!(Trust::DeployOnly.admits(Scope::Deploy));
         assert!(!Trust::DeployOnly.admits(Scope::Main));
         assert!(!Trust::DeployOnly.admits(Scope::Pr));
+        assert!(Trust::PrOnly.admits(Scope::Pr));
+        assert!(!Trust::PrOnly.admits(Scope::Main));
+        assert!(!Trust::PrOnly.admits(Scope::Deploy));
+    }
+
+    #[test]
+    fn pr_only_trust_serves_pull_requests_and_nothing_else() {
+        assert_eq!(Trust::PrOnly.as_str(), "pr-only");
+        let t: Trust = serde_json::from_str("\"pr-only\"").unwrap();
+        assert_eq!(t, Trust::PrOnly);
+        assert_eq!(serde_json::to_string(&t).unwrap(), "\"pr-only\"");
+        assert!(!Trust::PrOnly.serves_deploy());
+        assert!(Trust::DeployOnly.serves_deploy());
+        assert!(!Trust::PrOnly.runs_units());
+        assert!(Trust::Shared.runs_units() && Trust::Deploy.runs_units());
+        assert!(Trust::DeployOnly.runs_units());
+    }
+
+    #[test]
+    fn pr_only_runner_has_only_the_pr_label() {
+        let c = Classes::from_json(r#"{"label_prefix":"x-ci-","aliases":{"legacy":"medium"}}"#)
+            .unwrap();
+        let labels = c.runner_labels_for(Class::Medium, Scope::Pr, Trust::PrOnly);
+        assert_eq!(labels, ["x-ci-medium-pr"]);
+        assert_eq!(c.labels_scope(&labels), Some((Class::Medium, Scope::Pr)));
+        // Every other trust keeps today's labels.
+        for trust in [Trust::Shared, Trust::Deploy, Trust::DeployOnly] {
+            for scope in Scope::ALL {
+                assert_eq!(
+                    c.runner_labels_for(Class::Medium, scope, trust),
+                    c.runner_labels(Class::Medium, scope),
+                    "{trust:?} {scope:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -7,10 +7,16 @@ use super::{GithubError, unix_now};
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct RateLimitView {
-    limit: Option<u64>,
+    pub(crate) limit: Option<u64>,
     pub(crate) remaining: Option<u64>,
     pub(crate) reset_at: Option<i64>,
     pub(crate) retry_at: Option<i64>,
+    /// GETs answered with a body (charged against the quota).
+    pub(crate) gets_fetched: u64,
+    /// Conditional GETs answered 304 (not charged).
+    pub(crate) gets_not_modified: u64,
+    /// Jobs views reused instead of refreshed because quota was low.
+    pub(crate) jobs_views_reused: u64,
 }
 
 #[derive(Default)]
@@ -23,6 +29,20 @@ struct State {
 pub struct RateLimit(Arc<Mutex<State>>);
 
 impl RateLimit {
+    pub(crate) fn count_get(&self, not_modified: bool) {
+        let mut state = self.0.lock().expect("GitHub quota lock");
+        if not_modified {
+            state.view.gets_not_modified = state.view.gets_not_modified.saturating_add(1);
+        } else {
+            state.view.gets_fetched = state.view.gets_fetched.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn count_reused_view(&self) {
+        let mut state = self.0.lock().expect("GitHub quota lock");
+        state.view.jobs_views_reused = state.view.jobs_views_reused.saturating_add(1);
+    }
+
     pub(crate) fn view(&self) -> RateLimitView {
         self.0.lock().expect("GitHub quota lock").view.clone()
     }

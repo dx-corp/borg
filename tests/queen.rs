@@ -428,6 +428,40 @@ async fn a_5xx_on_one_runs_jobs_skips_that_run_and_the_tick_goes_on() {
 }
 
 #[tokio::test]
+async fn unchanged_job_listings_are_conditional_gets_that_cost_no_quota() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.heartbeat(&token, &[]).await;
+    {
+        let mut st = h.state();
+        st.jobs_by_run = true;
+        st.jobs_etags = true;
+        st.queued_runs = vec![1, 2];
+        st.jobs = vec![
+            job_in_run(1, 11, "borg-ci-light"),
+            job_in_run(2, 21, "borg-ci-light"),
+        ];
+    }
+    h.tick().await;
+    assert_eq!(h.state().jobs_fetched, 2);
+    assert_eq!(h.state().mints.len(), 2, "both queued jobs are placed");
+    // Nothing changed: every listing is a 304 and the view is the same.
+    h.tick().await;
+    assert_eq!(h.state().jobs_fetched, 2);
+    assert_eq!(h.state().jobs_not_modified, 2);
+    // A changed run is fetched again and its new job is seen.
+    h.state().jobs.push(job_in_run(1, 12, "borg-ci-light"));
+    h.tick().await;
+    assert_eq!(h.state().jobs_fetched, 3);
+    assert_eq!(h.state().jobs_not_modified, 3);
+    let m = h.metrics().await;
+    assert!(
+        m.contains("borg_github_gets_total{result=\"not_modified\"} 3"),
+        "{m}"
+    );
+}
+
+#[tokio::test]
 async fn an_auth_failure_on_one_runs_jobs_still_aborts_the_tick() {
     let h = Harness::start(json!({})).await;
     let token = h.enroll("d1").await;

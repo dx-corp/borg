@@ -62,7 +62,7 @@ pub struct HeartbeatRequest {
     /// Labels the drone asks to have added to its runners.
     #[serde(default)]
     pub extra_labels: Vec<String>,
-    /// `shared` (default), `deploy` or `deploy-only`; see [`Trust`].
+    /// `shared` (default), `deploy`, `deploy-only` or `pr-only`; see [`Trust`].
     #[serde(default)]
     pub trust: Trust,
     /// Standby lease ids the drone holds unstarted; acknowledges their JIT
@@ -1986,6 +1986,22 @@ pub fn render_metrics(status: &Status) -> String {
             .collect(),
     );
     gauge(
+        "borg_drone_class_slots",
+        "Leases of a class a drone could hold if empty; 0 means the class never fits there.",
+        status
+            .drones
+            .iter()
+            .flat_map(|d| {
+                d.theoretical_slots.iter().map(move |(c, n)| {
+                    (
+                        format!("drone=\"{}\",class=\"{c}\"", label_value(&d.name)),
+                        f64::from(*n),
+                    )
+                })
+            })
+            .collect(),
+    );
+    gauge(
         "borg_drone_free_slots",
         "Leases of a class that fit on a drone right now.",
         status
@@ -2784,6 +2800,29 @@ pub fn render_metrics(status: &Status) -> String {
         if let Some(value) = value {
             gauge(name, help, vec![(String::new(), value)]);
         }
+    }
+    {
+        let q = &status.github_rate_limit;
+        #[allow(clippy::cast_precision_loss, reason = "request counts far below 2^52")]
+        let rows = vec![
+            ("result=\"fetched\"".to_owned(), q.gets_fetched as f64),
+            (
+                "result=\"not_modified\"".to_owned(),
+                q.gets_not_modified as f64,
+            ),
+        ];
+        gauge(
+            "borg_github_gets_total",
+            "Queen App GETs since start: fetched (charged against the quota) or not_modified (a free 304 to a conditional GET).",
+            rows,
+        );
+        #[allow(clippy::cast_precision_loss, reason = "counts far below 2^52")]
+        let reused = q.jobs_views_reused as f64;
+        gauge(
+            "borg_github_jobs_views_reused_total",
+            "Repository jobs views reused instead of refreshed because GitHub quota was low.",
+            vec![(String::new(), reused)],
+        );
     }
     gauge(
         "borg_last_tick_ok",

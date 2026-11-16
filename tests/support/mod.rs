@@ -47,6 +47,11 @@ pub struct MockState {
     /// Delay each jobs listing, so concurrent listings overlap.
     pub jobs_delay_ms: u64,
     pub jobs_inflight: u32,
+    /// Queen job listings carry an ETag and answer 304 to a matching `If-None-Match`.
+    pub jobs_etags: bool,
+    /// Queen job listings answered with a body / with 304.
+    pub jobs_fetched: u32,
+    pub jobs_not_modified: u32,
     /// Most jobs listings that were in flight at once.
     pub jobs_max_inflight: u32,
     pub queued_runs: Vec<u64>,
@@ -80,6 +85,10 @@ pub struct MockState {
     pub fresh_status: HashMap<u64, String>,
     /// Attempt metadata returned by a fresh run read after the listing.
     pub fresh_attempts: HashMap<u64, (u64, String)>,
+    /// Branches `GET /git/ref/heads/<branch>` finds; others answer 404.
+    pub branches: Vec<String>,
+    /// Ref reads answer 500 (an unreadable ref keeps the run).
+    pub refs_fail: bool,
     /// Runs the janitor cancelled.
     pub cancelled: Vec<u64>,
     /// Runs whose cancel answers 409.
@@ -282,7 +291,8 @@ async fn jobs(
     State(s): State<Shared>,
     h: HeaderMap,
     Path((_o, _r, run)): Path<(String, String, u64)>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::response::IntoResponse as _;
     // The janitor reads a run's jobs with its own token; queen jobs carry no run_id.
     let janitor = check_janitor(&h).is_ok();
     if !janitor {
@@ -310,7 +320,23 @@ async fn jobs(
         .filter(|job| !by_run || job["run_id"] == run)
         .cloned()
         .collect();
-    Ok(Json(json!({"jobs": jobs})))
+    let body = json!({"jobs": jobs});
+    if janitor || !state.jobs_etags {
+        return Ok(Json(body).into_response());
+    }
+    let etag = format!("\"{:x}\"", fnv(body.to_string().as_bytes()));
+    if h.get("if-none-match").and_then(|v| v.to_str().ok()) == Some(etag.as_str()) {
+        state.jobs_not_modified += 1;
+        return Ok((StatusCode::NOT_MODIFIED, [("etag", etag)]).into_response());
+    }
+    state.jobs_fetched += 1;
+    Ok(([("etag", etag)], Json(body)).into_response())
+}
+
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 async fn one_job(
@@ -472,6 +498,23 @@ async fn pull(
     Ok(Json(json!({"state": "open", "head": {"sha": sha}})))
 }
 
+async fn branch_ref(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_o, _r, branch)): Path<(String, String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    check_pulls(&lock(&s), &h)?;
+    let st = lock(&s);
+    if st.refs_fail {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    if st.branches.contains(&branch) {
+        Ok(Json(json!({"ref": format!("refs/heads/{branch}")})))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
 async fn list_runners(State(s): State<Shared>, h: HeaderMap) -> Result<Json<Value>, StatusCode> {
     check_token(&h)?;
     let st = lock(&s);
@@ -619,6 +662,10 @@ impl Harness {
             .route(
                 "/repos/{owner}/{repo}/actions/jobs/{id}/rerun",
                 post(rerun_job),
+            )
+            .route(
+                "/repos/{owner}/{repo}/git/ref/heads/{*branch}",
+                get(branch_ref),
             )
             .route("/repos/{owner}/{repo}/pulls", get(pulls_by_head))
             .route("/repos/{owner}/{repo}/pulls/{n}", get(pull))
