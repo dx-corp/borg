@@ -92,6 +92,10 @@ async fn attempt(
             || env!("CARGO_PKG_VERSION").to_owned(),
             |bytes| crate::drone::selfupdate::build_version(env!("CARGO_PKG_VERSION"), &bytes),
         );
+    let service_config = cfg.service_config(
+        args.from_request,
+        std::path::Path::new(crate::update::config::DEFAULT_DRONE_SERVICE_CONFIG),
+    );
     let opts = Options {
         bin: &cfg.bin,
         current_version: &current,
@@ -105,7 +109,8 @@ async fn attempt(
         host_arch: std::env::consts::ARCH,
         runner_dir: cfg.runner_dir.as_deref(),
         runner_owner: cfg.runner_owner.as_deref(),
-        config_check: cfg.config_check.as_deref(),
+        config_check: service_config.as_ref().map(|(p, _)| p.as_path()),
+        config_check_drone: service_config.as_ref().is_some_and(|(_, drone)| *drone),
     };
     crate::update::run(
         &opts,

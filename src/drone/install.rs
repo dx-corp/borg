@@ -355,6 +355,7 @@ impl Installer<'_> {
             runner_owner: Some(self.job_owner()),
             health_timeout_secs: 120,
             config_check: None,
+            drone_config: Some(self.layout.config()),
         };
         let mut json = serde_json::to_string_pretty(&update_cfg)
             .map_err(|e| InstallError::Preflight(e.to_string()))?;

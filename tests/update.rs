@@ -176,6 +176,7 @@ impl Rig {
             runner_dir: None,
             runner_owner: None,
             config_check: None,
+            config_check_drone: false,
         }
     }
 
@@ -712,4 +713,42 @@ async fn the_new_binary_must_accept_the_service_config_before_anything_is_draine
         .unwrap();
     assert!(matches!(out, Outcome::Updated { .. }), "{out:?}");
     assert_eq!(fs::read(&rig.bin).unwrap(), NEW_BINARY);
+}
+
+#[tokio::test]
+async fn a_drone_refuses_a_binary_that_cannot_read_its_own_config() {
+    // 2026-11-16: borg-pr-1 (trust pr-only) was told to downgrade to a build
+    // that predates pr-only; the swapped binary could not parse drone.json and
+    // the drone crash-looped. The candidate must pass `config check --drone`
+    // before anything is drained.
+    let (base, _) = serve().await;
+    let rig = Rig::new();
+    let config = rig.dir.path().join("drone.json");
+    let m = manifest(&base, "0.3.0", &sha(NEW_BINARY), None);
+    let health = FakeHealth {
+        healthy_for: Some("0.3.0".into()),
+    };
+    let opts = Options {
+        config_check: Some(&config),
+        config_check_drone: true,
+        ..rig.options("0.4.0")
+    };
+    let reject = ConfigCheck {
+        passes: false,
+        calls: Mutex::default(),
+    };
+    let err = borg::update::run(&opts, &m, &rig.service(), &health, &reject)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, UpdateError::ConfigCheck(_)), "{err}");
+    let calls = reject.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].ends_with(&format!("config check --drone {}", config.display())),
+        "{calls:?}"
+    );
+    // The running drone was not stopped and its binary is unchanged.
+    assert!(rig.events().is_empty(), "{:?}", rig.events());
+    assert_eq!(fs::read_to_string(&rig.bin).unwrap(), "v1\n");
+    assert!(rig.leftovers().is_empty(), "{:?}", rig.leftovers());
 }

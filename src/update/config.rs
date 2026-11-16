@@ -64,6 +64,37 @@ pub struct UpdateConfig {
     /// written as `null`, so older updaters still read a drone's file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) config_check: Option<PathBuf>,
+    /// The drone's own config (`/etc/borg/drone.json`), checked with the new
+    /// binary (`config check --drone`) before the swap. A binary that cannot
+    /// read it would crash-loop the drone, so such an update (including a
+    /// rollout's downgrade to a version that predates a config value, for
+    /// example trust `pr-only`) is refused and the drone keeps running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) drone_config: Option<PathBuf>,
+}
+
+/// The drone config a drone's updater checks when its `update.json`
+/// predates `drone_config`.
+pub const DEFAULT_DRONE_SERVICE_CONFIG: &str = "/etc/borg/drone.json";
+
+impl UpdateConfig {
+    /// The config the new binary must accept before the swap, and whether it
+    /// is a drone config: `config_check` (the queen's), else `drone_config`,
+    /// else, for a drone-requested update (`from_request`) on a host whose
+    /// `update.json` predates `drone_config`, `default_drone` when it exists.
+    pub(crate) fn service_config(
+        &self,
+        from_request: bool,
+        default_drone: &Path,
+    ) -> Option<(PathBuf, bool)> {
+        if let Some(p) = &self.config_check {
+            return Some((p.clone(), false));
+        }
+        if let Some(p) = &self.drone_config {
+            return Some((p.clone(), true));
+        }
+        (from_request && default_drone.is_file()).then(|| (default_drone.to_owned(), true))
+    }
 }
 
 fn default_bin() -> PathBuf {
@@ -148,6 +179,45 @@ mod tests {
         assert_eq!(
             c.manifest_url_for(None),
             "https://m.example.test/latest.json"
+        );
+    }
+
+    #[test]
+    fn the_service_config_to_check_prefers_explicit_then_drone_then_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = dir.path().join("drone.json");
+        let base = UpdateConfig::from_json(BASE).unwrap();
+        // Nothing configured and no drone config on disk: no check.
+        assert_eq!(base.service_config(true, &default), None);
+        std::fs::write(&default, "{}").unwrap();
+        // A drone-requested update on an older update.json checks the drone config...
+        assert_eq!(
+            base.service_config(true, &default),
+            Some((default.clone(), true))
+        );
+        // ...but a manual `borg update` there does not guess.
+        assert_eq!(base.service_config(false, &default), None);
+        let drone = UpdateConfig {
+            drone_config: Some("/etc/borg/drone.json".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            drone.service_config(false, &default),
+            Some(("/etc/borg/drone.json".into(), true))
+        );
+        let queen = UpdateConfig {
+            config_check: Some("/etc/borg/queen.json".into()),
+            ..drone
+        };
+        assert_eq!(
+            queen.service_config(true, &default),
+            Some(("/etc/borg/queen.json".into(), false))
+        );
+        // An older updater still reads the new field's absence.
+        assert!(
+            !serde_json::to_string(&base)
+                .unwrap()
+                .contains("drone_config")
         );
     }
 
