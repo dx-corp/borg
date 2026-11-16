@@ -14,7 +14,9 @@
 //! 2. A main grant carries only the bare label; a pull-request grant carries
 //!    both labels; a deploy grant carries only the `-deploy` label (see
 //!    [`Classes::runner_labels`]). Deploy demand is placed only on
-//!    [`Trust::Deploy`] drones and pull-request demand never is.
+//!    [`Trust::Deploy`] drones and pull-request demand never is. A
+//!    [`Trust::PrOnly`] drone takes only pull-request demand, and its runners
+//!    carry only the `-pr` label ([`Classes::runner_labels_for`]).
 //! 3. Queued demand is first offset by leases that were granted but have not
 //!    yet taken a job ([`LeaseState::Pending`]); only the shortfall is minted.
 //! 4. A warm floor keeps that many pending leases of a (class, scope) alive
@@ -25,7 +27,7 @@
 //!    or several light slots depending on what is queued.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
@@ -1183,7 +1185,7 @@ fn place(
             drone_id: f.drone.id.clone(),
             class,
             scope,
-            labels: input.classes.runner_labels(class, scope),
+            labels: input.classes.runner_labels_for(class, scope, f.drone.trust),
             mem_mib: spec.mem_mib,
             vcpu: spec.vcpu,
         });
@@ -1441,10 +1443,25 @@ fn allocate_inner(
         need.insert((scope, class), 0);
         if n < wanted {
             let spec = input.classes.spec(class);
+            // Only a host something can drain from is worth holding: one with
+            // leases of its own, or on a node pool where another drone has
+            // some. Holding an idle host whose room is short for other reasons
+            // (memory used outside borg) frees nothing and idles the whole
+            // host (2026-11-16: wsl-desktop, 14 vCPU, held empty for heavy for
+            // hours while 147 medium main jobs queued).
+            let draining: BTreeSet<*const Cell<u64>> = free
+                .values()
+                .filter(|f| f.in_flight > 0)
+                .filter_map(|f| f.pool.as_ref().map(Rc::as_ptr))
+                .collect();
             let target = free
                 .iter()
                 .filter(|(id, f)| {
                     !reserved.contains_key(**id)
+                        && (f.in_flight > 0
+                            || f.pool
+                                .as_ref()
+                                .is_some_and(|p| draining.contains(&Rc::as_ptr(p))))
                         && f.drone.trust.admits(scope)
                         && f.could_ever_fit(spec)
                         && f.admission.admits(class, scope)

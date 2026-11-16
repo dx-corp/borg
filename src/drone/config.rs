@@ -267,9 +267,10 @@ pub struct DroneConfig {
     /// ignored by the queen so they cannot change a runner's scope.
     #[serde(default)]
     pub extra_labels: Vec<String>,
-    /// `shared` (default), `deploy` or `deploy-only`. A deploy drone runs only
-    /// deploy and main jobs, never pull-request jobs or work units; a
-    /// deploy-only drone runs only deploy jobs; a shared drone never runs
+    /// `shared` (default), `deploy`, `deploy-only` or `pr-only`. A deploy
+    /// drone runs only deploy and main jobs, never pull-request jobs or work
+    /// units; a deploy-only drone runs only deploy jobs; a pr-only drone runs
+    /// only pull-request jobs (no work units); a shared drone never runs
     /// deploy jobs.
     #[serde(default)]
     pub trust: crate::classes::Trust,

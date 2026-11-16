@@ -2038,3 +2038,91 @@ fn the_longest_waiting_aged_deploy_class_takes_the_room_that_frees() {
     let tie = setup(7_200, 7_200);
     assert_eq!(count(&allocate(&tie), Class::Heavy, Scope::Deploy), 1);
 }
+
+#[test]
+fn an_idle_host_short_of_room_for_other_reasons_is_not_held() {
+    // 2026-11-16: wsl-desktop had no leases, but memory used outside borg left
+    // it 12 GiB of its 15 GiB budget. Aged heavy demand held it empty for
+    // hours, so medium main work that fit never ran there.
+    let mut idle = DroneState {
+        mem_mib: 15 * 1024,
+        vcpu: 14,
+        ..host("wsl")
+    };
+    idle.live.mem_used_mib = Some(3 * 1024);
+    let mut i = input(
+        &[
+            (Class::Heavy, Scope::Main, 3),
+            (Class::Medium, Scope::Main, 3),
+        ],
+        vec![idle],
+    );
+    aged(&mut i, Class::Heavy, Scope::Main, 3600);
+    aged(&mut i, Class::Medium, Scope::Main, 3600);
+    let a = allocate(&i);
+    assert!(a.reserved_for.is_empty(), "{:?}", a.reserved_for);
+    assert_eq!(count(&a, Class::Heavy, Scope::Main), 0);
+    assert_eq!(count(&a, Class::Medium, Scope::Main), 1, "{:?}", a.grants);
+
+    // With a lease of its own to drain, the same host is still held.
+    i.leases = vec![lease("wsl", Class::Light, Scope::Main, LeaseState::Running)];
+    let a = allocate(&i);
+    assert_eq!(a.reserved_for.len(), 1, "{:?}", a.reserved_for);
+}
+
+#[test]
+fn pr_only_drone_takes_pull_request_demand_and_nothing_else() {
+    let pr_only = DroneState {
+        trust: Trust::PrOnly,
+        ..host("pr-1")
+    };
+    // Aged main, merge-group and deploy demand never lands on it, nor holds it
+    // in a starvation reservation, even with no other drone.
+    let mut i = input(
+        &[
+            (Class::Heavy, Scope::Deploy, 3),
+            (Class::Heavy, Scope::Main, 3),
+            (Class::Medium, Scope::Main, 3),
+        ],
+        vec![pr_only.clone()],
+    );
+    i.starvation_after_secs = Some(60);
+    i.queue_ages = [
+        (Class::Heavy, Scope::Deploy),
+        (Class::Heavy, Scope::Main),
+        (Class::Medium, Scope::Main),
+    ]
+    .into_iter()
+    .map(|(class, scope)| QueueAge {
+        class,
+        scope,
+        oldest_age_secs: 3600,
+    })
+    .collect();
+    let a = allocate(&i);
+    assert!(a.grants.is_empty(), "{:?}", a.grants);
+    assert!(a.reserved_for.is_empty(), "{:?}", a.reserved_for);
+
+    // With pull-request demand queued behind the same main backlog, the
+    // pr-only drone runs the pull-request jobs; main stays unmet.
+    i.demand.push(Demand {
+        class: Class::Heavy,
+        scope: Scope::Pr,
+        count: 1,
+    });
+    let a = allocate(&i);
+    assert_eq!(a.grants.len(), 1, "{:?}", a.grants);
+    let g = &a.grants[0];
+    assert_eq!(
+        (g.drone_id.as_str(), g.class, g.scope),
+        ("pr-1", Class::Heavy, Scope::Pr)
+    );
+    // Only the -pr label: GitHub cannot hand this runner a main job.
+    assert_eq!(g.labels, ["borg-ci-heavy-pr"]);
+}
+
+#[test]
+fn shared_pull_request_runner_keeps_both_labels() {
+    let a = allocate(&input(&[(Class::Light, Scope::Pr, 1)], vec![host("a")]));
+    assert_eq!(a.grants[0].labels, ["borg-ci-light", "borg-ci-light-pr"]);
+}

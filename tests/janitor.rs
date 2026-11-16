@@ -976,3 +976,78 @@ async fn compares_use_the_contents_credential_when_the_janitor_token_cannot_read
     );
     assert_eq!(st.scoped_requests[0]["repositories"], json!(["mono"]));
 }
+
+#[tokio::test]
+async fn merge_group_runs_whose_queue_branch_is_gone_are_cancelled() {
+    let h = Harness::start(with(json!({
+        "cancel_running": true,
+        "dead_merge_queue_runs": true
+    })))
+    .await;
+    let mg = |id: u64, status: &str, branch: &str| {
+        json!({"id": id, "status": status, "event": "merge_group", "head_sha": "a",
+            "head_branch": branch, "head_repository": {"full_name": "example-org/app"},
+            "pull_requests": []})
+    };
+    {
+        let mut st = h.state();
+        st.branches
+            .push("gh-readonly-queue/main/pr-3-live".to_owned());
+        // Gone: the queue entry merged.
+        st.pr_runs
+            .push(mg(1, "queued", "gh-readonly-queue/main/pr-1-merged"));
+        // Gone and running: cancelled because cancel_running is set.
+        st.pr_runs
+            .push(mg(2, "in_progress", "gh-readonly-queue/main/pr-2-merged"));
+        // Still in the queue: kept.
+        st.pr_runs
+            .push(mg(3, "queued", "gh-readonly-queue/main/pr-3-live"));
+        // A merge group on some other branch shape: never touched.
+        st.pr_runs.push(mg(4, "queued", "main"));
+        // A fork's head: never touched.
+        let mut fork = mg(5, "queued", "gh-readonly-queue/main/pr-5-gone");
+        fork["head_repository"] = json!({"full_name": "someone/fork"});
+        st.pr_runs.push(fork);
+    }
+    let r = h.janitor_pass().await;
+    assert_eq!(
+        (
+            r.dead_merge_group,
+            r.cancelled,
+            r.cancelled_running,
+            r.errors
+        ),
+        (2, 1, 1, 0),
+        "{r:?}"
+    );
+    let mut cancelled = h.state().cancelled.clone();
+    cancelled.sort_unstable();
+    assert_eq!(cancelled, [1, 2]);
+}
+
+#[tokio::test]
+async fn dead_merge_queue_runs_are_opt_in_and_unreadable_refs_keep_runs() {
+    let mg = json!({"id": 1, "status": "queued", "event": "merge_group", "head_sha": "a",
+        "head_branch": "gh-readonly-queue/main/pr-1-x",
+        "head_repository": {"full_name": "example-org/app"}, "pull_requests": []});
+    // Off by default.
+    let h = Harness::start(with(json!({"dedupe_same_sha": true}))).await;
+    h.state().pr_runs.push(mg.clone());
+    let r = h.janitor_pass().await;
+    assert_eq!((r.dead_merge_group, r.cancelled), (0, 0), "{r:?}");
+
+    // On, but the ref read fails: the run is kept and the error counted.
+    let h = Harness::start(with(json!({"dead_merge_queue_runs": true}))).await;
+    {
+        let mut st = h.state();
+        st.pr_runs.push(mg);
+        st.refs_fail = true;
+    }
+    let r = h.janitor_pass().await;
+    assert_eq!(
+        (r.dead_merge_group, r.cancelled, r.errors),
+        (0, 0, 1),
+        "{r:?}"
+    );
+    assert!(h.state().cancelled.is_empty());
+}

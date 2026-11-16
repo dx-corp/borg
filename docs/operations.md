@@ -56,8 +56,9 @@ label, so GitHub can hand it nothing but deploy jobs. Deploy demand is
 scheduled before main demand, and main before pull-request demand.
 
 A deploy drone never runs a pull-request job or a work unit; a shared drone
-never runs a deploy job. Which drones are deploy drones is set per drone with
-`trust` (see [Drone trust](#drone-trust)).
+never runs a deploy job; a pr-only drone runs nothing but pull-request jobs.
+Which drones are deploy or pr-only drones is set per drone with `trust` (see
+[Drone trust](#drone-trust)).
 
 ## Classes config
 
@@ -938,6 +939,15 @@ payloads, and publication waits on those exact runs. Each cancellation is logged
 the id of the run that was kept. With `dry_run` the log and `would_cancel` show
 what would have been cancelled.
 
+`dead_merge_queue_runs = true` cancels `merge_group` runs whose merge-queue
+branch (`gh-readonly-queue/...`) no longer exists: the queue entry merged or
+left the queue, so the run's verdict is moot. The ref is read with
+`compare_auth` when configured; only a 404 counts as gone, and any other
+answer keeps the run. Running ones are cancelled only with `cancel_running`.
+A workflow's own self-cancel step can't do this for jobs that never get a
+runner, and those jobs are older than main's newest work, so GitHub hands
+them main's runners first (`dead_merge_group` in the pass report).
+
 The pull request's current head comes from the run's own `pull_requests`
 entry, which GitHub fills at read time with the open pull requests whose head
 branch matches. The janitor reads the pulls API only when that entry carries no
@@ -1730,13 +1740,24 @@ jobs run as the drone's own account and the drone logs a warning.
 
 ### Drone trust
 
-`trust` in the drone config is `"shared"` (default), `"deploy"` or
-`"deploy-only"`. A `deploy-only` drone serves deploy-scope leases and nothing
-else: no main, no pull-request work, no work units. The drone
+`trust` in the drone config is `"shared"` (default), `"deploy"`,
+`"deploy-only"` or `"pr-only"`. A `deploy-only` drone serves deploy-scope
+leases and nothing else: no main, no pull-request work, no work units. A
+`pr-only` drone is the mirror image: it serves pull-request leases and
+nothing else, so main, merge-group and deploy demand can never take its
+slots, and it runs no work units. The drone
 reports it in every heartbeat and `/status` shows it per drone. The queen
-places deploy demand on `deploy` and `deploy-only` drones, never places
-pull-request demand or work units on either, and places main demand on
-`shared` or `deploy` drones. Set it on the
+places deploy demand on `deploy` and `deploy-only` drones, places
+pull-request demand on `shared` and `pr-only` drones, places main demand on
+`shared` or `deploy` drones. Work units follow the same scope rules, except
+that a `pr-only` drone runs none.
+
+A pull-request runner minted on a `shared` drone carries both the `-pr` and
+the bare class label, so GitHub may hand it a queued main job. A runner minted
+on a `pr-only` drone carries only `<prefix><class>-pr` (and no main alias), so
+GitHub can hand it nothing but pull-request jobs. That is what makes a
+`pr-only` drone a reservation: when main batches keep every shared slot busy,
+pull-request checks still have somewhere to run. Set it on the
 host, for example `"trust": "deploy"` in `drone.json` or
 `borg drone install --trust deploy`; nothing is set on the queen. A deploy
 drone should be a host that no pull-request job has touched, since the

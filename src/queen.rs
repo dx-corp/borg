@@ -1685,6 +1685,7 @@ impl Queen {
             groups.entry(key).or_insert_with(|| {
                 let mut group: Vec<DroneState> = drones
                     .iter()
+                    .filter(|d| d.trust.runs_units())
                     .filter(|d| admission::unit_host(&d.id, capacities, &rows_by_id, &u.platform))
                     .map(|d| {
                         let mut d = d.clone();

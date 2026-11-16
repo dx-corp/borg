@@ -106,6 +106,14 @@ pub struct JanitorSettings {
     /// red publish run was cancelled before its catch-up re-dispatch ran).
     #[serde(default)]
     pub(crate) superseded_push_workflows: Vec<String>,
+    /// Cancel `merge_group` runs whose merge-queue branch
+    /// (`gh-readonly-queue/...`) no longer exists: the queue entry merged or
+    /// left the queue, so the run's verdict is moot. Running ones too only
+    /// with `cancel_running`. A run's own self-cancel step cannot do this for
+    /// jobs that never get a runner (2026-11-16: 185 such jobs, from runs of
+    /// already-merged pull requests, took main's runners ahead of main).
+    #[serde(default)]
+    pub(crate) dead_merge_queue_runs: bool,
     /// Repositories the janitor passes over. Default: every queen `repos`
     /// entry. Set it when the queen watches repositories (for alias lanes)
     /// whose runs must not be deduplicated or superseded by these generic

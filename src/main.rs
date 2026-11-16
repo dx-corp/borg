@@ -661,9 +661,10 @@ struct InstallArgs {
     /// Add this label to every runner the drone registers; repeatable.
     #[arg(long = "extra-label")]
     extra_labels: Vec<String>,
-    /// `shared` (default), `deploy` or `deploy-only`: a deploy drone runs only
-    /// deploy and main jobs, a deploy-only drone only deploy jobs, a shared
-    /// drone never runs deploy jobs.
+    /// `shared` (default), `deploy`, `deploy-only` or `pr-only`: a deploy
+    /// drone runs only deploy and main jobs, a deploy-only drone only deploy
+    /// jobs, a pr-only drone only pull-request jobs, a shared drone never runs
+    /// deploy jobs.
     #[arg(long, value_parser = parse_trust, default_value = "shared")]
     trust: borg::classes::Trust,
     /// Start standby deploy runners after this many seconds without a queen
@@ -707,7 +708,7 @@ struct InstallArgs {
 
 fn parse_trust(s: &str) -> Result<borg::classes::Trust, String> {
     serde_json::from_value(serde_json::Value::from(s))
-        .map_err(|_| "expected shared, deploy or deploy-only".to_owned())
+        .map_err(|_| "expected shared, deploy, deploy-only or pr-only".to_owned())
 }
 
 fn parse_env_pair(s: &str) -> Result<(String, String), String> {
