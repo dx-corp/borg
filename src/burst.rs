@@ -24,7 +24,11 @@
 //! * **Retire**: a drone within `retire_margin_secs` of its hard maximum run
 //!   time is drained, so it does not take a job the cloud will cut short.
 //!   Replacements follow the scale-up rule only: a drone is replaced while
-//!   demand holds and not otherwise.
+//!   demand holds and not otherwise. A retiring drone no longer takes a place
+//!   under `max_drones`, so its replacement is created while it finishes its
+//!   leases, not after it is deleted; it cannot return to service, and the
+//!   cloud ends it within `retire_margin_secs`. It still counts toward the
+//!   budget and its headroom until it is deleted.
 //! * **Budget**: drone-hours per UTC day and per UTC month. Creation needs
 //!   headroom for `reserve_hours` of every drone, old and new. Once a budget
 //!   is spent every drone is drained and deleted as it empties; leases already
@@ -738,12 +742,16 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
 
     let mut actions = Vec::new();
     let mut provisioning = 0u32;
+    let mut retiring_vms = 0usize;
     for vm in &live_vms {
         let seen = drone(&vm.drone);
         let alive = seen.is_some_and(|d| d.alive);
         let leases = seen.map_or(0, |d| d.leases);
         let age = now - vm.created_at;
         let retiring = age >= max_run - down.retire_margin_secs;
+        if retiring {
+            retiring_vms += 1;
+        }
         if !alive && age < down.provision_grace_secs && vm.draining_at.is_none() {
             provisioning += 1;
         }
@@ -809,7 +817,9 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
                 && !obs.vms.iter().any(|v| v.drone == d.name)
         })
         .count();
-    let counted = live_vms.len() + unmanaged;
+    // A retiring drone takes no new lease and is never undrained, so it holds
+    // no place under the cap: its replacement must not wait for its delete.
+    let counted = live_vms.len().saturating_sub(retiring_vms) + unmanaged;
     let room = usize::try_from(cfg.max_drones)
         .unwrap_or(usize::MAX)
         .saturating_sub(counted);
@@ -2011,6 +2021,105 @@ mod tests {
                 why: "near its maximum run time"
             }]
         );
+        assert!(p.actions.iter().all(|a| a.kind() != "create"));
+    }
+
+    #[test]
+    fn a_retiring_drone_is_replaced_while_it_drains_when_demand_holds() {
+        let mut c = cfg();
+        c.max_drones = 1;
+        let heavy = [unmet(Class::Heavy, Scope::Main, 2)];
+        let mut vms = vec![vm("gcp-burst-qa", "us-west1-b", T0 - (12 * 3600 - 1700))];
+        let busy = [drone("gcp-burst-qa", true, 3)];
+        let mut st = BurstState {
+            demand_since: Some(T0 - 600),
+            ..BurstState::default()
+        };
+        // The pass that retires the only allowed drone also creates its
+        // replacement: the retiring drone holds no place under the cap.
+        let p = run(&c, &mut st, T0, &heavy, &busy, &vms);
+        assert_eq!(
+            p.actions.iter().map(Action::kind).collect::<Vec<_>>(),
+            ["drain", "create"],
+            "{:?}",
+            p.actions
+        );
+        assert_eq!(p.outcome, "create");
+        apply_simulated(&c, &mut vms, &p.actions, T0);
+        assert_eq!(vms.len(), 2);
+        let replacement = vms[1].drone.clone();
+
+        // While the replacement provisions and the old drone still runs
+        // its leases, nothing more is created.
+        let p = run(&c, &mut st, T0 + 60, &heavy, &busy, &vms);
+        assert_eq!(p.outcome, "provisioning");
+        assert!(p.actions.is_empty(), "{:?}", p.actions);
+
+        // Once the replacement serves, it is the one drone the cap allows,
+        // however long demand has held.
+        let both = [drone("gcp-burst-qa", true, 1), drone(&replacement, true, 4)];
+        let p = run(&c, &mut st, T0 + 1200, &heavy, &both, &vms);
+        assert_eq!(p.outcome, "at_max_drones");
+        assert!(p.actions.iter().all(|a| a.kind() != "create"));
+
+        // The old drone is deleted when it holds no lease, as before.
+        let emptied = [drone("gcp-burst-qa", true, 0), drone(&replacement, true, 4)];
+        let p = run(&c, &mut st, T0 + 1260, &heavy, &emptied, &vms);
+        assert_eq!(
+            p.actions,
+            [Action::Delete {
+                drone: "gcp-burst-qa".to_owned(),
+                why: "drained and empty"
+            }]
+        );
+    }
+
+    #[test]
+    fn a_drone_drained_for_idleness_still_holds_its_place_under_the_cap() {
+        let mut c = cfg();
+        c.max_drones = 1;
+        let heavy = [unmet(Class::Heavy, Scope::Main, 2)];
+        // Drained for idleness and not near its maximum run time: demand
+        // returns it to service, so it is not replaced.
+        let draining = [BurstVm {
+            draining_at: Some(T0 - 30),
+            ..vm("gcp-burst-qa", "us-west1-b", T0 - 7200)
+        }];
+        let idle = [drone("gcp-burst-qa", true, 0)];
+        let mut st = BurstState {
+            demand_since: Some(T0 - 600),
+            ..BurstState::default()
+        };
+        let p = run(&c, &mut st, T0, &heavy, &idle, &draining);
+        assert_eq!(
+            p.actions,
+            [Action::Undrain {
+                drone: "gcp-burst-qa".to_owned()
+            }]
+        );
+        assert_eq!(p.outcome, "at_max_drones");
+    }
+
+    #[test]
+    fn a_retiring_drone_is_not_replaced_once_the_budget_lacks_headroom() {
+        let mut c = cfg();
+        c.max_drones = 1;
+        let heavy = [unmet(Class::Heavy, Scope::Main, 2)];
+        let vms = [vm("gcp-burst-qa", "us-west1-b", T0 - (12 * 3600 - 1700))];
+        let busy = [drone("gcp-burst-qa", true, 3)];
+        // The retiring drone still counts toward the budget: a day budget
+        // with room for its own reserve and not for a second drone's refuses
+        // the replacement.
+        let (day_start, _) = windows(T0);
+        #[allow(clippy::cast_precision_loss, reason = "seconds within one day")]
+        let spent_today = (T0 - day_start.max(vms[0].created_at)) as f64 / 3600.0;
+        c.budget.drone_hours_per_day = spent_today + 1.5 * c.budget.reserve_hours;
+        let mut st = BurstState {
+            demand_since: Some(T0 - 600),
+            ..BurstState::default()
+        };
+        let p = run(&c, &mut st, T0, &heavy, &busy, &vms);
+        assert_eq!(p.outcome, "no_headroom", "{}", p.reason);
         assert!(p.actions.iter().all(|a| a.kind() != "create"));
     }
 

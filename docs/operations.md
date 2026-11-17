@@ -1219,7 +1219,11 @@ creates and deletes VMs (see "Live burst drones" below). Each pass it:
   of headroom for every live drone plus the new one;
 - would drain a drone idle for `idle_secs`, near its maximum run time
   (`retire_margin_secs`) or once a budget is spent, and delete it on a later
-  pass only when it holds no lease.
+  pass only when it holds no lease. A drone near its maximum run time no
+  longer counts toward `max_drones`: while demand holds, its replacement is
+  created in the pass that drains it, so for up to `retire_margin_secs` there
+  is one drone more than `max_drones`. The old drone takes no new lease and
+  still counts toward the drone-hour budgets and their headroom.
 
 What it would do is logged as `burst_would_create`, `burst_would_drain`,
 `burst_would_undrain` and `burst_would_delete` health events under the drone
