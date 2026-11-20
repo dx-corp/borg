@@ -491,6 +491,34 @@ async fn disk_floor_blocks_new_delivery_and_placement_with_contract_off_but_keep
 }
 
 #[tokio::test]
+async fn reclaim_floor_is_the_disk_floor_of_the_largest_class_the_drone_hosts() {
+    let h = Harness::start(json!({"env_contract": {
+        "enabled": false,
+        "classes": {"heavy": {"min_cache_dir_free_bytes": 32u64 << 30}}
+    }}))
+    .await;
+    let token = h.enroll("disk").await;
+    let heavy_host = h.heartbeat_with(&token, json!({})).await;
+    assert_eq!(heavy_host["min_free_disk_bytes"], 10u64 << 30);
+    assert_eq!(heavy_host["reclaim_floor_bytes"], 32u64 << 30);
+
+    let mut small = serde_json::to_value(support::capacity()).unwrap();
+    small["mem_mib"] = json!(6 * 1024);
+    let light_host = h.heartbeat_with(&token, json!({"capacity": small})).await;
+    assert_eq!(
+        light_host["reclaim_floor_bytes"],
+        10u64 << 30,
+        "a host too small for a heavy lease keeps the admission floor"
+    );
+
+    let reclaim_only = h.heartbeat_with(&token, json!({"accepting": false})).await;
+    assert!(
+        reclaim_only.get("reclaim_floor_bytes").is_none(),
+        "a drone that takes no leases keeps its own floor: {reclaim_only}"
+    );
+}
+
+#[tokio::test]
 async fn low_cache_blocks_pending_delivery_without_cache_stats_and_recovers_at_exact_floor() {
     let h = Harness::start(json!({"env_contract": {"checks": {"cache_store": "advisory"}}})).await;
     let token = h.enroll("disk").await;

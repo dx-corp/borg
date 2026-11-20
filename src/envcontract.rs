@@ -481,6 +481,20 @@ impl ContractSettings {
         )
     }
 
+    /// The free space reclaim keeps on a drone: the largest disk floor among
+    /// the classes it `hosts`. A drone that hosts heavy leases must stay above
+    /// the heavy floor or the queen stops placing them there, so its reclaim
+    /// frees build caches at that floor and not at the global one, under which
+    /// the drone takes no lease at all. A class the drone cannot hold does not
+    /// raise it.
+    pub fn reclaim_floor_bytes(&self, hosts: impl Fn(Class) -> bool) -> u64 {
+        Class::ALL
+            .into_iter()
+            .filter(|class| hosts(*class))
+            .map(|class| self.min_cache_dir_free_bytes_for(class))
+            .fold(self.min_cache_dir_free_bytes, u64::max)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.facts_max_age_secs <= 0
             || self.allowed_wrappers.is_empty()
@@ -1109,6 +1123,28 @@ mod tests {
             settings.min_cache_dir_free_bytes_for(Class::Heavy),
             32 << 30
         );
+    }
+
+    #[test]
+    fn reclaim_keeps_the_floor_of_the_largest_class_a_drone_hosts() {
+        // borg-main-1 on 2026-11-20: reclaim freed to the 10 GiB global floor
+        // while heavy needs 32 GiB, so free space swung between 26 and 35 GiB
+        // and its five heavy slots dropped out of the fleet and came back.
+        let mut settings = ContractSettings::default();
+        settings.classes.insert(
+            Class::Heavy,
+            ClassContract {
+                min_cache_dir_free_bytes: Some(32 << 30),
+                ..ClassContract::default()
+            },
+        );
+        assert_eq!(settings.reclaim_floor_bytes(|_| true), 32 << 30);
+        assert_eq!(
+            settings.reclaim_floor_bytes(|class| class != Class::Heavy),
+            10 << 30,
+            "a drone too small for heavy keeps the global floor"
+        );
+        assert_eq!(settings.reclaim_floor_bytes(|_| false), 10 << 30);
     }
 
     const NOW: i64 = 10_000;

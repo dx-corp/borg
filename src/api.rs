@@ -26,8 +26,8 @@ use time::OffsetDateTime;
 mod sanitize;
 
 use crate::allocator::{
-    ActiveLease, AdmissionState, HostCaps, LeaseState, Reservation, Unmet, free_room, free_slots,
-    max_slots,
+    ActiveLease, AdmissionState, DroneState, HostCaps, LeaseState, Reservation, Unmet, free_room,
+    free_slots, max_slots,
 };
 use crate::bid::{ClassPressure, DroneBid};
 use crate::classes::{Class, Scope, Trust};
@@ -191,6 +191,12 @@ pub struct HeartbeatResponse {
     /// Existing Queen disk floor; older Queens omit it and drones use 10 GiB.
     #[serde(default = "crate::envcontract::default_min_disk_free_bytes")]
     pub min_free_disk_bytes: u64,
+    /// The free space this drone's reclaim keeps: the largest disk floor of
+    /// the classes its hardware can host (`reclaim_floor_bytes` in
+    /// `envcontract`). Absent for a drone that takes no leases and from older
+    /// queens; the drone then reclaims to `min_free_disk_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaim_floor_bytes: Option<u64>,
     pub leases: Vec<LeaseGrant>,
     /// Work units to run (resent until acknowledged in `active_units`).
     #[serde(default)]
@@ -764,6 +770,12 @@ async fn heartbeat(
     };
     Ok(Json(HeartbeatResponse {
         min_free_disk_bytes: queen.config().env_contract.min_cache_dir_free_bytes,
+        reclaim_floor_bytes: req.accepting.then(|| {
+            let cfg = queen.config();
+            let state = DroneState::from_capacity(drone.clone(), &req.capacity, &req.caps);
+            cfg.env_contract
+                .reclaim_floor_bytes(|class| max_slots(&state, cfg.classes.spec(class)) > 0)
+        }),
         leases,
         units,
         cancel_units,

@@ -251,7 +251,7 @@ async fn runs_a_granted_lease_cleans_up_and_reports_the_result() {
     );
     let lease_id = name.rsplit('-').next().unwrap().to_owned();
     assert!(
-        !rig.path("work/slot-0").exists(),
+        !rig.path("work/slot-15").exists(),
         "slot dir removed after the job"
     );
     assert_eq!(
@@ -592,7 +592,7 @@ async fn jobs_share_cache_dirs_and_a_git_mirror_that_survive_cleanup() {
         )
     );
     let installs = read("install-");
-    let slot_install = format!("{}/slot-0/cargo-install", rig.path("work").display());
+    let slot_install = format!("{}/slot-15/cargo-install", rig.path("work").display());
     assert_eq!(
         installs,
         [slot_install.clone(), slot_install],
@@ -687,8 +687,8 @@ async fn leases_get_distinct_slots_while_concurrent_and_the_same_path_when_a_slo
     let during = drone.slot_assignments();
     assert_eq!(
         during.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
-        [0, 1],
-        "distinct slots while concurrent"
+        [14, 15],
+        "distinct slots while concurrent, from the top for a light lease"
     );
     drain(&mut tasks).await;
     assert!(
@@ -715,15 +715,15 @@ async fn leases_get_distinct_slots_while_concurrent_and_the_same_path_when_a_slo
     let first_pwds: Vec<String> = read_all("pwd-").into_iter().map(|(_, p)| p).collect();
     let work = fs::canonicalize(rig.path("work")).unwrap();
     let mut want = vec![
-        work.join("slot-0").display().to_string(),
-        work.join("slot-1").display().to_string(),
+        work.join("slot-15").display().to_string(),
+        work.join("slot-14").display().to_string(),
     ];
     let mut got = first_pwds.clone();
     got.sort();
     want.sort();
     assert_eq!(got, want);
 
-    // A later lease alone takes slot 0 again, at exactly the same path.
+    // A later lease alone takes slot 15 again, at exactly the same path.
     rig.h.state().jobs.clear();
     rig.h.queue_job(3, "borg-ci-light", 1);
     rig.h.tick().await;
@@ -733,9 +733,9 @@ async fn leases_get_distinct_slots_while_concurrent_and_the_same_path_when_a_slo
     assert_eq!(all.len(), 3);
     let slot_files = read_all("slot-");
     assert_eq!(
-        slot_files.iter().filter(|(_, s)| s == "0").count(),
+        slot_files.iter().filter(|(_, s)| s == "15").count(),
         2,
-        "slot 0 was used twice"
+        "slot 15 was used twice"
     );
     assert_eq!(fs::read_dir(rig.path("work")).unwrap().count(), 0);
 }
@@ -795,11 +795,11 @@ async fn with_a_job_user_the_runner_and_its_file_operations_go_through_setpriv()
         "the runner install is cloned as the job user: {calls}"
     );
     assert!(
-        has("/work/slot-0/run.sh"),
+        has("/work/slot-15/run.sh"),
         "run.sh is started through setpriv: {calls}"
     );
     assert!(
-        has("rm -rf -- ") && has("/work/slot-0"),
+        has("rm -rf -- ") && has("/work/slot-15"),
         "cleanup removes the slot as the job user: {calls}"
     );
 
@@ -814,10 +814,10 @@ async fn with_a_job_user_the_runner_and_its_file_operations_go_through_setpriv()
     );
     assert_eq!(
         fs::read_to_string(rig.path("out/who.txt")).unwrap().trim(),
-        format!("{}|borg-job", rig.path("work/slot-0/_home").display()),
+        format!("{}|borg-job", rig.path("work/slot-15/_home").display()),
         "the job gets a private HOME inside its lease directory"
     );
-    assert!(!rig.path("work/slot-0").exists());
+    assert!(!rig.path("work/slot-15").exists());
 }
 
 #[tokio::test]
@@ -865,7 +865,7 @@ async fn files_a_job_writes_to_home_never_reach_the_next_job() {
             "{leaked} must not land in the shared home"
         );
     }
-    assert!(!rig.path("work/slot-0").exists());
+    assert!(!rig.path("work/slot-15").exists());
 }
 
 #[tokio::test]
@@ -1335,10 +1335,10 @@ async fn a_unit_runs_from_the_mirror_streams_its_log_and_finishes_with_a_receipt
     let id = u.start(&drone, &mut tasks, &script, json!({})).await;
 
     u.wait_for(&up).await;
-    // While it runs: the next heartbeat acknowledges it, and it holds slot 0.
+    // While it runs: the next heartbeat acknowledges it, and it holds slot 15 (a unit is not a heavy lease).
     drone.heartbeat_once(true, &mut tasks).await.unwrap();
     assert_eq!(u.unit(&id).await.state, borg::units::UnitState::Running);
-    assert_eq!(drone.slot_assignments(), [(0, id.clone())]);
+    assert_eq!(drone.slot_assignments(), [(15, id.clone())]);
     fs::write(&go, "").unwrap();
     drain(&mut tasks).await;
 
@@ -1350,12 +1350,12 @@ async fn a_unit_runs_from_the_mirror_streams_its_log_and_finishes_with_a_receipt
     assert!(unit.receipt().unwrap().verifies());
     let log = u.log(&id).await;
     assert!(log.starts_with("hello from the tree\n"), "{log}");
-    assert!(log.contains(&format!("unit={id} slot=0")), "{log}");
+    assert!(log.contains(&format!("unit={id} slot=15")), "{log}");
     assert!(
         log.contains(&u.tree),
         "HEAD is a commit of the unit's tree: {log}"
     );
-    let checkout = u.rig.path("work/slot-0/_work/app/app");
+    let checkout = u.rig.path("work/slot-15/_work/app/app");
     assert!(
         log.contains(&checkout.display().to_string()),
         "checked out where a CI job's checkout is: {log}"
@@ -1382,7 +1382,7 @@ async fn a_unit_runs_from_the_mirror_streams_its_log_and_finishes_with_a_receipt
     assert!(
         log.contains(&format!(
             "home={}",
-            u.rig.path("work/slot-0/_home").display()
+            u.rig.path("work/slot-15/_home").display()
         )),
         "{log}"
     );
@@ -1390,7 +1390,7 @@ async fn a_unit_runs_from_the_mirror_streams_its_log_and_finishes_with_a_receipt
         u.rig.path("cache/git/example-org/app.git/HEAD").exists(),
         "the mirror was made on demand and survives the unit"
     );
-    assert!(!u.rig.path("work/slot-0").exists(), "slot cleaned up");
+    assert!(!u.rig.path("work/slot-15").exists(), "slot cleaned up");
     assert!(drone.unit_ids().is_empty() && drone.slot_assignments().is_empty());
 }
 
@@ -1548,7 +1548,7 @@ async fn a_tree_the_drone_cannot_get_fails_the_unit_so_the_client_falls_back() {
         "{why}"
     );
     assert!(u.log(&id).await.contains(&why));
-    assert!(!u.rig.path("work/slot-0").exists());
+    assert!(!u.rig.path("work/slot-15").exists());
 }
 
 #[tokio::test]
@@ -1570,6 +1570,7 @@ async fn units_share_the_local_lease_cap_with_ci_leases() {
     u.rig.h.queue_job(1, "borg-ci-light", 1);
     u.rig.h.tick().await;
     assert_eq!(drone.heartbeat_once(true, &mut tasks).await.unwrap(), 0);
+    // `max_leases: 1` leaves one slot, which every class shares.
     assert_eq!(drone.slot_assignments(), [(0, id.clone())]);
     fs::write(&go, "").unwrap();
     drain(&mut tasks).await;

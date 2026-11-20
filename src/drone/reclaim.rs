@@ -520,7 +520,8 @@ pub struct LiveHost<'a> {
     sizes: &'a Mutex<HashMap<PathBuf, (i64, u64)>>,
     /// Common git dir of each worktree probed, for `worktree prune`.
     common: Mutex<HashMap<PathBuf, PathBuf>>,
-    /// The queen's disk admission floor (0 when unknown).
+    /// The free space the build filesystems keep: the queen's disk floor for
+    /// the largest class this drone hosts (0 when unknown).
     floor: u64,
     /// Leases the drone is running now: a CI slot's tool home or a shared
     /// namespace cache is busy while any lease runs (its tools execute from
@@ -977,8 +978,12 @@ pub struct Reclaimer {
     slots: Arc<Slots>,
     work_root: PathBuf,
     cache_root: PathBuf,
-    /// The queen's disk admission floor (shared with the drone).
+    /// The queen's disk admission floor (shared with the drone). The Docker
+    /// tier frees to this one: Docker often has its own small volume.
     floor: Arc<AtomicU64>,
+    /// The free space the build filesystems keep (shared with the drone): the
+    /// disk floor of the largest class this drone hosts.
+    build_floor: Arc<AtomicU64>,
     stats: Mutex<ReclaimStats>,
     seq: Mutex<u64>,
     sizes: Mutex<HashMap<PathBuf, (i64, u64)>>,
@@ -1001,6 +1006,7 @@ impl Reclaimer {
         leases: Arc<Mutex<HashSet<String>>>,
         slots: Arc<Slots>,
         floor: Arc<AtomicU64>,
+        build_floor: Arc<AtomicU64>,
     ) -> Option<Arc<Self>> {
         let settings = cfg.reclaim.clone();
         if !settings.enabled {
@@ -1069,6 +1075,7 @@ impl Reclaimer {
             work_root: cfg.work_root.clone(),
             cache_root: cfg.cache_root.clone(),
             floor,
+            build_floor,
             seq: Mutex::new(seq),
             sizes: Mutex::new(HashMap::new()),
             kick: tokio::sync::Notify::new(),
@@ -1152,7 +1159,7 @@ impl Reclaimer {
                 size_floor_secs: self.settings.critical_min_age_secs,
                 sizes: &self.sizes,
                 common: Mutex::new(HashMap::new()),
-                floor: self.floor.load(Ordering::Relaxed),
+                floor: self.build_floor.load(Ordering::Relaxed),
                 leases: &self.leases,
                 slots: &self.slots,
                 work_root: &self.work_root,
@@ -1792,7 +1799,9 @@ mod tests {
         let held = found.iter().find(|c| c.path == slot).unwrap();
         let unrelated = found.iter().find(|c| c.path == other).unwrap();
 
-        let pause = slots.acquire("paused-lease").unwrap();
+        let pause = slots
+            .acquire("paused-lease", crate::classes::Class::Heavy)
+            .unwrap();
         assert_eq!(pause.index(), 0);
         leases.lock().unwrap().insert("paused-lease".into());
         assert_eq!(

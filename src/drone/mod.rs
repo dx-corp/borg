@@ -38,6 +38,7 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 
 use crate::api::{HeartbeatRequest, LeaseGrant, ResultRequest};
+use crate::classes::Class;
 use crate::probe::{self, Host};
 use caches::Caches;
 use cleanup::{Scope, cleanup_docker, remove_lease_dir, sweep_work_root, valid_lease_id};
@@ -124,9 +125,12 @@ pub struct Drone {
     invariant_failures: Mutex<Vec<crate::envcontract::InvariantFailure>>,
     /// The last container network probe (`None`: passed or not run yet).
     network_probe: Arc<Mutex<Option<crate::envcontract::InvariantFailure>>>,
-    /// Last Queen floor, retained while the Queen is unreachable (shared
-    /// with reclaim, which treats free space below it as critical).
+    /// Last Queen floor, retained while the Queen is unreachable.
     disk_floor: Arc<AtomicU64>,
+    /// The free space reclaim keeps (shared with reclaim, which treats free
+    /// space below it as critical): the Queen's floor for the largest class
+    /// this drone hosts, never under `disk_floor`.
+    reclaim_floor: Arc<AtomicU64>,
     capability_cache: capabilities::CapabilityCache,
     /// Busy-cores rate of the host, fed by heartbeats and lease samples.
     cpu_meter: Arc<crate::hostdiag::CpuMeter>,
@@ -174,6 +178,9 @@ impl Drone {
         let disk_floor = Arc::new(AtomicU64::new(
             crate::envcontract::DEFAULT_MIN_DISK_FREE_BYTES,
         ));
+        let reclaim_floor = Arc::new(AtomicU64::new(
+            crate::envcontract::DEFAULT_MIN_DISK_FREE_BYTES,
+        ));
         let slots = Slots::new(slot_count);
         let reclaimer = reclaim::Reclaimer::new(
             &cfg,
@@ -181,6 +188,7 @@ impl Drone {
             Arc::clone(&held),
             Arc::clone(&slots),
             Arc::clone(&disk_floor),
+            Arc::clone(&reclaim_floor),
         );
         let setpriv = cfg
             .job_user
@@ -206,6 +214,7 @@ impl Drone {
             network_probe: Arc::default(),
             tools_cache: probe::ToolsCache::default(),
             disk_floor,
+            reclaim_floor,
             capability_cache: capabilities::CapabilityCache::default(),
             cpu_meter: Arc::default(),
             reclaimer,
@@ -439,6 +448,10 @@ impl Drone {
         let resp = self.client.heartbeat(&req).await?;
         self.disk_floor
             .store(resp.min_free_disk_bytes, Ordering::Relaxed);
+        self.reclaim_floor.store(
+            reclaim_floor(resp.min_free_disk_bytes, resp.reclaim_floor_bytes),
+            Ordering::Relaxed,
+        );
         let accepting = accepting
             && !crate::envcontract::disk_admission(
                 resp.min_free_disk_bytes,
@@ -554,7 +567,7 @@ impl Drone {
     /// Claim a slot for `grant` and run it as a lease. Returns whether it
     /// started.
     fn start_lease(&self, grant: LeaseGrant, tasks: &mut JoinSet<()>) -> bool {
-        let Some(ctx) = self.claim(&grant.lease_id, false) else {
+        let Some(ctx) = self.claim(&grant.lease_id, grant.class, false) else {
             return false;
         };
         tasks.spawn(handle_lease(ctx, grant));
@@ -563,16 +576,16 @@ impl Drone {
 
     /// Claim a slot for a work unit and run it. Returns whether it started.
     fn start_unit(&self, grant: crate::units::UnitGrant, tasks: &mut JoinSet<()>) -> bool {
-        let Some(ctx) = self.claim(&grant.unit_id, true) else {
+        let Some(ctx) = self.claim(&grant.unit_id, grant.class, true) else {
             return false;
         };
         tasks.spawn(units::handle_unit(ctx, grant));
         true
     }
 
-    /// Admit `id` and give it a slot, a cancel switch and the shared job
-    /// machinery. `None` when it may not start now.
-    fn claim(&self, id: &str, unit: bool) -> Option<LeaseContext> {
+    /// Admit `id` and give it a slot for its class, a cancel switch and the
+    /// shared job machinery. `None` when it may not start now.
+    fn claim(&self, id: &str, class: Class, unit: bool) -> Option<LeaseContext> {
         if !self.admit(id, unit) {
             return None;
         }
@@ -586,7 +599,7 @@ impl Drone {
         if let Ok(mut preempts) = self.preempts.lock() {
             preempts.insert(id.to_owned(), preempt_tx);
         }
-        let Some(slot) = self.slots.acquire(id) else {
+        let Some(slot) = self.slots.acquire(id, class) else {
             tracing::warn!("no free slot for {id}; leaving it unstarted");
             return None;
         };
@@ -1064,6 +1077,14 @@ async fn network_probe_round(
     invariants::next_probe_delay(s, failing)
 }
 
+/// The free space reclaim keeps on the build filesystems: the queen's floor
+/// for the largest class this drone hosts when it sends one, never below the
+/// floor under which the drone takes no lease at all. An older queen sends
+/// only that floor.
+fn reclaim_floor(admission_floor: u64, class_floor: Option<u64>) -> u64 {
+    class_floor.unwrap_or(0).max(admission_floor)
+}
+
 /// The free-disk floor a held standby must clear to start while the queen is
 /// unreachable: its class's floor as the queen sent it with the standby, never
 /// below the last global floor the queen gave.
@@ -1114,6 +1135,17 @@ mod disk_tests {
         fn run(&self, _: &str, _: &[&str]) -> std::io::Result<Output> {
             panic!("disk-blocked standby must not run commands")
         }
+    }
+
+    #[test]
+    fn reclaim_keeps_the_class_floor_and_never_less_than_the_admission_floor() {
+        assert_eq!(reclaim_floor(10 << 30, Some(32 << 30)), 32 << 30);
+        assert_eq!(
+            reclaim_floor(10 << 30, None),
+            10 << 30,
+            "an older queen sends only the admission floor"
+        );
+        assert_eq!(reclaim_floor(10 << 30, Some(5 << 30)), 10 << 30);
     }
 
     #[tokio::test]
