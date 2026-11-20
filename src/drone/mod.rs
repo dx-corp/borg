@@ -20,6 +20,7 @@ pub(crate) mod hostview;
 pub mod install;
 pub mod invariants;
 pub mod jobuser;
+pub mod memlimit;
 pub mod pins;
 pub mod reclaim;
 pub(crate) mod registry_fault;
@@ -138,6 +139,8 @@ pub struct Drone {
     reclaimer: Option<Arc<reclaim::Reclaimer>>,
     /// Job-credential wipe; `None` when off or unsupported here.
     credwipe: Option<Arc<credwipe::CredWiper>>,
+    /// Per-lease memory cgroups; `None` without a delegated cgroup v2 tree.
+    cgroups: Option<Arc<memlimit::LeaseCgroups>>,
     /// The version reported to the queen, with the binary's hash once
     /// measured (see `selfupdate::running_build_version`).
     reported_version: Arc<std::sync::OnceLock<String>>,
@@ -219,6 +222,7 @@ impl Drone {
             cpu_meter: Arc::default(),
             reclaimer,
             credwipe,
+            cgroups: None,
             reported_version: Arc::default(),
             client: Arc::new(client),
             host,
@@ -617,6 +621,7 @@ impl Drone {
             caches: Arc::clone(&self.caches),
             credwipe: self.credwipe.clone(),
             reclaimer: self.reclaimer.clone(),
+            cgroups: self.cgroups.clone(),
             slot,
             held,
         })
@@ -782,6 +787,18 @@ impl Drone {
     }
 
     /// Heartbeat until `shutdown` resolves, then drain.
+    /// Run each lease in its own memory-limited cgroup when this host
+    /// delegates a cgroup v2 tree with the memory controller to the drone
+    /// (see [`memlimit`]); otherwise say why and run without limits.
+    #[must_use]
+    pub fn with_lease_cgroups(mut self) -> Self {
+        match memlimit::LeaseCgroups::system() {
+            Ok(c) => self.cgroups = Some(Arc::new(c)),
+            Err(e) => tracing::warn!("leases run without memory limits: {e}"),
+        }
+        self
+    }
+
     pub async fn run(self, shutdown: impl std::future::Future<Output = ()>) {
         self.startup_sweep().await;
         let mut tasks = JoinSet::new();
@@ -879,6 +896,7 @@ struct LeaseContext {
     caches: Arc<Caches>,
     credwipe: Option<Arc<credwipe::CredWiper>>,
     reclaimer: Option<Arc<reclaim::Reclaimer>>,
+    cgroups: Option<Arc<memlimit::LeaseCgroups>>,
     /// Dropped before `held`, so the slot is free whenever the id is.
     slot: SlotGuard,
     held: HeldGuard,
@@ -979,6 +997,8 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         preempt_grace: Duration::from_secs(ctx.cfg.preempt_grace_secs),
         job_user: ctx.cfg.job_user.as_ref(),
         proc_root: &ctx.proc_root,
+        cgroups: ctx.cgroups.as_deref(),
+        memory: grant.memory,
     };
     let host_start = sample_host(&ctx).await;
     let outcome = run_lease(
@@ -1015,6 +1035,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
             peak_rss_mib: o.peak_rss_mib,
             telemetry: None,
             preempted: o.preempted,
+            oom_killed: o.oom_killed,
             host,
         },
         Err(e) => {
@@ -1025,6 +1046,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
                 peak_rss_mib: None,
                 telemetry: None,
                 preempted: false,
+                oom_killed: false,
                 host,
             }
         }
@@ -1165,6 +1187,7 @@ mod disk_tests {
             jit_config: Secret::new("jit".to_owned()),
             expires_at: i64::MAX,
             min_free_disk_bytes: None,
+            memory: None,
         });
         let mut tasks = JoinSet::new();
         drone.fail_open(&mut tasks).await;
@@ -1185,6 +1208,7 @@ mod disk_tests {
             jit_config: Secret::new("jit".to_owned()),
             expires_at: i64::MAX,
             min_free_disk_bytes: floor,
+            memory: None,
         }
     }
 

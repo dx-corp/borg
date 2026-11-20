@@ -3,11 +3,25 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use super::as_active;
 use crate::allocator::{ActiveLease, LeaseState, Promotion};
-use crate::classes::{Class, Scope};
+use crate::classes::{Class, Scope, disk_labels_mib};
 use crate::probe::Capacity;
 use crate::store::{LeaseRow, LeaseStatus};
+
+/// A lease row as the allocator sees it; its disk labels set its floor.
+pub(super) fn as_active(l: &LeaseRow) -> ActiveLease {
+    ActiveLease {
+        drone_id: l.drone.clone(),
+        class: l.class,
+        scope: l.scope,
+        state: match l.state {
+            LeaseStatus::Running => LeaseState::Running,
+            LeaseStatus::Standby => LeaseState::Standby,
+            _ => LeaseState::Pending,
+        },
+        disk_mib: disk_labels_mib(&l.labels),
+    }
+}
 
 /// A lease as placement sees it. A pending lease not yet delivered to a
 /// drone whose heartbeat withholds it (`withheld`) can take no job until that

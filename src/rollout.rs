@@ -41,6 +41,15 @@
 //! * **independence**: in the canary stage every canary host is also checked on
 //!   its own, so one clean host cannot vouch for a failing one.
 //!
+//! Capacity: a told drone stops taking work until it updates, so a wave tells
+//! its drones a few at a time. While a member is still draining or updating, a
+//! further drone is told only if the capacity then out of service (members
+//! not yet on the target, and drones not accepting work) stays within
+//! `max_unavailable_pct` of every class it can run. One drone may always be in
+//! flight, so the rollout cannot deadlock. And while the queue of a class has
+//! waited `pause_when_queued_secs`, no drone that can run that class is told,
+//! for at most `max_pause_secs` of a stage. The canary stage is unchanged.
+//!
 //! Any failing check **halts** the rollout and **rolls back**: every drone is
 //! told the previous version. A halted rollout stays halted until an operator
 //! resets it or the target changes. A newer target that only follows the queen's
@@ -53,6 +62,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::allocator::QueueAge;
+use crate::classes::Class;
 use crate::health::{Outcome, OutcomeKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -91,6 +102,14 @@ pub struct RolloutSettings {
     pub absolute_host_failure_pm: u32,
     /// Control-group jobs needed to compare against.
     pub min_baseline_jobs: u32,
+    /// Share of each class's capacity (slots of fresh, schedulable drones)
+    /// that may be out of service while a wave tells another drone.
+    pub max_unavailable_pct: u32,
+    /// A queue of a class that has waited this long holds back telling any
+    /// drone that can run the class. `null` turns the pause off.
+    pub pause_when_queued_secs: Option<u64>,
+    /// How long into a stage queues may hold telling drones back.
+    pub max_pause_secs: u64,
 }
 
 impl Default for RolloutSettings {
@@ -110,6 +129,9 @@ impl Default for RolloutSettings {
             max_success_drop_pm: 50,
             absolute_host_failure_pm: 100,
             min_baseline_jobs: 5,
+            max_unavailable_pct: 25,
+            pause_when_queued_secs: Some(600),
+            max_pause_secs: 3600,
         }
     }
 }
@@ -128,6 +150,9 @@ impl RolloutSettings {
             || self.waves_pct.contains(&0)
         {
             return Err("rollout waves_pct must be ascending percentages ending at 100".into());
+        }
+        if self.max_unavailable_pct > 100 {
+            return Err("rollout max_unavailable_pct must be at most 100".into());
         }
         if self.update_timeout_secs == 0 || self.wave_jobs == 0 || self.drain_timeout_secs == 0 {
             return Err(
@@ -294,6 +319,13 @@ pub struct DroneView {
     /// reclaim-only drone (dev-desktop) or one that stopped accepting is
     /// never picked; it still updates with the waves.
     pub(crate) runs_jobs: bool,
+    /// Placement admits work on it now: it runs jobs and is not in a
+    /// suspect cool-down or otherwise refused by the allocator. Capacity of a
+    /// drone out of service is already lost before the rollout tells it.
+    pub(crate) in_service: bool,
+    /// Leases of each class the drone holds when empty; capacity a told drone
+    /// takes out of service until it updates.
+    pub(crate) slots: BTreeMap<Class, u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -390,6 +422,114 @@ fn track_drains(
     }
 }
 
+/// Per class: the slots of fresh, schedulable drones, and of those the ones
+/// out of service (members not yet on `target`, or not accepting work); and
+/// whether any member is still on its way to the target.
+fn out_of_service(
+    st: &RolloutState,
+    drones: &[DroneView],
+    target: &str,
+) -> (BTreeMap<Class, u64>, BTreeMap<Class, u64>, bool) {
+    let (mut total, mut lost) = (BTreeMap::new(), BTreeMap::new());
+    let mut in_flight = false;
+    for d in drones.iter().filter(|d| d.fresh && !d.held) {
+        let updating = st.members.contains(&d.name)
+            && !d.maintenance
+            && !d
+                .version
+                .as_deref()
+                .is_some_and(|v| same_release(v, target));
+        in_flight |= updating;
+        for (&class, &n) in &d.slots {
+            *total.entry(class).or_default() += u64::from(n);
+            if updating || !d.in_service {
+                *lost.entry(class).or_default() += u64::from(n);
+            }
+        }
+    }
+    (total, lost, in_flight)
+}
+
+/// Tell drones the target, by name, until the wave has `want` members, as far
+/// as capacity allows (see the module docs). Returns why it stopped short.
+fn tell_within_capacity(
+    st: &mut RolloutState,
+    s: &RolloutSettings,
+    drones: &[DroneView],
+    target: &str,
+    now: i64,
+    queued: &[QueueAge],
+    want: usize,
+) -> Option<String> {
+    let paused: BTreeSet<Class> = match s.pause_when_queued_secs {
+        Some(after) if now.saturating_sub(st.stage_started_at) < secs(s.max_pause_secs) => queued
+            .iter()
+            .filter(|q| q.oldest_age_secs >= after)
+            .map(|q| q.class)
+            .collect(),
+        _ => BTreeSet::new(),
+    };
+    let mut candidates: Vec<&DroneView> = drones
+        .iter()
+        .filter(|d| d.fresh && !d.held && !st.members.contains(&d.name))
+        .collect();
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut why = None;
+    for d in candidates {
+        if st.members.len() >= want {
+            break;
+        }
+        let on_target = d
+            .version
+            .as_deref()
+            .is_some_and(|v| same_release(v, target));
+        // A drone already on the target takes nothing out of service.
+        if !on_target {
+            let runs = |c: &Class| d.slots.get(c).is_some_and(|&n| n > 0);
+            if let Some(c) = paused.iter().find(|c| runs(c)) {
+                why.get_or_insert(format!(
+                    "{} waits: {} jobs have queued for {}s or more",
+                    d.name,
+                    c.as_str(),
+                    s.pause_when_queued_secs.unwrap_or_default()
+                ));
+                continue;
+            }
+            let (total, lost, in_flight) = out_of_service(st, drones, target);
+            let over = in_flight
+                .then(|| {
+                    // A drone already out of service is already in `lost`;
+                    // telling it takes nothing more out.
+                    let adds = |n: u32| if d.in_service { u64::from(n) } else { 0 };
+                    d.slots.iter().find(|&(c, &n)| {
+                        let all = total.get(c).copied().unwrap_or(0);
+                        let out = lost.get(c).copied().unwrap_or(0) + adds(n);
+                        adds(n) > 0 && out * 100 > all * u64::from(s.max_unavailable_pct)
+                    })
+                })
+                .flatten();
+            if let Some((c, _)) = over {
+                why.get_or_insert(format!(
+                    "{} waits: telling it now would take more than {}% of {} capacity out of service",
+                    d.name,
+                    s.max_unavailable_pct,
+                    c.as_str()
+                ));
+                continue;
+            }
+        }
+        st.members.push(d.name.clone());
+    }
+    why
+}
+
+/// Drones a wave of `pct` percent tells: that share of the drones that can
+/// update now (fresh and schedulable), rounded up.
+fn wave_want(drones: &[DroneView], pct: u32) -> usize {
+    let eligible = drones.iter().filter(|d| d.fresh && !d.held).count();
+    (eligible * usize::try_from(pct).unwrap_or(100)).div_ceil(100)
+}
+
 fn observe<'a>(outcomes: &'a [Outcome], pick: impl Fn(&Outcome) -> bool + 'a) -> Observed {
     let mut o = Observed::default();
     for x in outcomes.iter().filter(|x| pick(x)) {
@@ -452,7 +592,8 @@ fn compare(s: &RolloutSettings, label: &str, new: &Observed, control: &Observed)
 /// before the first pass for this target).
 #[allow(
     clippy::too_many_lines,
-    reason = "one linear state machine; splitting it would scatter the stage rules"
+    clippy::too_many_arguments,
+    reason = "one linear state machine over the fleet, its jobs and its queues; splitting it would scatter the stage rules"
 )]
 pub fn advance(
     now: i64,
@@ -462,6 +603,7 @@ pub fn advance(
     state: Option<RolloutState>,
     drones: &[DroneView],
     outcomes: &[Outcome],
+    queued: &[QueueAge],
 ) -> Advance {
     let mut events = Vec::new();
     let mut st = match state {
@@ -762,7 +904,30 @@ pub fn advance(
             let soaked = now.saturating_sub(st.stage_started_at)
                 >= i64::try_from(s.soak_secs).unwrap_or(i64::MAX);
             let enough = stage_jobs.jobs >= s.wave_jobs;
-            if wait.is_none() && !soaked {
+            // The wave tells its drones as capacity allows; it is not done
+            // until all of them are told.
+            let want = wave_want(drones, s.waves_pct[st.wave]);
+            let before = st.members.len();
+            let short = tell_within_capacity(&mut st, s, drones, target, now, queued, want);
+            // This pass's update and heartbeat checks ran before these drones
+            // were told, so the wave waits a pass to check them too.
+            let added = st.members.len() > before;
+            let told = st.members.len() >= want;
+            if wait.is_none() && !told {
+                wait = Some(short.unwrap_or_else(|| {
+                    format!(
+                        "wave {}: {} of {want} drones told",
+                        st.wave + 1,
+                        st.members.len()
+                    )
+                }));
+            } else if wait.is_none() && added {
+                wait = Some(format!(
+                    "wave {}: {} drone(s) just told; checking them first",
+                    st.wave + 1,
+                    st.members.len() - before
+                ));
+            } else if wait.is_none() && !soaked {
                 wait = Some(format!("soaking wave {} for {}s", st.wave + 1, s.soak_secs));
             } else if wait.is_none() && !enough {
                 wait = Some(format!(
@@ -772,7 +937,7 @@ pub fn advance(
                     s.wave_jobs
                 ));
             }
-            soaked && enough && wait.is_none()
+            told && !added && soaked && enough && wait.is_none()
         }
         _ => false,
     };
@@ -789,32 +954,30 @@ pub fn advance(
             events.push(format!("rollout of {target} complete"));
         } else {
             // Only drones that can update now: a silent one would only stall
-            // the wave until it timed out.
-            let eligible: Vec<&DroneView> = drones.iter().filter(|d| d.fresh && !d.held).collect();
-            let pct = usize::try_from(s.waves_pct[next]).unwrap_or(100);
-            let want = (eligible.len() * pct).div_ceil(100);
-            let mut extra: Vec<&str> = eligible
-                .iter()
-                .map(|d| d.name.as_str())
-                .filter(|n| !members.contains(n))
-                .collect();
-            extra.sort_unstable();
-            for n in extra
-                .into_iter()
-                .take(want.saturating_sub(st.members.len()))
-            {
-                st.members.push(n.to_owned());
-            }
+            // the wave until it timed out. The rest of the wave is told on
+            // later passes as capacity allows.
+            let pct = s.waves_pct[next];
             st.phase = Phase::Wave;
             st.wave = next;
             st.stage_started_at = now;
+            wait = tell_within_capacity(
+                &mut st,
+                s,
+                drones,
+                target,
+                now,
+                queued,
+                wave_want(drones, pct),
+            );
             events.push(format!(
                 "rollout of {target}: wave {} ({pct}%), {} drone(s) told",
                 next + 1,
                 st.members.len()
             ));
         }
-        wait = None;
+        if st.phase == Phase::Complete {
+            wait = None;
+        }
     }
     Advance {
         state: st,
@@ -866,10 +1029,19 @@ mod tests {
             },
             drone("b", "linux", "0.1.0+old", 0),
         ];
-        let a = advance(10, &s, "0.1.0+old", "0.1.0+new", None, &fleet, &[]);
+        let a = advance(10, &s, "0.1.0+old", "0.1.0+new", None, &fleet, &[], &[]);
         assert_eq!(a.state.canaries, ["b"]);
         // With only a reclaim-only drone there is no canary yet.
-        let a = advance(10, &s, "0.1.0+old", "0.1.0+new", None, &fleet[..1], &[]);
+        let a = advance(
+            10,
+            &s,
+            "0.1.0+old",
+            "0.1.0+new",
+            None,
+            &fleet[..1],
+            &[],
+            &[],
+        );
         assert!(a.state.canaries.is_empty());
         assert!(a.waiting.is_some());
     }
@@ -886,6 +1058,8 @@ mod tests {
             has_active_leases: false,
             version: Some(version.into()),
             version_since: Some(since),
+            slots: BTreeMap::new(),
+            in_service: true,
         }
     }
 
@@ -913,7 +1087,7 @@ mod tests {
     }
 
     fn step(now: i64, st: Option<RolloutState>, fleet: &[DroneView], jobs: &[Outcome]) -> Advance {
-        advance(now, &settings(), OLD, NEW, st, fleet, jobs)
+        advance(now, &settings(), OLD, NEW, st, fleet, jobs, &[])
     }
 
     fn set_version(fleet: &mut [DroneView], names: &[&str], version: &str, since: i64) {
@@ -1352,7 +1526,16 @@ mod tests {
         let a = step(100, None, &f, &[]);
         let halted = step(500, Some(a.state), &f, &[]);
         assert_eq!(halted.state.phase, Phase::Halted);
-        let b = advance(600, &settings(), OLD, "3.0.0", Some(halted.state), &f, &[]);
+        let b = advance(
+            600,
+            &settings(),
+            OLD,
+            "3.0.0",
+            Some(halted.state),
+            &f,
+            &[],
+            &[],
+        );
         assert_eq!(
             (b.state.phase, b.state.target.as_str()),
             (Phase::Canary, "3.0.0")
@@ -1488,7 +1671,7 @@ mod tests {
         // rollout's previous version and says what it replaced.
         let prev = previous_for("3.0.0", Some(&st), &fleet()).unwrap();
         assert_eq!(prev, OLD);
-        let a = advance(limit + 1, &s, &prev, "3.0.0", Some(st), &fleet(), &[]);
+        let a = advance(limit + 1, &s, &prev, "3.0.0", Some(st), &fleet(), &[], &[]);
         assert_eq!(a.state.phase, Phase::Canary);
         assert!(
             a.events[0].contains("2.0.0 superseded by 3.0.0 in its wave stage"),
@@ -1584,5 +1767,197 @@ mod tests {
             previous_for("0.1.0+new", Some(&halted), &fleet).as_deref(),
             Some("0.1.0+first")
         );
+    }
+
+    #[test]
+    fn a_drone_told_in_the_last_wave_is_checked_before_the_rollout_completes() {
+        let (mut f, st) = promoted_to_wave();
+        let jobs: Vec<Outcome> = (0..6)
+            .map(|i| job("l1", 150 + i, OutcomeKind::Ok))
+            .collect();
+        let b = step(241, Some(st), &f, &jobs);
+        set_version(&mut f, &["l2"], NEW, 250);
+        let jobs2: Vec<Outcome> = (0..6)
+            .map(|i| job("l2", 260 + i, OutcomeKind::Ok))
+            .collect();
+        let c = step(400, Some(b.state), &f, &jobs2);
+        assert_eq!((c.state.phase, c.state.wave), (Phase::Wave, 2));
+        set_version(&mut f, &["l3", "m2"], NEW, 410);
+        // A drone joins on the old version as the last wave would complete:
+        // it is told, and the wave waits to check it before completing.
+        f.push(drone("l4", "linux", OLD, 0));
+        let jobs3: Vec<Outcome> = (0..6)
+            .map(|i| job("l3", 420 + i, OutcomeKind::Ok))
+            .collect();
+        let d = step(520, Some(c.state), &f, &jobs3);
+        assert_eq!(d.state.phase, Phase::Wave);
+        assert!(d.state.members.iter().any(|m| m == "l4"));
+        assert!(
+            d.waiting.as_deref().unwrap().contains("just told"),
+            "{:?}",
+            d.waiting
+        );
+        // Once it runs the target, the rollout completes.
+        set_version(&mut f, &["l4"], NEW, 525);
+        let e = step(530, Some(d.state), &f, &jobs3);
+        assert_eq!(e.state.phase, Phase::Complete);
+    }
+
+    #[test]
+    fn telling_a_drone_already_out_of_service_takes_nothing_more_out() {
+        // pve-a is still updating, so the capacity rule applies. borg-heavy-1
+        // is not accepting work: its heavy slots are already out of service,
+        // so telling it adds none and it is told; borg-heavy-2 then waits.
+        let f = morning_fleet();
+        let s = RolloutSettings {
+            canary_oses: vec!["linux".into()],
+            ..settings()
+        };
+        let a = advance(1000, &s, OLD, NEW, Some(last_wave(1000)), &f, &[], &[]);
+        assert_eq!(told_heavy(&a.state, &f), ["borg-heavy-1"]);
+    }
+
+    /// The shared fleet on 2026-11-20 as the rollout saw it, with the slots
+    /// each drone holds when empty: borg-main-1 holds half the heavy slots and
+    /// borg-heavy-1 is not accepting work.
+    fn morning_fleet() -> Vec<DroneView> {
+        let with = |name: &str, heavy: u32, medium: u32, light: u32| {
+            let mut d = drone(name, "linux", OLD, 0);
+            d.slots = [
+                (Class::Heavy, heavy),
+                (Class::Medium, medium),
+                (Class::Light, light),
+            ]
+            .into_iter()
+            .filter(|&(_, n)| n > 0)
+            .collect();
+            d
+        };
+        let mut idle = with("borg-heavy-1", 2, 4, 8);
+        idle.runs_jobs = false;
+        idle.in_service = false;
+        vec![
+            idle,
+            with("borg-heavy-2", 2, 4, 8),
+            with("borg-main-1", 5, 14, 32),
+            with("gha-heavy", 1, 3, 8),
+            with("pve-a", 0, 0, 3),
+            with("pve-b", 0, 0, 3),
+            with("pve-c", 0, 0, 3),
+        ]
+    }
+
+    /// The last wave (100%) just started, with only `pve-a` told so far.
+    fn last_wave(at: i64) -> RolloutState {
+        RolloutState {
+            target: NEW.into(),
+            previous: OLD.into(),
+            phase: Phase::Wave,
+            canaries: vec!["pve-a".into()],
+            members: vec!["pve-a".into()],
+            wave: 2,
+            started_at: 0,
+            stage_started_at: at,
+            update_started_at: BTreeMap::new(),
+            drain_started_at: BTreeMap::new(),
+            cordoned: Vec::new(),
+            halted_reason: None,
+        }
+    }
+
+    fn told_heavy(st: &RolloutState, fleet: &[DroneView]) -> Vec<String> {
+        fleet
+            .iter()
+            .filter(|d| st.members.contains(&d.name) && d.slots.contains_key(&Class::Heavy))
+            .filter(|d| d.version.as_deref() != Some(NEW))
+            .map(|d| d.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_wave_tells_heavy_capable_drones_one_at_a_time() {
+        let mut f = morning_fleet();
+        set_version(&mut f, &["pve-a"], NEW, 0);
+        let s = RolloutSettings {
+            canary_oses: vec!["linux".into()],
+            ..settings()
+        };
+        let a = advance(1000, &s, OLD, NEW, Some(last_wave(1000)), &f, &[], &[]);
+        // One drone is always allowed; the small ones fit the light budget;
+        // no second heavy-capable drone goes out while borg-heavy-1 updates.
+        assert_eq!(a.state.members, ["pve-a", "borg-heavy-1", "pve-b", "pve-c"]);
+        assert_eq!(told_heavy(&a.state, &f), ["borg-heavy-1"]);
+        let why = a.waiting.as_deref().unwrap();
+        assert!(why.contains("capacity out of service"), "{why}");
+
+        // Once they run the target, the next heavy-capable drone is told,
+        // and only it.
+        set_version(&mut f, &["borg-heavy-1", "pve-b", "pve-c"], NEW, 1010);
+        let b = advance(1020, &s, OLD, NEW, Some(a.state), &f, &[], &[]);
+        assert_eq!(told_heavy(&b.state, &f), ["borg-heavy-2"]);
+        // The wave cannot complete until every drone is told.
+        assert_eq!(b.state.phase, Phase::Wave);
+    }
+
+    #[test]
+    fn aged_queues_hold_back_drones_that_run_their_class_for_a_bounded_time() {
+        let mut f = morning_fleet();
+        set_version(&mut f, &["pve-a"], NEW, 0);
+        let s = RolloutSettings {
+            canary_oses: vec!["linux".into()],
+            ..settings()
+        };
+        let heavy_queue = [QueueAge {
+            class: Class::Heavy,
+            scope: crate::classes::Scope::Main,
+            oldest_age_secs: 4877,
+        }];
+        let a = advance(
+            1000,
+            &s,
+            OLD,
+            NEW,
+            Some(last_wave(1000)),
+            &f,
+            &[],
+            &heavy_queue,
+        );
+        // Only drones that cannot run heavy work are told.
+        assert_eq!(a.state.members, ["pve-a", "pve-b", "pve-c"]);
+        assert!(
+            a.waiting
+                .as_deref()
+                .unwrap()
+                .contains("heavy jobs have queued")
+        );
+        // The pause lasts at most max_pause_secs into the stage.
+        let late = 1000 + secs(s.max_pause_secs) + 1;
+        let b = advance(
+            late,
+            &s,
+            OLD,
+            NEW,
+            Some(last_wave(1000)),
+            &f,
+            &[],
+            &heavy_queue,
+        );
+        assert_eq!(told_heavy(&b.state, &f), ["borg-heavy-1"]);
+    }
+
+    #[test]
+    fn canaries_are_chosen_as_before_whatever_the_queues() {
+        let f = morning_fleet();
+        let s = RolloutSettings {
+            canary_oses: vec!["linux".into()],
+            ..settings()
+        };
+        let heavy_queue = [QueueAge {
+            class: Class::Heavy,
+            scope: crate::classes::Scope::Main,
+            oldest_age_secs: 4877,
+        }];
+        let a = advance(10, &s, OLD, NEW, None, &f, &[], &heavy_queue);
+        assert_eq!(a.state.canaries, ["borg-heavy-2"]);
     }
 }

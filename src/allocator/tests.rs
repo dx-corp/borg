@@ -58,6 +58,7 @@ fn lease(drone: &str, class: Class, scope: Scope, state: LeaseState) -> ActiveLe
         class,
         scope,
         state,
+        disk_mib: None,
     }
 }
 
@@ -1982,6 +1983,7 @@ fn memory_in_use_beyond_commitments_shrinks_the_room() {
         class: Class::Heavy,
         scope: Scope::Main,
         state: LeaseState::Running,
+        disk_mib: None,
     }];
     assert_eq!(count(&allocate(&i), Class::Medium, Scope::Main), 1);
 }
@@ -2036,6 +2038,7 @@ fn drones_on_one_node_share_its_free_memory() {
         class: Class::Heavy,
         scope: Scope::Main,
         state: LeaseState::Running,
+        disk_mib: None,
     }];
     assert_eq!(count(&allocate(&i), Class::Heavy, Scope::Main), 0);
     // Different nodes do not share.

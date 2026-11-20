@@ -34,7 +34,7 @@ use crate::burst::{
     Action as BurstAction, BurstSettings, BurstState, BurstView, BurstVm,
     Decision as BurstDecision, ObservedDrone, ZONE_COOLDOWN_SECS,
 };
-use crate::classes::{Class, Scope};
+use crate::classes::{Class, Scope, disk_labels_mib};
 use crate::config::{QueenConfig, StandbySettings};
 use crate::envcontract::{
     CheckKind, CheckState, Mode, Need, blocked_classes, capability_states, fresh_disk_admissions,
@@ -53,8 +53,7 @@ use crate::probe::Capacity;
 use crate::profile::{ClassProfile, QueuedFamilies, build_profiles, family_of};
 use crate::requeue::Requeuer;
 use crate::rollout::{
-    Check as RolloutCheck, DroneView, Observed as RolloutObserved, RolloutState, advance,
-    desired_for,
+    Check as RolloutCheck, Observed as RolloutObserved, RolloutState, desired_for,
 };
 use crate::store::{DroneRow, LeaseRow, LeaseStatus, PreemptionRow, Store, StoreError};
 use crate::tailnet::TailnetEnroll;
@@ -420,19 +419,6 @@ fn new_lease_id() -> String {
     hex::encode(b)
 }
 
-fn as_active(l: &LeaseRow) -> ActiveLease {
-    ActiveLease {
-        drone_id: l.drone.clone(),
-        class: l.class,
-        scope: l.scope,
-        state: match l.state {
-            LeaseStatus::Running => LeaseState::Running,
-            LeaseStatus::Standby => LeaseState::Standby,
-            _ => LeaseState::Pending,
-        },
-    }
-}
-
 /// Where a preemptible lease's job lives: repo, run id, job id.
 type JobRef<'a> = (&'a str, u64, u64);
 
@@ -737,7 +723,7 @@ impl Queen {
         if let Err(e) = self.assess_health(now_ts).await {
             tracing::warn!("health assessment failed: {e}");
         }
-        if let Err(e) = self.advance_rollout(now_ts, &active).await {
+        if let Err(e) = self.advance_rollout(now_ts, &active, &queue_ages).await {
             tracing::warn!("rollout pass failed: {e}");
         }
         let profiles = self.profiles(now_ts).await;
@@ -885,6 +871,7 @@ impl Queen {
                 class: g.class,
                 scope: g.scope,
                 state: LeaseState::Pending,
+                disk_mib: disk_labels_mib(&g.labels),
             }));
             held.extend(spent_bids.iter().cloned());
             let units = self
@@ -918,6 +905,7 @@ impl Queen {
                     class: g.class,
                     scope: g.scope,
                     state: LeaseState::Pending,
+                    disk_mib: disk_labels_mib(&g.labels),
                 }));
             // A starving unit needs contiguous room as existing work drains.
             // Do not refill its eligible reserved host with new CI this tick.
@@ -973,6 +961,7 @@ impl Queen {
                 class: g.class,
                 scope: g.scope,
                 state: LeaseState::Pending,
+                disk_mib: disk_labels_mib(&g.labels),
             })
             .collect();
         held.extend(runner_spent.iter().cloned());
@@ -1030,6 +1019,7 @@ impl Queen {
             class: g.class,
             scope: g.scope,
             state: LeaseState::Pending,
+            disk_mib: disk_labels_mib(&g.labels),
         }));
         let idle_after = crate::allocator::idle_after(
             &runner_input.drones,
@@ -1369,6 +1359,7 @@ impl Queen {
                         class,
                         scope: Scope::Deploy,
                         state: LeaseState::Standby,
+                        disk_mib: None,
                     });
                 }
             }
@@ -1397,100 +1388,6 @@ impl Queen {
             .map(|r| desired_for(&r.state, drone).to_owned())
     }
 
-    /// One pass of the quorum rollout gate (only when both the target and
-    /// `rollout.previous_version` are configured).
-    async fn advance_rollout(&self, now: i64, active: &[LeaseRow]) -> Result<(), QueenError> {
-        let Some(target) = self.rollout_target() else {
-            return Ok(());
-        };
-        if self.cfg.rollout.previous_version.is_none() && !self.cfg.rollout.follow_queen {
-            return Ok(());
-        }
-        let stored = self.store.rollout_state().await?;
-        let target = self.settled_target(target, stored.as_ref(), now);
-        let rows = self.store.drones().await?;
-        let busy_drones: HashSet<&str> = active
-            .iter()
-            .filter(|lease| lease.state != LeaseStatus::Standby)
-            .map(|lease| lease.drone.as_str())
-            .collect();
-        let views: Vec<DroneView> = rows
-            .iter()
-            .map(|d| DroneView {
-                name: d.name.clone(),
-                os: d
-                    .capacity
-                    .as_ref()
-                    .map(|c| c.os.clone())
-                    .unwrap_or_default(),
-                fresh: d
-                    .last_heartbeat
-                    .is_some_and(|t| now - t <= self.cfg.drone_stale_secs),
-                held: d.held(),
-                maintenance: d.hold() == crate::health::Hold::Operator,
-                has_active_leases: busy_drones.contains(d.name.as_str()),
-                version: d.version.clone(),
-                version_since: d.version_since,
-                shared: d.trust == crate::classes::Trust::Shared,
-                runs_jobs: d.accepting,
-            })
-            .collect();
-        let Some(previous) = self
-            .cfg
-            .rollout
-            .previous_version
-            .clone()
-            .or_else(|| crate::rollout::previous_for(&target, stored.as_ref(), &views))
-        else {
-            // A reset can leave no baseline when all fresh drones already run
-            // the target. Clear the old view and its heartbeat instructions.
-            self.update_snapshot(|s| s.rollout = None);
-            return Ok(());
-        };
-        let since = stored
-            .as_ref()
-            .filter(|s| s.target == target)
-            .map_or(now.saturating_sub(86_400), |s| s.started_at);
-        let outcomes: Vec<Outcome> = self
-            .store
-            .telemetry_since(since, MAX_REPORT_ROWS)
-            .await?
-            .iter()
-            .filter_map(outcome_of)
-            .collect();
-        let adv = advance(
-            now,
-            &self.cfg.rollout,
-            &previous,
-            &target,
-            stored.clone(),
-            &views,
-            &outcomes,
-        );
-        if stored.as_ref() != Some(&adv.state)
-            && !self
-                .store
-                .save_rollout_state_if_current(stored.as_ref(), &adv.state, now)
-                .await?
-        {
-            return Ok(());
-        }
-        for e in &adv.events {
-            tracing::warn!("rollout: {e}");
-            self.store.log_rollout(now, e).await?;
-        }
-        self.update_snapshot(|s| {
-            s.rollout = Some(RolloutView {
-                state: adv.state,
-                checks: adv.checks,
-                waiting: adv.waiting,
-                new_group: adv.new_group,
-                control_group: adv.control_group,
-            });
-        });
-        Ok(())
-    }
-
     /// Units already placed hold capacity like running leases.
     async fn unit_leases(&self) -> Vec<ActiveLease> {
         if !self.cfg.units.enabled {
@@ -1515,6 +1412,7 @@ impl Queen {
                         } else {
                             LeaseState::Held
                         },
+                        disk_mib: None,
                     })
                 })
                 .collect(),
@@ -1928,6 +1826,7 @@ impl Queen {
                     class: g.class,
                     scope: g.scope,
                     state: LeaseState::Held,
+                    disk_mib: None,
                 };
                 base.push(lease.clone());
                 placed.leases.push(lease);
@@ -2983,10 +2882,11 @@ mod coverage;
 mod families;
 mod hostlost;
 mod pinned;
+mod rollout_pass;
 #[cfg(test)]
 use admission::pressure_window_mean;
 pub use build::QueenBuild;
-use coverage::{as_placed, promotions};
+use coverage::{as_active, as_placed, promotions};
 use families::{families_by_class, placement_profiles};
 pub use pinned::jit_labels;
 

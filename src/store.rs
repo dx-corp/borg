@@ -473,11 +473,31 @@ pub struct PreemptionRow {
     pub requeued_at: Option<i64>,
 }
 
+/// What [`Store::finish_lease`] did with a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Finish {
+    /// No lease of this id belongs to the drone.
+    NotOwned,
+    /// This result ended the lease.
+    Ended,
+    /// The lease had already ended (a retried result): nothing changed.
+    AlreadyEnded,
+}
+
+impl Finish {
+    /// The drone owns the lease, whether or not this result ended it.
+    pub fn owned(self) -> bool {
+        self != Self::NotOwned
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LeaseResult {
     pub exit_code: i32,
     pub duration_secs: u64,
     pub peak_rss_mib: Option<u64>,
+    /// The kernel OOM-killed a job process at the lease's memory limit.
+    pub oom_killed: bool,
 }
 
 #[derive(Clone)]
@@ -674,6 +694,7 @@ impl Store {
             "ALTER TABLE drones ADD COLUMN trust TEXT NOT NULL DEFAULT 'shared'",
             "ALTER TABLE units ADD COLUMN scope TEXT NOT NULL DEFAULT 'pr'",
             "ALTER TABLE units ADD COLUMN supersede_key TEXT",
+            "ALTER TABLE leases ADD COLUMN oom_killed INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE units ADD COLUMN record INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE clients ADD COLUMN max_scope TEXT NOT NULL DEFAULT 'pr'",
             "ALTER TABLE clients ADD COLUMN expires_at INTEGER",
@@ -1586,7 +1607,7 @@ impl Store {
         drone: &str,
         result: &LeaseResult,
         now: i64,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Finish, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         let owned = sqlx::query("SELECT 1 FROM leases WHERE id = ? AND drone = ?")
             .bind(id)
@@ -1595,21 +1616,27 @@ impl Store {
             .await?
             .is_some();
         if !owned {
-            return Ok(false);
+            return Ok(Finish::NotOwned);
         }
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
-        sqlx::query(
-            "UPDATE leases SET state = 'done', finished_at = ?, jit_config = NULL, exit_code = ?, duration_secs = ?, peak_rss_mib = ?
+        let ended = sqlx::query(
+            "UPDATE leases SET state = 'done', finished_at = ?, jit_config = NULL, exit_code = ?, duration_secs = ?, peak_rss_mib = ?, oom_killed = ?
              WHERE id = ? AND state IN ('standby', 'pending', 'running', 'expired')",
         )
         .bind(now)
         .bind(i64::from(result.exit_code))
         .bind(i64::try_from(result.duration_secs).unwrap_or(i64::MAX))
         .bind(result.peak_rss_mib.map(|v| i64::try_from(v).unwrap_or(i64::MAX)))
+        .bind(result.oom_killed)
         .bind(id)
         .execute(&self.pool)
-        .await?;
-        Ok(true)
+        .await?
+        .rows_affected();
+        Ok(if ended == 0 {
+            Finish::AlreadyEnded
+        } else {
+            Finish::Ended
+        })
     }
 
     /// Mark an active lease preempted and record the job it was running, once.
@@ -1946,10 +1973,21 @@ VALUES ('l1', 'd1', 'medium', 'pr', '[\"a\"]', 'borg-d1-l1', 7, 'jit', 'pending'
             exit_code: 0,
             duration_secs: 5,
             peak_rss_mib: Some(100),
+            oom_killed: false,
         };
-        assert!(!s.finish_lease("l1", "d2", &r, 500).await.unwrap());
-        assert!(s.finish_lease("l1", "d1", &r, 500).await.unwrap());
-        assert!(s.finish_lease("l1", "d1", &r, 600).await.unwrap());
+        assert_eq!(
+            s.finish_lease("l1", "d2", &r, 500).await.unwrap(),
+            Finish::NotOwned
+        );
+        assert_eq!(
+            s.finish_lease("l1", "d1", &r, 500).await.unwrap(),
+            Finish::Ended
+        );
+        // A retried result is accepted and changes nothing.
+        assert_eq!(
+            s.finish_lease("l1", "d1", &r, 600).await.unwrap(),
+            Finish::AlreadyEnded
+        );
         let l = s.lease("l1").await.unwrap().unwrap();
         assert_eq!(l.state, LeaseStatus::Done);
         assert!(l.jit_config.is_none(), "secret dropped when the lease ends");

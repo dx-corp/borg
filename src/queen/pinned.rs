@@ -18,7 +18,7 @@ use crate::allocator::{
     ActiveLease, AllocatorInput, Demand, Grant, LeaseState, PlacementDecision, QueueAge,
     Reservation, allocate_reserved,
 };
-use crate::classes::Classes;
+use crate::classes::{Class, Classes, disk_labels_mib, parse_disk_label};
 use crate::github::QueuedJob;
 
 /// `Queen::summarize` of some jobs: its queue, demand, ages and families.
@@ -82,10 +82,38 @@ pub(super) fn place<Q, F>(
         let (_, demand, ages, _) = summarize(&group.jobs);
         let mut sub = input.clone();
         sub.drones.retain(|d| group.drones.contains(&d.id));
+        // A disk label raises every class's floor on these drones for this
+        // group; the allocator charges it per grant.
+        if let Some(gib) = group.disk_gib {
+            let need = gib << 10;
+            // Only an idle runner minted for this disk floor carries the
+            // label these jobs ask for. Any other pending runner, and every
+            // deploy standby, cannot take them: it holds its room and disk
+            // without covering them, so they get a runner of their own.
+            for l in &mut sub.leases {
+                if matches!(l.state, LeaseState::Pending | LeaseState::Standby)
+                    && l.disk_mib != Some(need)
+                {
+                    l.state = LeaseState::Held;
+                }
+            }
+            for d in &mut sub.drones {
+                for class in Class::ALL {
+                    let floor = d.disk_floor_mib.entry(class).or_default();
+                    *floor = (*floor).max(need);
+                }
+            }
+        }
         sub.demand = demand;
         sub.queue_ages = ages;
         sub.warm_floors = Vec::new();
-        let placed = allocate_reserved(&sub, reserved);
+        let mut placed = allocate_reserved(&sub, reserved);
+        // The runner carries the job's disk labels as the job spells them
+        // (GitHub matches labels by name, case-insensitively), so GitHub
+        // hands it the job.
+        for g in &mut placed.grants {
+            g.labels.extend(group.disk_labels.iter().cloned());
+        }
         let held: Vec<ActiveLease> = placed
             .grants
             .iter()
@@ -93,7 +121,10 @@ pub(super) fn place<Q, F>(
                 drone_id: g.drone_id.clone(),
                 class: g.class,
                 scope: g.scope,
+                // Not started: holds its room and the group's disk floor,
+                // in this tick's class pass and, from its labels, after.
                 state: LeaseState::Held,
+                disk_mib: disk_labels_mib(&g.labels),
             })
             .collect();
         super::spend_bids(&mut input.drones, &held);
@@ -138,20 +169,33 @@ pub(super) fn split(
         let wants: PinKey = job
             .labels
             .iter()
-            .filter(|l| classes.parse_label(l).is_none())
+            .filter(|l| classes.parse_label(l).is_none() && parse_disk_label(l).is_none())
             .map(|l| l.to_ascii_lowercase())
             .filter(|l| offered.contains(l))
             .collect();
-        if wants.is_empty() {
+        // A disk label is never offered: it pins the job to no drone, only
+        // to a disk floor (see `place`).
+        let disk_labels: BTreeSet<String> = job
+            .labels
+            .iter()
+            .filter(|l| parse_disk_label(l).is_some())
+            .map(|l| l.to_ascii_lowercase())
+            .collect();
+        let disk_gib = disk_labels.iter().filter_map(|l| parse_disk_label(l)).max();
+        if wants.is_empty() && disk_gib.is_none() {
             unpinned.push(job.clone());
             continue;
         }
-        let group = groups.entry(wants.clone()).or_insert_with(|| PinnedGroup {
+        let mut key = wants.clone();
+        key.extend(disk_labels.iter().cloned());
+        let group = groups.entry(key).or_insert_with(|| PinnedGroup {
             drones: carried
                 .iter()
                 .filter(|(_, has)| wants.is_subset(has))
                 .map(|(drone, _)| (*drone).to_owned())
                 .collect(),
+            disk_gib,
+            disk_labels: disk_labels.clone(),
             jobs: Vec::new(),
         });
         group.jobs.push(job.clone());
@@ -165,6 +209,12 @@ pub(super) fn split(
 pub(super) struct PinnedGroup {
     /// Fresh drones whose runners carry every label of the group.
     pub(super) drones: BTreeSet<String>,
+    /// Free work disk the group's jobs ask for (`borg-disk-<N>g`), GiB: the
+    /// largest of their disk labels.
+    pub(super) disk_gib: Option<u64>,
+    /// The disk labels the group's jobs carry, lower case. Their runners
+    /// carry every one, since GitHub requires each label a job names.
+    pub(super) disk_labels: BTreeSet<String>,
     pub(super) jobs: Vec<QueuedJob>,
 }
 
@@ -193,6 +243,7 @@ pub(super) fn describe(groups: &BTreeMap<PinKey, PinnedGroup>, now: OffsetDateTi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classes::disk_label;
 
     fn job(id: u64, labels: &[&str]) -> QueuedJob {
         QueuedJob {
@@ -260,5 +311,202 @@ mod tests {
         let (unpinned, groups) = split(&jobs, &Classes::default(), &no_single);
         assert!(unpinned.is_empty(), "no runner borg mints could take it");
         assert!(groups.values().next().unwrap().drones.is_empty());
+    }
+
+    fn drone(id: &str, work_free_gib: u64) -> crate::allocator::DroneState {
+        let mut d: crate::allocator::DroneState = serde_json::from_value(serde_json::json!({
+            "id": id, "vcpu": 16, "mem_mib": 28672, "docker": true,
+            "accepting": true, "max_leases": null,
+        }))
+        .unwrap();
+        d.work_free_mib = Some(work_free_gib << 10);
+        // The queen's floors: 10 GiB for light and medium, 32 GiB for heavy.
+        d.disk_floor_mib = [
+            (Class::Light, 10 << 10),
+            (Class::Medium, 10 << 10),
+            (Class::Heavy, 32 << 10),
+        ]
+        .into_iter()
+        .collect();
+        d
+    }
+
+    fn placed(jobs: &[QueuedJob], drones: Vec<crate::allocator::DroneState>) -> Vec<Grant> {
+        placed_with(jobs, drones, Vec::new())
+    }
+
+    fn placed_with(
+        jobs: &[QueuedJob],
+        drones: Vec<crate::allocator::DroneState>,
+        leases: Vec<ActiveLease>,
+    ) -> Vec<Grant> {
+        let classes = Classes::default();
+        let extra: HashMap<String, Vec<String>> =
+            drones.iter().map(|d| (d.id.clone(), Vec::new())).collect();
+        let (unpinned, groups) = split(jobs, &classes, &extra);
+        let summarize = |jobs: &[QueuedJob]| {
+            let demand: Vec<Demand> = jobs
+                .iter()
+                .filter_map(|j| j.labels.iter().find_map(|l| classes.parse_label(l)))
+                .map(|(class, scope)| Demand {
+                    class,
+                    scope,
+                    count: 1,
+                })
+                .collect();
+            ((), demand, Vec::new(), ())
+        };
+        let mut input = AllocatorInput {
+            classes: classes.clone(),
+            demand: summarize(&unpinned).1,
+            drones,
+            leases,
+            warm_floors: Vec::new(),
+            queue_ages: Vec::new(),
+            starvation_after_secs: None,
+            weights: crate::bid::ScoreWeights::default(),
+            admission: None,
+            pr_turn: crate::allocator::PrTurn::default(),
+            larger_hold: crate::allocator::LargerHold::default(),
+        };
+        let (mut grants, _) = place(&groups, &mut input, &[], summarize);
+        grants.extend(allocate_reserved(&input, &[]).grants);
+        grants
+    }
+
+    #[test]
+    fn a_disk_label_is_never_offered_and_groups_the_job_on_every_drone() {
+        let jobs = [
+            job(1, &["borg-ci-medium-pr", "borg-disk-32g"]),
+            job(2, &["borg-ci-medium-pr"]),
+        ];
+        let (unpinned, groups) = split(&jobs, &Classes::default(), &fleet());
+        assert_eq!(unpinned, [jobs[1].clone()]);
+        let g = &groups[&PinKey::from(["borg-disk-32g".to_owned()])];
+        assert_eq!(g.disk_gib, Some(32));
+        assert_eq!(g.drones.len(), fleet().len());
+        // A drone cannot advertise it as one of its own labels.
+        let labels = Classes::default()
+            .sanitize_extra_labels(&["borg-disk-32g".to_owned(), "highmem".to_owned()]);
+        assert_eq!(labels, ["highmem"]);
+    }
+
+    #[test]
+    fn a_32g_medium_job_goes_only_where_32_gib_of_work_disk_is_free() {
+        let jobs = [job(1, &["borg-ci-medium-pr", "borg-disk-32g"])];
+        // 15 GiB free: medium's own 10 GiB floor would admit it; 32g refuses.
+        assert!(placed(&jobs, vec![drone("small", 15)]).is_empty());
+        let grants = placed(&jobs, vec![drone("small", 15), drone("big", 69)]);
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0].drone_id, "big");
+        assert!(grants[0].labels.contains(&"borg-disk-32g".to_owned()));
+        assert!(grants[0].labels.contains(&"borg-ci-medium-pr".to_owned()));
+    }
+
+    fn active(drone: &str, labels: &[&str], state: LeaseState) -> ActiveLease {
+        let labels: Vec<String> = labels.iter().map(|l| (*l).to_owned()).collect();
+        let (class, scope) = labels
+            .iter()
+            .find_map(|l| Classes::default().parse_label(l))
+            .unwrap();
+        ActiveLease {
+            drone_id: drone.into(),
+            class,
+            scope,
+            state,
+            disk_mib: disk_labels_mib(&labels),
+        }
+    }
+
+    #[test]
+    fn a_labelled_runner_still_holds_its_disk_on_later_ticks() {
+        // A 32g runner minted on an earlier tick and not yet running holds 32
+        // GiB, not medium's 10: of 69 GiB, 37 are left, room for one more.
+        let job32 = |id| job(id, &["borg-ci-medium-pr", "borg-disk-32g"]);
+        // Running: its writes are in the reading already, so both new jobs
+        // fit in 69 GiB.
+        // Memory and vCPU for four medium leases, so disk is what binds.
+        let mut big = drone("big", 69);
+        big.mem_mib = 48 * 1024;
+        big.vcpu = 16;
+        let held = |state| {
+            placed_with(
+                &[job32(1), job32(2)],
+                vec![big.clone()],
+                vec![active(
+                    "big",
+                    &["borg-ci-medium-pr", "borg-disk-32g"],
+                    state,
+                )],
+            )
+        };
+        assert_eq!(held(LeaseState::Running).len(), 2);
+        // Pending (an earlier tick's grant, read back from its labels): it
+        // still holds 32 GiB, so only one more fits.
+        assert_eq!(held(LeaseState::Held).len(), 1);
+        assert_eq!(held(LeaseState::Pending).len(), 1);
+    }
+
+    #[test]
+    fn unlabelled_runners_and_standbys_never_cover_a_disk_job() {
+        let job32 = [job(1, &["borg-ci-medium-pr", "borg-disk-32g"])];
+        for cover in [
+            active("big", &["borg-ci-medium-pr"], LeaseState::Pending),
+            active("big", &["borg-ci-medium-deploy"], LeaseState::Standby),
+        ] {
+            let grants = placed_with(&job32, vec![drone("big", 69)], vec![cover.clone()]);
+            assert_eq!(grants.len(), 1, "{cover:?} covered it: {grants:?}");
+            assert!(grants[0].labels.contains(&"borg-disk-32g".to_owned()));
+        }
+        // An idle runner minted for the same floor does cover it.
+        let same = active(
+            "big",
+            &["borg-ci-medium-pr", "borg-disk-32g"],
+            LeaseState::Pending,
+        );
+        assert!(placed_with(&job32, vec![drone("big", 69)], vec![same]).is_empty());
+    }
+
+    #[test]
+    fn the_runner_carries_every_disk_label_as_the_job_spells_it() {
+        // GitHub matches each label a job names by name, so a runner labelled
+        // only `borg-disk-32g` could not take a job asking `borg-disk-032g`.
+        let jobs = [job(
+            1,
+            &["borg-ci-medium-pr", "borg-disk-032g", "BORG-DISK-16G"],
+        )];
+        let grants = placed(&jobs, vec![drone("small", 20), drone("big", 69)]);
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(
+            grants[0].drone_id, "big",
+            "the largest label sets the floor"
+        );
+        for l in ["borg-disk-032g", "borg-disk-16g"] {
+            assert!(grants[0].labels.contains(&l.to_owned()), "{l}: {grants:?}");
+        }
+    }
+
+    #[test]
+    fn ordinary_medium_jobs_place_as_before() {
+        let jobs = [job(1, &["borg-ci-medium-pr"])];
+        let grants = placed(&jobs, vec![drone("small", 15)]);
+        assert_eq!(grants.len(), 1);
+        assert!(!grants[0].labels.iter().any(|l| l.starts_with("borg-disk-")));
+    }
+
+    #[test]
+    fn disk_labels_parse_strictly() {
+        assert_eq!(parse_disk_label("borg-disk-32g"), Some(32));
+        assert_eq!(parse_disk_label("BORG-DISK-8G"), Some(8));
+        for bad in [
+            "borg-disk-0g",
+            "borg-disk-g",
+            "borg-disk-32",
+            "borg-disk--1g",
+            "borg-disk-9999g",
+        ] {
+            assert_eq!(parse_disk_label(bad), None, "{bad}");
+        }
+        assert_eq!(disk_label(32), "borg-disk-32g");
     }
 }

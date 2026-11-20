@@ -1127,7 +1127,8 @@ async fn run_drone(path: &Path, token_file: Option<PathBuf>) -> Result<()> {
     }
     let token = cfg.load_token()?;
     let client = QueenClient::new(&cfg, token)?;
-    let drone = Drone::new(cfg, client, Arc::new(SystemHost), Arc::new(SystemExec));
+    let drone =
+        Drone::new(cfg, client, Arc::new(SystemHost), Arc::new(SystemExec)).with_lease_cgroups();
     drone.run(wait_for_shutdown()).await;
     Ok(())
 }

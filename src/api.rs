@@ -23,11 +23,14 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+mod handoff;
 mod sanitize;
+mod wire;
+pub use wire::{LeaseGrant, ResultRequest};
 
 use crate::allocator::{
-    ActiveLease, AdmissionState, DroneState, HostCaps, LeaseState, Reservation, Unmet, free_room,
-    free_slots, max_slots,
+    ActiveLease, AdmissionState, DroneState, HostCaps, Reservation, Unmet, free_room, free_slots,
+    max_slots,
 };
 use crate::bid::{ClassPressure, DroneBid};
 use crate::classes::{Class, Scope, Trust};
@@ -38,16 +41,16 @@ use crate::envcontract::{
 };
 use crate::health::{DroneHealth, HealthState};
 use crate::homeostasis::KeyReport;
-use crate::hostdiag::{JobHostView, LeaseHostReport};
+use crate::hostdiag::JobHostView;
 use crate::probe::Capacity;
 use crate::queen::RolloutView;
 use crate::queen::{Queen, QueenError, QueueEntry};
 use crate::reclaim::ReclaimStats;
 use crate::rollout::Phase as RolloutPhase;
 use crate::secret::Secret;
-use crate::store::{LeaseResult, LeaseStatus, StoreError};
+use crate::store::{Finish, LeaseResult, LeaseStatus, StoreError};
 use crate::tailnet::drone_name_for;
-use crate::telemetry::{JobTelemetry, MAX_REPORT_ROWS, Report, build_report};
+use crate::telemetry::{MAX_REPORT_ROWS, Report, build_report};
 use crate::units::UnitGrant;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -159,23 +162,6 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LeaseGrant {
-    pub lease_id: String,
-    pub class: Class,
-    pub scope: Scope,
-    pub labels: Vec<String>,
-    pub runner_name: String,
-    pub jit_config: Secret,
-    pub expires_at: i64,
-    /// The class's free-disk floor, sent with a standby so the drone holds
-    /// it (and keeps it across a restart) for fail-open: a standby never
-    /// starts below its class's floor while the queen is unreachable. Older
-    /// queens omit it and the drone uses the global floor alone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_free_disk_bytes: Option<u64>,
-}
-
 /// A drone's report of an update it ran.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateReport {
@@ -231,24 +217,6 @@ pub struct HeartbeatResponse {
     /// memory only and never log it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror_credential: Option<crate::mirror_auth::MirrorCredential>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ResultRequest {
-    pub exit_code: i32,
-    pub duration_secs: u64,
-    #[serde(default)]
-    pub peak_rss_mib: Option<u64>,
-    /// Compact per-job summary; see [`crate::telemetry`] for the wire format.
-    #[serde(default)]
-    pub telemetry: Option<JobTelemetry>,
-    /// The drone stopped the job because the queen preempted the lease.
-    #[serde(default)]
-    pub preempted: bool,
-    /// Host load when the runner started and when it exited; see
-    /// [`crate::hostdiag`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) host: Option<LeaseHostReport>,
 }
 
 #[derive(Debug)]
@@ -699,6 +667,7 @@ async fn heartbeat(
                 runner_name: l.runner_name,
                 jit_config: l.jit_config?,
                 expires_at: l.expires_at,
+                memory: lease_memory(&queen, l.class),
                 min_free_disk_bytes: Some(
                     queen
                         .config()
@@ -740,11 +709,13 @@ async fn heartbeat(
     } else {
         (Vec::new(), Vec::new())
     };
+    let mut disk_left = req.capacity.free_disk_mib;
     let leases = store
         .undelivered(&drone)
         .await?
         .into_iter()
         .filter(|l| grants && !disk.classes[&l.class].blocked())
+        .filter(|l| handoff::fits(&mut disk_left, &l.labels))
         .filter_map(|l| {
             Some(LeaseGrant {
                 lease_id: l.id,
@@ -755,6 +726,7 @@ async fn heartbeat(
                 jit_config: l.jit_config?,
                 expires_at: l.expires_at,
                 min_free_disk_bytes: None,
+                memory: lease_memory(&queen, l.class),
             })
         })
         .collect();
@@ -794,6 +766,13 @@ async fn heartbeat(
     }))
 }
 
+/// The memory limit a lease of `class` runs under, if limits are on.
+fn lease_memory(queen: &Queen, class: Class) -> Option<crate::drone::memlimit::LeaseMemory> {
+    let cfg = queen.config();
+    let mem = cfg.classes.spec(class).mem_mib;
+    cfg.lease_memory.as_ref().map(|m| m.limit(mem))
+}
+
 async fn lease_result(
     State(queen): State<Arc<Queen>>,
     headers: HeaderMap,
@@ -805,13 +784,25 @@ async fn lease_result(
         exit_code: req.exit_code,
         duration_secs: req.duration_secs,
         peak_rss_mib: req.peak_rss_mib,
+        oom_killed: req.oom_killed,
     };
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    if queen
+    let finish = queen
         .store()
         .finish_lease(&id, &drone, &result, now)
-        .await?
-    {
+        .await?;
+    if finish.owned() {
+        // Only the result that ended the lease records the kill: a drone
+        // retries a result whose response it lost.
+        if result.oom_killed && finish == Finish::Ended {
+            // The job outgrew its memory limit and was killed alone: its own
+            // outcome, recorded for the fleet, never a host failure.
+            let reason = format!("lease {id}: a job process was OOM-killed at its memory limit");
+            queen
+                .store()
+                .record_health_event(now, &drone, "oom_killed", &reason)
+                .await?;
+        }
         // A drone that reports its lease's result was not lost, whether or
         // not the rerunner already decided the record.
         if queen.store().withdraw_host_lost(&id, now).await? {
@@ -1251,12 +1242,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
 
     let mut held: Vec<ActiveLease> = active
         .iter()
-        .map(|l| ActiveLease {
-            drone_id: l.drone.clone(),
-            class: l.class,
-            scope: l.scope,
-            state: LeaseState::Running,
-        })
+        .map(|l| ActiveLease::running(l.drone.clone(), l.class, l.scope))
         .collect();
     // Placed work units hold capacity like running leases.
     if cfg.units.enabled {
@@ -1267,12 +1253,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             .await?
         {
             if let Some(drone_id) = u.drone {
-                held.push(ActiveLease {
-                    drone_id,
-                    class: u.class,
-                    scope: Scope::Pr,
-                    state: LeaseState::Running,
-                });
+                held.push(ActiveLease::running(drone_id, u.class, Scope::Pr));
             }
         }
     }

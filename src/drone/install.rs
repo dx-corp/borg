@@ -220,6 +220,9 @@ pub fn render_systemd_unit(
          # SIGTERM goes to the drone only, so in-flight jobs can finish while it\n\
          # drains; leftovers are killed once the drone exits.\n\
          KillMode=mixed\n\
+         # Hand the drone its cgroup subtree: each lease runs in a child cgroup\n\
+         # with its own memory limit (drone/memlimit.rs).\n\
+         Delegate=yes\n\
          TimeoutStopSec={stop}\n\
          \n\
          [Install]\n\

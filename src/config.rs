@@ -488,6 +488,49 @@ fn default_pr_fairness() -> Option<PrFairnessSettings> {
     })
 }
 
+/// Each lease runs under a memory limit of its class's memory plus
+/// `headroom_pct`, with `memory.high` at `high_pct` of that limit
+/// ([`crate::drone::memlimit`]). One job over it is OOM-killed alone instead
+/// of taking the whole host or container with it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LeaseMemorySettings {
+    pub(crate) headroom_pct: u32,
+    pub(crate) high_pct: u32,
+}
+
+impl Default for LeaseMemorySettings {
+    fn default() -> Self {
+        Self {
+            headroom_pct: 50,
+            high_pct: 90,
+        }
+    }
+}
+
+impl LeaseMemorySettings {
+    /// The limit of a lease whose class reserves `class_mem_mib`.
+    pub(crate) fn limit(&self, class_mem_mib: u64) -> crate::drone::memlimit::LeaseMemory {
+        let max_mib = class_mem_mib.saturating_mul(100 + u64::from(self.headroom_pct)) / 100;
+        let max_bytes = max_mib.saturating_mul(1 << 20);
+        crate::drone::memlimit::LeaseMemory {
+            max_bytes,
+            high_bytes: max_bytes / 100 * u64::from(self.high_pct),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !(1..=100).contains(&self.high_pct) {
+            return Err("lease_memory.high_pct must be between 1 and 100".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn default_lease_memory() -> Option<LeaseMemorySettings> {
+    Some(LeaseMemorySettings::default())
+}
+
 /// `false`/`null` turns a settings block off; `true` is an error.
 fn settings_or_off<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
@@ -554,6 +597,10 @@ pub struct QueenConfig {
     /// (900 s, 2 main grants between). `false` (or JSON `null`) disables it.
     #[serde(default = "default_pr_fairness", deserialize_with = "settings_or_off")]
     pub(crate) pr_fairness: Option<PrFairnessSettings>,
+    /// The memory limit sent with each lease grant; on by default. `false`
+    /// (or JSON `null`) sends none, so leases run without a limit.
+    #[serde(default = "default_lease_memory", deserialize_with = "settings_or_off")]
+    pub(crate) lease_memory: Option<LeaseMemorySettings>,
     #[serde(default)]
     pub classes: Classes,
     #[serde(default = "default_warm_floors")]
@@ -807,6 +854,9 @@ impl QueenConfig {
         self.units.validate().map_err(ConfigError::Invalid)?;
         self.wake.validate().map_err(ConfigError::Invalid)?;
         self.rollout.validate().map_err(ConfigError::Invalid)?;
+        if let Some(m) = &self.lease_memory {
+            m.validate().map_err(ConfigError::Invalid)?;
+        }
         self.profiles.validate().map_err(ConfigError::Invalid)?;
         self.homeostasis.validate().map_err(ConfigError::Invalid)?;
         self.health.validate().map_err(ConfigError::Invalid)?;
@@ -1222,6 +1272,35 @@ mod tests {
         };
         assert!(err(with("", "")).contains("drone_expiry.burst_prefixes"));
         assert!(err(with(expiry, r#""dry_run":false,"#)).contains("credentials_path"));
+    }
+
+    #[test]
+    fn lease_memory_limits_follow_the_class_with_headroom_and_turn_off() {
+        let c = QueenConfig::from_json(MIN).unwrap();
+        let m = c.lease_memory.as_ref().unwrap();
+        // Heavy (20 GiB) gets 30 GiB, throttled from 27 GiB.
+        let heavy = m.limit(20 << 10);
+        assert_eq!(heavy.max_bytes, 30u64 << 30);
+        assert_eq!(heavy.high_bytes, (30u64 << 30) / 100 * 90);
+        let off =
+            QueenConfig::from_json(&MIN.replace("\"repos\"", "\"lease_memory\":false,\"repos\""))
+                .unwrap();
+        assert!(off.lease_memory.is_none());
+        let custom = QueenConfig::from_json(&MIN.replace(
+            "\"repos\"",
+            "\"lease_memory\":{\"headroom_pct\":25,\"high_pct\":80},\"repos\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            custom.lease_memory.unwrap().limit(8 << 10).max_bytes,
+            10u64 << 30
+        );
+        assert!(
+            QueenConfig::from_json(
+                &MIN.replace("\"repos\"", "\"lease_memory\":{\"high_pct\":0},\"repos\"")
+            )
+            .is_err()
+        );
     }
 
     #[test]

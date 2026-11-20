@@ -144,6 +144,7 @@ fn records_reservation_and_whether_backfill_preserves_the_reserved_job() {
             class: Class::Medium,
             scope: Scope::Main,
             state: LeaseState::Running,
+            disk_mib: None,
         });
         i.queue_ages.push(QueueAge {
             class: Class::Heavy,
@@ -231,6 +232,7 @@ fn starvation_never_reserves_a_host_that_declines_the_demand() {
         class: Class::Light,
         scope: Scope::Main,
         state: LeaseState::Running,
+        disk_mib: None,
     });
     i.queue_ages.push(QueueAge {
         class: Class::Heavy,

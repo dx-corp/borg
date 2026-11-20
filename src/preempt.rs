@@ -144,6 +144,7 @@ pub fn select(input: &PreemptInput<'_>) -> Vec<Victim> {
                     class: r.class,
                     scope: r.scope,
                     state: LeaseState::Running,
+                    disk_mib: None,
                 },
             )
         }))

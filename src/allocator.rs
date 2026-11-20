@@ -420,6 +420,29 @@ pub struct ActiveLease {
     pub class: Class,
     pub scope: Scope,
     pub state: LeaseState,
+    /// Free work disk this lease needs to start, MiB, when its job asked for
+    /// more than its class floor (`borg-disk-<N>g`). Until it runs it holds
+    /// the larger of the two; see [`DroneState::disk_floor_mib`].
+    #[serde(default)]
+    pub disk_mib: Option<u64>,
+}
+
+impl ActiveLease {
+    /// A lease already running a job, with only its class's disk floor.
+    pub fn running(drone_id: String, class: Class, scope: Scope) -> Self {
+        Self {
+            drone_id,
+            class,
+            scope,
+            state: LeaseState::Running,
+            disk_mib: None,
+        }
+    }
+
+    /// The free work disk this lease holds on `drone` until it runs, MiB.
+    fn disk_floor_on(&self, drone: &DroneState) -> u64 {
+        drone.disk_floor(self.class).max(self.disk_mib.unwrap_or(0))
+    }
 }
 
 /// Queued jobs waiting for a runner of `(class, scope)`.
@@ -801,7 +824,7 @@ impl DroneState {
         let promised: u64 = held
             .iter()
             .filter(|l| l.drone_id == self.id && l.state != LeaseState::Running)
-            .map(|l| self.disk_floor(l.class))
+            .map(|l| l.disk_floor_on(self))
             .sum();
         free.saturating_sub(promised) >= self.disk_floor(class)
     }
@@ -1221,7 +1244,8 @@ fn free_by_drone<'a>(
             // A running lease's writes are already in the measured free
             // space; one not started yet will still need its floor.
             if lease.state != LeaseState::Running {
-                f.charge_disk(lease.class);
+                let floor = lease.disk_floor_on(f.drone);
+                f.disk_mib = f.disk_mib.map(|d| d.saturating_sub(floor));
             }
             *committed.entry(f.drone.id.as_str()).or_default() += spec.mem_mib;
         }
