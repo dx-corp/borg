@@ -2672,3 +2672,74 @@ fn one_drone_covers_heavy_waiting_in_main_and_pull_requests() {
     assert_eq!(on(&a, "big-b", Class::Light), 1, "{:?}", a.decisions);
     assert_eq!(on(&a, "big-a", Class::Light), 0);
 }
+
+#[test]
+fn aged_light_work_is_released_from_the_hold_in_main_and_pull_request_turns() {
+    // The 2026-11-20 07:12Z shape: heavy waits in main and pull requests,
+    // light main has waited 4958 s and light-pr 631 s, and borg-main-1 runs
+    // small leases short of a heavy slot. Light work past the hold is never
+    // refused for larger work, in a PR turn or after main.
+    let age = |class, scope, oldest_age_secs| QueueAge {
+        class,
+        scope,
+        oldest_age_secs,
+    };
+    let turns = PrTurn {
+        after_secs: Some(300),
+        between: 1,
+        main_grants_since_pr: BTreeMap::new(),
+    };
+    for pr_turn in [PrTurn::default(), turns] {
+        let turned = pr_turn.after_secs.is_some();
+        let i = AllocatorInput {
+            pr_turn,
+            demand: vec![
+                Demand {
+                    class: Class::Heavy,
+                    scope: Scope::Main,
+                    count: 13,
+                },
+                Demand {
+                    class: Class::Heavy,
+                    scope: Scope::Pr,
+                    count: 7,
+                },
+                Demand {
+                    class: Class::Light,
+                    scope: Scope::Main,
+                    count: 27,
+                },
+                Demand {
+                    class: Class::Light,
+                    scope: Scope::Pr,
+                    count: 60,
+                },
+            ],
+            queue_ages: vec![
+                age(Class::Heavy, Scope::Main, 4997),
+                age(Class::Heavy, Scope::Pr, 738),
+                age(Class::Light, Scope::Main, 4958),
+                age(Class::Light, Scope::Pr, LARGER_HOLD_SECS + 31),
+            ],
+            ..starved_0335(0, refilled_main_1())
+        };
+        let a = allocate(&i);
+        assert_within_budget(&i, &a);
+        let held: Vec<_> = a
+            .decisions
+            .iter()
+            .filter(|d| d.class == Class::Light)
+            .flat_map(|d| d.candidates.iter().map(move |c| (d.scope, &c.drone_id, c)))
+            .filter(|(_, _, c)| c.rejection_reasons.contains(&Rejection::HeldForLarger))
+            .map(|(scope, id, _)| (scope, id.clone()))
+            .collect();
+        assert!(held.is_empty(), "{held:?}");
+        assert!(count(&a, Class::Light, Scope::Main) > 0);
+        // With turns, aged light-pr takes its turn on the room left.
+        assert!(
+            !turned || count(&a, Class::Light, Scope::Pr) > 0,
+            "{:?}",
+            a.grants
+        );
+    }
+}
