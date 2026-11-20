@@ -1523,6 +1523,47 @@ async fn queued_deploy_demand_starts_the_standby_instead_of_minting_and_a_replac
 }
 
 #[tokio::test]
+async fn a_standby_on_a_drone_in_its_host_lost_cool_down_neither_starts_nor_covers_demand() {
+    let h = Harness::start(standby_cfg()).await;
+    let dep1 = h.enroll("dep1").await;
+    standby_beat(&h, &dep1, &[], &[]).await;
+    h.tick().await;
+    let id = standby_beat(&h, &dep1, &[], &[]).await["standby"][0]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // dep1 lost a job: it is in its cool-down and still holds its standby.
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    h.queen
+        .store()
+        .suspect_drone("dep1", now + 900)
+        .await
+        .unwrap();
+    let dep2 = h.enroll("dep2").await;
+    standby_beat(&h, &dep2, &[], &[]).await;
+    standby_beat(&h, &dep1, &[&id], &[]).await;
+
+    h.queue_job(1, "borg-ci-medium-deploy", 5);
+    h.tick().await;
+    let body = standby_beat(&h, &dep1, &[&id], &[]).await;
+    assert_eq!(
+        body["start_standby"],
+        json!([]),
+        "the suspect drone starts nothing"
+    );
+    assert_eq!(body["leases"], json!([]));
+    let lease = h.queen.store().lease(&id).await.unwrap().unwrap();
+    assert_eq!(lease.state, borg::store::LeaseStatus::Standby);
+
+    // The job is covered on the healthy drone instead.
+    let body = standby_beat(&h, &dep2, &[], &[]).await;
+    let started =
+        body["leases"].as_array().unwrap().len() + body["start_standby"].as_array().unwrap().len();
+    assert_eq!(started, 1, "{body}");
+}
+
+#[tokio::test]
 async fn a_standby_started_during_an_outage_is_reconciled_when_the_queen_returns() {
     let h = Harness::start(standby_cfg()).await;
     let dep = h.enroll("dep").await;

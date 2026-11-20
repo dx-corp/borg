@@ -375,19 +375,7 @@ impl Drone {
             // the next ten-minute tick: no job is admitted until then.
             r.kick();
         }
-        let failures = if self.cfg.host_invariants.enabled {
-            let mut f =
-                invariants::fast_checks(self.host.as_ref(), capacity.docker_usable, disk_blocked);
-            if let Ok(p) = self.network_probe.lock()
-                && let Some(n) = p.as_ref()
-            {
-                f.push(n.clone());
-            }
-            f.sort();
-            f
-        } else {
-            Vec::new()
-        };
+        let failures = self.host_invariant_failures(capacity.docker_usable, disk_blocked);
         if let Ok(mut last) = self.invariant_failures.lock() {
             invariants::log_change(&last, &failures);
             last.clone_from(&failures);
@@ -532,17 +520,32 @@ impl Drone {
         else {
             return;
         };
-        if crate::envcontract::disk_admission(
-            self.disk_floor.load(Ordering::Relaxed),
-            work_free,
-            cache_free,
-        )
-        .blocked()
-        {
-            tracing::warn!("disk below admission floor: leaving standby runners unstarted");
+        let global = self.disk_floor.load(Ordering::Relaxed);
+        let ids = self.standbys.ids();
+        let admitted: Vec<String> = ids
+            .iter()
+            .filter(|id| {
+                self.standbys.get(id).is_some_and(|g| {
+                    !crate::envcontract::disk_admission(
+                        fail_open_floor(&g, global),
+                        work_free,
+                        cache_free,
+                    )
+                    .blocked()
+                })
+            })
+            .cloned()
+            .collect();
+        if admitted.len() < ids.len() {
+            tracing::warn!(
+                "disk below admission floor: leaving {} standby runner(s) unstarted",
+                ids.len() - admitted.len()
+            );
+        }
+        if admitted.is_empty() {
             return;
         }
-        let started = self.start_standbys(None, tasks);
+        let started = self.start_standbys(Some(&admitted), tasks);
         if started > 0 {
             tracing::warn!("queen unreachable: started {started} standby deploy runner(s)");
         }
@@ -606,44 +609,46 @@ impl Drone {
         })
     }
 
+    /// The host invariants a heartbeat reports: the cheap checks run now
+    /// plus the latest container network probe. Any failure but `disk`
+    /// keeps the drone from taking leases.
+    fn host_invariant_failures(
+        &self,
+        docker_usable: bool,
+        disk_blocked: bool,
+    ) -> Vec<crate::envcontract::InvariantFailure> {
+        if !self.cfg.host_invariants.enabled {
+            return Vec::new();
+        }
+        let mut f = invariants::fast_checks(self.host.as_ref(), docker_usable, disk_blocked);
+        if let Ok(p) = self.network_probe.lock()
+            && let Some(n) = p.as_ref()
+        {
+            f.push(n.clone());
+        }
+        f.sort();
+        f
+    }
+
     /// Probe container networking end to end now and every
-    /// `host_invariants.interval_secs`; heartbeats use the latest result.
+    /// `host_invariants.interval_secs`, or a minute after a probe that failed
+    /// (`invariants::next_probe_delay`); heartbeats use the latest result, so
+    /// the drone takes no lease from a failed probe until one passes.
     fn spawn_network_probe(&self) -> Option<tokio::task::JoinHandle<()>> {
         let s = self.cfg.host_invariants.clone();
         if !s.enabled || !s.container_network {
             return None;
         }
-        let (exec, docker, out) = (
+        let (exec, host, out) = (
             Arc::clone(&self.exec),
-            self.cfg.docker_bin.clone(),
+            Arc::clone(&self.host),
             Arc::clone(&self.network_probe),
         );
-        let host = Arc::clone(&self.host);
+        let docker = self.cfg.docker_bin.clone();
         Some(tokio::spawn(async move {
-            let mut every = tokio::time::interval(Duration::from_secs(s.interval_secs.max(60)));
-            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                every.tick().await;
-                let (exec, docker, s2, host) = (
-                    Arc::clone(&exec),
-                    docker.clone(),
-                    s.clone(),
-                    Arc::clone(&host),
-                );
-                let result = tokio::task::spawn_blocking(move || {
-                    // No docker here: nothing to probe.
-                    host.run(&docker, &["--version"])?;
-                    invariants::container_network(exec.as_ref(), &docker, &s2)
-                })
-                .await;
-                match result {
-                    Ok(r) => {
-                        if let Ok(mut slot) = out.lock() {
-                            *slot = r;
-                        }
-                    }
-                    Err(e) => tracing::warn!("container network probe panicked: {e}"),
-                }
+                let wait = network_probe_round(&exec, &host, &docker, &s, &out).await;
+                tokio::time::sleep(wait).await;
             }
         }))
     }
@@ -1025,6 +1030,47 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     }
 }
 
+/// Run one container network probe, store its result for heartbeats, and
+/// return how long to wait before the next. A probe that panicked leaves the
+/// last result in force, and a failure still in force is retried sooner.
+async fn network_probe_round(
+    exec: &Arc<dyn Exec>,
+    host: &Arc<dyn Host + Send + Sync>,
+    docker: &str,
+    s: &invariants::InvariantSettings,
+    out: &Mutex<Option<crate::envcontract::InvariantFailure>>,
+) -> Duration {
+    let (exec, host, docker, s2) = (
+        Arc::clone(exec),
+        Arc::clone(host),
+        docker.to_owned(),
+        s.clone(),
+    );
+    let result = tokio::task::spawn_blocking(move || {
+        // No docker here: nothing to probe.
+        host.run(&docker, &["--version"])?;
+        invariants::container_network(exec.as_ref(), &docker, &s2)
+    })
+    .await;
+    match result {
+        Ok(r) => {
+            if let Ok(mut slot) = out.lock() {
+                *slot = r;
+            }
+        }
+        Err(e) => tracing::warn!("container network probe panicked: {e}"),
+    }
+    let failing = out.lock().map(|slot| slot.is_some()).unwrap_or(false);
+    invariants::next_probe_delay(s, failing)
+}
+
+/// The free-disk floor a held standby must clear to start while the queen is
+/// unreachable: its class's floor as the queen sent it with the standby, never
+/// below the last global floor the queen gave.
+fn fail_open_floor(grant: &LeaseGrant, global: u64) -> u64 {
+    grant.min_free_disk_bytes.unwrap_or(0).max(global)
+}
+
 #[cfg(test)]
 mod disk_tests {
     use super::*;
@@ -1086,6 +1132,7 @@ mod disk_tests {
             runner_name: "standby".into(),
             jit_config: Secret::new("jit".to_owned()),
             expires_at: i64::MAX,
+            min_free_disk_bytes: None,
         });
         let mut tasks = JoinSet::new();
         drone.fail_open(&mut tasks).await;
@@ -1096,6 +1143,54 @@ mod disk_tests {
         assert!(!*drone.abort.subscribe().borrow());
     }
 
+    fn standby(id: &str, class: Class, floor: Option<u64>) -> LeaseGrant {
+        LeaseGrant {
+            lease_id: id.into(),
+            class,
+            scope: JobScope::Deploy,
+            labels: vec![],
+            runner_name: id.into(),
+            jit_config: Secret::new("jit".to_owned()),
+            expires_at: i64::MAX,
+            min_free_disk_bytes: floor,
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_open_leaves_a_heavy_standby_below_its_class_floor_unstarted() {
+        // 20 GiB free on /work: above the 10 GiB global floor, below the
+        // 32 GiB heavy floor the queen sent with the standby.
+        let cfg = DroneConfig::from_json(r#"{"queen_url":"http://127.0.0.1:1","allow_insecure":true,"runner_dir":"/runner","work_root":"/work","cache_root":"/cache","reclaim":{"enabled":false}}"#).unwrap();
+        let client = QueenClient::new(&cfg, Secret::new("test".to_owned())).unwrap();
+        let drone = Drone::new(cfg, client, Arc::new(DiskHost), Arc::new(NoExec));
+        drone.disk_floor.store(10 << 30, Ordering::Relaxed);
+        drone
+            .standbys
+            .insert(standby("heavy", Class::Heavy, Some(32 << 30)));
+        let mut tasks = JoinSet::new();
+        drone.fail_open(&mut tasks).await;
+        assert!(tasks.is_empty());
+        assert_eq!(drone.standbys.ids(), vec!["heavy"]);
+        assert!(drone.slot_assignments().is_empty());
+    }
+
+    #[test]
+    fn the_fail_open_floor_is_the_class_floor_and_never_below_the_global_one() {
+        let heavy = standby("h", Class::Heavy, Some(32 << 30));
+        assert_eq!(fail_open_floor(&heavy, 10 << 30), 32 << 30);
+        // An older queen sent no class floor: the global floor alone.
+        let old = standby("o", Class::Heavy, None);
+        assert_eq!(fail_open_floor(&old, 10 << 30), 10 << 30);
+        // A class floor below a raised global floor does not lower it.
+        let light = standby("l", Class::Light, Some(10 << 30));
+        assert_eq!(fail_open_floor(&light, 16 << 30), 16 << 30);
+        // The floor is kept with the persisted standby.
+        let json = serde_json::to_value(&heavy).unwrap();
+        assert_eq!(json["min_free_disk_bytes"], 32u64 << 30);
+        let back: LeaseGrant = serde_json::from_value(json).unwrap();
+        assert_eq!(back.min_free_disk_bytes, Some(32 << 30));
+    }
+
     #[test]
     fn older_queen_response_keeps_default_floor_and_new_response_carries_configured_floor() {
         let mut response = serde_json::json!({"leases": []});
@@ -1104,5 +1199,90 @@ mod disk_tests {
         response["min_free_disk_bytes"] = serde_json::json!(32u64 << 30);
         let new: crate::api::HeartbeatResponse = serde_json::from_value(response).unwrap();
         assert_eq!(new.min_free_disk_bytes, 32 << 30);
+    }
+}
+
+#[cfg(test)]
+mod network_probe_tests {
+    use super::*;
+    use crate::drone::exec::Output;
+    use crate::secret::Secret;
+
+    /// A Linux docker host with IPv4 forwarding on.
+    struct DockerHost;
+    impl Host for DockerHost {
+        fn read_to_string(&self, path: &Path) -> Option<String> {
+            (path == Path::new("/proc/sys/net/ipv4/ip_forward")).then(|| "1\n".to_owned())
+        }
+        fn exists(&self, _: &Path) -> bool {
+            false
+        }
+        fn run(&self, program: &str, _: &[&str]) -> Option<String> {
+            (program == "docker").then(|| "Docker version 29".to_owned())
+        }
+        fn os(&self) -> &'static str {
+            "linux"
+        }
+        fn arch(&self) -> &'static str {
+            "x86_64"
+        }
+        fn available_parallelism(&self) -> Option<u32> {
+            Some(8)
+        }
+    }
+
+    /// Answers each probe container run with the next scripted outcome:
+    /// `Some(stdout)` is the container's output, `None` panics the probe.
+    struct ScriptedProbe(Mutex<std::collections::VecDeque<Option<&'static str>>>);
+    impl Exec for ScriptedProbe {
+        fn run(&self, program: &str, _: &[&str]) -> std::io::Result<Output> {
+            assert_eq!(program, "timeout", "only the probe container runs");
+            let next = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("a scripted probe");
+            let stdout = next.expect("the probe panics");
+            Ok(Output {
+                success: true,
+                stdout: stdout.to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_probe_blocks_leases_survives_a_panic_and_clears_on_the_retry() {
+        let cfg = DroneConfig::from_json(r#"{"queen_url":"http://127.0.0.1:1","allow_insecure":true,"runner_dir":"/runner","work_root":"/work","cache_root":"/cache","reclaim":{"enabled":false}}"#).unwrap();
+        let client = QueenClient::new(&cfg, Secret::new("test".to_owned())).unwrap();
+        let exec: Arc<dyn Exec> = Arc::new(ScriptedProbe(Mutex::new(
+            [Some("connect-fail"), None, Some("ok")].into(),
+        )));
+        let host: Arc<dyn Host + Send + Sync> = Arc::new(DockerHost);
+        let drone = Drone::new(cfg, client, Arc::clone(&host), Arc::clone(&exec));
+        let s = drone.cfg.host_invariants.clone();
+        assert!(s.enabled && s.container_network);
+        let docker = drone.cfg.docker_bin.clone();
+        let round = || network_probe_round(&exec, &host, &docker, &s, &drone.network_probe);
+        let checks = || {
+            drone
+                .host_invariant_failures(true, false)
+                .into_iter()
+                .map(|f| f.check)
+                .collect::<Vec<_>>()
+        };
+        assert!(checks().is_empty(), "nothing probed yet");
+
+        // The probe fails: heartbeats report it, so no lease is taken, and
+        // the next probe runs in a minute, not a whole interval.
+        assert_eq!(round().await, Duration::from_secs(invariants::RETRY_SECS));
+        assert_eq!(checks(), ["container_network"]);
+        // The retry panics: the failure stays in force and is retried again.
+        assert_eq!(round().await, Duration::from_secs(invariants::RETRY_SECS));
+        assert_eq!(checks(), ["container_network"]);
+        // The next retry passes: leases resume and probes return to the
+        // configured interval.
+        assert_eq!(round().await, Duration::from_secs(s.interval_secs));
+        assert!(checks().is_empty());
     }
 }

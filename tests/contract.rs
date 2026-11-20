@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 use support::Harness;
 use time::OffsetDateTime;
 
+const GIB: u64 = 1 << 30;
+
 fn now() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp()
 }
@@ -35,6 +37,26 @@ fn cfg(extra: Value) -> Value {
         c[k] = v;
     }
     c
+}
+
+fn scoped_disk_cfg(extra: Value) -> Value {
+    let mut merged = json!({
+        "env_contract": {
+            "classes": {
+                "heavy": {"min_cache_dir_free_bytes": 32u64 << 30}
+            }
+        }
+    });
+    for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+        merged[k] = v;
+    }
+    cfg(merged)
+}
+
+fn facts_with_cache_free(cache_free_bytes: u64) -> Value {
+    let mut facts = good("1.95.0");
+    facts["cache_dir_free_bytes"] = json!(cache_free_bytes);
+    facts
 }
 
 async fn beat(h: &Harness, token: &str, facts: Option<Value>) -> Value {
@@ -514,4 +536,471 @@ async fn stale_cache_space_is_unknown_and_does_not_override_current_work_capacit
     assert_eq!(d["accepting"], true);
     assert_eq!(d["disk_admission"]["state"], "unknown");
     assert!(d["disk_admission"]["cache_free_bytes"].is_null());
+}
+
+#[tokio::test]
+async fn scoped_disk_floor_blocks_heavy_only_and_recovers_at_exact_floor() {
+    let h = Harness::start(scoped_disk_cfg(json!({}))).await;
+    let at_20_4 = h.enroll("disk-20").await;
+    let at_30_1 = h.enroll("disk-30").await;
+    h.heartbeat_with(
+        &at_20_4,
+        json!({"env_facts": facts_with_cache_free(20 * GIB + 2 * GIB / 5)}),
+    )
+    .await;
+    h.heartbeat_with(
+        &at_30_1,
+        json!({"env_facts": facts_with_cache_free(30 * GIB + GIB / 10)}),
+    )
+    .await;
+
+    let status = h.status().await;
+    for name in ["disk-20", "disk-30"] {
+        let d = drone(&status, name);
+        assert_eq!(d["accepting"], true);
+        assert_eq!(d["disk_admission"]["minimum_free_bytes"], 10 * GIB);
+        assert_eq!(
+            d["class_disk_admission"]["light"]["minimum_free_bytes"],
+            10 * GIB
+        );
+        assert_eq!(
+            d["class_disk_admission"]["medium"]["minimum_free_bytes"],
+            10 * GIB
+        );
+        assert_eq!(d["class_disk_admission"]["medium"]["state"], "pass");
+        assert_eq!(
+            d["class_disk_admission"]["heavy"]["minimum_free_bytes"],
+            32 * GIB
+        );
+        assert_eq!(d["class_disk_admission"]["heavy"]["state"], "fail");
+        assert!(
+            d["class_disk_admission"]["heavy"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("cache directory")
+        );
+        assert_eq!(d["free_slots"]["heavy"], 0);
+        assert_eq!(d["theoretical_slots"]["heavy"], 0);
+        assert!(d["free_slots"]["light"].as_u64().unwrap() > 0);
+        assert!(d["theoretical_slots"]["light"].as_u64().unwrap() > 0);
+        assert!(
+            d["contract"].is_null(),
+            "the optional contract stays disabled"
+        );
+    }
+
+    h.queue_job(400, "borg-ci-light-pr", 1);
+    h.queue_job(401, "borg-ci-heavy-pr", 1);
+    h.tick().await;
+    let mints = h.state().mints.clone();
+    assert_eq!(mints.len(), 1);
+    assert!(
+        mints[0]["labels"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("borg-ci-light-pr")),
+        "light remains placeable while heavy is blocked"
+    );
+    assert!(mints.iter().all(|mint| {
+        !mint["labels"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("borg-ci-heavy-pr"))
+    }));
+
+    h.heartbeat_with(
+        &at_20_4,
+        json!({"env_facts": facts_with_cache_free(32 * GIB)}),
+    )
+    .await;
+    h.tick().await;
+    assert_eq!(
+        h.state().mints.len(),
+        2,
+        "exactly the configured floor admits heavy"
+    );
+    assert!(h.state().mints.iter().any(|mint| {
+        mint["labels"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("borg-ci-heavy-pr"))
+    }));
+}
+
+#[tokio::test]
+async fn scoped_disk_floor_rechecks_pending_lease_and_never_cancels_active_work() {
+    let h = Harness::start(scoped_disk_cfg(json!({}))).await;
+    let token = h.enroll("disk").await;
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": facts_with_cache_free(32 * GIB)}),
+    )
+    .await;
+    h.queue_job(501, "borg-ci-heavy-pr", 1);
+    h.tick().await;
+    assert_eq!(h.state().mints.len(), 1);
+
+    let blocked = h
+        .heartbeat_with(
+            &token,
+            json!({"env_facts": facts_with_cache_free(30 * GIB + GIB / 10)}),
+        )
+        .await;
+    assert!(blocked["leases"].as_array().unwrap().is_empty());
+    assert!(blocked["cancel_leases"].as_array().unwrap().is_empty());
+    let omitted = h.heartbeat_with(&token, json!({})).await;
+    assert!(
+        omitted["leases"].as_array().unwrap().is_empty(),
+        "a heartbeat without new facts still uses the latest fresh stored cache measurement"
+    );
+    let pending = h.queen.store().active_leases().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].state, borg::store::LeaseStatus::Pending);
+
+    let recovered = h
+        .heartbeat_with(
+            &token,
+            json!({"env_facts": facts_with_cache_free(32 * GIB)}),
+        )
+        .await;
+    let id = recovered["leases"][0]["lease_id"].as_str().unwrap();
+    let active = h
+        .heartbeat_with(
+            &token,
+            json!({
+                "active_leases": [id],
+                "env_facts": facts_with_cache_free(20 * GIB + 2 * GIB / 5)
+            }),
+        )
+        .await;
+    assert!(active["cancel_leases"].as_array().unwrap().is_empty());
+    let status = h.status().await;
+    assert_eq!(drone(&status, "disk")["active_leases"], 1);
+}
+
+#[tokio::test]
+async fn scoped_disk_floor_rechecks_standby_delivery_and_start() {
+    let h = Harness::start(scoped_disk_cfg(json!({
+        "standby": {"classes": ["heavy"], "per_drone": 1}
+    })))
+    .await;
+    let token = h.enroll("deploy").await;
+    h.heartbeat_with(
+        &token,
+        json!({"trust": "deploy-only", "env_facts": facts_with_cache_free(32 * GIB)}),
+    )
+    .await;
+    h.tick().await;
+
+    let blocked = h
+        .heartbeat_with(
+            &token,
+            json!({"trust": "deploy-only", "env_facts": facts_with_cache_free(30 * GIB + GIB / 10)}),
+        )
+        .await;
+    assert!(blocked["standby"].as_array().unwrap().is_empty());
+    let recovered = h
+        .heartbeat_with(
+            &token,
+            json!({"trust": "deploy-only", "env_facts": facts_with_cache_free(32 * GIB)}),
+        )
+        .await;
+    let id = recovered["standby"][0]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    h.queue_job(601, "borg-ci-heavy-deploy", 1);
+    h.tick().await;
+    let blocked_start = h
+        .heartbeat_with(
+            &token,
+            json!({
+                "trust": "deploy-only",
+                "held_standby": [&id],
+                "env_facts": facts_with_cache_free(30 * GIB + GIB / 10)
+            }),
+        )
+        .await;
+    assert!(
+        blocked_start["start_standby"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let recovered_start = h
+        .heartbeat_with(
+            &token,
+            json!({
+                "trust": "deploy-only",
+                "held_standby": [&id],
+                "env_facts": facts_with_cache_free(32 * GIB)
+            }),
+        )
+        .await;
+    assert_eq!(recovered_start["start_standby"], json!([id]));
+}
+
+#[tokio::test]
+async fn scoped_disk_floor_rechecks_unit_placement_delivery_and_active_retention() {
+    let h = Harness::start(scoped_disk_cfg(json!({}))).await;
+    let client = enroll::new_token();
+    h.queen
+        .store()
+        .enroll_client("agent", &enroll::hash_token(&client), 0)
+        .await
+        .unwrap();
+    let token = h.enroll("unit-host").await;
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": facts_with_cache_free(20 * GIB + 2 * GIB / 5)}),
+    )
+    .await;
+
+    let response = h
+        .http
+        .post(format!("{}/v1/units", h.url))
+        .bearer_auth(&client)
+        .json(&json!({
+            "repo": "example-org/app",
+            "tree_sha": "c".repeat(40),
+            "argv": ["cargo", "check"],
+            "platform": "linux-x86_64",
+            "class": "heavy",
+            "rust_toolchain": "1.95.0"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let id = response.json::<Value>().await.unwrap()["unit_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    h.tick().await;
+    assert_eq!(
+        h.queen
+            .store()
+            .unit(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+            .as_str(),
+        "queued",
+        "the unit-group recomputation preserves the class disk block"
+    );
+
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": facts_with_cache_free(32 * GIB)}),
+    )
+    .await;
+    h.tick().await;
+    assert_eq!(
+        h.queen
+            .store()
+            .unit(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+            .as_str(),
+        "leased"
+    );
+    let blocked = h
+        .heartbeat_with(
+            &token,
+            json!({"env_facts": facts_with_cache_free(20 * GIB + 2 * GIB / 5)}),
+        )
+        .await;
+    assert!(blocked["units"].as_array().unwrap().is_empty());
+
+    let recovered = h
+        .heartbeat_with(
+            &token,
+            json!({"env_facts": facts_with_cache_free(32 * GIB)}),
+        )
+        .await;
+    assert_eq!(recovered["units"][0]["unit_id"], id);
+    let active = h
+        .heartbeat_with(
+            &token,
+            json!({
+                "active_units": [&id],
+                "env_facts": facts_with_cache_free(20 * GIB + 2 * GIB / 5)
+            }),
+        )
+        .await;
+    assert!(active["cancel_units"].as_array().unwrap().is_empty());
+    assert_eq!(
+        h.queen
+            .store()
+            .unit(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+            .as_str(),
+        "running"
+    );
+}
+
+#[tokio::test]
+async fn scoped_disk_floor_keeps_stale_and_missing_measurements_compatible() {
+    let h = Harness::start(scoped_disk_cfg(json!({}))).await;
+    let missing = h.enroll("missing").await;
+    let stale = h.enroll("stale").await;
+    let mut no_cache = facts_with_cache_free(0);
+    no_cache
+        .as_object_mut()
+        .unwrap()
+        .remove("cache_dir_free_bytes");
+    h.heartbeat_with(&missing, json!({"env_facts": no_cache}))
+        .await;
+    let mut old = facts_with_cache_free(0);
+    old["observed_at"] = json!(now() - 1_000);
+    h.heartbeat_with(&stale, json!({"env_facts": old})).await;
+
+    let status = h.status().await;
+    for name in ["missing", "stale"] {
+        let d = drone(&status, name);
+        assert_eq!(d["class_disk_admission"]["heavy"]["state"], "unknown");
+        assert_eq!(
+            d["class_disk_admission"]["heavy"]["minimum_free_bytes"],
+            32 * GIB
+        );
+        assert!(d["free_slots"]["heavy"].as_u64().unwrap() > 0);
+    }
+}
+
+#[tokio::test]
+async fn scoped_disk_floor_leaves_blocked_drones_out_of_the_fleet_class_slots() {
+    let h = Harness::start(scoped_disk_cfg(json!({}))).await;
+    let token = h.enroll("disk").await;
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": facts_with_cache_free(20 * GIB)}),
+    )
+    .await;
+    h.tick().await;
+    let status = h.status().await;
+    assert_eq!(drone(&status, "disk")["theoretical_slots"]["heavy"], 0);
+    assert_eq!(status["classes"]["heavy"]["slots"], 0, "{status}");
+    assert!(status["classes"]["light"]["slots"].as_u64().unwrap() > 0);
+    let m = h.metrics().await;
+    assert!(
+        m.contains("borg_class_slots{class=\"heavy\"} 0"),
+        "a class every drone blocks has no fleet slots\n{m}"
+    );
+
+    // Exactly the floor admits heavy again.
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": facts_with_cache_free(32 * GIB)}),
+    )
+    .await;
+    h.tick().await;
+    let status = h.status().await;
+    assert_eq!(status["classes"]["heavy"]["slots"], 1, "{status}");
+    assert!(
+        h.metrics()
+            .await
+            .contains("borg_class_slots{class=\"heavy\"} 1")
+    );
+}
+
+async fn standby_on(h: &Harness, name: &str) -> Vec<String> {
+    h.queen
+        .store()
+        .active_leases()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|l| l.drone == name && l.state == borg::store::LeaseStatus::Standby)
+        .map(|l| l.id)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_standby_below_its_class_floor_neither_covers_deploy_demand_nor_is_started() {
+    let deploy =
+        |free: u64| json!({"trust": "deploy-only", "env_facts": facts_with_cache_free(free)});
+    let t0 = OffsetDateTime::now_utc();
+
+    // Two deploy drones hold heavy standbys; a-deploy's is the older one.
+    let h = Harness::start(scoped_disk_cfg(json!({
+        "standby": {"classes": ["heavy"], "per_drone": 1}
+    })))
+    .await;
+    let a = h.enroll("a-deploy").await;
+    h.heartbeat_with(&a, deploy(100 * GIB)).await;
+    h.queen.tick(t0).await.unwrap();
+    let b = h.enroll("b-deploy").await;
+    h.heartbeat_with(&b, deploy(100 * GIB)).await;
+    h.queen
+        .tick(t0 + time::Duration::seconds(10))
+        .await
+        .unwrap();
+    let (held_a, held_b) = (
+        standby_on(&h, "a-deploy").await,
+        standby_on(&h, "b-deploy").await,
+    );
+    assert_eq!((held_a.len(), held_b.len()), (1, 1));
+
+    // a-deploy falls below the 32 GiB heavy floor (above the global one) and
+    // a heavy deploy job queues: b-deploy's standby starts.
+    h.heartbeat_with(&a, deploy(20 * GIB)).await;
+    h.queue_job(701, "borg-ci-heavy-deploy", 1);
+    h.queen
+        .tick(t0 + time::Duration::seconds(20))
+        .await
+        .unwrap();
+    let mut beat = deploy(100 * GIB);
+    beat["held_standby"] = json!(held_b);
+    assert_eq!(
+        h.heartbeat_with(&b, beat).await["start_standby"],
+        json!(held_b)
+    );
+    let mut beat = deploy(20 * GIB);
+    beat["held_standby"] = json!(held_a);
+    assert_eq!(h.heartbeat_with(&a, beat).await["start_standby"], json!([]));
+
+    // Only the blocked drone holds a standby: a runner is minted elsewhere.
+    let h = Harness::start(scoped_disk_cfg(json!({
+        "standby": {"classes": ["heavy"], "per_drone": 1}
+    })))
+    .await;
+    let a = h.enroll("a-deploy").await;
+    h.heartbeat_with(&a, deploy(100 * GIB)).await;
+    h.queen.tick(t0).await.unwrap();
+    assert_eq!(standby_on(&h, "a-deploy").await.len(), 1);
+    h.heartbeat_with(&a, deploy(20 * GIB)).await;
+    let b = h.enroll("b-deploy").await;
+    h.heartbeat_with(&b, deploy(100 * GIB)).await;
+    h.queue_job(702, "borg-ci-heavy-deploy", 1);
+    h.queen
+        .tick(t0 + time::Duration::seconds(10))
+        .await
+        .unwrap();
+    let minted: Vec<_> = h
+        .queen
+        .store()
+        .active_leases()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|l| l.state == borg::store::LeaseStatus::Pending)
+        .map(|l| (l.drone, l.class, l.scope))
+        .collect();
+    assert_eq!(
+        minted,
+        vec![(
+            "b-deploy".to_owned(),
+            borg::classes::Class::Heavy,
+            borg::classes::Scope::Deploy
+        )],
+        "the blocked standby does not cover the job"
+    );
 }

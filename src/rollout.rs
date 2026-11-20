@@ -20,7 +20,14 @@
 //! Checks, evaluated every pass against a control group (the drones still on the
 //! previous version, same period):
 //! * **update**: a told drone must report the target within `update_timeout_secs`
-//!   of the queen seeing its active leases finish;
+//!   of the queen seeing its active leases finish. A told drone still holding
+//!   leases is *draining*: it updates as soon as it is idle. A draining canary
+//!   holds the canary stage (it must run the target to prove anything), but a
+//!   draining wave member does not hold its wave: the members already on the
+//!   target supply the wave's evidence. One that is still draining after
+//!   `drain_timeout_secs` is *cordoned*: the queen grants it no new leases or
+//!   units, so it drains within the length of its running jobs. Running jobs
+//!   are never stopped;
 //! * **heartbeat health**: drones on the target stay fresh and out of health
 //!   quarantine. An operator's maintenance quarantine is not a verdict on the
 //!   version: a canary under maintenance is replaced by another host of its OS,
@@ -36,8 +43,11 @@
 //!
 //! Any failing check **halts** the rollout and **rolls back**: every drone is
 //! told the previous version. A halted rollout stays halted until an operator
-//! resets it or the target changes. The module is pure: the caller supplies the
-//! clock, the fleet view and the job outcomes, and persists the returned state.
+//! resets it or the target changes. A newer target that only follows the queen's
+//! build waits for the rollout in flight, unless that rollout's stage has not
+//! moved for `soak_secs + supersede_stalled_after_secs` (see
+//! [`settled_target`]). The module is pure: the caller supplies the clock, the
+//! fleet view and the job outcomes, and persists the returned state.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -69,6 +79,12 @@ pub struct RolloutSettings {
     pub soak_secs: u64,
     /// How long a told drone has to report the target after its active leases drain.
     pub update_timeout_secs: u64,
+    /// How long a told drone may keep holding leases before the queen cordons
+    /// it (grants it nothing new) so that it drains. Running jobs finish.
+    pub drain_timeout_secs: u64,
+    /// A stage that has not moved for `soak_secs` plus this long is stalled: a
+    /// newer queen build then supersedes the rollout in flight.
+    pub supersede_stalled_after_secs: u64,
     pub max_host_failure_increase_pm: u32,
     pub max_success_drop_pm: u32,
     /// Host-failure cap (permille) when the control group is too small.
@@ -88,6 +104,8 @@ impl Default for RolloutSettings {
             wave_jobs: 10,
             soak_secs: 1800,
             update_timeout_secs: 900,
+            drain_timeout_secs: 900,
+            supersede_stalled_after_secs: 3600,
             max_host_failure_increase_pm: 20,
             max_success_drop_pm: 50,
             absolute_host_failure_pm: 100,
@@ -111,8 +129,11 @@ impl RolloutSettings {
         {
             return Err("rollout waves_pct must be ascending percentages ending at 100".into());
         }
-        if self.update_timeout_secs == 0 || self.wave_jobs == 0 {
-            return Err("rollout update_timeout_secs and wave_jobs must be positive".into());
+        if self.update_timeout_secs == 0 || self.wave_jobs == 0 || self.drain_timeout_secs == 0 {
+            return Err(
+                "rollout update_timeout_secs, drain_timeout_secs and wave_jobs must be positive"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -184,11 +205,41 @@ pub(crate) fn previous_for(
 /// finish. So a rollout in progress keeps its target until it completes or
 /// halts, including every wave's observation period. The next pass then
 /// adopts the current queen build.
-pub(crate) fn settled_target(target: String, stored: Option<&RolloutState>) -> String {
+///
+/// A rollout whose current stage has not moved for `soak_secs` plus
+/// `supersede_stalled_after_secs` is stalled, and the newer build supersedes
+/// it: holding every later fix behind a stage that cannot finish helps no one.
+/// The new rollout starts from the stalled one's previous version, the last
+/// one the whole fleet ran, with a fresh canary.
+pub(crate) fn settled_target(
+    target: String,
+    stored: Option<&RolloutState>,
+    now: i64,
+    s: &RolloutSettings,
+) -> String {
     match stored {
-        Some(s) if matches!(s.phase, Phase::Canary | Phase::Wave) => s.target.clone(),
+        Some(st) if matches!(st.phase, Phase::Canary | Phase::Wave) && !stalled(st, now, s) => {
+            st.target.clone()
+        }
         _ => target,
     }
+}
+
+fn secs(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+/// Whether the rollout's current stage has gone without moving for longer
+/// than its soak plus `supersede_stalled_after_secs`.
+fn stalled(st: &RolloutState, now: i64, s: &RolloutSettings) -> bool {
+    now.saturating_sub(st.stage_started_at)
+        > secs(s.soak_secs).saturating_add(secs(s.supersede_stalled_after_secs))
+}
+
+/// Whether the queen must grant `name` nothing new: a told member of a rollout
+/// in flight that kept its leases past `drain_timeout_secs`.
+pub fn cordoned(state: &RolloutState, name: &str) -> bool {
+    matches!(state.phase, Phase::Canary | Phase::Wave) && state.cordoned.iter().any(|c| c == name)
 }
 
 /// The persisted state of one rollout.
@@ -208,6 +259,14 @@ pub struct RolloutState {
     /// When the queen first saw each updating drone without active leases.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub update_started_at: BTreeMap<String, i64>,
+    /// When the queen first saw each told member, not yet on the target,
+    /// holding active leases.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub drain_started_at: BTreeMap<String, i64>,
+    /// Told members still draining after `drain_timeout_secs`: granted no new
+    /// leases or units until they drain. Running jobs are never stopped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cordoned: Vec<String>,
     pub halted_reason: Option<String>,
 }
 
@@ -297,6 +356,40 @@ pub fn desired_for<'a>(state: &'a RolloutState, name: &str) -> &'a str {
     }
 }
 
+/// Rebuild the drain clocks and cordons of `st.members`: a told member that is
+/// fresh, not in maintenance, not yet on `target` and holding leases is
+/// draining since the queen first saw it so; past `drain_timeout` it is
+/// cordoned. A member that drained, updated or went silent drops out.
+fn track_drains(
+    st: &mut RolloutState,
+    drones: &[DroneView],
+    target: &str,
+    now: i64,
+    drain_timeout: i64,
+) {
+    let before = std::mem::take(&mut st.drain_started_at);
+    st.cordoned.clear();
+    for n in &st.members {
+        let draining = drones.iter().find(|d| d.name == *n).is_some_and(|d| {
+            d.fresh
+                && !d.maintenance
+                && d.has_active_leases
+                && !d
+                    .version
+                    .as_deref()
+                    .is_some_and(|v| same_release(v, target))
+        });
+        if !draining {
+            continue;
+        }
+        let since = before.get(n).copied().unwrap_or(now);
+        st.drain_started_at.insert(n.clone(), since);
+        if now.saturating_sub(since) > drain_timeout {
+            st.cordoned.push(n.clone());
+        }
+    }
+}
+
 fn observe<'a>(outcomes: &'a [Outcome], pick: impl Fn(&Outcome) -> bool + 'a) -> Observed {
     let mut o = Observed::default();
     for x in outcomes.iter().filter(|x| pick(x)) {
@@ -373,7 +466,18 @@ pub fn advance(
     let mut events = Vec::new();
     let mut st = match state {
         Some(st) if st.target == target => st,
-        _ => {
+        old => {
+            if let Some(o) = old
+                .as_ref()
+                .filter(|o| matches!(o.phase, Phase::Canary | Phase::Wave))
+            {
+                events.push(format!(
+                    "rollout of {} superseded by {target} in its {} stage (unchanged for {}s)",
+                    o.target,
+                    o.phase.as_str(),
+                    now.saturating_sub(o.stage_started_at)
+                ));
+            }
             events.push(format!("rollout of {target} started (from {previous})"));
             RolloutState {
                 target: target.to_owned(),
@@ -385,6 +489,8 @@ pub fn advance(
                 started_at: now,
                 stage_started_at: now,
                 update_started_at: BTreeMap::new(),
+                drain_started_at: BTreeMap::new(),
+                cordoned: Vec::new(),
                 halted_reason: None,
             }
         }
@@ -398,6 +504,8 @@ pub fn advance(
         control_group: Observed::default(),
     };
     if matches!(st.phase, Phase::Complete | Phase::Halted) {
+        st.drain_started_at.clear();
+        st.cordoned.clear();
         return done(st, events, None);
     }
 
@@ -455,6 +563,10 @@ pub fn advance(
                 None => {
                     st.canaries = picked;
                     st.members = st.canaries.clone();
+                    // The canaries already chosen keep their drain clock and
+                    // are cordoned on time, so they are ready when the
+                    // missing host appears.
+                    track_drains(&mut st, drones, target, now, secs(s.drain_timeout_secs));
                     let why = format!("waiting for a fresh {os} host to use as canary");
                     return done(st, events, Some(why));
                 }
@@ -465,6 +577,7 @@ pub fn advance(
         st.stage_started_at = now;
     }
 
+    track_drains(&mut st, drones, target, now, secs(s.drain_timeout_secs));
     let by_name = |n: &str| drones.iter().find(|d| d.name == n);
     let members: BTreeSet<&str> = st.members.iter().map(String::as_str).collect();
     let on_target = |d: &DroneView| {
@@ -482,7 +595,7 @@ pub fn advance(
             .and_then(|d| d.version_since)
             .unwrap_or(i64::MAX)
     };
-    let timeout = i64::try_from(s.update_timeout_secs).unwrap_or(i64::MAX);
+    let timeout = secs(s.update_timeout_secs);
     let overdue = now.saturating_sub(st.stage_started_at) > timeout;
 
     // Observations: members on the target, since they got it (and since the
@@ -501,6 +614,9 @@ pub fn advance(
     let mut checks = Vec::new();
     let mut halt: Option<String> = None;
     let mut wait: Option<String> = None;
+    // Rebuilt every pass, so a member that drained, updated or went silent
+    // drops out of both.
+    let mut draining = Vec::new();
 
     for n in &st.members {
         let Some(d) = by_name(n) else {
@@ -526,7 +642,20 @@ pub fn advance(
             }
             if d.has_active_leases {
                 st.update_started_at.remove(n);
-                wait.get_or_insert(format!("waiting for {n} to drain its active leases"));
+                let cordon = st.cordoned.contains(n);
+                let label = if cordon {
+                    format!("{n} (cordoned)")
+                } else {
+                    n.clone()
+                };
+                if st.phase == Phase::Canary {
+                    // A canary proves nothing until it runs the target.
+                    wait.get_or_insert(format!("waiting for {label} to drain its active leases"));
+                } else {
+                    // The members already on the target supply the wave's
+                    // evidence; this one updates once it is idle.
+                    draining.push(label);
+                }
                 continue;
             }
             let started_at = *st.update_started_at.entry(n.clone()).or_insert(now);
@@ -554,10 +683,16 @@ pub fn advance(
     checks.push(Check {
         name: "update_and_heartbeat",
         ok: halt.is_none(),
-        detail: halt
-            .clone()
-            .or_else(|| wait.clone())
-            .unwrap_or_else(|| "all told drones run the target and heartbeat".into()),
+        detail: halt.clone().or_else(|| wait.clone()).unwrap_or_else(|| {
+            if draining.is_empty() {
+                "all told drones run the target and heartbeat".into()
+            } else {
+                format!(
+                    "told drones on the target heartbeat; still draining, updating when idle: {}",
+                    draining.join(", ")
+                )
+            }
+        }),
     });
 
     checks.extend(compare(s, "new version", &new_group, &control_group));
@@ -591,6 +726,8 @@ pub fn advance(
     if let Some(reason) = halt {
         st.phase = Phase::Halted;
         st.halted_reason = Some(reason.clone());
+        st.drain_started_at.clear();
+        st.cordoned.clear();
         events.push(format!(
             "rollout of {target} HALTED, rolled back to {}: {reason}",
             st.previous
@@ -647,6 +784,8 @@ pub fn advance(
         };
         if next >= s.waves_pct.len() {
             st.phase = Phase::Complete;
+            st.drain_started_at.clear();
+            st.cordoned.clear();
             events.push(format!("rollout of {target} complete"));
         } else {
             // Only drones that can update now: a silent one would only stall
@@ -1187,7 +1326,9 @@ mod tests {
         let fleet = fleet();
         let canary = step(1000, None, &fleet, &[]).state;
         assert_eq!(canary.phase, Phase::Canary);
-        let hold = |stored: &RolloutState| settled_target("0.1.0+newer".into(), Some(stored));
+        let s = settings();
+        let hold =
+            |stored: &RolloutState| settled_target("0.1.0+newer".into(), Some(stored), 1000, &s);
         for phase in [Phase::Canary, Phase::Wave] {
             let active = RolloutState {
                 phase,
@@ -1202,7 +1343,7 @@ mod tests {
             };
             assert_eq!(hold(&done), "0.1.0+newer");
         }
-        assert_eq!(settled_target("x".into(), None), "x");
+        assert_eq!(settled_target("x".into(), None, 1000, &s), "x");
     }
 
     #[test]
@@ -1216,6 +1357,145 @@ mod tests {
             (b.state.phase, b.state.target.as_str()),
             (Phase::Canary, "3.0.0")
         );
+    }
+
+    fn set_busy(fleet: &mut [DroneView], name: &str, busy: bool) {
+        for d in fleet.iter_mut().filter(|d| d.name == name) {
+            d.has_active_leases = busy;
+        }
+    }
+
+    #[test]
+    fn a_draining_wave_member_does_not_hold_the_wave_and_is_cordoned_after_the_drain_timeout() {
+        let (mut f, st) = promoted_to_wave();
+        let ok: Vec<Outcome> = (0..6)
+            .map(|i| job("l1", 150 + i, OutcomeKind::Ok))
+            .collect();
+        let b = step(241, Some(st), &f, &ok);
+        assert_eq!(b.state.members, ["l1", "m1", "l2"]);
+        // l2 is told but always busy on OLD (a deploy drone).
+        set_busy(&mut f, "l2", true);
+        let c = step(250, Some(b.state), &f, &ok);
+        assert_eq!(c.state.drain_started_at.get("l2"), Some(&250));
+        assert!(c.state.cordoned.is_empty(), "inside the drain timeout");
+        assert!(!cordoned(&c.state, "l2"));
+        // Past the drain timeout (900s) it is cordoned, and never halted,
+        // while l1 on NEW keeps running jobs.
+        let ok: Vec<Outcome> = ok
+            .iter()
+            .cloned()
+            .chain((0..6).map(|i| job("l1", 300 + i, OutcomeKind::Ok)))
+            .collect();
+        let d = step(250 + 901, Some(c.state), &f, &ok);
+        assert_ne!(d.state.phase, Phase::Halted, "{:?}", d.state.halted_reason);
+        assert_eq!(d.state.cordoned, ["l2"]);
+        assert!(cordoned(&d.state, "l2"));
+        assert!(!cordoned(&d.state, "l1"));
+        // The members on NEW satisfied the wave meanwhile: it promoted to 100%.
+        assert_eq!((d.state.phase, d.state.wave), (Phase::Wave, 2));
+        let detail = &d.checks[0].detail;
+        assert!(detail.contains("l2 (cordoned)"), "{detail}");
+        // It drains and updates: no longer draining or cordoned.
+        set_busy(&mut f, "l2", false);
+        set_version(&mut f, &["l2"], NEW, 1200);
+        let e = step(1210, Some(d.state), &f, &ok);
+        assert!(e.state.drain_started_at.is_empty());
+        assert!(e.state.cordoned.is_empty());
+    }
+
+    #[test]
+    fn a_soaked_wave_promotes_past_a_member_that_never_goes_idle() {
+        // The stall seen live: the wave soaked, the updated members ran
+        // enough jobs, and one member was always busy. It used to wait for
+        // that member forever; it now promotes.
+        let (mut f, st) = promoted_to_wave();
+        let ok: Vec<Outcome> = (0..6)
+            .map(|i| job("l1", 150 + i, OutcomeKind::Ok))
+            .collect();
+        let b = step(241, Some(st), &f, &ok);
+        set_busy(&mut f, "l2", true);
+        let more: Vec<Outcome> = ok
+            .iter()
+            .cloned()
+            .chain((0..6).map(|i| job("m1", 250 + i, OutcomeKind::Ok)))
+            .collect();
+        let c = step(241 + 101, Some(b.state), &f, &more);
+        assert_eq!((c.state.phase, c.state.wave), (Phase::Wave, 2));
+        assert_eq!(c.waiting, None);
+    }
+
+    #[test]
+    fn a_draining_canary_still_holds_the_canary_stage_and_is_cordoned_after_the_timeout() {
+        let mut f = fleet();
+        let a = step(100, None, &f, &[]);
+        set_busy(&mut f, "l1", true);
+        set_version(&mut f, &["m1"], NEW, 105);
+        let jobs: Vec<Outcome> = (0..3)
+            .map(|i| job("m1", 110 + i, OutcomeKind::Ok))
+            .collect();
+        let b = step(200, Some(a.state), &f, &jobs);
+        assert_eq!(b.state.phase, Phase::Canary);
+        assert!(b.waiting.as_deref().unwrap().contains("l1 to drain"));
+        assert!(b.state.cordoned.is_empty());
+        let c = step(200 + 901, Some(b.state), &f, &jobs);
+        assert_eq!(c.state.phase, Phase::Canary, "{:?}", c.state.halted_reason);
+        assert_eq!(c.state.cordoned, ["l1"]);
+        assert!(c.waiting.as_deref().unwrap().contains("l1 (cordoned)"));
+        // A halt or completion lifts every cordon.
+        let halted = RolloutState {
+            phase: Phase::Halted,
+            ..c.state.clone()
+        };
+        assert!(!cordoned(&halted, "l1"));
+        let d = step(2000, Some(halted), &f, &jobs);
+        assert!(d.state.cordoned.is_empty());
+    }
+
+    #[test]
+    fn a_chosen_canary_is_cordoned_on_time_while_another_os_has_no_host() {
+        // Linux canary chosen and always busy; no macOS host at all.
+        let mut f: Vec<DroneView> = fleet().into_iter().filter(|d| d.os == "linux").collect();
+        set_busy(&mut f, "l1", true);
+        let a = step(100, None, &f, &[]);
+        assert_eq!(a.state.canaries, ["l1"]);
+        assert!(a.waiting.as_deref().unwrap().contains("macos"));
+        assert_eq!(a.state.drain_started_at.get("l1"), Some(&100));
+        assert!(a.state.cordoned.is_empty());
+        let b = step(100 + 901, Some(a.state), &f, &[]);
+        assert_eq!(b.state.phase, Phase::Canary);
+        assert!(b.waiting.as_deref().unwrap().contains("macos"));
+        assert_eq!(b.state.cordoned, ["l1"]);
+        assert!(cordoned(&b.state, "l1"));
+        // Once it drains the cordon lifts, and the stage still waits.
+        set_busy(&mut f, "l1", false);
+        let c = step(1100, Some(b.state), &f, &[]);
+        assert!(c.state.cordoned.is_empty() && c.state.drain_started_at.is_empty());
+        assert_eq!(c.state.phase, Phase::Canary);
+    }
+
+    #[test]
+    fn a_newer_build_supersedes_only_a_stalled_rollout() {
+        let s = settings();
+        let (_, st) = promoted_to_wave();
+        // The wave started at 140; soak 100 + supersede 3600.
+        let limit = 140 + 100 + 3600;
+        assert_eq!(settled_target("3.0.0".into(), Some(&st), limit, &s), NEW);
+        assert_eq!(
+            settled_target("3.0.0".into(), Some(&st), limit + 1, &s),
+            "3.0.0"
+        );
+        // The superseding pass starts a fresh canary from the stalled
+        // rollout's previous version and says what it replaced.
+        let prev = previous_for("3.0.0", Some(&st), &fleet()).unwrap();
+        assert_eq!(prev, OLD);
+        let a = advance(limit + 1, &s, &prev, "3.0.0", Some(st), &fleet(), &[]);
+        assert_eq!(a.state.phase, Phase::Canary);
+        assert!(
+            a.events[0].contains("2.0.0 superseded by 3.0.0 in its wave stage"),
+            "{:?}",
+            a.events
+        );
+        assert!(a.state.cordoned.is_empty() && a.state.drain_started_at.is_empty());
     }
 
     #[test]
@@ -1242,6 +1522,10 @@ mod tests {
             },
             RolloutSettings {
                 canary_jobs: 0,
+                ..RolloutSettings::default()
+            },
+            RolloutSettings {
+                drain_timeout_secs: 0,
                 ..RolloutSettings::default()
             },
         ] {
@@ -1277,6 +1561,8 @@ mod tests {
             started_at: 0,
             stage_started_at: 0,
             update_started_at: BTreeMap::new(),
+            drain_started_at: BTreeMap::new(),
+            cordoned: Vec::new(),
             halted_reason: None,
         };
         // The same rollout keeps the previous it started with, whatever the

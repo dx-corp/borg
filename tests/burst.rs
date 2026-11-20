@@ -14,8 +14,8 @@ fn config() -> Value {
             "scale_up": {"classes": ["heavy"], "weights": {"main": 3, "pr": 1},
                          "min_weighted_unmet": 6, "sustained_secs": 600},
             "scale_down": {"idle_secs": 900},
-            "gce": {"project": "p", "network": "borg-burst", "subnet": "borg-burst-usw1",
-                    "zones": ["us-west1-b", "us-west1-a"], "machine_type": "c2d-highcpu-56"}
+            "gce": {"project": "p", "network": "borg-burst", "subnet": "borg-burst-usc1",
+                    "zones": ["us-central1-b", "us-central1-a"], "machine_type": "c2d-highcpu-56"}
         }
     })
 }
@@ -66,7 +66,7 @@ async fn dry_run_logs_what_it_would_create_drain_and_delete_and_creates_nothing(
     let s = status_at(&h, at(600)).await;
     assert_eq!(s["burst"]["outcome"], "create", "{}", s["burst"]);
     assert_eq!(s["burst"]["drones"]["managed"], 1);
-    assert_eq!(s["burst"]["vms"][0]["zone"], "us-west1-b");
+    assert_eq!(s["burst"]["vms"][0]["zone"], "us-central1-b");
     assert_eq!(burst_events(&s), ["burst_would_create"]);
     // Nothing real: no drone was enrolled and no runner was minted.
     assert_eq!(s["drones"], json!([]));
@@ -216,14 +216,28 @@ async fn live_burst_creates_scrubs_drains_and_deletes_a_real_drone() {
     );
     let instance = h.state().gce_instances[0].clone();
     assert_eq!(instance["name"], vm_name);
-    assert_eq!(instance["zone"], "us-west1-b");
+    assert_eq!(instance["zone"], "us-central1-b");
+    // The VM is made from the instance template: the request names it and
+    // sends nothing that shapes the host.
+    assert_eq!(instance["template"], support::GCE_TEMPLATE);
     let body = &instance["body"];
-    assert_eq!(body["scheduling"]["provisioningModel"], "SPOT");
-    assert_eq!(body["scheduling"]["instanceTerminationAction"], "DELETE");
-    assert_eq!(body["serviceAccounts"], json!([]));
+    for host_property in [
+        "machineType",
+        "scheduling",
+        "disks",
+        "networkInterfaces",
+        "serviceAccounts",
+    ] {
+        assert!(body.get(host_property).is_none(), "{host_property}");
+    }
+    // The template's labels and access metadata survive beside the queen's.
+    assert_eq!(body["labels"]["owner"], "platform");
+    assert_eq!(body["labels"]["lane"], "burst");
+    assert_eq!(body["labels"]["borg-burst"], "queen");
+    assert_eq!(body["labels"]["borg-drone"], drone_name);
     assert_eq!(
-        body["machineType"],
-        "zones/us-west1-b/machineTypes/c2d-highcpu-56"
+        metadata_item(&instance, "enable-oslogin").as_deref(),
+        Some("TRUE")
     );
     let script = metadata_item(&instance, "startup-script").unwrap();
     assert!(script.contains("QUEEN_URL='https://queen.example.test'"));
@@ -267,7 +281,12 @@ async fn live_burst_creates_scrubs_drains_and_deletes_a_real_drone() {
         .iter()
         .map(|i| i["key"].as_str().unwrap())
         .collect();
-    assert_eq!(kept, ["startup-script"]);
+    // The two secrets are gone; the template's access settings and the
+    // bootstrap script stay.
+    assert_eq!(
+        kept,
+        ["enable-oslogin", "block-project-ssh-keys", "startup-script"]
+    );
     assert_eq!(s["burst"]["drones"]["managed"], 1);
     assert_eq!(s["burst"]["drones"]["provisioning"], 0);
 
@@ -348,10 +367,10 @@ async fn a_vm_whose_drone_never_heartbeats_is_deleted_and_listed_as_never_enroll
     assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
     assert_eq!(listed[0]["drone"], drone_name);
     assert_eq!(listed[0]["vm"], vm_name);
-    assert_eq!(listed[0]["zone"], "us-west1-b");
+    assert_eq!(listed[0]["zone"], "us-central1-b");
     assert_eq!(listed[0]["ended_at"], at(2100).unix_timestamp());
     assert!(h.metrics().await.contains(&format!(
-        "borg_burst_never_enrolled_timestamp_seconds{{drone=\"{drone_name}\",vm=\"{vm_name}\",zone=\"us-west1-b\"}} {}",
+        "borg_burst_never_enrolled_timestamp_seconds{{drone=\"{drone_name}\",vm=\"{vm_name}\",zone=\"us-central1-b\"}} {}",
         at(2100).unix_timestamp()
     )));
 }
@@ -387,7 +406,60 @@ async fn a_failed_create_undoes_the_enrollment_and_moves_to_another_zone() {
         "{:?}",
         burst_events(&s)
     );
-    assert_eq!(h.state().gce_instances[0]["zone"], "us-west1-a");
+    assert_eq!(h.state().gce_instances[0]["zone"], "us-central1-a");
+}
+
+#[tokio::test]
+async fn without_the_instance_template_nothing_is_created_or_enrolled() {
+    let h = Harness::start(live_config()).await;
+    h.queue_job(1, "borg-ci-heavy", 5);
+    h.queue_job(2, "borg-ci-heavy", 5);
+    let t0 = OffsetDateTime::now_utc().replace_time(time::Time::from_hms(12, 0, 0).unwrap());
+    let at = |s: i64| t0 + time::Duration::seconds(s);
+    // The template was deleted, or the queen may not read it.
+    h.state().gce_template_missing = true;
+
+    h.queen.tick(at(0)).await.unwrap();
+    h.queen.tick(at(600)).await.unwrap();
+    let s = status_at(&h, at(600)).await;
+    assert_eq!(burst_events(&s), ["burst_create_failed"]);
+    assert!(h.state().gce_template_reads >= 1);
+    assert!(
+        h.state().gce_instances.is_empty(),
+        "no VM is built from the queen's own settings"
+    );
+    assert_eq!(s["burst"]["drones"]["managed"], 0);
+    assert_eq!(
+        s["drones"],
+        json!([]),
+        "no drone is enrolled for a VM that was never requested"
+    );
+}
+
+#[tokio::test]
+async fn a_template_whose_lifetime_differs_from_the_plan_creates_and_enrolls_nothing() {
+    // Shorter would cut a running job off before the queen retires the
+    // drone; longer would leave a VM the queen no longer counts or deletes.
+    for template_secs in [21_600, 86_400] {
+        let h = Harness::start(live_config()).await;
+        h.queue_job(1, "borg-ci-heavy", 5);
+        h.queue_job(2, "borg-ci-heavy", 5);
+        let t0 = OffsetDateTime::now_utc().replace_time(time::Time::from_hms(12, 0, 0).unwrap());
+        let at = |s: i64| t0 + time::Duration::seconds(s);
+        h.state().gce_template_max_run_secs = Some(template_secs);
+
+        h.queen.tick(at(0)).await.unwrap();
+        h.queen.tick(at(600)).await.unwrap();
+        let s = status_at(&h, at(600)).await;
+        assert_eq!(burst_events(&s), ["burst_create_failed"], "{template_secs}");
+        assert!(h.state().gce_instances.is_empty(), "{template_secs}");
+        assert_eq!(s["burst"]["drones"]["managed"], 0);
+        assert_eq!(
+            s["drones"],
+            json!([]),
+            "nothing enrolled for {template_secs}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -491,8 +563,8 @@ async fn unrecorded_burst_vms_are_found_by_label_counted_and_deleted() {
     {
         let mut st = h.state();
         st.gce_instances = vec![
-            orphan("borg-burst-q1c7f304", "us-west1-a"),
-            orphan("borg-burst-q1c7f30e", "us-west1-a"),
+            orphan("borg-burst-q1c7f304", "us-central1-a"),
+            orphan("borg-burst-q1c7f30e", "us-central1-a"),
         ];
         st.gce_fail_delete = true;
     }
@@ -539,12 +611,12 @@ async fn an_unrecorded_vm_whose_drone_is_enrolled_is_adopted_not_deleted() {
     let h = Harness::start(live_config()).await;
     let vm = "borg-burst-q1c7f304";
     h.enroll("gcp-burst-q1c7f304").await;
-    h.state().gce_instances = vec![orphan(vm, "us-west1-a")];
+    h.state().gce_instances = vec![orphan(vm, "us-central1-a")];
     let now = OffsetDateTime::now_utc();
     h.queen.tick(now).await.unwrap();
     let s = status_at(&h, now).await;
     assert!(h.state().gce_deleted.is_empty());
     assert_eq!(s["burst"]["drones"]["managed"], 1, "{}", s["burst"]);
     assert_eq!(s["burst"]["vms"][0]["vm"], vm);
-    assert_eq!(s["burst"]["vms"][0]["zone"], "us-west1-a");
+    assert_eq!(s["burst"]["vms"][0]["zone"], "us-central1-a");
 }

@@ -4,7 +4,7 @@ use crate::support;
 use std::path::Path;
 use std::process::Output;
 
-use borg::allocator::{AllocatorInput, Demand, DroneState, HostCaps, PrTurn, allocate};
+use borg::allocator::{AllocatorInput, Demand, DroneState, HostCaps, LargerHold, PrTurn, allocate};
 use borg::bid::ScoreWeights;
 use borg::classes::{Class, Classes, Scope};
 use borg::explain::{Explanation, PlacementKind, PlacementOutcome, PlacementRecord};
@@ -62,6 +62,7 @@ async fn record(store: &Store, kind: PlacementKind, key: &str, client: Option<&s
         weights: ScoreWeights::default(),
         admission: None,
         pr_turn: PrTurn::default(),
+        larger_hold: LargerHold::default(),
     };
     store
         .record_placement(PlacementRecord {

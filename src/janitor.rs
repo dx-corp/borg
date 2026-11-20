@@ -7,11 +7,16 @@
 //! (one of its jobs is running or has concluded, even while GitHub still
 //! reports the run `queued` because every other job waits for a runner) is
 //! the batch verdict for every push since the previous one; it is cancelled
-//! only once one of its jobs has failed: its verdict is final,
+//! only once a job has failed, or a completed job was cancelled or timed out:
+//! its verdict cannot pass,
 //! and on a branch whose workflow keeps one running run per concurrency
 //! group (platform-ci on main) it would otherwise hold the group for hours
 //! while every newer push waits and is replaced unstarted (2026-11-08: a
 //! 15:30Z main run, red since 15:57Z, held main CI until 17:25Z).
+//! With `verdict_jobs` set, such a red run is first left to finish the jobs
+//! that attest closure verdicts (bounded by `verdict_wait_secs` from its
+//! first failure), so its passing units are banked and the next main run
+//! does not test them again.
 //!
 //! A push to a pull request branch makes every run of the older commit
 //! pointless, but GitHub keeps them queued and they occupy runner demand. Two
@@ -114,9 +119,12 @@ pub struct PassReport {
     /// Runs left for a later pass by the per-pass cap.
     pub deferred: u32,
     /// Superseded push runs left alone because one of their jobs started
-    /// (running or concluded) and none failed. GitHub shows a run as
+    /// (running or concluded) and no job is known unable to pass. GitHub shows a run as
     /// `queued` while any job waits for a runner.
     pub started_push: u32,
+    /// Red superseded push runs kept so their unfinished `verdict_jobs` can
+    /// attest closure verdicts, within `verdict_wait_secs` of the first failure.
+    pub awaiting_verdicts: u32,
     /// Runs left alone when a fresh status, head or active child job
     /// contradicted the listing used to select them.
     pub raced: u32,
@@ -156,6 +164,7 @@ impl PassReport {
         self.would_cancel += o.would_cancel;
         self.deferred += o.deferred;
         self.started_push += o.started_push;
+        self.awaiting_verdicts += o.awaiting_verdicts;
         self.raced += o.raced;
         self.uncancellable += o.uncancellable;
         self.errors += o.errors;
@@ -492,7 +501,7 @@ impl Janitor {
         }
         self.promotion_passes(&mut budget, &mut report).await;
         tracing::debug!(
-            "janitor pass: considered {} superseded {} closed_pr {} superseded_push {} cancelled {} cancelled_running {} duplicates {} dedup_cancelled {} would_cancel {} deferred {} started_push {} raced {} uncancellable {} errors {}",
+            "janitor pass: considered {} superseded {} closed_pr {} superseded_push {} cancelled {} cancelled_running {} duplicates {} dedup_cancelled {} would_cancel {} deferred {} started_push {} awaiting_verdicts {} raced {} uncancellable {} errors {}",
             report.considered,
             report.superseded,
             report.closed_pr,
@@ -504,6 +513,7 @@ impl Janitor {
             report.would_cancel,
             report.deferred,
             report.started_push,
+            report.awaiting_verdicts,
             report.raced,
             report.uncancellable,
             report.errors
@@ -642,7 +652,7 @@ impl Janitor {
                 report.deferred += 1;
                 continue;
             }
-            let jobs = match self.job_states(repo, run.id).await {
+            let jobs = match self.job_states(repo, run.id, &st.verdict_jobs).await {
                 Ok(j) => j,
                 Err(e) => {
                     tracing::warn!("janitor: {repo} run {}: {e}", run.id);
@@ -650,11 +660,26 @@ impl Janitor {
                     continue;
                 }
             };
-            let Some((why, kind)) = superseded_push_action(run, newer, jobs, st.cancel_running)
+            let Some((mut why, kind)) = superseded_push_action(run, newer, jobs, st.cancel_running)
             else {
                 report.started_push += 1;
                 continue;
             };
+            if kind == Kind::Running {
+                match verdict_hold(jobs, st.verdict_wait_secs, now()) {
+                    VerdictHold::Wait => {
+                        report.awaiting_verdicts += 1;
+                        continue;
+                    }
+                    VerdictHold::Expired => {
+                        why.push_str(&format!(
+                            " (verdict jobs unfinished {}s after the first failure)",
+                            st.verdict_wait_secs
+                        ));
+                    }
+                    VerdictHold::Done => {}
+                }
+            }
             let outcome = self
                 .cancel_if_unchanged(repo, run, &why, self.settings.dry_run)
                 .await;
@@ -828,23 +853,33 @@ impl Janitor {
     /// `queued` while one job waits for a runner, even when others have
     /// started or finished.
     async fn has_started_job(&self, repo: &str, run: u64) -> Result<bool, GithubError> {
-        Ok(self.job_states(repo, run).await?.started)
+        Ok(self.job_states(repo, run, &[]).await?.started)
     }
 
-    /// Whether any latest-attempt job of `run` is running, and whether any
-    /// concluded `failure`.
-    async fn job_states(&self, repo: &str, run: u64) -> Result<JobStates, GithubError> {
+    /// Whether any latest-attempt job of `run` is running, whether any
+    /// concluded `failure`, and whether a `verdict_jobs` job is unfinished.
+    async fn job_states(
+        &self,
+        repo: &str,
+        run: u64,
+        verdict_jobs: &[String],
+    ) -> Result<JobStates, GithubError> {
         #[derive(Deserialize)]
         struct Jobs {
             jobs: Vec<Job>,
         }
         #[derive(Deserialize)]
         struct Job {
+            #[serde(default)]
+            name: String,
             status: String,
             #[serde(default)]
             conclusion: Option<String>,
+            #[serde(default)]
+            completed_at: Option<String>,
         }
         let mut out = JobStates::default();
+        let mut seen = vec![false; verdict_jobs.len()];
         for page in 1..=MAX_PAGES {
             let jobs: Jobs = self
                 .get(&format!(
@@ -857,11 +892,20 @@ impl Janitor {
             // reporting the run as `queued` and no job `in_progress`.
             for job in &jobs.jobs {
                 out.include(&job.status, job.conclusion.as_deref());
+                out.include_verdict(
+                    &job.name,
+                    &job.status,
+                    job.conclusion.as_deref(),
+                    job.completed_at.as_deref().and_then(unix),
+                    verdict_jobs,
+                );
+                mark_seen(&job.name, verdict_jobs, &mut seen);
             }
             if jobs.jobs.len() < 100 {
                 break;
             }
         }
+        out.require_seen(&seen);
         Ok(out)
     }
 
@@ -1018,7 +1062,13 @@ struct JobStates {
     /// group even while GitHub reports it `queued` (every remaining job is
     /// waiting for a runner).
     started: bool,
-    failed: bool,
+    // Preserve failure handling; cancellation and timeout require an explicit completion.
+    nonpassing: bool,
+    /// A `verdict_jobs` job has not completed: it may still attest closure
+    /// verdicts for the units it tests, whatever other jobs concluded.
+    verdict_pending: bool,
+    /// When the earliest job that cannot pass completed (unix seconds).
+    first_nonpassing_at: Option<i64>,
 }
 
 impl JobStates {
@@ -1027,14 +1077,92 @@ impl JobStates {
         // conservative so they still protect work that may have started.
         self.started |=
             status == "in_progress" || (status == "completed" && conclusion != Some("skipped"));
-        self.failed |= conclusion == Some("failure");
+        self.nonpassing |= conclusion == Some("failure")
+            || (status == "completed" && matches!(conclusion, Some("cancelled" | "timed_out")));
+    }
+
+    /// Track `verdict_jobs` progress and the first failure's time for one job.
+    fn include_verdict(
+        &mut self,
+        name: &str,
+        status: &str,
+        conclusion: Option<&str>,
+        completed_at: Option<i64>,
+        verdict_jobs: &[String],
+    ) {
+        if status != "completed" && is_verdict_job(name, verdict_jobs) {
+            self.verdict_pending = true;
+        }
+        let failed = conclusion == Some("failure")
+            || (status == "completed" && matches!(conclusion, Some("cancelled" | "timed_out")));
+        if failed && let Some(at) = completed_at {
+            self.first_nonpassing_at = Some(self.first_nonpassing_at.map_or(at, |t| t.min(at)));
+        }
+    }
+}
+
+/// Mark every `verdict_jobs` entry that job `name` matches.
+fn mark_seen(name: &str, verdict_jobs: &[String], seen: &mut [bool]) {
+    for (entry, hit) in verdict_jobs.iter().zip(seen.iter_mut()) {
+        *hit |= is_verdict_job(name, std::slice::from_ref(entry));
+    }
+}
+
+impl JobStates {
+    /// A `verdict_jobs` entry with no job in the listing is still pending:
+    /// GitHub lists a job only once its `needs` have finished, so an
+    /// attester waiting on an unlisted prerequisite (platform-ui behind
+    /// platform-ui-quality) is absent, not done. It appears, run or skipped,
+    /// once its prerequisites finish; the cap bounds the wait otherwise.
+    fn require_seen(&mut self, seen: &[bool]) {
+        if seen.iter().any(|hit| !hit) {
+            self.verdict_pending = true;
+        }
+    }
+}
+
+/// Whether job `name` is one of `verdict_jobs`: the exact name, or the name
+/// followed by a parenthesized matrix or display suffix
+/// (`full-rust-test-shard` matches `full-rust-test-shard (platform-api)`).
+fn is_verdict_job(name: &str, verdict_jobs: &[String]) -> bool {
+    verdict_jobs.iter().any(|v| {
+        name == v
+            || name
+                .strip_prefix(v.as_str())
+                .is_some_and(|rest| rest.starts_with(" ("))
+    })
+}
+
+/// What to do with a red superseded push run that `superseded_push_action`
+/// would cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerdictHold {
+    /// No verdict job is unfinished: cancel now.
+    Done,
+    /// A verdict job is unfinished and the cap has not passed: keep the run,
+    /// so the job can attest closure verdicts the next main run then skips.
+    Wait,
+    /// A verdict job is unfinished but `verdict_wait_secs` have passed since
+    /// the first failure (or that time is unknown): cancel anyway, so a red
+    /// run on a starved fleet cannot hold the main group for hours.
+    Expired,
+}
+
+fn verdict_hold(jobs: JobStates, wait_secs: u64, now: i64) -> VerdictHold {
+    if !jobs.verdict_pending {
+        return VerdictHold::Done;
+    }
+    let wait = i64::try_from(wait_secs).unwrap_or(i64::MAX);
+    match jobs.first_nonpassing_at {
+        Some(at) if now.saturating_sub(at) < wait => VerdictHold::Wait,
+        _ => VerdictHold::Expired,
     }
 }
 
 /// Whether to cancel a superseded push run, why, and how to count it: a run
 /// with no job started yet goes; a started one only with `cancel_running` and
-/// once a job failed (its verdict is final and it only holds the concurrency
-/// group). A started run that is still green is the batch verdict for every
+/// once a job cannot pass (failure, or a completed cancellation or timeout).
+/// A started run whose verdict may still pass is the batch verdict for every
 /// push since the previous one and is never cancelled here.
 fn superseded_push_action(
     run: &Run,
@@ -1044,13 +1172,13 @@ fn superseded_push_action(
 ) -> Option<(String, Kind)> {
     let branch = run.head_branch.as_deref().unwrap_or("?");
     let started = run.status == "in_progress" || jobs.started;
-    match (started, jobs.failed && cancel_running) {
+    match (started, jobs.nonpassing && cancel_running) {
         (false, _) => Some((
             format!("on {branch}: superseded by run {newer}"),
             Kind::Stale,
         )),
         (true, true) => Some((
-            format!("on {branch}: superseded by run {newer} and already failed"),
+            format!("on {branch}: superseded by run {newer} and has a job that cannot pass"),
             Kind::Running,
         )),
         (true, false) => None,
@@ -1202,17 +1330,19 @@ mod tests {
     }
 
     #[test]
-    fn a_started_superseded_push_run_is_cancelled_only_once_it_failed() {
+    fn a_started_superseded_push_run_is_cancelled_only_once_it_cannot_pass() {
         let queued = run(1, 1, "queued", "push", "a", &[]);
         let running = run(2, 1, "in_progress", "push", "b", &[]);
         let idle = JobStates::default();
         let busy = JobStates {
             started: true,
-            failed: false,
+            nonpassing: false,
+            ..JobStates::default()
         };
         let red = JobStates {
             started: true,
-            failed: true,
+            nonpassing: true,
+            ..JobStates::default()
         };
         // Not started: superseded is enough.
         assert_eq!(
@@ -1229,11 +1359,177 @@ mod tests {
         let (why, kind) = superseded_push_action(&running, 3, red, true).unwrap();
         assert_eq!(kind, Kind::Running);
         assert!(
-            why.ends_with("superseded by run 3 and already failed"),
+            why.ends_with("superseded by run 3 and has a job that cannot pass"),
             "{why}"
         );
         // Without cancel_running a started run is never cancelled.
         assert_eq!(superseded_push_action(&running, 3, red, false), None);
+    }
+
+    #[test]
+    fn verdict_jobs_match_by_name_or_parenthesized_suffix() {
+        let v = [
+            "full-rust-test-shard".to_string(),
+            "platform-ui".to_string(),
+        ];
+        assert!(is_verdict_job("full-rust-test-shard (platform-api)", &v));
+        assert!(is_verdict_job(
+            "full-rust-test-shard (platform-api parity)",
+            &v
+        ));
+        assert!(is_verdict_job("platform-ui", &v));
+        // Another job sharing a prefix is not a verdict job.
+        assert!(!is_verdict_job("platform-ui-e2e (1/6)", &v));
+        assert!(!is_verdict_job("platform-ui-quality (1/3)", &v));
+        assert!(!is_verdict_job("full-rust-test-workspace", &v));
+        assert!(!is_verdict_job("platform-ui", &[]));
+    }
+
+    #[test]
+    fn a_red_run_is_kept_until_its_verdict_jobs_finish_within_the_cap() {
+        // 2026-11-20 run 44655765005: `ci-contract-checks (corpus)` failed at
+        // 02:19Z and the run was cancelled at 02:21Z with every
+        // `full-rust-test-shard` job still unfinished, so no closure verdict
+        // was attested and the next main run had to test those units again.
+        let v = ["full-rust-test-shard".to_string()];
+        let failed_at = 1_000_000;
+        let mut jobs = JobStates::default();
+        for (name, status, conclusion, at) in [
+            (
+                "ci-contract-checks (corpus)",
+                "completed",
+                Some("failure"),
+                Some(failed_at),
+            ),
+            (
+                "workspace-maestro",
+                "completed",
+                Some("failure"),
+                Some(failed_at + 60),
+            ),
+            (
+                "full-rust-test-shard (platform-api)",
+                "in_progress",
+                None,
+                None,
+            ),
+            (
+                "full-rust-test-shard (workspace-rest)",
+                "queued",
+                None,
+                None,
+            ),
+        ] {
+            jobs.include(status, conclusion);
+            jobs.include_verdict(name, status, conclusion, at, &v);
+        }
+        assert!(jobs.nonpassing && jobs.verdict_pending);
+        assert_eq!(jobs.first_nonpassing_at, Some(failed_at));
+        assert_eq!(verdict_hold(jobs, 3600, failed_at + 120), VerdictHold::Wait);
+        assert_eq!(
+            verdict_hold(jobs, 3600, failed_at + 3599),
+            VerdictHold::Wait
+        );
+        // The cap counts from the first failure, not the latest.
+        assert_eq!(
+            verdict_hold(jobs, 3600, failed_at + 3600),
+            VerdictHold::Expired
+        );
+        // Without verdict jobs configured, a red run goes at once, as before.
+        let mut plain = JobStates::default();
+        plain.include("completed", Some("failure"));
+        plain.include_verdict("x", "completed", Some("failure"), Some(failed_at), &[]);
+        plain.include("in_progress", None);
+        plain.include_verdict("full-rust-test-shard (a)", "in_progress", None, None, &[]);
+        assert_eq!(verdict_hold(plain, 3600, failed_at), VerdictHold::Done);
+    }
+
+    #[test]
+    fn a_red_run_whose_verdict_jobs_finished_is_cancelled_at_once() {
+        let v = ["full-rust-test-shard".to_string()];
+        let mut jobs = JobStates::default();
+        for (name, status, conclusion) in [
+            ("ci-contract-checks (corpus)", "completed", Some("failure")),
+            (
+                "full-rust-test-shard (platform-api)",
+                "completed",
+                Some("success"),
+            ),
+            (
+                "full-rust-test-shard (workspace-rest)",
+                "completed",
+                Some("failure"),
+            ),
+            (
+                "full-rust-test-shard (platform-api parity)",
+                "completed",
+                Some("skipped"),
+            ),
+            ("platform-ui-e2e (1/6)", "in_progress", None),
+        ] {
+            jobs.include(status, conclusion);
+            jobs.include_verdict(name, status, conclusion, Some(10), &v);
+        }
+        assert!(!jobs.verdict_pending, "non-verdict jobs never hold the run");
+        assert_eq!(verdict_hold(jobs, 3600, 20), VerdictHold::Done);
+    }
+
+    #[test]
+    fn an_attester_not_yet_listed_still_holds_a_red_run() {
+        // GitHub lists platform-ui only once platform-ui-quality finishes, so
+        // while it waits it is absent from the jobs response, not finished.
+        let v = [
+            "full-rust-test-shard".to_string(),
+            "platform-ui".to_string(),
+            "full-rust-test-shard (platform-api parity)".to_string(),
+        ];
+        let listed = [
+            ("ci-contract-checks (corpus)", "completed", Some("failure")),
+            (
+                "full-rust-test-shard (platform-api)",
+                "completed",
+                Some("success"),
+            ),
+            ("platform-ui-quality (1/3)", "in_progress", None),
+        ];
+        let mut jobs = JobStates::default();
+        let mut seen = vec![false; v.len()];
+        for (name, status, conclusion) in listed {
+            jobs.include(status, conclusion);
+            jobs.include_verdict(name, status, conclusion, Some(10), &v);
+            mark_seen(name, &v, &mut seen);
+        }
+        jobs.require_seen(&seen);
+        assert_eq!(seen, [true, false, false]);
+        assert_eq!(verdict_hold(jobs, 3600, 20), VerdictHold::Wait);
+
+        // Once both appear finished (run or skipped), the run may go.
+        for (name, status, conclusion) in [
+            ("platform-ui", "completed", Some("skipped")),
+            (
+                "full-rust-test-shard (platform-api parity)",
+                "completed",
+                Some("success"),
+            ),
+        ] {
+            jobs = JobStates {
+                verdict_pending: false,
+                ..jobs
+            };
+            mark_seen(name, &v, &mut seen);
+            jobs.include_verdict(name, status, conclusion, Some(10), &v);
+        }
+        jobs.require_seen(&seen);
+        assert_eq!(verdict_hold(jobs, 3600, 20), VerdictHold::Done);
+    }
+
+    #[test]
+    fn an_unknown_failure_time_never_holds_a_red_run() {
+        let v = ["full-rust-test-shard".to_string()];
+        let mut jobs = JobStates::default();
+        jobs.include_verdict("lint", "completed", Some("failure"), None, &v);
+        jobs.include_verdict("full-rust-test-shard (a)", "queued", None, None, &v);
+        assert_eq!(verdict_hold(jobs, 3600, 0), VerdictHold::Expired);
     }
 
     #[test]
@@ -1244,11 +1540,60 @@ mod tests {
         jobs.include("queued", None);
 
         assert!(!jobs.started, "a skipped job never acquired a runner");
-        assert!(!jobs.failed);
+        assert!(!jobs.nonpassing);
         assert_eq!(
             superseded_push_action(&queued, 2, jobs, true).map(|(_, kind)| kind),
             Some(Kind::Stale)
         );
+    }
+
+    #[test]
+    fn completed_cancelled_or_timed_out_jobs_release_a_superseded_push_holder() {
+        let mut old = run(1, 1, "queued", "push", "old", &[]);
+        old.path = ".github/workflows/platform-ci.yml".into();
+        let mut new = run(2, 1, "pending", "push", "new", &[]);
+        new.path = ".github/workflows/platform-ci.yml".into();
+        let runs = [old, new];
+        let candidates = superseded_pushes(
+            &runs,
+            &["main".into()],
+            &[".github/workflows/platform-ci.yml".into()],
+        );
+        assert_eq!(candidates.len(), 1);
+        let (holder, newer) = candidates[0];
+        assert_eq!((holder.id, newer), (1, 2));
+
+        for conclusion in ["cancelled", "timed_out"] {
+            let mut jobs = JobStates::default();
+            jobs.include("completed", Some("success"));
+            jobs.include("completed", Some(conclusion));
+            jobs.include("queued", None);
+
+            assert_eq!(
+                superseded_push_action(holder, newer, jobs, true).map(|(_, kind)| kind),
+                Some(Kind::Running),
+                "a completed {conclusion} job cannot produce a passing batch verdict"
+            );
+            assert_eq!(superseded_push_action(holder, newer, jobs, false), None);
+        }
+    }
+
+    #[test]
+    fn unfinished_cancelled_or_timed_out_jobs_preserve_a_started_push_holder() {
+        let holder = run(1, 1, "queued", "push", "old", &[]);
+        for status in ["queued", "pending", "waiting", "in_progress", "unknown"] {
+            for conclusion in ["cancelled", "timed_out"] {
+                let mut jobs = JobStates::default();
+                jobs.include("in_progress", None);
+                jobs.include(status, Some(conclusion));
+
+                assert_eq!(
+                    superseded_push_action(&holder, 2, jobs, true),
+                    None,
+                    "unfinished job {status} {conclusion} must not retire healthy work"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1259,8 +1604,6 @@ mod tests {
             ("in_progress", Some("skipped")),
             ("completed", Some("success")),
             ("completed", Some("neutral")),
-            ("completed", Some("cancelled")),
-            ("completed", Some("timed_out")),
             ("completed", Some("unknown-conclusion")),
             ("completed", None),
             ("completed", Some("failure")),
@@ -1270,7 +1613,7 @@ mod tests {
             jobs.include(status, conclusion);
 
             assert!(jobs.started, "{status} {conclusion:?}");
-            assert_eq!(jobs.failed, conclusion == Some("failure"));
+            assert_eq!(jobs.nonpassing, conclusion == Some("failure"));
             assert_eq!(superseded_push_action(&queued, 2, jobs, false), None);
             assert_eq!(
                 superseded_push_action(&queued, 2, jobs, true).map(|(_, kind)| kind),

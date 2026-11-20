@@ -28,6 +28,7 @@ Configuration, scheduling, drone administration, and protocol details for
   - [Starvation guard](#starvation-guard)
   - [Pull-request turns](#pull-request-turns)
   - [Preemption](#preemption)
+  - [Host-lost jobs](#host-lost-jobs)
   - [Admission by CPU pressure](#admission-by-cpu-pressure)
   - [Standby runners and deploy fail-open](#standby-runners-and-deploy-fail-open)
 - [Drone](#drone)
@@ -201,7 +202,10 @@ job's own failure) or `unknown`. Unrecognized values read as `unknown`; at most
 recorded. The queen keeps it for `telemetry_retention_days` (default 30).
 `borg report --queen <url>` (or `--config queen.json` on the queen host) and
 `GET /report` summarize time by job and step, queue wait per class, the
-cancellation share and host-caused failures per drone.
+cancellation share and host-caused failures per drone. The drone table also
+counts leases that ended because the host was lost (`host-lost`) and the jobs
+re-run for it (`rerun`), and a `Host-lost jobs` section lists the newest ones
+with what the queen did; see [host-lost jobs](#host-lost-jobs).
 
 #### GitHub job feedback
 
@@ -738,7 +742,9 @@ target is the build the queen runs (`/status` `queen.version`), so a queen
 self-update carries the drones with it through the same canary and wave gate.
 A queen self-update during a canary or wave keeps the persisted rollout target
 until it completes or halts, including every wave's observation period. The next
-pass then adopts the current queen build. An explicit `rollout_target_version`
+pass then adopts the current queen build. A rollout whose stage has not moved
+for `soak_secs` plus `supersede_stalled_after_secs` is stalled, and the current
+queen build supersedes it with a fresh canary. An explicit `rollout_target_version`
 still overrides the active rollout immediately.
 The previous version (what a halt rolls back to) is fixed when each rollout
 starts: the last rollout's target if it completed, its previous otherwise, or
@@ -799,7 +805,9 @@ profile. `/status` `queue[].families` lists the most-queued families per label.
 
 Every allocator decision records a `reason`: the term that separated the
 winner from the best other eligible drone (`cost`, `profile`, `host` or
-`bid`), or `only_eligible`, `tightest_fit` or `name` when nothing else did.
+`bid`), `spares_larger` when it was kept off a drone that larger waiting
+work can use, or `only_eligible`, `tightest_fit` or `name` when nothing else
+did.
 `/explain` shows it with each candidate's terms, and `/status`
 `placement.placed` lists the newest decisions with their drone, reason and
 score.
@@ -856,7 +864,9 @@ accepting drones could hold if empty) and `free_slots` next to `unmet_main`,
 `unmet_placeable`. When main demand of a class in `capacity_alarm.classes`
 stays unmet for `capacity_alarm.after_secs` while that class has at most
 `capacity_alarm.max_slots` *free admitting* slots, the queen logs a
-`capacity_starved` event (drone `fleet`; the reason names the stale drones).
+`capacity_starved` event (drone `fleet`; the reason names the drones that
+went stale within the last day, and counts the ones silent longer or never
+seen).
 A free admitting slot is room left after placement on a drone that admits
 every scope of the class (not shedding under CPU pressure, class not blocked
 by its environment); `schedulable_slots` is the nominal total and does not
@@ -901,7 +911,7 @@ Production Prometheus scrapes `/metrics` through the tailnet (job
 | `borg_static_runner_offline_seconds{runner}` | Seconds since this queen first saw the runner offline. |
 | `borg_burst_never_enrolled_timestamp_seconds{drone,vm,zone}` | End time of each burst VM that ended in the last 24 hours without its drone ever heartbeating (`burst.never_enrolled` in `/status`). |
 | `borg_drone_info{drone,version,trust}` | The version each drone reports: `<package>+<first 12 hex of the binary's sha256>`, so a drone that missed a roll shows a different `version` from the fleet. Rollout targets without `+` match every build of a release. |
-| `borg_drone_host_invariant_failing{drone,check}` | 1 per host invariant the drone reports broken (`ip_forward`, `docker_daemon`, `container_network`, `disk`; `drone::invariants`). The drone takes no leases while any but `disk` fails (disk has its own admission). The container network check runs a `busybox` container on the default bridge that must resolve and connect to `host_invariants.probe_host:probe_port` (github.com:443) at startup and every `interval_secs` (600). |
+| `borg_drone_host_invariant_failing{drone,check}` | 1 per host invariant the drone reports broken (`ip_forward`, `docker_daemon`, `container_network`, `disk`; `drone::invariants`). The drone takes no leases while any but `disk` fails (disk has its own admission). The container network check runs a `busybox` container on the default bridge that must resolve and connect to `host_invariants.probe_host:probe_port` (github.com:443) at startup and every `interval_secs` (600). A failed probe is run again after 60 seconds, so a probe that did not finish keeps the drone out for about a minute; it still takes no leases until a probe passes. A probe that did not finish reports why in `host_invariant_failures[].detail` (at most 300 characters): timed out after 120 s, or the exit code (125 means docker could not run the container, an image pull or daemon error), then the first three stderr lines. The image comes from `host_invariants.probe_image` (`busybox:1.37`, which is Docker Hub unless the daemon has a registry mirror), pulled when missing; point it at a mirror a host without Docker Hub access can reach. |
 | `borg_drone_active_leases{drone}` / `borg_drone_accepting{drone}` | Leases the drone runs, and whether it takes new ones: a drone with free capacity 0 and no leases while its class has queued jobs is stuck. |
 
 ### Tailnet enrollment
@@ -1000,6 +1010,19 @@ reach:
   main) would otherwise hold the group while every newer push waits and is
   replaced before it starts. On 2026-11-08 a 15:30Z main run, red since 15:57Z,
   held main CI until 17:25Z this way.
+* `verdict_jobs` and `verdict_wait_secs` (default 3600): a red superseded
+  push run is kept while one of the named jobs is unfinished, because those
+  jobs attest closure verdicts on success and the next main run then skips
+  the units they covered. A name matches GitHub's job name exactly or followed
+  by a parenthesized matrix or display suffix (`full-rust-test-shard` covers
+  `full-rust-test-shard (platform-api)`, not `full-rust-test-workspace`). The
+  wait is capped at `verdict_wait_secs` from the run's first failed job, so a
+  red run on a starved fleet still releases the group; kept runs are counted
+  as `awaiting_verdicts`. List every platform-ci job that runs
+  `.github/actions/attest-closure-verdict`
+  (`scripts/ci/test-red-main-alarm.py` checks the list against the workflow).
+  On 2026-11-20, 97 of the last 100 main platform-ci runs were cancelled after
+  an unrelated job failed, before any test shard attested.
 * `repos`: the repositories a pass covers, a subset of the queen's `repos`.
   Default: all of them. Set it when the queen also watches repositories only to
   serve their alias lanes (for example a deploy repository): `dedupe_same_sha`
@@ -1159,23 +1182,20 @@ untrusted:
   signs or holds production credentials) from a burst drone that also runs
   pull-request jobs.
 
-**Lifetime.** Use spot or preemptible capacity with a hard maximum run
-duration and delete-on-termination, so a forgotten drone costs at most one
-run duration. On GCP:
+**Lifetime.** Use STANDARD capacity with a hard maximum run duration and
+delete-on-termination, so a forgotten drone costs at most one run duration.
+Spot and preemptible VMs are banned (founder, 2026-11-18: they cost more in
+egress than they saved); the queen rejects `burst.gce.spot: true`. Run burst
+VMs in us-central1, the region of Artifact Registry, the sccache bucket and
+GKE; the queen rejects zones outside it.
 
-```sh
-gcloud compute instances create burst-drone-1 \
-  --machine-type=c2d-highcpu-56 --provisioning-model=SPOT \
-  --instance-termination-action=DELETE --max-run-duration=12h \
-  --no-service-account --no-scopes \
-  --network=borg-burst --subnet=borg-burst \
-  --image-family=ubuntu-2404-lts-amd64 --image-project=ubuntu-os-cloud
-```
-
-The VM keeps its ephemeral external IP by default; do not pass `--no-address`
-unless a NAT gateway exists, which this setup avoids. If the cloud reclaims a
-spot VM mid-job, GitHub fails that job when its runner stops responding; rerun
-it. Queued jobs are unaffected and go to other drones.
+**One template.** Put all of the above in an instance template and name it in
+`burst.gce.instance_template`. The queen creates every burst VM from it and
+adds only the VM name, two labels and the bootstrap metadata, so a host
+cannot drift from the template by way of the queen's config. Ours is the CI
+host template in dx-corp/iac (`infrastructure/gcp/modules/ci-host`): STANDARD,
+us-central1, one ephemeral external IPv4 and no NAT gateway, no ingress but
+the identity-aware tunnel, a baked image, and owner, purpose and lane labels.
 
 #### Additional estimated dollar ceilings
 
@@ -1188,7 +1208,7 @@ A crossed cap drains owned VMs and prevents new creation, preserving
 running leases until they complete.
 
 Dollar limits use `burst.hourly_cost_usd`, an **operator estimate**
-that must be conservative enough to include the expected Spot compute,
+that must be conservative enough to include the expected STANDARD compute,
 boot disk, public IP and traffic overhead. Unlike cloud billing budgets,
 the estimated ceiling **cannot guarantee a maximum invoice**: real prices
 vary and network egress is workload-dependent. Live mode persists the VM
@@ -1248,14 +1268,36 @@ Live, every action is carried out and logged as `burst_create`,
 zone whose create failed is avoided for 15 minutes while another is open).
 The queen needs, under `burst.gce`:
 
+- `instance_template`: the instance template every burst VM is created from,
+  as `projects/<project>/global/instanceTemplates/<name>` (the full URL and a
+  us-central1 regional template are accepted too). The template decides the
+  host: provisioning model, machine type, image, disk, network, address,
+  identity and labels. The queen reads it, then creates the VM with
+  `sourceInstanceTemplate` and sends only the VM name, the template's labels
+  plus `borg-burst` and `borg-drone`, and the template's metadata plus the
+  bootstrap script and its two secrets. Before it enrolls a drone the queen
+  checks that the template is STANDARD, deletes the VM on termination, and
+  has a `maxRunDuration` equal to `max_run_secs`: the queen retires drones,
+  counts drone hours and stops tracking a VM by `max_run_secs`, so a template
+  that deletes sooner would cut jobs off and one that deletes later would
+  leave a VM nobody counts. A template that differs is refused
+  (`burst_create_failed`). `network`, `subnet`, `machine_type`,
+  `boot_disk_gb`, `boot_disk_type`, `image_family` and `image_project` are
+  still parsed, so older configs load, but nothing reads them. Without a
+  template the queen creates nothing: a config with burst enabled and
+  `dry_run: false` fails validation, and burst enabled later through the
+  control API logs `burst_create_failed` instead of building a host itself.
+  Ours is the CI host template in dx-corp/iac
+  (`infrastructure/gcp/modules/ci-host`, `kind = "template"`).
 - `credentials_path`: a service-account key file (JSON). The account needs
   only `compute.instances.{create,get,list,delete,setMetadata,setLabels}`,
+  `compute.instanceTemplates.{get,useReadOnly}`,
   `compute.disks.create`, `compute.subnetworks.{use,useExternalIp}`,
   `compute.images.useReadOnly`, `compute.zones.get` and
-  `compute.zoneOperations.get` in the project (a custom role; no
-  `iam.serviceAccounts.actAs`, since the VMs carry no account). The queen
-  signs a JWT with it and calls the Compute API directly; no `gcloud` on
-  the queen.
+  `compute.zoneOperations.get` in the project (a custom role), plus
+  `iam.serviceAccounts.actAs` on the one account the template attaches, if
+  it attaches one. The queen signs a JWT with it and calls the Compute API
+  directly; no `gcloud` on the queen.
 - `queen_url`: where drones reach this queen over the tailnet: the
   queen's `https://` MagicDNS name.
 - `tailscale_authkey_path`: a reusable, ephemeral, pre-authorized key for
@@ -1271,7 +1313,7 @@ The queen needs, under `burst.gce`:
   for c2d-standard-56).
 
 Create: the queen enrolls `gcp-burst-q<minute>` itself (one-time token), then
-inserts `borg-burst-q<minute>` with the spot, 12-hour delete-on-termination,
+inserts `borg-burst-q<minute>` with the STANDARD, 12-hour delete-on-termination,
 no-service-account shape documented above and three metadata items: the
 rendered `startup-script`, `borg-ts-authkey` and `borg-enroll-token`. The
 startup script joins the tailnet, fetches the binary and toolchain script
@@ -1300,8 +1342,8 @@ and changes nothing else.
 
 Drain quarantines the drone (`manual_quarantine`, reason `burst: idle`,
 `burst: budget spent` or `burst: near its maximum run time`); undrain
-releases it. Delete removes the VM (a 404 counts as done: spot VMs delete
-themselves) and then the drone record, so `drone_expiry` is not needed for
+releases it. Delete removes the VM (a 404 counts as done: a VM past its
+maximum run time deletes itself) and then the drone record, so `drone_expiry` is not needed for
 managed drones.
 
 Turning it on: roll the binary and config together (the old binary rejects
@@ -1501,6 +1543,28 @@ that can free up soonest (fewest in-flight leases, ties by name) and grants no
 smaller lease there until the starving lease fits. Held drones are listed in
 `/status` under `reserved_for`.
 
+### Room for larger work
+
+Larger classes are placed first, but that alone does not keep a large drone
+for them: once it is full, every lease that ends frees room too small for the
+larger class, and smaller work refills it before it adds up to a larger slot.
+While larger work of a scope waits (the runner queue's unmet demand counts for
+work units too), smaller work of that scope or a later one:
+
+- goes first to drones that cannot host the larger work (too small, the wrong
+  trust, or the class blocked there), whatever their scores, and spills onto
+  one that can only when no other drone has room (`/explain` reason
+  `spares_larger`);
+- is refused (`held_for_larger`) on as many of the drones that can host it as
+  cover the waiting count, fewest in-flight leases first: as their smaller
+  leases end the room is kept until it makes a larger slot. Room that could
+  never become one, what is left beside the larger leases a drone runs, still
+  takes smaller work.
+
+Smaller work whose oldest job has waited 600 seconds is no longer refused
+(it still prefers the drones larger work cannot use), so a small queue waits
+at most that long. Trust rules are unchanged.
+
 ### Pull-request turns
 
 Main demand is placed before pull-request demand, and the starvation guard
@@ -1581,6 +1645,71 @@ answer as final, retries other errors on the next pass, and in the janitor's
 `dry_run` only logs `would rerun`. `/status` shows the counters under `requeue`
 and `/metrics` as `borg_requeue_<field>_total` (`checked`, `rerun`, `waiting`,
 `stale`, `terminal`, `errors`).
+
+### Host-lost jobs
+
+A host that dies under a job (a stopped or reclaimed VM, memory exhaustion, a
+lost network) takes its runner with it. GitHub ends the job minutes later as an
+ordinary `failure` whose running step never concluded. The queen classifies
+such a lease `host_lost`, distinct from a job failure, and re-runs the job once
+through the jobs rerun API. It is on by default and applies to every workflow
+whose jobs run on a lease, in every repository the queen serves. It uses the
+janitor's credential when one is configured, else the queen's own App token,
+which then needs Actions: write.
+
+**Classification.** A lease is `host_lost` when it was running a job, ended
+without a result from its drone, was not preempted, and its drone was not
+heard: silent for more than `drone_stale_secs` when the lease ended, back from
+such a silence that began under the lease, or removed as expired. The queen
+classifies nothing while it could not have heard the drone: for
+`drone_stale_secs` after it starts, and while no other drone has been heard in
+that window. Each classification is a `host_lost` health event. The drone gets
+no new lease for `suspect_cooldown_secs`, so the rerun lands elsewhere; a
+result the drone reports later withdraws the record and ends the cool-down.
+
+**Rerun.** After `backoff_secs` (doubling per earlier rerun of the run, up to
+`max_backoff_secs`) and once the run has completed, the job is re-run when it
+is still the newest attempt of that job, GitHub concluded it `failure`, and no
+step of it concluded `failure` or `timed_out`. These are left alone and the
+reason is recorded:
+
+| Reason | Meaning |
+| --- | --- |
+| `job_failed` | A step failed or the job timed out: the job's own verdict. |
+| `job_cancelled` | Cancelled by a person, a concurrency group or the supersede janitor. |
+| `job_not_failed` | The job succeeded or was skipped. |
+| `already_rerun` | A newer attempt of the job exists. |
+| `head_changed` | A `pull_request` run with no open pull request at its commit. |
+| `superseded` | A `push` run with a newer run of the same workflow on its branch. |
+| `run_cap` | The run had `max_reruns_per_run_per_hour` reruns this hour. |
+| `drone_reported` | The drone reported the lease's result after all. |
+| `stale`, `unbound`, `gone`, `refused`, `rerun_off` | Older than `max_age_secs`; the queen never saw the job; GitHub no longer has it; GitHub answered 403, 404 or 409; reruns are off. |
+
+`max_reruns_per_hour` bounds reruns across the fleet; past it they wait. It
+never updates a branch and never re-runs a job that failed on its own.
+
+```json
+"host_lost": {
+  "rerun": true,
+  "dry_run": false,
+  "interval_secs": 30,
+  "backoff_secs": 60,
+  "max_backoff_secs": 900,
+  "max_reruns_per_run_per_hour": 2,
+  "max_reruns_per_hour": 30,
+  "suspect_cooldown_secs": 900,
+  "max_age_secs": 21600
+}
+```
+
+Every key is optional; the values shown are the defaults. `rerun: false` still
+classifies, holds the drone and reports. `/status` shows the pass counters
+under `host_lost`, `/metrics` as `borg_host_lost_<field>_total` (`checked`,
+`rerun`, `would_rerun`, `waiting`, `skipped`, `errors`), and `borg report` the
+per-drone counts and the newest records.
+
+Jobs on runners the queen does not lease (static runners, other runner
+systems) are outside this.
 
 ### Admission by CPU pressure
 

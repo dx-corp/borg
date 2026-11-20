@@ -39,6 +39,7 @@ fn input(demand: &[(Class, Scope, u32)], drones: Vec<DroneState>) -> AllocatorIn
         weights: ScoreWeights::default(),
         admission: None,
         pr_turn: PrTurn::default(),
+        larger_hold: LargerHold::default(),
     }
 }
 
@@ -825,7 +826,8 @@ fn aged_heavy_pr_reservation_precedes_smaller_main_refill() {
     next.leases.retain(|l| l.drone_id != "b-pr");
     next.pr_turn = PrTurn {
         after_secs: Some(900),
-        classes: vec![Class::Heavy],
+        between: 1,
+        main_grants_since_pr: [(Class::Heavy, 1)].into(),
     };
     let admitted = allocate(&next);
     assert!(
@@ -848,7 +850,8 @@ fn aged_heavy_pr_reservation_precedes_a_smaller_pr_turn() {
     aged(&mut i, Class::Medium, Scope::Pr, 1200);
     i.pr_turn = PrTurn {
         after_secs: Some(900),
-        classes: vec![Class::Medium],
+        between: 1,
+        main_grants_since_pr: [(Class::Medium, 1)].into(),
     };
     let a = allocate(&i);
     assert_eq!(
@@ -1712,8 +1715,71 @@ fn pr_turn(i: &mut AllocatorInput, class: Class) {
     });
     i.pr_turn = PrTurn {
         after_secs: Some(900),
-        classes: vec![class],
+        between: 1,
+        main_grants_since_pr: [(class, 1)].into(),
     };
+}
+
+/// Heavy grant scopes in the order the pass placed them.
+fn heavy_order(a: &Allocation) -> Vec<Scope> {
+    a.grants
+        .iter()
+        .filter(|g| g.class == Class::Heavy)
+        .map(|g| g.scope)
+        .collect()
+}
+
+#[test]
+fn pr_turns_alternate_grant_by_grant_when_several_slots_free_at_once() {
+    let mut i = input(
+        &[(Class::Heavy, Scope::Main, 9), (Class::Heavy, Scope::Pr, 9)],
+        ["a", "b", "c", "d"].map(host).into(),
+    );
+    pr_turn(&mut i, Class::Heavy);
+    // Due a turn, one main grant between: four freed slots split two and two.
+    let a = allocate(&i);
+    assert_eq!(
+        heavy_order(&a),
+        [Scope::Pr, Scope::Main, Scope::Pr, Scope::Main]
+    );
+    assert_within_budget(&i, &a);
+    // The same when main is starving too and placed in the aged pass.
+    let mut starving = i.clone();
+    starving.queue_ages.push(QueueAge {
+        class: Class::Heavy,
+        scope: Scope::Main,
+        oldest_age_secs: 1000,
+    });
+    starving.starvation_after_secs = Some(120);
+    assert_eq!(
+        heavy_order(&allocate(&starving)),
+        [Scope::Pr, Scope::Main, Scope::Pr, Scope::Main]
+    );
+    // Not yet due: main's run counts on from the earlier passes.
+    i.pr_turn.main_grants_since_pr.insert(Class::Heavy, 0);
+    assert_eq!(
+        heavy_order(&allocate(&i)),
+        [Scope::Main, Scope::Pr, Scope::Main, Scope::Pr]
+    );
+    // Two main grants between, one already taken.
+    i.pr_turn.between = 2;
+    i.pr_turn.main_grants_since_pr.insert(Class::Heavy, 1);
+    assert_eq!(
+        heavy_order(&allocate(&i)),
+        [Scope::Main, Scope::Pr, Scope::Main, Scope::Main]
+    );
+    // Pull-request demand runs out: main takes the rest.
+    i.demand.retain(|d| d.scope != Scope::Pr);
+    i.demand.push(Demand {
+        class: Class::Heavy,
+        scope: Scope::Pr,
+        count: 1,
+    });
+    i.pr_turn.between = 1;
+    assert_eq!(
+        heavy_order(&allocate(&i)),
+        [Scope::Pr, Scope::Main, Scope::Main, Scope::Main]
+    );
 }
 
 #[test]
@@ -2125,4 +2191,484 @@ fn pr_only_drone_takes_pull_request_demand_and_nothing_else() {
 fn shared_pull_request_runner_keeps_both_labels() {
     let a = allocate(&input(&[(Class::Light, Scope::Pr, 1)], vec![host("a")]));
     assert_eq!(a.grants[0].labels, ["borg-ci-light", "borg-ci-light-pr"]);
+}
+
+/// The classes `config/borg/queen.json` sets.
+fn live_classes() -> Classes {
+    let spec = |mem_mib, vcpu, docker| ClassSpec {
+        mem_mib,
+        vcpu,
+        docker,
+    };
+    Classes {
+        light: spec(2048, 1, false),
+        medium: spec(8192, 2, true),
+        heavy: spec(20480, 4, true),
+        ..Classes::default()
+    }
+}
+
+fn sized(id: &str, vcpu: u32, mem_mib: u64, psi: u16) -> DroneState {
+    DroneState {
+        vcpu,
+        mem_mib,
+        cpu_psi_pm: Some(psi),
+        ..host(id)
+    }
+}
+
+/// The shared fleet at 2026-11-20 03:35Z: borg-main-1 is the only drone
+/// with room for more than one heavy lease; the rest are small, or run their
+/// own heavy lease already (gha-heavy-pve50-1), or never take heavy
+/// (wsl-desktop takes light and medium only).
+fn fleet_0335() -> Vec<DroneState> {
+    let mut wsl = sized("wsl-desktop", 14, 48174, 49);
+    wsl.blocked_classes = vec![Class::Heavy];
+    vec![
+        sized("borg-main-1", 32, 120_832, 0),
+        sized("build-medium-1", 8, 12288, 126),
+        sized("gha-heavy-pve50-1", 8, 28672, 93),
+        sized("pve50-vm240", 6, 7936, 0),
+        sized("pve50-vm242", 6, 7936, 0),
+        sized("pve50-vm245", 6, 7936, 0),
+        wsl,
+    ]
+}
+
+fn ages(heavy: u64, small: u64) -> Vec<QueueAge> {
+    [
+        (Class::Heavy, heavy),
+        (Class::Medium, small),
+        (Class::Light, small),
+    ]
+    .into_iter()
+    .map(|(class, oldest_age_secs)| QueueAge {
+        class,
+        scope: Scope::Main,
+        oldest_age_secs,
+    })
+    .collect()
+}
+
+fn on(a: &Allocation, drone: &str, class: Class) -> usize {
+    a.grants
+        .iter()
+        .filter(|g| g.drone_id == drone && g.class == class)
+        .count()
+}
+
+/// borg-main-1 as it was at 03:35Z after its restart: refilled with 11
+/// medium and 6 light leases, 18 GiB and 4 vCPU left, short of a heavy slot.
+fn refilled_main_1() -> Vec<ActiveLease> {
+    let mut leases = vec![lease(
+        "gha-heavy-pve50-1",
+        Class::Heavy,
+        Scope::Main,
+        LeaseState::Running,
+    )];
+    leases.extend((0..11).map(|_| {
+        lease(
+            "borg-main-1",
+            Class::Medium,
+            Scope::Main,
+            LeaseState::Running,
+        )
+    }));
+    leases.extend((0..6).map(|_| {
+        lease(
+            "borg-main-1",
+            Class::Light,
+            Scope::Main,
+            LeaseState::Running,
+        )
+    }));
+    leases
+}
+
+fn starved_0335(small_age: u64, leases: Vec<ActiveLease>) -> AllocatorInput {
+    AllocatorInput {
+        classes: live_classes(),
+        leases,
+        queue_ages: ages(839, small_age),
+        starvation_after_secs: Some(120),
+        ..input(
+            &[
+                (Class::Heavy, Scope::Main, 29),
+                (Class::Medium, Scope::Main, 22),
+                (Class::Light, Scope::Main, 9),
+            ],
+            fleet_0335(),
+        )
+    }
+}
+
+#[test]
+fn an_empty_big_drone_goes_to_heavy_and_small_work_to_the_small_drones() {
+    let mut i = starved_0335(
+        300,
+        vec![lease(
+            "gha-heavy-pve50-1",
+            Class::Heavy,
+            Scope::Main,
+            LeaseState::Running,
+        )],
+    );
+    i.demand = vec![
+        Demand {
+            class: Class::Heavy,
+            scope: Scope::Main,
+            count: 29,
+        },
+        Demand {
+            class: Class::Medium,
+            scope: Scope::Main,
+            count: 6,
+        },
+        Demand {
+            class: Class::Light,
+            scope: Scope::Main,
+            count: 9,
+        },
+    ];
+    let a = allocate(&i);
+    assert_within_budget(&i, &a);
+    assert_eq!(on(&a, "borg-main-1", Class::Heavy), 5);
+    assert_eq!(on(&a, "borg-main-1", Class::Medium), 0, "{:?}", a.grants);
+    assert_eq!(on(&a, "borg-main-1", Class::Light), 0, "{:?}", a.grants);
+    assert_eq!(count(&a, Class::Medium, Scope::Main), 6);
+    assert_eq!(count(&a, Class::Light, Scope::Main), 9);
+}
+
+#[test]
+fn a_refilled_big_drone_drains_to_heavy_slots_while_small_work_waits() {
+    let i = starved_0335(300, refilled_main_1());
+    let a = allocate(&i);
+    assert_within_budget(&i, &a);
+    // The small drones take what they can; borg-main-1 takes nothing more,
+    // although 18 GiB of it would fit two medium leases.
+    assert!(count(&a, Class::Medium, Scope::Main) > 0);
+    assert!(count(&a, Class::Light, Scope::Main) > 0);
+    assert!(
+        a.grants.iter().all(|g| g.drone_id != "borg-main-1"),
+        "{:?}",
+        a.grants
+    );
+    let held = a
+        .decisions
+        .iter()
+        .filter(|d| d.class != Class::Heavy && d.winner.is_none())
+        .flat_map(|d| &d.candidates)
+        .find(|c| c.drone_id == "borg-main-1")
+        .expect("borg-main-1 was a candidate");
+    assert!(
+        held.rejection_reasons.contains(&Rejection::HeldForLarger),
+        "{held:?}"
+    );
+
+    // Three medium and six light leases end there: heavy takes the room.
+    let mut leases = refilled_main_1();
+    leases.retain(|l| l.drone_id != "borg-main-1");
+    leases.extend((0..8).map(|_| {
+        lease(
+            "borg-main-1",
+            Class::Medium,
+            Scope::Main,
+            LeaseState::Running,
+        )
+    }));
+    leases.extend(
+        a.grants
+            .iter()
+            .map(|g| lease(&g.drone_id, g.class, g.scope, LeaseState::Running)),
+    );
+    let next = starved_0335(300, leases);
+    let b = allocate(&next);
+    assert_within_budget(&next, &b);
+    assert_eq!(on(&b, "borg-main-1", Class::Heavy), 2, "{:?}", b.grants);
+    assert_eq!(
+        b.grants
+            .iter()
+            .filter(|g| g.drone_id == "borg-main-1")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn small_work_that_has_waited_out_the_hold_may_refill_the_big_drone() {
+    let held = allocate(&starved_0335(LARGER_HOLD_SECS - 1, refilled_main_1()));
+    assert!(held.grants.iter().all(|g| g.drone_id != "borg-main-1"));
+
+    let i = starved_0335(LARGER_HOLD_SECS, refilled_main_1());
+    let a = allocate(&i);
+    assert_within_budget(&i, &a);
+    assert!(
+        a.grants
+            .iter()
+            .any(|g| g.drone_id == "borg-main-1" && g.class != Class::Heavy),
+        "{:?}",
+        a.grants
+    );
+    // It still fills the small drones first.
+    assert_eq!(
+        on(&a, "pve50-vm242", Class::Light),
+        on(&held, "pve50-vm242", Class::Light)
+    );
+
+    // Without heavy demand nothing is held, however young the small work.
+    let mut idle = starved_0335(0, refilled_main_1());
+    idle.demand.retain(|d| d.class != Class::Heavy);
+    let c = allocate(&idle);
+    assert!(c.grants.iter().any(|g| g.drone_id == "borg-main-1"));
+}
+
+#[test]
+fn only_the_drones_that_cover_the_waiting_heavy_count_are_held() {
+    // Two big drones running small work, each draining toward five heavy
+    // slots; two heavy jobs wait, so one drone is enough to hold.
+    let drones = vec![
+        sized("big-a", 32, 120_832, 0),
+        sized("big-b", 32, 120_832, 0),
+    ];
+    let mut leases = Vec::new();
+    for d in ["big-a", "big-b"] {
+        leases.extend((0..11).map(|_| lease(d, Class::Medium, Scope::Main, LeaseState::Running)));
+        leases.extend((0..6).map(|_| lease(d, Class::Light, Scope::Main, LeaseState::Running)));
+    }
+    let i = AllocatorInput {
+        classes: live_classes(),
+        leases,
+        queue_ages: ages(839, 300),
+        ..input(
+            &[
+                (Class::Heavy, Scope::Main, 2),
+                (Class::Medium, Scope::Main, 4),
+            ],
+            drones,
+        )
+    };
+    let a = allocate(&i);
+    assert_within_budget(&i, &a);
+    assert_eq!(on(&a, "big-a", Class::Medium), 0, "{:?}", a.grants);
+    assert_eq!(on(&a, "big-b", Class::Medium), 2, "{:?}", a.grants);
+
+    // Seven heavy jobs need both drones' five slots each: both are held.
+    let mut more = i.clone();
+    more.demand[0].count = 7;
+    let b = allocate(&more);
+    assert!(b.grants.is_empty(), "{:?}", b.grants);
+}
+
+#[test]
+fn a_work_unit_keeps_off_the_big_drone_while_runner_heavy_work_waits() {
+    // Work units are placed one at a time against their own queue; the
+    // runner queue's heavy demand reaches them through the hold. Freshly
+    // restarted, borg-main-1 has the lowest CPU pressure and the most idle
+    // room, so a medium unit went there first.
+    let unit = |hold: LargerHold| AllocatorInput {
+        classes: live_classes(),
+        queue_ages: ages(839, 30),
+        larger_hold: hold,
+        ..input(&[(Class::Medium, Scope::Main, 1)], fleet_0335())
+    };
+    let backlog = [Demand {
+        class: Class::Medium,
+        scope: Scope::Main,
+        count: 10,
+    }];
+    let runner_heavy = vec![Demand {
+        class: Class::Heavy,
+        scope: Scope::Main,
+        count: 29,
+    }];
+    let alone = allocate_reserved_with_backlog(&unit(LargerHold::default()), &[], &backlog);
+    assert_eq!(alone.grants[0].drone_id, "borg-main-1");
+
+    let a = allocate_reserved_with_backlog(
+        &unit(LargerHold::with_elsewhere(runner_heavy)),
+        &[],
+        &backlog,
+    );
+    assert_eq!(a.grants[0].drone_id, "wsl-desktop");
+    assert_eq!(a.decisions[0].reason, Some(PlacementReason::SparesLarger));
+}
+
+#[test]
+fn larger_hold_keeps_trust_rules() {
+    // A pr-only drone never takes main work and a deploy-only one never takes
+    // main or pull-request work, held or not.
+    let mut pr = sized("pr", 8, 12288, 0);
+    pr.trust = Trust::PrOnly;
+    let mut deploy = sized("deploy", 8, 12288, 0);
+    deploy.trust = Trust::DeployOnly;
+    let i = AllocatorInput {
+        classes: live_classes(),
+        queue_ages: ages(839, 300),
+        ..input(
+            &[
+                (Class::Heavy, Scope::Main, 3),
+                (Class::Light, Scope::Main, 4),
+            ],
+            vec![sized("big", 32, 120_832, 0), pr, deploy],
+        )
+    };
+    let a = allocate(&i);
+    assert!(
+        a.grants.iter().all(|g| g.drone_id == "big"),
+        "{:?}",
+        a.grants
+    );
+    assert_eq!(on(&a, "big", Class::Heavy), 3);
+    assert_eq!(on(&a, "big", Class::Light), 4);
+}
+
+#[test]
+fn runner_demand_pending_runners_cover_does_not_hold_room_from_units() {
+    // One pending heavy runner covers the heavy job; two medium jobs wait.
+    let drone = DroneState {
+        mem_mib: 48 * 1024,
+        ..host("a")
+    };
+    let runner = AllocatorInput {
+        leases: vec![lease("a", Class::Heavy, Scope::Main, LeaseState::Pending)],
+        ..input(
+            &[
+                (Class::Heavy, Scope::Main, 1),
+                (Class::Medium, Scope::Main, 2),
+            ],
+            vec![drone.clone()],
+        )
+    };
+    let uncovered = uncovered_demand(&runner, &[]);
+    assert_eq!(
+        uncovered,
+        vec![Demand {
+            class: Class::Medium,
+            scope: Scope::Main,
+            count: 2,
+        }]
+    );
+
+    // A medium unit takes its share of the 24 GiB the pending runner leaves.
+    let unit = |hold: LargerHold| AllocatorInput {
+        leases: vec![lease("a", Class::Heavy, Scope::Main, LeaseState::Running)],
+        larger_hold: hold,
+        ..input(&[(Class::Medium, Scope::Main, 1)], vec![drone.clone()])
+    };
+    let backlog = [Demand {
+        class: Class::Medium,
+        scope: Scope::Main,
+        count: 1,
+    }];
+    let a =
+        allocate_reserved_with_backlog(&unit(LargerHold::with_elsewhere(uncovered)), &[], &backlog);
+    assert_eq!(a.grants.len(), 1, "{:?}", a.decisions);
+    // The raw queue would have held the room for a heavy job already covered.
+    let raw = allocate_reserved_with_backlog(
+        &unit(LargerHold::with_elsewhere(runner.demand.clone())),
+        &[],
+        &backlog,
+    );
+    assert!(raw.grants.is_empty());
+}
+
+#[test]
+fn memory_used_outside_borg_on_the_node_is_not_held_for_larger_work() {
+    // 28 GiB budget, but the node has only 12 GiB free: no heavy (24 GiB)
+    // can ever fit, nothing on the drone drains, so medium is not held off.
+    let mut drone = host("a");
+    drone.live.host = Some(HostMemory {
+        key: "node".into(),
+        available_mib: 12 * 1024,
+        reserve_mib: 0,
+    });
+    let i = AllocatorInput {
+        queue_ages: vec![
+            QueueAge {
+                class: Class::Heavy,
+                scope: Scope::Main,
+                oldest_age_secs: 10,
+            },
+            QueueAge {
+                class: Class::Medium,
+                scope: Scope::Main,
+                oldest_age_secs: 10,
+            },
+        ],
+        ..input(
+            &[
+                (Class::Heavy, Scope::Main, 1),
+                (Class::Medium, Scope::Main, 1),
+            ],
+            vec![drone],
+        )
+    };
+    let a = allocate(&i);
+    assert_eq!(
+        count(&a, Class::Medium, Scope::Main),
+        1,
+        "{:?}",
+        a.decisions
+    );
+    assert_eq!(count(&a, Class::Heavy, Scope::Main), 0);
+}
+
+#[test]
+fn an_older_starving_medium_deploy_is_not_held_for_younger_heavy_deploy() {
+    let mut drone = host("deploy");
+    drone.trust = Trust::DeployOnly;
+    let age = |class, oldest_age_secs| QueueAge {
+        class,
+        scope: Scope::Deploy,
+        oldest_age_secs,
+    };
+    let at = |medium, heavy| AllocatorInput {
+        starvation_after_secs: Some(120),
+        queue_ages: vec![age(Class::Medium, medium), age(Class::Heavy, heavy)],
+        ..input(
+            &[
+                (Class::Heavy, Scope::Deploy, 1),
+                (Class::Medium, Scope::Deploy, 1),
+            ],
+            vec![drone.clone()],
+        )
+    };
+    // Medium has waited longer: it goes first and takes the drone.
+    let a = allocate(&at(300, 200));
+    assert_eq!(count(&a, Class::Medium, Scope::Deploy), 1, "{:?}", a.grants);
+    assert_eq!(count(&a, Class::Heavy, Scope::Deploy), 0);
+    // Heavy has waited longer: heavy goes first, as before.
+    let b = allocate(&at(200, 300));
+    assert_eq!(count(&b, Class::Heavy, Scope::Deploy), 1, "{:?}", b.grants);
+}
+
+#[test]
+fn one_drone_covers_heavy_waiting_in_main_and_pull_requests() {
+    // Each drone drains toward five heavy slots; one main and one PR heavy
+    // job wait. The first drone covers both, so the second takes PR light.
+    let drones = vec![
+        sized("big-a", 32, 120_832, 0),
+        sized("big-b", 32, 120_832, 0),
+    ];
+    let mut leases = Vec::new();
+    for d in ["big-a", "big-b"] {
+        leases.extend((0..11).map(|_| lease(d, Class::Medium, Scope::Main, LeaseState::Running)));
+        leases.extend((0..6).map(|_| lease(d, Class::Light, Scope::Main, LeaseState::Running)));
+    }
+    let i = AllocatorInput {
+        classes: live_classes(),
+        leases,
+        ..input(
+            &[
+                (Class::Heavy, Scope::Main, 1),
+                (Class::Heavy, Scope::Pr, 1),
+                (Class::Light, Scope::Pr, 1),
+            ],
+            drones,
+        )
+    };
+    let a = allocate(&i);
+    assert_within_budget(&i, &a);
+    assert_eq!(on(&a, "big-b", Class::Light), 1, "{:?}", a.decisions);
+    assert_eq!(on(&a, "big-a", Class::Light), 0);
 }

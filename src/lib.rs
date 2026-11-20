@@ -28,6 +28,7 @@ pub mod github;
 pub mod health;
 pub mod homeostasis;
 pub mod hostdiag;
+pub mod hostlost;
 pub mod janitor;
 pub mod lead;
 pub mod mirror_auth;

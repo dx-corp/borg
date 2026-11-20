@@ -343,7 +343,8 @@ impl DroneConfig {
             path: path.to_owned(),
             source,
         })?;
-        let cfg: Self = crate::configfile::parse(path, &text)?;
+        let mut cfg: Self = crate::configfile::parse(path, &text)?;
+        cfg.reclaim = cfg.reclaim.upgraded();
         cfg.validate()?;
         Ok(cfg)
     }

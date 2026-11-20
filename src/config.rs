@@ -106,6 +106,22 @@ pub struct JanitorSettings {
     /// red publish run was cancelled before its catch-up re-dispatch ran).
     #[serde(default)]
     pub(crate) superseded_push_workflows: Vec<String>,
+    /// Jobs of those workflows, by name (a parenthesized matrix or display
+    /// suffix also matches: `full-rust-test-shard` covers
+    /// `full-rust-test-shard (platform-api)`), that attest closure verdicts
+    /// on success. A started superseded push run with a failed job is kept
+    /// while one of them is unfinished, so the units it tests get a verdict
+    /// and the next main run need not test them again (2026-11-20: 97 of 100
+    /// main platform-ci runs were cancelled by unrelated failures before any
+    /// test shard attested). Empty: cancel at the first failure, as before.
+    #[serde(default)]
+    pub(crate) verdict_jobs: Vec<String>,
+    /// Upper bound, from the run's first failed job, on keeping a red
+    /// superseded push run for its `verdict_jobs`. Past it the run is
+    /// cancelled anyway, so on a starved fleet a red run cannot hold the
+    /// branch's concurrency group for hours.
+    #[serde(default = "default_verdict_wait")]
+    pub(crate) verdict_wait_secs: u64,
     /// Cancel `merge_group` runs whose merge-queue branch
     /// (`gh-readonly-queue/...`) no longer exists: the queue entry merged or
     /// left the queue, so the run's verdict is moot. Running ones too only
@@ -217,6 +233,9 @@ fn default_janitor_interval() -> u64 {
 }
 fn default_janitor_max() -> u32 {
     20
+}
+fn default_verdict_wait() -> u64 {
+    3600
 }
 
 /// Cost-aware placement. A paid cloud drone (one whose name matches
@@ -579,6 +598,11 @@ pub struct QueenConfig {
     /// Host-health thresholds, decay and cooldown; see [`crate::health`].
     #[serde(default)]
     pub health: HealthSettings,
+    /// Jobs whose runner host was lost: classification, the suspect
+    /// cool-down and the one automatic rerun; on by default. See
+    /// [`crate::hostlost`].
+    #[serde(default)]
+    pub host_lost: crate::hostlost::HostLostSettings,
     /// Job telemetry older than this is deleted.
     #[serde(default = "default_telemetry_days")]
     pub telemetry_retention_days: u32,
@@ -786,6 +810,7 @@ impl QueenConfig {
         self.profiles.validate().map_err(ConfigError::Invalid)?;
         self.homeostasis.validate().map_err(ConfigError::Invalid)?;
         self.health.validate().map_err(ConfigError::Invalid)?;
+        self.host_lost.validate().map_err(ConfigError::Invalid)?;
         if let Some(a) = &self.admission {
             a.validate().map_err(ConfigError::Invalid)?;
         }
@@ -919,6 +944,26 @@ mod tests {
         ] {
             assert!(QueenConfig::from_json(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn host_lost_is_on_by_default_and_rejects_unknown_keys_and_bad_values() {
+        let c = QueenConfig::from_json(MIN).unwrap();
+        assert!(c.host_lost.rerun && !c.host_lost.dry_run);
+        let with = |block: &str| {
+            QueenConfig::from_json(
+                &MIN.replace("\"repos\"", &format!("\"host_lost\":{block},\"repos\"")),
+            )
+        };
+        let c = with(r#"{"rerun":false,"max_reruns_per_run_per_hour":1}"#).unwrap();
+        assert!(!c.host_lost.rerun);
+        assert_eq!(c.host_lost.max_reruns_per_run_per_hour, 1);
+        assert_eq!(
+            c.host_lost.backoff_secs, 60,
+            "unset keys keep their defaults"
+        );
+        assert!(with(r#"{"reruns":3}"#).is_err());
+        assert!(with(r#"{"interval_secs":0}"#).is_err());
     }
 
     #[test]
@@ -1160,7 +1205,7 @@ mod tests {
                 "budget":{{"drone_hours_per_day":24,"drone_hours_per_month":150}},
                 "scale_up":{{"classes":["heavy"],"weights":{{"main":3,"pr":1}},"min_weighted_unmet":6,"sustained_secs":600}},
                 "scale_down":{{"idle_secs":900}},
-                "gce":{{"project":"p","network":"n","subnet":"s","zones":["us-west1-b"],"machine_type":"c2d-highcpu-56"}}}}"#
+                "gce":{{"project":"p","network":"n","subnet":"s","zones":["us-central1-b"],"machine_type":"c2d-highcpu-56"}}}}"#
             )
         };
         let with = |expiry: &str, extra: &str| {

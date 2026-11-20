@@ -211,6 +211,26 @@ CREATE TABLE IF NOT EXISTS preemptions (
     at           INTEGER NOT NULL,
     requeued_at  INTEGER
 );
+-- Leases that ended because their drone was lost, and what the queen did
+-- about the job each was running; see hostlost.rs. `outcome` is NULL until
+-- the job is re-run or left alone.
+CREATE TABLE IF NOT EXISTS host_lost (
+    lease_id     TEXT PRIMARY KEY,
+    drone        TEXT NOT NULL,
+    class        TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    repo         TEXT,
+    run_id       INTEGER,
+    job_id       INTEGER,
+    job_name     TEXT,
+    at           INTEGER NOT NULL,
+    silent_secs  INTEGER NOT NULL,
+    outcome      TEXT,
+    reason       TEXT,
+    decided_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS host_lost_at ON host_lost(at);
+CREATE INDEX IF NOT EXISTS host_lost_run ON host_lost(repo, run_id);
 CREATE TABLE IF NOT EXISTS burst_vms (
     drone        TEXT PRIMARY KEY,
     vm           TEXT NOT NULL,
@@ -335,6 +355,12 @@ pub struct DroneRow {
     /// The drone's last heartbeat said it runs work units. Drones older than
     /// the drone half of units never say so and are never given one.
     pub runs_units: bool,
+    /// The drone's newest silence the queen saw end: the last heartbeat
+    /// before it and the heartbeat that ended it. See [`crate::hostlost`].
+    pub silence: Option<(i64, i64)>,
+    /// Set when a lease on this drone ended because the host was lost: no
+    /// new leases until then.
+    pub suspect_until: Option<i64>,
 }
 
 impl DroneRow {
@@ -371,10 +397,15 @@ impl DroneRow {
         }
     }
 
+    /// Inside the cool-down after a host-lost lease.
+    pub fn suspect(&self, now: i64) -> bool {
+        self.suspect_until.is_some_and(|until| now < until)
+    }
+
     /// The allocator's view of a fresh drone with a known capacity.
     pub fn allocator_state(&self, cap: &Capacity, now: i64) -> DroneState {
         let mut s = DroneState::from_capacity(self.name.clone(), cap, &self.caps);
-        s.accepting = self.schedulable();
+        s.accepting = self.schedulable() && !self.suspect(now);
         s.trust = self.trust;
         if self.on_probation() {
             s.max_leases = Some(s.max_leases.map_or(1, |m| m.min(1)));
@@ -478,14 +509,14 @@ fn from_text<T: DeserializeOwned>(s: &str) -> Result<T, StoreError> {
     serde_json::from_str(s).map_err(|e| StoreError::Corrupt(e.to_string()))
 }
 
-fn enum_text<T: Serialize>(v: &T) -> Result<String, StoreError> {
+pub(crate) fn enum_text<T: Serialize>(v: &T) -> Result<String, StoreError> {
     match serde_json::to_value(v) {
         Ok(serde_json::Value::String(s)) => Ok(s),
         _ => Err(StoreError::Corrupt("enum is not a string".to_owned())),
     }
 }
 
-fn enum_from<T: DeserializeOwned>(s: &str) -> Result<T, StoreError> {
+pub(crate) fn enum_from<T: DeserializeOwned>(s: &str) -> Result<T, StoreError> {
     from_text(&format!("\"{s}\""))
 }
 
@@ -647,6 +678,13 @@ impl Store {
             "ALTER TABLE clients ADD COLUMN max_scope TEXT NOT NULL DEFAULT 'pr'",
             "ALTER TABLE clients ADD COLUMN expires_at INTEGER",
             "ALTER TABLE drones ADD COLUMN runs_units INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE drones ADD COLUMN silent_from INTEGER",
+            "ALTER TABLE drones ADD COLUMN silent_until INTEGER",
+            "ALTER TABLE drones ADD COLUMN suspect_until INTEGER",
+            // 1 while a host-lost rerun claim waits for GitHub's answer.
+            "ALTER TABLE host_lost ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
+            // 1 once the lease's drone reported its result, whatever was decided.
+            "ALTER TABLE host_lost ADD COLUMN reported INTEGER NOT NULL DEFAULT 0",
         ] {
             // sqlx-runtime-query: one-off additive migration, no data involved
             if let Err(e) = sqlx::query(ddl).execute(&mut *conn).await
@@ -780,7 +818,7 @@ impl Store {
     pub async fn drones(&self) -> Result<Vec<DroneRow>, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         let rows = sqlx::query(
-            "SELECT name, last_heartbeat, capacity, caps, accepting, cache_stats, quarantined, quarantine_reason, version, extra_labels, bids, quarantine_source, quarantined_at, probation_since, quarantine_strikes, health_cleared_at, version_since, reclaim, env_facts, trust, runs_units FROM drones ORDER BY name",
+            "SELECT name, last_heartbeat, capacity, caps, accepting, cache_stats, quarantined, quarantine_reason, version, extra_labels, bids, quarantine_source, quarantined_at, probation_since, quarantine_strikes, health_cleared_at, version_since, reclaim, env_facts, trust, runs_units, silent_from, silent_until, suspect_until FROM drones ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -815,6 +853,10 @@ impl Store {
                         .unwrap_or_default(),
                     trust: enum_from(&r.get::<String, _>("trust"))?,
                     runs_units: r.get::<i64, _>("runs_units") != 0,
+                    silence: r
+                        .get::<Option<i64>, _>("silent_from")
+                        .zip(r.get::<Option<i64>, _>("silent_until")),
+                    suspect_until: r.get("suspect_until"),
                     quarantine_source: r.get("quarantine_source"),
                     quarantined_at: r.get("quarantined_at"),
                     probation_since: r.get("probation_since"),
@@ -1334,6 +1376,19 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn env_facts(&self, name: &str) -> Result<Option<EnvFacts>, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let row = sqlx::query("SELECT env_facts FROM drones WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let facts: Option<String> = row.get("env_facts");
+        facts.as_deref().map(from_text).transpose()
     }
 
     /// Replace the bids a drone last reported.

@@ -1,8 +1,8 @@
 use crate::support;
 
 use borg::allocator::{
-    ActiveLease, Allocation, AllocatorInput, Demand, DroneState, HostCaps, LeaseState, PrTurn,
-    QueueAge, Rejection, allocate,
+    ActiveLease, Allocation, AllocatorInput, Demand, DroneState, HostCaps, LargerHold, LeaseState,
+    PrTurn, QueueAge, Rejection, allocate,
 };
 use borg::bid::ScoreWeights;
 use borg::classes::{Class, Classes, Scope};
@@ -31,6 +31,7 @@ fn input(drones: Vec<DroneState>, count: u32) -> AllocatorInput {
         weights: ScoreWeights::default(),
         admission: None,
         pr_turn: PrTurn::default(),
+        larger_hold: LargerHold::default(),
     }
 }
 

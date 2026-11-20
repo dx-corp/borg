@@ -198,6 +198,84 @@ async fn a_superseded_main_push_with_a_running_job_is_kept() {
 }
 
 #[tokio::test]
+async fn a_red_superseded_main_run_finishes_its_verdict_jobs_before_it_is_cancelled() {
+    // 2026-11-20: 97 of the last 100 main platform-ci runs were cancelled
+    // once any job failed, before a `full-rust-test-shard` job could attest
+    // a closure verdict, so no main run ever banked one.
+    let rfc3339 = |secs_ago: i64| {
+        (time::OffsetDateTime::now_utc() - time::Duration::seconds(secs_ago))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let push = |id: u64, status: &str, sha: &str| {
+        json!({"id": id, "workflow_id": 1, "status": status, "event": "push",
+            "head_sha": sha, "head_branch": "main", "pull_requests": []})
+    };
+    let setup = |failed_secs_ago: i64, shard: &str| {
+        let shard = shard.to_string();
+        let failed_at = rfc3339(failed_secs_ago);
+        move |h: &Harness| {
+            let mut st = h.state();
+            st.pr_runs.push(push(1, "in_progress", "a"));
+            st.pr_runs.push(push(2, "pending", "b"));
+            st.jobs.push(
+                json!({"id": 10, "run_id": 1, "name": "ci-contract-checks (corpus)",
+                "status": "completed", "conclusion": "failure", "completed_at": failed_at}),
+            );
+            let shard = if shard == "completed" {
+                json!({"id": 11, "run_id": 1, "name": "full-rust-test-shard (platform-api)",
+                    "status": "completed", "conclusion": "success"})
+            } else {
+                json!({"id": 11, "run_id": 1, "name": "full-rust-test-shard (platform-api)",
+                    "status": shard})
+            };
+            st.jobs.push(shard);
+            st.jobs.push(
+                json!({"id": 12, "run_id": 1, "name": "platform-ui-e2e (1/6)",
+                "status": "in_progress"}),
+            );
+        }
+    };
+    let rule = json!({"superseded_push_branches": ["main"], "cancel_running": true,
+        "verdict_jobs": ["full-rust-test-shard"], "verdict_wait_secs": 3600});
+
+    // A shard still running, 2 minutes after the first failure: kept.
+    let h = Harness::start(with(rule.clone())).await;
+    setup(120, "in_progress")(&h);
+    let r = h.janitor_pass().await;
+    assert_eq!(
+        (r.superseded_push, r.awaiting_verdicts, r.cancelled_running),
+        (1, 1, 0),
+        "{r:?}"
+    );
+    assert!(h.state().cancelled.is_empty());
+
+    // The shard attested and finished: the red run goes, whatever else runs.
+    let h = Harness::start(with(rule.clone())).await;
+    setup(120, "completed")(&h);
+    let r = h.janitor_pass().await;
+    assert_eq!((r.awaiting_verdicts, r.cancelled_running), (0, 1), "{r:?}");
+    assert_eq!(h.state().cancelled, [1]);
+
+    // Still waiting for a runner an hour after the first failure: the cap
+    // lets the newer tip start.
+    let h = Harness::start(with(rule)).await;
+    setup(3700, "queued")(&h);
+    let r = h.janitor_pass().await;
+    assert_eq!((r.awaiting_verdicts, r.cancelled_running), (0, 1), "{r:?}");
+    assert_eq!(h.state().cancelled, [1]);
+
+    // Without verdict_jobs the first failure cancels, as before.
+    let h = Harness::start(with(
+        json!({"superseded_push_branches": ["main"], "cancel_running": true}),
+    ))
+    .await;
+    setup(120, "in_progress")(&h);
+    let r = h.janitor_pass().await;
+    assert_eq!((r.awaiting_verdicts, r.cancelled_running), (0, 1), "{r:?}");
+}
+
+#[tokio::test]
 async fn the_per_pass_cap_defers_the_rest_to_later_passes() {
     let h = Harness::start(enabled(false, 2)).await;
     for id in 1..=5 {

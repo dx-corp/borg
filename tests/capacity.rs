@@ -62,6 +62,29 @@ async fn status_reports_free_capacity_next_to_theoretical_capacity() {
 }
 
 #[tokio::test]
+async fn free_slots_by_scope_leave_out_drones_whose_trust_refuses_the_scope() {
+    let h = Harness::start(json!({})).await;
+    let shared = h.enroll("shared").await;
+    h.heartbeat(&shared, &[]).await;
+    let deploy = h.enroll("dep").await;
+    h.heartbeat_with(&deploy, json!({"trust": "deploy-only"}))
+        .await;
+
+    let s = h.status().await;
+    let heavy = &s["classes"]["heavy"];
+    assert_eq!(heavy["free_slots"], 2);
+    // A shared drone never takes deploy jobs; a deploy-only one takes nothing else.
+    assert_eq!(heavy["free_slots_by_scope"]["deploy"], 1);
+    assert_eq!(heavy["free_slots_by_scope"]["main"], 1);
+    assert_eq!(heavy["free_slots_by_scope"]["pr"], 1);
+    let m = h.metrics().await;
+    assert!(
+        m.contains("borg_class_free_slots_usable{class=\"heavy\",scope=\"main\"} 1"),
+        "{m}"
+    );
+}
+
+#[tokio::test]
 async fn demand_is_split_into_what_non_borg_runners_will_take_and_what_borg_must_place() {
     let h = Harness::start(json!({})).await;
     // No drones at all: every queued job is unmet.
@@ -282,6 +305,12 @@ async fn a_drone_shedding_under_pressure_has_no_free_slot_for_the_alarm() {
     let s = status_at(&h, t0).await;
     assert_eq!(s["drones"][0]["admission"]["state"], "light_only");
     assert_eq!(s["capacity"]["heavy"]["schedulable_slots"], 1, "nominal");
+    // The class shows the nominal free slot; by scope, no main or
+    // pull-request heavy job can use it, while light work still can.
+    assert_eq!(s["classes"]["heavy"]["free_slots"], 1);
+    assert_eq!(s["classes"]["heavy"]["free_slots_by_scope"]["main"], 0);
+    assert_eq!(s["classes"]["heavy"]["free_slots_by_scope"]["pr"], 0);
+    assert!(s["classes"]["light"]["free_slots_by_scope"]["main"].as_u64() > Some(0));
     assert_eq!(s["capacity"]["heavy"]["unmet_main"], 2);
     assert_eq!(s["capacity"]["heavy"]["alarm"], false, "not for 60s yet");
     // The clock starts at the oldest queued job, not at this pass.

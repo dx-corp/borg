@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use crate::classes::{Class, Scope};
+use crate::hostlost::{HostLostRow, Outcome};
 use crate::store::{LeaseRow, Store, StoreError};
 
 pub const MAX_STEPS: usize = 64;
@@ -408,6 +409,26 @@ pub struct DroneHealth {
     pub host_failures: u32,
     pub code_failures: u32,
     pub cancelled: u32,
+    /// Leases that ended because this drone's host was lost.
+    #[serde(default)]
+    pub host_lost: u32,
+    /// Of those, jobs the queen re-run automatically.
+    #[serde(default)]
+    pub auto_reruns: u32,
+}
+
+/// Jobs whose runner host was lost in the window; see [`crate::hostlost`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostLostReport {
+    pub lost: u32,
+    /// Re-run automatically.
+    pub rerun: u32,
+    /// Still waiting for a decision (backoff, caps, run in progress).
+    pub pending: u32,
+    /// Left alone, by reason.
+    pub skipped: BTreeMap<String, u32>,
+    /// The newest records (at most the report's `limit`).
+    pub recent: Vec<HostLostRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -420,6 +441,8 @@ pub struct Report {
     pub queue_wait: Vec<QueueWait>,
     pub cancellation: Cancellation,
     pub drones: Vec<DroneHealth>,
+    #[serde(default)]
+    pub host_lost: HostLostReport,
 }
 
 #[derive(Default)]
@@ -443,9 +466,29 @@ fn count(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// Aggregate `rows` (all finished within the last `window_secs`). The by-job
-/// and by-step lists hold the `limit` entries with the most total time.
-pub fn build_report(rows: &[TelemetryRow], now: i64, window_secs: i64, limit: usize) -> Report {
+fn drone_health(drone: &str) -> DroneHealth {
+    DroneHealth {
+        drone: drone.to_owned(),
+        jobs: 0,
+        failed: 0,
+        host_failures: 0,
+        code_failures: 0,
+        cancelled: 0,
+        host_lost: 0,
+        auto_reruns: 0,
+    }
+}
+
+/// Aggregate `rows` (all finished within the last `window_secs`) and `lost`
+/// (host-lost leases of the same window, newest first). The by-job and
+/// by-step lists hold the `limit` entries with the most total time.
+pub fn build_report(
+    rows: &[TelemetryRow],
+    lost: &[HostLostRow],
+    now: i64,
+    window_secs: i64,
+    limit: usize,
+) -> Report {
     let mut jobs: BTreeMap<(&str, &str), Sum> = BTreeMap::new();
     let mut steps: BTreeMap<(&str, &str), Sum> = BTreeMap::new();
     let mut waits: BTreeMap<Class, Vec<u64>> = BTreeMap::new();
@@ -468,14 +511,7 @@ pub fn build_report(rows: &[TelemetryRow], now: i64, window_secs: i64, limit: us
         }
         let d = drones
             .entry(r.drone.as_str())
-            .or_insert_with(|| DroneHealth {
-                drone: r.drone.clone(),
-                jobs: 0,
-                failed: 0,
-                host_failures: 0,
-                code_failures: 0,
-                cancelled: 0,
-            });
+            .or_insert_with(|| drone_health(&r.drone));
         d.jobs += 1;
         let failed = matches!(t.conclusion, Conclusion::Failure | Conclusion::TimedOut);
         if failed {
@@ -489,6 +525,32 @@ pub fn build_report(rows: &[TelemetryRow], now: i64, window_secs: i64, limit: us
             FailureClass::Host => d.host_failures += 1,
             FailureClass::Code => d.code_failures += 1,
             FailureClass::Unknown => {}
+        }
+    }
+
+    let mut host_lost = HostLostReport {
+        lost: count(lost.len()),
+        recent: lost.iter().take(limit).cloned().collect(),
+        ..HostLostReport::default()
+    };
+    for l in lost {
+        // A drone can lose its host before any of its jobs reports telemetry.
+        let d = drones
+            .entry(l.drone.as_str())
+            .or_insert_with(|| drone_health(&l.drone));
+        d.host_lost += 1;
+        match l.outcome {
+            Some(Outcome::Rerun) => {
+                d.auto_reruns += 1;
+                host_lost.rerun += 1;
+            }
+            Some(Outcome::Skipped) => {
+                *host_lost
+                    .skipped
+                    .entry(l.reason.clone().unwrap_or_else(|| "unknown".to_owned()))
+                    .or_default() += 1;
+            }
+            None => host_lost.pending += 1,
         }
     }
 
@@ -543,8 +605,8 @@ pub fn build_report(rows: &[TelemetryRow], now: i64, window_secs: i64, limit: us
     };
     let mut drones: Vec<DroneHealth> = drones.into_values().collect();
     drones.sort_by(|a, b| {
-        b.host_failures
-            .cmp(&a.host_failures)
+        (b.host_failures, b.host_lost)
+            .cmp(&(a.host_failures, a.host_lost))
             .then_with(|| a.drone.cmp(&b.drone))
     });
     Report {
@@ -560,6 +622,7 @@ pub fn build_report(rows: &[TelemetryRow], now: i64, window_secs: i64, limit: us
             share,
         },
         drones,
+        host_lost,
     }
 }
 
@@ -639,14 +702,48 @@ pub fn render_text(r: &Report) -> String {
     );
     let _ = writeln!(
         o,
-        "\nDrones\n  {:<20} {:>5} {:>7} {:>5} {:>5} {:>9}",
-        "drone", "jobs", "failed", "host", "code", "cancelled"
+        "\nDrones\n  {:<20} {:>5} {:>7} {:>5} {:>5} {:>9} {:>9} {:>6}",
+        "drone", "jobs", "failed", "host", "code", "cancelled", "host-lost", "rerun"
     );
     for d in &r.drones {
         let _ = writeln!(
             o,
-            "  {:<20} {:>5} {:>7} {:>5} {:>5} {:>9}",
-            d.drone, d.jobs, d.failed, d.host_failures, d.code_failures, d.cancelled
+            "  {:<20} {:>5} {:>7} {:>5} {:>5} {:>9} {:>9} {:>6}",
+            d.drone,
+            d.jobs,
+            d.failed,
+            d.host_failures,
+            d.code_failures,
+            d.cancelled,
+            d.host_lost,
+            d.auto_reruns
+        );
+    }
+    let h = &r.host_lost;
+    let _ = writeln!(
+        o,
+        "\nHost-lost jobs: {} lost, {} re-run automatically, {} waiting, {} left alone",
+        h.lost,
+        h.rerun,
+        h.pending,
+        h.skipped.values().sum::<u32>()
+    );
+    for (reason, n) in &h.skipped {
+        let _ = writeln!(o, "  left alone ({reason}): {n}");
+    }
+    for l in &h.recent {
+        let outcome = match (l.outcome, l.reason.as_deref()) {
+            (Some(Outcome::Rerun), _) => "re-run".to_owned(),
+            (Some(Outcome::Skipped), why) => format!("left alone ({})", why.unwrap_or("unknown")),
+            (None, _) => "waiting".to_owned(),
+        };
+        let _ = writeln!(
+            o,
+            "  {:<20} {} / {} (run {}): {outcome}",
+            l.drone,
+            l.repo.as_deref().unwrap_or("?"),
+            l.job_name.as_deref().unwrap_or("job not seen"),
+            l.run_id.map_or_else(|| "?".to_owned(), |id| id.to_string()),
         );
     }
     o
@@ -772,7 +869,7 @@ mod tests {
                 FailureClass::Unknown,
             ),
         ];
-        let r = build_report(&rows, 2000, 86_400, 10);
+        let r = build_report(&rows, &[], 2000, 86_400, 10);
         assert_eq!(r.jobs, 4);
         assert_eq!(r.by_job.len(), 2);
         assert_eq!(
@@ -830,10 +927,10 @@ mod tests {
         );
         big.duration_secs = 900;
         rows.push(big);
-        let r = build_report(&rows, 0, 60, 1);
+        let r = build_report(&rows, &[], 0, 60, 1);
         assert_eq!(r.by_job.len(), 1);
         assert_eq!(r.by_job[0].job_name, "big");
-        let empty = build_report(&[], 0, 60, 5);
+        let empty = build_report(&[], &[], 0, 60, 5);
         assert_eq!((empty.jobs, empty.cancellation.share), (0, 0.0));
         assert!(render_text(&empty).contains("0 job(s)"));
     }

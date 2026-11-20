@@ -20,6 +20,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use reqwest::{Method, RequestBuilder};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::config::JanitorSettings;
@@ -75,38 +76,23 @@ struct Run {
     status: String,
 }
 
-pub struct Requeuer {
+/// The Actions API calls every automatic rerun shares: preempted jobs here,
+/// and host-lost jobs in [`crate::hostlost`].
+pub(crate) struct Actions {
     rate_limit: RateLimit,
     http: reqwest::Client,
     api_base: String,
     token: TokenSource,
-    dry_run: bool,
-    max_per_pass: u32,
-    view: Mutex<RequeueView>,
 }
 
-impl Requeuer {
-    pub fn with_rate_limit(mut self, rate_limit: RateLimit) -> Self {
-        self.rate_limit = rate_limit;
-        self
-    }
-
-    /// Built from the janitor's token and settings.
-    pub fn new(
-        api_base: &str,
-        token: Secret,
-        settings: &JanitorSettings,
-    ) -> Result<Self, GithubError> {
-        Self::with_token_source(api_base, TokenSource::Static(token), settings)
-    }
-
-    pub fn with_token_source(
+impl Actions {
+    pub(crate) fn new(
         api_base: &str,
         token: TokenSource,
-        settings: &JanitorSettings,
+        user_agent: &str,
     ) -> Result<Self, GithubError> {
         let http = reqwest::Client::builder()
-            .user_agent("borg-queen-requeue")
+            .user_agent(user_agent)
             .timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self {
@@ -114,14 +100,11 @@ impl Requeuer {
             http,
             api_base: api_base.trim_end_matches('/').to_owned(),
             token,
-            dry_run: settings.dry_run,
-            max_per_pass: settings.max_cancels_per_pass,
-            view: Mutex::default(),
         })
     }
 
-    pub fn view(&self) -> RequeueView {
-        self.view.lock().expect("requeue view lock").clone()
+    pub(crate) fn set_rate_limit(&mut self, rate_limit: RateLimit) {
+        self.rate_limit = rate_limit;
     }
 
     async fn request(&self, method: Method, path: &str) -> Result<RequestBuilder, GithubError> {
@@ -134,24 +117,26 @@ impl Requeuer {
             .bearer_auth(token.expose()))
     }
 
-    async fn run_status(&self, repo: &str, run: u64) -> Result<String, GithubError> {
-        let path = format!("/repos/{repo}/actions/runs/{run}");
+    /// `GET path` with `query`, decoded as `T`.
+    pub(crate) async fn get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<T, GithubError> {
         let resp = self
             .rate_limit
-            .send(self.request(Method::GET, &path).await?)
+            .send(self.request(Method::GET, path).await?.query(query))
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(status_error(&self.rate_limit, "GET", &path, status.as_u16(), resp).await);
+            return Err(status_error(&self.rate_limit, "GET", path, status.as_u16(), resp).await);
         }
         let bytes = resp.bytes().await?;
-        serde_json::from_slice::<Run>(&bytes)
-            .map(|r| r.status)
-            .map_err(|e| GithubError::Decode(format!("{path}: {e}")))
+        serde_json::from_slice(&bytes).map_err(|e| GithubError::Decode(format!("{path}: {e}")))
     }
 
     /// Re-run a job. `Ok(Some(code))` is a terminal refusal (permission 403, 404, 409).
-    async fn rerun(&self, repo: &str, job: u64) -> Result<Option<u16>, GithubError> {
+    pub(crate) async fn rerun_job(&self, repo: &str, job: u64) -> Result<Option<u16>, GithubError> {
         let path = format!("/repos/{repo}/actions/jobs/{job}/rerun");
         let resp = self
             .rate_limit
@@ -170,6 +155,53 @@ impl Requeuer {
             code @ (404 | 409) => Ok(Some(code)),
             code => Err(status_error(&self.rate_limit, "POST", &path, code, resp).await),
         }
+    }
+}
+
+pub struct Requeuer {
+    api: Actions,
+    dry_run: bool,
+    max_per_pass: u32,
+    view: Mutex<RequeueView>,
+}
+
+impl Requeuer {
+    pub fn with_rate_limit(mut self, rate_limit: RateLimit) -> Self {
+        self.api.set_rate_limit(rate_limit);
+        self
+    }
+
+    /// Built from the janitor's token and settings.
+    pub fn new(
+        api_base: &str,
+        token: Secret,
+        settings: &JanitorSettings,
+    ) -> Result<Self, GithubError> {
+        Self::with_token_source(api_base, TokenSource::Static(token), settings)
+    }
+
+    pub fn with_token_source(
+        api_base: &str,
+        token: TokenSource,
+        settings: &JanitorSettings,
+    ) -> Result<Self, GithubError> {
+        Ok(Self {
+            api: Actions::new(api_base, token, "borg-queen-requeue")?,
+            dry_run: settings.dry_run,
+            max_per_pass: settings.max_cancels_per_pass,
+            view: Mutex::default(),
+        })
+    }
+
+    pub fn view(&self) -> RequeueView {
+        self.view.lock().expect("requeue view lock").clone()
+    }
+
+    async fn run_status(&self, repo: &str, run: u64) -> Result<String, GithubError> {
+        self.api
+            .get::<Run>(&format!("/repos/{repo}/actions/runs/{run}"), &[])
+            .await
+            .map(|r| r.status)
     }
 
     /// One pass over the preemptions not yet re-run.
@@ -208,7 +240,7 @@ impl Requeuer {
                 }
             }
             budget -= 1;
-            match self.rerun(repo, job).await {
+            match self.api.rerun_job(repo, job).await {
                 Ok(None) => {
                     tracing::info!("requeue: re-ran {repo} job {job} (run {run})");
                     store.mark_requeued(&row.lease_id, now).await?;

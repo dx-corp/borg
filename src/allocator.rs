@@ -457,20 +457,76 @@ pub struct AllocatorInput {
     pub admission: Option<AdmissionThresholds>,
     /// Pull-request turns; the default keeps strict main-before-PR order.
     pub pr_turn: PrTurn,
+    /// Room kept for larger waiting work; see [`LargerHold`].
+    pub larger_hold: LargerHold,
+}
+
+/// How long smaller work stays off room that larger waiting work needs.
+pub const LARGER_HOLD_SECS: u64 = 600;
+
+/// Larger classes are placed first, but a drone that has no room for them
+/// this pass is refilled with smaller work as soon as anything ends, so it
+/// never drains to a larger slot. On 2026-11-20 borg-main-1 (32 vCPU, the only
+/// large shared drone) came back empty and took 17 mostly light and medium
+/// leases while 29 heavy main jobs queued; the small drones that could have
+/// run them stayed idle. While larger work of a scope waits:
+///
+/// - Smaller work of that scope or a later one goes to a drone that cannot
+///   host the larger work (too small, the wrong trust, the class blocked)
+///   before one that can, whatever their scores. It spills onto a drone that
+///   can only when no other drone has room.
+/// - Enough of the drones that can host it to cover what waits are held: as
+///   their smaller leases end the room is kept until it makes a larger slot,
+///   and a smaller lease is granted there only into room that never could
+///   (what is left beside the larger leases it runs; [`Free::spares`]).
+///
+/// Smaller work whose oldest job has waited `after_secs` is no longer held
+/// off (the preference stays), so a small queue waits at most that long
+/// behind larger work. Only the drones that cover the waiting count are held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LargerHold {
+    /// Smaller work that has waited this long may use held room; `None` turns
+    /// the preference and the hold off.
+    pub(crate) after_secs: Option<u64>,
+    /// Larger demand queued in another queue that draws on the same drones:
+    /// the runner queue, when the queen places work units.
+    pub(crate) elsewhere: Vec<Demand>,
+}
+
+impl Default for LargerHold {
+    fn default() -> Self {
+        Self {
+            after_secs: Some(LARGER_HOLD_SECS),
+            elsewhere: Vec::new(),
+        }
+    }
+}
+
+impl LargerHold {
+    /// The default hold, protecting `elsewhere` as well.
+    pub(crate) fn with_elsewhere(elsewhere: Vec<Demand>) -> Self {
+        Self {
+            elsewhere,
+            ..Self::default()
+        }
+    }
 }
 
 /// Main demand is served before pull-request demand, so a main queue that
-/// never empties starves pull requests forever. A class listed here gives one
-/// grant to its pull-request demand, if that has waited `after_secs`, before
-/// its main demand is placed. The queen lists a class once main has taken
-/// enough grants in a row; see `pr_fairness` in the queen config.
+/// never empties starves pull requests forever. Once pull-request demand of a
+/// class has waited `after_secs`, it takes one grant of that class after every
+/// `between` main grants, counted grant by grant across passes and inside
+/// one: a pass that frees several slots splits them the same way as passes
+/// that free one each. See `pr_fairness` in the queen config.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PrTurn {
     /// Pull-request demand that has waited at least this long may take a
     /// turn; `None` turns turns off.
     pub(crate) after_secs: Option<u64>,
-    /// Classes whose next grant goes to starving pull-request demand.
-    pub(crate) classes: Vec<Class>,
+    /// Main grants of a class owed between two pull-request turns.
+    pub(crate) between: u32,
+    /// Main grants per class since that class last granted a pull request.
+    pub(crate) main_grants_since_pr: BTreeMap<Class, u32>,
 }
 
 /// An instruction to mint one runner and hand it to one drone.
@@ -545,6 +601,9 @@ pub enum Rejection {
     Vcpu,
     LeaseCap,
     Reserved,
+    /// Held for larger waiting work: this lease would take room that becomes
+    /// a larger slot once the drone's smaller leases end. See [`LargerHold`].
+    HeldForLarger,
     NoBid,
     BidExhausted,
     BidThreshold,
@@ -581,6 +640,10 @@ pub struct Candidate {
     /// drone. See [`cost_term`].
     #[serde(default)]
     pub(crate) cost_score: i64,
+    /// The drone could host larger work that is waiting, so smaller work goes
+    /// elsewhere first. See [`LargerHold`].
+    #[serde(default)]
+    pub(crate) larger_capable: bool,
     pub score: Option<i64>,
 }
 
@@ -636,6 +699,8 @@ pub(crate) enum PlacementReason {
     Host,
     /// A better bid (warmer caches, sooner start, lower pressure).
     Bid,
+    /// Kept off a drone that larger waiting work can use; see [`LargerHold`].
+    SparesLarger,
     /// Equal score; less memory left over.
     TightestFit,
     /// Equal score and fit; the lower drone name.
@@ -729,6 +794,14 @@ pub fn free_slots(drone: &DroneState, room: &Room, spec: &ClassSpec) -> u32 {
     u32::try_from(by_mem.min(by_cpu).min(by_cap)).unwrap_or(u32::MAX)
 }
 
+/// Whole leases of `spec` in `mem` MiB, `cpu` vCPU and `leases` lease slots.
+fn slots_in(mem: u128, cpu: u128, leases: Option<u128>, spec: &ClassSpec) -> u64 {
+    let slots = (mem / u128::from(spec.mem_mib.max(1)))
+        .min(cpu / u128::from(spec.vcpu.max(1)))
+        .min(leases.unwrap_or(u128::MAX));
+    u64::try_from(slots).unwrap_or(u64::MAX)
+}
+
 /// Free memory one node's drones share this pass; see [`LiveFacts`].
 type Pool = Rc<Cell<u64>>;
 
@@ -741,6 +814,8 @@ struct Free<'a> {
     vcpu: u32,
     leases_left: Option<u32>,
     in_flight: u32,
+    /// Of `in_flight`, the leases per class.
+    in_flight_by: BTreeMap<Class, u32>,
     admission: AdmissionState,
     /// Grants made to this drone this pass, per key (bounds `available_slots`).
     granted: BTreeMap<(Class, Scope), u32>,
@@ -931,6 +1006,7 @@ impl Free<'_> {
             profile_score: evaluated.profile_score,
             host_score: evaluated.host_score,
             cost_score: evaluated.cost_score,
+            larger_capable: false,
         }
     }
 
@@ -968,6 +1044,74 @@ impl Free<'_> {
             && self.drone.max_leases != Some(0)
     }
 
+    /// Whether `(class, scope)` work may ever run here: trust, size,
+    /// admission, the environment and the drone's bid all allow it.
+    fn could_host(
+        &self,
+        class: Class,
+        scope: Scope,
+        input: &AllocatorInput,
+        pressure: &BTreeMap<Class, u16>,
+    ) -> bool {
+        self.drone.trust.admits(scope)
+            && self.could_ever_fit(input.classes.spec(class))
+            && self.admission.admits(class, scope)
+            && !self.drone.blocked_classes.contains(&class)
+            && self
+                .offer(
+                    class,
+                    scope,
+                    pressure.get(&class).copied().unwrap_or(0),
+                    &input.weights,
+                )
+                .is_some()
+    }
+
+    /// Leases of `larger` the drone would hold once every lease of a smaller
+    /// class on it ends: those in flight and those granted this pass. Memory
+    /// is what a new lease may take now ([`Free::mem_room`], so the node pool
+    /// too) plus what those leases free; memory used outside borg never
+    /// becomes a slot, so an idle host short of it is not held.
+    fn drained_slots(&self, classes: &Classes, larger: Class) -> u64 {
+        let smaller = self
+            .in_flight_by
+            .range(..larger)
+            .map(|(&class, &n)| (class, n))
+            .chain(
+                self.granted
+                    .iter()
+                    .filter(|&(&(class, _), _)| class < larger)
+                    .map(|(&(class, _), &n)| (class, n)),
+            );
+        let (mut mem, mut cpu, mut leases) = (
+            u128::from(self.mem_room()),
+            u128::from(self.vcpu),
+            self.leases_left.map(u128::from),
+        );
+        for (class, n) in smaller {
+            let spec = classes.spec(class);
+            mem += u128::from(n) * u128::from(spec.mem_mib);
+            cpu += u128::from(n) * u128::from(spec.vcpu);
+            leases = leases.map(|l| l + u128::from(n));
+        }
+        slots_in(mem, cpu, leases, classes.spec(larger))
+    }
+
+    /// Whether a lease of `small` here leaves the drone's room holding every
+    /// `larger` slot it would hold once its smaller leases end: true only for
+    /// room that could never become a larger slot (what is left beside the
+    /// larger leases it runs). Anything else would refill room the drone is
+    /// draining toward a larger slot, which is what starved heavy work.
+    fn spares(&self, classes: &Classes, larger: Class, small: &ClassSpec) -> bool {
+        let after = slots_in(
+            u128::from(self.mem_room()).saturating_sub(u128::from(small.mem_mib)),
+            u128::from(self.vcpu).saturating_sub(u128::from(small.vcpu)),
+            self.leases_left.map(|l| u128::from(l).saturating_sub(1)),
+            classes.spec(larger),
+        );
+        after >= self.drained_slots(classes, larger)
+    }
+
     fn take(&mut self, spec: &ClassSpec) {
         self.mem_mib = self.mem_mib.saturating_sub(spec.mem_mib);
         if let Some(p) = &self.pool {
@@ -995,6 +1139,7 @@ fn free_by_drone<'a>(
             vcpu: drone.vcpu,
             leases_left: drone.max_leases,
             in_flight: 0,
+            in_flight_by: BTreeMap::new(),
             admission: drone.admission(admission),
             granted: BTreeMap::new(),
         });
@@ -1005,6 +1150,7 @@ fn free_by_drone<'a>(
             let spec = classes.spec(lease.class);
             f.take(spec);
             f.in_flight += 1;
+            *f.in_flight_by.entry(lease.class).or_default() += 1;
             *committed.entry(f.drone.id.as_str()).or_default() += spec.mem_mib;
         }
     }
@@ -1106,42 +1252,196 @@ fn sum_counts<I: IntoIterator<Item = (Class, Scope, u32)>>(items: I) -> Counts {
     map
 }
 
+/// Larger work still waiting that smaller `(class, scope)` work must make
+/// room for: larger classes of `scope` or an earlier one, less what this pass
+/// has granted, largest class and earliest scope first. Deploy keys keep their
+/// oldest-first order: smaller deploy work is not held for larger deploy work
+/// that [`deploy_rank`] places after it. Empty when the hold is off.
+fn larger_waiting(
+    input: &AllocatorInput,
+    waiting: &Counts,
+    out: &Allocation,
+    (scope, class): (Scope, Class),
+) -> Vec<(Class, Scope, u32)> {
+    if input.larger_hold.after_secs.is_none() {
+        return Vec::new();
+    }
+    let mut keys: Vec<(Class, Scope, u32)> = waiting
+        .iter()
+        .filter(|&(&(c, s), _)| c > class && s <= scope)
+        .filter(|&(&(c, s), _)| {
+            !(s == Scope::Deploy && scope == Scope::Deploy)
+                || deploy_rank(input, c) >= deploy_rank(input, class)
+        })
+        .map(|(&(c, s), &n)| {
+            let granted = out
+                .grants
+                .iter()
+                .filter(|g| g.class == c && g.scope == s)
+                .count();
+            (
+                c,
+                s,
+                n.saturating_sub(u32::try_from(granted).unwrap_or(u32::MAX)),
+            )
+        })
+        .filter(|&(_, _, n)| n > 0)
+        .collect();
+    keys.sort_by_key(|&(c, s, _)| (std::cmp::Reverse(c), s));
+    keys
+}
+
+/// Where a deploy class goes in a pass, higher first: the age of its oldest
+/// queued job once that has waited `starvation_after_secs`, else 0. Equal ranks
+/// go larger class first.
+fn deploy_rank(input: &AllocatorInput, class: Class) -> u64 {
+    input
+        .queue_ages
+        .iter()
+        .filter(|a| a.class == class && a.scope == Scope::Deploy)
+        .map(|a| a.oldest_age_secs)
+        .max()
+        .filter(|&age| {
+            input
+                .starvation_after_secs
+                .is_some_and(|after| age >= after)
+        })
+        .unwrap_or(0)
+}
+
+/// The drones held for larger waiting work, each with the class it is held
+/// for. Per waiting key, the unused slots of drones already held for the same
+/// class count first (a drone's slots are counted once, across scopes), then
+/// drones that could host it are taken fewest in-flight leases first until the
+/// slots they hold once their smaller leases end cover what waits, so the hold
+/// never takes more room than the queue needs. A drone reserved for smaller
+/// starving work keeps that reservation instead.
+fn larger_holds<'a>(
+    input: &AllocatorInput,
+    free: &BTreeMap<&'a str, Free<'_>>,
+    pressure: &BTreeMap<Class, u16>,
+    reserved: &BTreeMap<String, (Class, Scope)>,
+    larger: &[(Class, Scope, u32)],
+) -> BTreeMap<&'a str, Class> {
+    let mut held: BTreeMap<&str, Class> = BTreeMap::new();
+    // Slots of each held drone not yet counted for a waiting key.
+    let mut unused: BTreeMap<&str, u64> = BTreeMap::new();
+    for &(class, scope, count) in larger {
+        let mut left = u64::from(count);
+        for (id, slots) in &mut unused {
+            if left == 0 {
+                break;
+            }
+            if held.get(id) == Some(&class)
+                && free
+                    .get(id)
+                    .is_some_and(|f| f.could_host(class, scope, input, pressure))
+            {
+                let take = (*slots).min(left);
+                *slots -= take;
+                left -= take;
+            }
+        }
+        let mut hosts: Vec<(&str, u32, u64)> = free
+            .iter()
+            .filter(|(id, f)| {
+                !held.contains_key(**id)
+                    && reserved.get(**id).is_none_or(|r| r.0 >= class)
+                    && f.could_host(class, scope, input, pressure)
+            })
+            .map(|(id, f)| (*id, f.in_flight, f.drained_slots(&input.classes, class)))
+            .filter(|&(_, _, slots)| slots > 0)
+            .collect();
+        hosts.sort_by_key(|&(id, in_flight, _)| (in_flight, id));
+        for (id, _, slots) in hosts {
+            if left == 0 {
+                break;
+            }
+            let take = slots.min(left);
+            held.insert(id, class);
+            unused.insert(id, slots - take);
+            left -= take;
+        }
+    }
+    held
+}
+
+/// A placement candidate's rank, best first: a drone larger waiting work
+/// cannot use, the highest score, the tightest fit, then the id.
+type Rank<'a> = (bool, std::cmp::Reverse<i64>, u64, &'a str);
+
 /// Place up to `wanted` runners of `(class, scope)` on the tightest-fitting
-/// drones, skipping drones reserved for something else. Returns how many fit.
+/// drones, skipping drones reserved for something else and keeping off room
+/// held for larger waiting work (`waiting`, see [`LargerHold`]). Returns how
+/// many fit.
+#[allow(clippy::too_many_arguments)]
 fn place(
     input: &AllocatorInput,
     free: &mut BTreeMap<&str, Free<'_>>,
     pressure: &BTreeMap<Class, u16>,
     reserved: &BTreeMap<String, (Class, Scope)>,
+    waiting: &Counts,
     (scope, class): (Scope, Class),
     wanted: u32,
     out: &mut Allocation,
 ) -> u32 {
     let level = pressure.get(&class).copied().unwrap_or(0);
     let spec = input.classes.spec(class);
+    let larger = larger_waiting(input, waiting, out, (scope, class));
+    // Work that has waited past the hold may use held room; it still prefers
+    // drones the larger work cannot use.
+    let outwaited = input.larger_hold.after_secs.is_some_and(|after| {
+        input
+            .queue_ages
+            .iter()
+            .any(|a| a.class == class && a.scope == scope && a.oldest_age_secs >= after)
+    });
     let mut placed = 0;
     for _ in 0..wanted {
-        // Highest bid score; then tightest fit, which keeps hosts packed; then
-        // id, which keeps the output stable.
+        let held = if outwaited || larger.is_empty() {
+            BTreeMap::new()
+        } else {
+            larger_holds(input, free, pressure, reserved, &larger)
+        };
         let mut candidates = Vec::new();
         let mut winning_candidate = None;
         let mut runner_up: Option<Candidate> = None;
-        let mut best: Option<(i64, u64, &str)> = None;
-        let mut second: Option<(i64, u64, &str)> = None;
+        let mut best: Option<Rank<'_>> = None;
+        let mut second: Option<Rank<'_>> = None;
+        // The best score on a drone larger work can use, which the winner
+        // may have been preferred over.
+        let mut best_capable: Option<i64> = None;
         for (id, f) in free.iter() {
-            let candidate = f.candidate(input, class, scope, level, reserved.get(*id).copied());
+            let mut candidate = f.candidate(input, class, scope, level, reserved.get(*id).copied());
+            candidate.larger_capable = larger
+                .iter()
+                .any(|&(c, s, _)| f.could_host(c, s, input, pressure));
+            // A drone already reserved for larger work keeps the reservation's
+            // own rule, which admits only a backfill it can prove safe.
+            if let Some(&big) = held.get(*id)
+                && reserved.get(*id).is_none_or(|r| r.0 < big)
+                && !f.spares(&input.classes, big, spec)
+            {
+                candidate.rejection_reasons.push(Rejection::HeldForLarger);
+                candidate.score = None;
+            }
             if let Some(score) = candidate.score {
-                let rank = (std::cmp::Reverse(score), f.mem_room() - spec.mem_mib, *id);
-                let beats = |held: Option<(i64, u64, &str)>| {
-                    held.is_none_or(|(s, mem, name)| rank < (std::cmp::Reverse(s), mem, name))
-                };
-                if beats(best) {
+                if candidate.larger_capable {
+                    best_capable = best_capable.max(Some(score));
+                }
+                let rank: Rank<'_> = (
+                    candidate.larger_capable,
+                    std::cmp::Reverse(score),
+                    f.mem_room() - spec.mem_mib,
+                    *id,
+                );
+                if best.is_none_or(|b| rank < b) {
                     second = best;
                     runner_up = winning_candidate.take();
-                    best = Some((score, f.mem_room() - spec.mem_mib, *id));
+                    best = Some(rank);
                     winning_candidate = Some(candidate.clone());
-                } else if beats(second) {
-                    second = Some((score, f.mem_room() - spec.mem_mib, *id));
+                } else if second.is_none_or(|b| rank < b) {
+                    second = Some(rank);
                     runner_up = Some(candidate.clone());
                 }
             }
@@ -1149,10 +1449,14 @@ fn place(
                 candidates.push(candidate);
             }
         }
-        let winner = best.map(|(_, _, id)| id);
-        let reason = winning_candidate
-            .as_ref()
-            .map(|w| PlacementReason::of(w, runner_up.as_ref()));
+        let winner = best.map(|(_, _, _, id)| id);
+        let reason = winning_candidate.as_ref().map(|w| {
+            if !w.larger_capable && best_capable > w.score {
+                PlacementReason::SparesLarger
+            } else {
+                PlacementReason::of(w, runner_up.as_ref())
+            }
+        });
         if let Some(candidate) = winning_candidate
             && !candidates.iter().any(|c| c.drone_id == candidate.drone_id)
         {
@@ -1224,19 +1528,45 @@ pub fn allocate_reserved_with_backlog(
     allocate_inner(input, inherited, Some(uncovered_backlog), None)
 }
 
-fn allocate_inner(
-    input: &AllocatorInput,
-    inherited: &[Reservation],
-    backlog: Option<&[Demand]>,
-    scope: Option<Scope>,
-) -> Allocation {
-    let mut free = free_by_drone(
-        &input.drones,
-        &input.leases,
-        &input.classes,
-        input.admission,
-    );
+/// Place up to `main_wanted` main runners one at a time through `place_one`,
+/// giving pull-request demand (`pr_left` runners; 0 when it may not take a
+/// turn) one grant whenever main has taken `between` in a row. `since` is
+/// main's run, carried across calls. Stops at the first main grant that does
+/// not fit; a PR grant that does not fit ends the turns. Returns the main and
+/// pull-request runners placed.
+fn share_with_pr(
+    main_wanted: u32,
+    mut pr_left: u32,
+    between: u32,
+    since: &mut u32,
+    mut place_one: impl FnMut(Scope) -> bool,
+) -> (u32, u32) {
+    let (mut main, mut pr) = (0, 0);
+    loop {
+        if pr_left > 0 && *since >= between {
+            if place_one(Scope::Pr) {
+                pr += 1;
+                pr_left -= 1;
+                *since = 0;
+            } else {
+                pr_left = 0;
+            }
+        }
+        if main == main_wanted || !place_one(Scope::Main) {
+            return (main, pr);
+        }
+        main += 1;
+        *since = since.saturating_add(1);
+    }
+}
 
+/// Runners each `(scope, class)` still has to mint once pending runners,
+/// spare pull-request runners and standby deploy runners cover what they can,
+/// with the standby deploy runners to start. Also returns the queued counts.
+fn runner_need(
+    input: &AllocatorInput,
+    free: &BTreeMap<&str, Free<'_>>,
+) -> (BTreeMap<(Scope, Class), u32>, Vec<Promotion>, Counts) {
     let queued = sum_counts(input.demand.iter().map(|d| (d.class, d.scope, d.count)));
     let floors = sum_counts(
         input
@@ -1255,7 +1585,17 @@ fn allocate_inner(
         input
             .leases
             .iter()
-            .filter(|l| l.state == LeaseState::Standby && free.contains_key(l.drone_id.as_str()))
+            // A standby counts only on a drone that may start it: one that is
+            // not accepting (draining, out of disk, in its host-lost
+            // cool-down) or that blocks the standby's class (below the
+            // class's disk floor) is not handed it, so it must not cover
+            // demand. It still holds its room.
+            .filter(|l| {
+                l.state == LeaseState::Standby
+                    && free.get(l.drone_id.as_str()).is_some_and(|f| {
+                        f.drone.accepting && !f.drone.blocked_classes.contains(&l.class)
+                    })
+            })
             .map(|l| (l.class, l.scope, 1)),
     );
     let get = |m: &Counts, c, s| m.get(&(c, s)).copied().unwrap_or(0);
@@ -1302,6 +1642,50 @@ fn allocate_inner(
         need.insert((Scope::Pr, class), pr_need);
     }
 
+    (need, promote, queued)
+}
+
+/// Queued demand runners still have to be minted for: the queue less what
+/// pending, spare pull-request and standby deploy runners already cover, by
+/// the same accounting as a full pass, counting `granted` (grants this pass
+/// has already made, such as deploy's) as pending runners too.
+pub(crate) fn uncovered_demand(input: &AllocatorInput, granted: &[ActiveLease]) -> Vec<Demand> {
+    let mut input = input.clone();
+    input.leases.extend(granted.iter().cloned());
+    let free = free_by_drone(
+        &input.drones,
+        &input.leases,
+        &input.classes,
+        input.admission,
+    );
+    let (need, _, queued) = runner_need(&input, &free);
+    need.into_iter()
+        .filter_map(|((scope, class), n)| {
+            let count = n.min(queued.get(&(class, scope)).copied().unwrap_or(0));
+            (count > 0).then_some(Demand {
+                class,
+                scope,
+                count,
+            })
+        })
+        .collect()
+}
+
+fn allocate_inner(
+    input: &AllocatorInput,
+    inherited: &[Reservation],
+    backlog: Option<&[Demand]>,
+    scope: Option<Scope>,
+) -> Allocation {
+    let mut free = free_by_drone(
+        &input.drones,
+        &input.leases,
+        &input.classes,
+        input.admission,
+    );
+
+    let (mut need, mut promote, queued) = runner_need(input, &free);
+    let get = |m: &Counts, c, s| m.get(&(c, s)).copied().unwrap_or(0);
     let mut initial_need = need.clone();
     let pressure_backlog =
         backlog.map(|demand| sum_counts(demand.iter().map(|d| (d.class, d.scope, d.count))));
@@ -1314,6 +1698,19 @@ fn allocate_inner(
         })
     };
     let aged = |class, scope| waited(class, scope, input.starvation_after_secs);
+    // Queued work this pass still has to place, for the larger hold: the
+    // uncovered queue, and larger demand of other queues on these drones.
+    let mut waiting: Counts = match &pressure_backlog {
+        Some(backlog) => backlog.clone(),
+        None => initial_need
+            .iter()
+            .map(|(&(scope, class), &n)| ((class, scope), n.min(get(&queued, class, scope))))
+            .collect(),
+    };
+    for d in &input.larger_hold.elsewhere {
+        let n = waiting.entry((d.class, d.scope)).or_default();
+        *n = n.saturating_add(d.count);
+    }
     let mut pressure: BTreeMap<Class, u16> = BTreeMap::new();
     let mut idle_by_class: Vec<ClassIdle> = Vec::new();
     for class in Class::ALL {
@@ -1379,25 +1776,16 @@ fn allocate_inner(
     // smaller grant or PR turn can refill its draining host. Main stays first
     // within a class, apart from its PR turn.
     // formal: begin deploy_placement/Placement.MediumPlaced
-    let oldest = |class, scope| {
-        input
-            .queue_ages
-            .iter()
-            .filter(|a| a.class == class && a.scope == scope)
-            .map(|a| a.oldest_age_secs)
-            .max()
-            .unwrap_or(0)
-    };
     let mut deploy_order: Vec<Class> = Class::ALL.into_iter().rev().collect();
     // Stable: equal ages (and every key that is not aged) keep larger first.
-    deploy_order.sort_by_key(|&class| {
-        std::cmp::Reverse(if aged(class, Scope::Deploy) {
-            oldest(class, Scope::Deploy)
-        } else {
-            0
-        })
-    });
+    deploy_order.sort_by_key(|&class| std::cmp::Reverse(deploy_rank(input, class)));
     // formal: end deploy_placement/Placement.MediumPlaced
+    // Pull-request turns: aged PR demand of a class, and main's run of that
+    // class since its last PR grant, carried through this pass.
+    let pr_turns = |class| {
+        get(&queued, class, Scope::Pr) > 0 && waited(class, Scope::Pr, input.pr_turn.after_secs)
+    };
+    let mut main_since_pr = input.pr_turn.main_grants_since_pr.clone();
     let placement_order = deploy_order
         .into_iter()
         .map(|class| (Scope::Deploy, class))
@@ -1408,41 +1796,62 @@ fn allocate_inner(
                 .flat_map(|class| [(Scope::Main, class), (Scope::Pr, class)]),
         );
     for (scope, class) in placement_order {
-        if scope == Scope::Main {
-            // One grant per listed class to aged PR demand, ahead of Main's
-            // demand for that class, while respecting larger reservations.
-            let key = (Scope::Pr, class);
-            let wanted = need.get(&key).copied().unwrap_or(0);
-            if wanted > 0
-                && input.pr_turn.classes.contains(&class)
-                && get(&queued, class, Scope::Pr) > 0
-                && waited(class, Scope::Pr, input.pr_turn.after_secs)
-            {
-                let n = place(input, &mut free, &pressure, &reserved, key, 1, &mut out);
-                *placed.entry(key).or_default() += n;
-                need.insert(key, wanted - n);
-            }
-        }
+        // Main shares its grants with aged PR demand of the same class, grant
+        // by grant; see [`PrTurn`]. A turn respects larger reservations.
+        let wanted = need.get(&(scope, class)).copied().unwrap_or(0);
+        let eligible = wanted > 0 && get(&queued, class, scope) > 0 && aged(class, scope);
+        let n = if scope == Scope::Main {
+            let pr = (Scope::Pr, class);
+            let pr_left = if pr_turns(class) {
+                need.get(&pr).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            let since = main_since_pr.entry(class).or_default();
+            let (main, pr_n) = share_with_pr(
+                if eligible { wanted } else { 0 },
+                pr_left,
+                input.pr_turn.between,
+                since,
+                |scope| {
+                    place(
+                        input,
+                        &mut free,
+                        &pressure,
+                        &reserved,
+                        &waiting,
+                        (scope, class),
+                        1,
+                        &mut out,
+                    ) == 1
+                },
+            );
+            *placed.entry(pr).or_default() += pr_n;
+            *need.entry(pr).or_default() -= pr_n;
+            main
+        } else if eligible {
+            place(
+                input,
+                &mut free,
+                &pressure,
+                &reserved,
+                &waiting,
+                (scope, class),
+                wanted,
+                &mut out,
+            )
+        } else {
+            0
+        };
 
         // Aged work that still cannot fit holds the host that can free up
         // soonest. Smaller grants may only use the existing safe backfill.
-        let wanted = need.get(&(scope, class)).copied().unwrap_or(0);
-        if wanted == 0 || get(&queued, class, scope) == 0 || !aged(class, scope) {
+        if !eligible {
             continue;
         }
-        let n = place(
-            input,
-            &mut free,
-            &pressure,
-            &reserved,
-            (scope, class),
-            wanted,
-            &mut out,
-        );
         *placed.entry((scope, class)).or_default() += n;
         need.insert((scope, class), 0);
         if n < wanted {
-            let spec = input.classes.spec(class);
             // Only a host something can drain from is worth holding: one with
             // leases of its own, or on a node pool where another drone has
             // some. Holding an idle host whose room is short for other reasons
@@ -1462,17 +1871,7 @@ fn allocate_inner(
                             || f.pool
                                 .as_ref()
                                 .is_some_and(|p| draining.contains(&Rc::as_ptr(p))))
-                        && f.drone.trust.admits(scope)
-                        && f.could_ever_fit(spec)
-                        && f.admission.admits(class, scope)
-                        && !f.drone.blocked_classes.contains(&class)
-                        && f.offer(
-                            class,
-                            scope,
-                            pressure.get(&class).copied().unwrap_or(0),
-                            &input.weights,
-                        )
-                        .is_some()
+                        && f.could_host(class, scope, input, &pressure)
                 })
                 .min_by_key(|(id, f)| (f.in_flight, **id))
                 .map(|(id, _)| (*id).to_owned());
@@ -1497,15 +1896,42 @@ fn allocate_inner(
     for scope in Scope::ALL {
         for class in Class::ALL.into_iter().rev() {
             let wanted = need.get(&(scope, class)).copied().unwrap_or(0);
-            let n = place(
-                input,
-                &mut free,
-                &pressure,
-                &reserved,
-                (scope, class),
-                wanted,
-                &mut out,
-            );
+            let n = if scope == Scope::Main && pr_turns(class) {
+                let pr = (Scope::Pr, class);
+                let since = main_since_pr.entry(class).or_default();
+                let (main, pr_n) = share_with_pr(
+                    wanted,
+                    need.get(&pr).copied().unwrap_or(0),
+                    input.pr_turn.between,
+                    since,
+                    |scope| {
+                        place(
+                            input,
+                            &mut free,
+                            &pressure,
+                            &reserved,
+                            &waiting,
+                            (scope, class),
+                            1,
+                            &mut out,
+                        ) == 1
+                    },
+                );
+                *placed.entry(pr).or_default() += pr_n;
+                *need.entry(pr).or_default() -= pr_n;
+                main
+            } else {
+                place(
+                    input,
+                    &mut free,
+                    &pressure,
+                    &reserved,
+                    &waiting,
+                    (scope, class),
+                    wanted,
+                    &mut out,
+                )
+            };
             *placed.entry((scope, class)).or_default() += n;
         }
     }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use borg::admin;
 use borg::api;
-use borg::config::{JanitorSettings, QueenConfig};
+use borg::config::QueenConfig;
 use borg::drone::client::QueenClient;
 use borg::drone::config::DroneConfig;
 use borg::drone::exec::SystemExec;
@@ -734,14 +734,16 @@ fn private_key(cfg: &QueenConfig) -> Result<Vec<u8>> {
 static JANITOR_READ_PERMISSIONS: std::sync::LazyLock<serde_json::Value> =
     std::sync::LazyLock::new(|| serde_json::json!({"contents": "read", "pull_requests": "read"}));
 
-/// The janitor's token: `token_path`, else `BORG_JANITOR_TOKEN`, else the
-/// queen's own App installation token (the App then needs Actions: write).
+/// The token that cancels and re-runs: the janitor's `token_path`, else
+/// `BORG_JANITOR_TOKEN`, else the queen's own App installation token (the
+/// App then needs Actions: write). Host-lost reruns use it with or without a
+/// janitor.
 fn janitor_token(
-    settings: &JanitorSettings,
+    token_path: Option<&std::path::Path>,
     cfg: &QueenConfig,
     rate_limit: borg::github::RateLimit,
 ) -> Result<TokenSource> {
-    let raw = match &settings.token_path {
+    let raw = match token_path {
         Some(path) => Some(
             std::fs::read_to_string(path)
                 .with_context(|| format!("read janitor token {}", path.display()))?,
@@ -821,10 +823,12 @@ async fn run_queen(path: &Path) -> Result<()> {
             let client = GceClient::from_key_file(key, &g.project, &g.api_base)
                 .with_context(|| format!("burst.gce.credentials_path: {}", key.display()))?;
             tracing::info!(
-                "burst capacity LIVE (configured enabled={}; control overrides may change it): up to {} {} spot VMs in {} ({}), {} drone-hours/day, {} /month",
+                "burst capacity LIVE (configured enabled={}; control overrides may change it): up to {} VMs from instance template {} in {} ({}), {} drone-hours/day, {} /month",
                 b.enabled,
                 b.max_drones,
-                g.machine_type,
+                g.instance_template
+                    .as_deref()
+                    .unwrap_or("<none: nothing will be created>"),
                 g.project,
                 g.zones.join(","),
                 b.budget.drone_hours_per_day,
@@ -840,10 +844,30 @@ async fn run_queen(path: &Path) -> Result<()> {
             );
         }
     }
+    // Host-lost reruns use the janitor's credential when one is configured,
+    // else the queen's own App token (which then needs Actions: write).
+    let actions_token = janitor_token(
+        cfg.supersede_janitor
+            .as_ref()
+            .and_then(|j| j.token_path.as_deref()),
+        &cfg,
+        github.rate_limit(),
+    )?;
+    let host_lost = {
+        let token = actions_token.clone();
+        let rate_limit = token.rate_limit();
+        tracing::info!(
+            rerun = cfg.host_lost.rerun,
+            dry_run = cfg.host_lost.dry_run,
+            "host-lost reruns enabled"
+        );
+        borg::hostlost::HostLostRerunner::new(&cfg.github.api_base, token, cfg.host_lost.clone())?
+            .with_rate_limit(rate_limit)
+    };
     let mut requeuer = None;
     let janitor = match &cfg.supersede_janitor {
         Some(settings) => {
-            let token = janitor_token(settings, &cfg, github.rate_limit())?;
+            let token = actions_token.clone();
             let rate_limit = token.rate_limit();
             let mode = if settings.dry_run {
                 "dry-run"
@@ -923,6 +947,7 @@ async fn run_queen(path: &Path) -> Result<()> {
     if let Some(r) = requeuer {
         queen = queen.with_requeuer(r);
     }
+    queen = queen.with_host_lost(host_lost);
     if let Some(settings) = &queen.config().mirror_auth {
         let pem = settings.private_key(std::env::var("BORG_MIRROR_APP_PRIVATE_KEY").ok())?;
         let client = GithubClient::new(
@@ -978,7 +1003,10 @@ async fn report(a: ReportArgs) -> Result<()> {
             let rows = store
                 .telemetry_since(now - window, borg::telemetry::MAX_REPORT_ROWS)
                 .await?;
-            borg::telemetry::build_report(&rows, now, window, a.limit)
+            let lost = store
+                .host_lost_since(now - window, borg::telemetry::MAX_REPORT_ROWS)
+                .await?;
+            borg::telemetry::build_report(&rows, &lost, now, window, a.limit)
         }
         (None, None) => bail!("give --queen or --config"),
     };

@@ -840,6 +840,7 @@ impl Installer<'_> {
             .and_then(|v| v.get("reclaim").cloned())
             .and_then(|r| serde_json::from_value::<crate::reclaim::ReclaimSettings>(r).ok())
             .filter(|r| !r.is_legacy_default())
+            .map(crate::reclaim::ReclaimSettings::upgraded)
             .unwrap_or_else(|| {
                 if accept_leases {
                     crate::reclaim::ReclaimSettings::default()
