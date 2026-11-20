@@ -770,6 +770,11 @@ impl Queen {
                     d.env_facts.as_ref(),
                     now_ts,
                 );
+                state.disk_floor_mib = disk
+                    .classes
+                    .iter()
+                    .map(|(&c, a)| (c, a.minimum_free_bytes >> 20))
+                    .collect();
                 state.accepting &= !disk.global.blocked();
                 state.accepting &= !cordoned.contains(&d.name);
                 withheld.insert(
@@ -1503,7 +1508,13 @@ impl Queen {
                         drone_id: u.drone?,
                         class: u.class,
                         scope: u.scope,
-                        state: LeaseState::Running,
+                        // A unit placed and not yet acknowledged has not
+                        // started writing: it holds its disk floor.
+                        state: if u.state == UnitState::Running {
+                            LeaseState::Running
+                        } else {
+                            LeaseState::Held
+                        },
                     })
                 })
                 .collect(),
@@ -1840,7 +1851,9 @@ impl Queen {
                         .iter()
                         .cloned()
                         .map(|mut l| {
-                            l.state = LeaseState::Running;
+                            if l.state != LeaseState::Running {
+                                l.state = LeaseState::Held;
+                            }
                             l
                         })
                         .collect(),
@@ -1914,7 +1927,7 @@ impl Queen {
                     drone_id: g.drone_id.clone(),
                     class: g.class,
                     scope: g.scope,
-                    state: LeaseState::Running,
+                    state: LeaseState::Held,
                 };
                 base.push(lease.clone());
                 placed.leases.push(lease);

@@ -93,7 +93,7 @@ pub(super) fn place<Q, F>(
                 drone_id: g.drone_id.clone(),
                 class: g.class,
                 scope: g.scope,
-                state: LeaseState::Running,
+                state: LeaseState::Held,
             })
             .collect();
         super::spend_bids(&mut input.drones, &held);

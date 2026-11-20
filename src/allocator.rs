@@ -105,6 +105,15 @@ pub struct DroneState {
     /// fresh facts. Empty: the drone is sized by its budget alone.
     #[serde(default)]
     pub(crate) live: LiveFacts,
+    /// Free space on the work filesystem leases build in, MiB, as the drone
+    /// last measured it; `None` when not measured.
+    #[serde(default)]
+    pub(crate) work_free_mib: Option<u64>,
+    /// Free work-filesystem space each class needs to start, MiB (the disk
+    /// admission floors). A lease granted but not yet running is charged its
+    /// floor, so one free reading is never promised to several leases.
+    #[serde(default)]
+    pub(crate) disk_floor_mib: BTreeMap<Class, u64>,
 }
 
 /// A drone's measured memory facts, which size it beyond its budget:
@@ -379,6 +388,8 @@ impl DroneState {
             trust: Trust::Shared,
             cost_permille: OWNED_COST_PERMILLE,
             live: LiveFacts::default(),
+            work_free_mib: capacity.free_disk_mib,
+            disk_floor_mib: BTreeMap::new(),
         }
     }
 }
@@ -395,6 +406,11 @@ pub enum LeaseState {
     Pending,
     /// Runner is executing a job: only consumes capacity.
     Running,
+    /// Granted or placed and not started, but covering no queued demand (a
+    /// lease its drone withholds, or work of another queue seen by a
+    /// separate placement). Consumes capacity and, unlike `Running`, still
+    /// holds its class's disk floor: its writes are not in the free reading.
+    Held,
 }
 
 /// A lease already granted and not yet finished.
@@ -596,6 +612,9 @@ pub enum Rejection {
     Environment,
     Docker,
     Memory,
+    /// The work filesystem's free space, less the floors of leases granted
+    /// and not yet running, is below this class's disk floor.
+    Disk,
     /// The drone has room but its node's shared free memory does not.
     HostMemory,
     Vcpu,
@@ -766,6 +785,28 @@ pub struct Room {
     pub leases_left: Option<u32>,
 }
 
+impl DroneState {
+    /// Free work-filesystem space `class` needs to start, MiB; 0 when unset.
+    pub(crate) fn disk_floor(&self, class: Class) -> u64 {
+        self.disk_floor_mib.get(&class).copied().unwrap_or(0)
+    }
+
+    /// Whether the work filesystem, less the floors of `held` leases on this
+    /// drone not yet running, still has `class`'s floor free. True when the
+    /// drone reports no reading.
+    pub(crate) fn disk_admits(&self, held: &[ActiveLease], class: Class) -> bool {
+        let Some(free) = self.work_free_mib else {
+            return true;
+        };
+        let promised: u64 = held
+            .iter()
+            .filter(|l| l.drone_id == self.id && l.state != LeaseState::Running)
+            .map(|l| self.disk_floor(l.class))
+            .sum();
+        free.saturating_sub(promised) >= self.disk_floor(class)
+    }
+}
+
 /// The room left on `drone` after `held` (leases on other drones are ignored).
 pub fn free_room(drone: &DroneState, held: &[ActiveLease], classes: &Classes) -> Room {
     let mut room = Room {
@@ -816,6 +857,9 @@ struct Free<'a> {
     in_flight: u32,
     /// Of `in_flight`, the leases per class.
     in_flight_by: BTreeMap<Class, u32>,
+    /// Work-filesystem space left for new leases, MiB; see
+    /// [`DroneState::disk_floor_mib`].
+    disk_mib: Option<u64>,
     admission: AdmissionState,
     /// Grants made to this drone this pass, per key (bounds `available_slots`).
     granted: BTreeMap<(Class, Scope), u32>,
@@ -963,6 +1007,9 @@ impl Free<'_> {
             reasons.push(Rejection::Memory);
         } else if self.mem_room() < spec.mem_mib {
             reasons.push(Rejection::HostMemory);
+        }
+        if self.disk_mib.is_some_and(|d| d < self.disk_floor(class)) {
+            reasons.push(Rejection::Disk);
         }
         if self.vcpu < spec.vcpu {
             reasons.push(Rejection::Vcpu);
@@ -1112,6 +1159,25 @@ impl Free<'_> {
         after >= self.drained_slots(classes, larger)
     }
 
+    fn disk_floor(&self, class: Class) -> u64 {
+        self.drone.disk_floor(class)
+    }
+
+    /// Whole leases of `class` the work filesystem's unpromised space holds.
+    fn disk_slots(&self, class: Class) -> u32 {
+        let floor = self.disk_floor(class);
+        match self.disk_mib {
+            Some(free) if floor > 0 => u32::try_from(free / floor).unwrap_or(u32::MAX),
+            _ => u32::MAX,
+        }
+    }
+
+    /// Promise `class`'s disk floor to a lease.
+    fn charge_disk(&mut self, class: Class) {
+        let floor = self.disk_floor(class);
+        self.disk_mib = self.disk_mib.map(|d| d.saturating_sub(floor));
+    }
+
     fn take(&mut self, spec: &ClassSpec) {
         self.mem_mib = self.mem_mib.saturating_sub(spec.mem_mib);
         if let Some(p) = &self.pool {
@@ -1140,6 +1206,7 @@ fn free_by_drone<'a>(
             leases_left: drone.max_leases,
             in_flight: 0,
             in_flight_by: BTreeMap::new(),
+            disk_mib: drone.work_free_mib,
             admission: drone.admission(admission),
             granted: BTreeMap::new(),
         });
@@ -1151,6 +1218,11 @@ fn free_by_drone<'a>(
             f.take(spec);
             f.in_flight += 1;
             *f.in_flight_by.entry(lease.class).or_default() += 1;
+            // A running lease's writes are already in the measured free
+            // space; one not started yet will still need its floor.
+            if lease.state != LeaseState::Running {
+                f.charge_disk(lease.class);
+            }
             *committed.entry(f.drone.id.as_str()).or_default() += spec.mem_mib;
         }
     }
@@ -1211,7 +1283,8 @@ fn class_idle(free: &BTreeMap<&str, Free<'_>>, class: Class, spec: &ClassSpec) -
             && !f.drone.blocked_classes.contains(&class)
             && Scope::ALL.iter().all(|s| f.admission.admits(class, *s))
     }) {
-        let mut slots = f.slots(spec);
+        // Room the disk floors have already promised away is not idle.
+        let mut slots = f.slots(spec).min(f.disk_slots(class));
         if let Some(p) = &f.pool {
             let left = pools.entry(Rc::as_ptr(p)).or_insert_with(|| p.get());
             slots = slots.min(u32::try_from(*left / spec.mem_mib.max(1)).unwrap_or(u32::MAX));
@@ -1483,6 +1556,7 @@ fn place(
             break;
         };
         f.take(spec);
+        f.charge_disk(class);
         *f.granted.entry((class, scope)).or_default() += 1;
         placed += 1;
         out.grants.push(Grant {

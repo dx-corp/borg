@@ -21,7 +21,7 @@ pub(super) fn as_placed(l: &LeaseRow, withheld: &HashMap<String, Vec<Class>>) ->
             .get(&l.drone)
             .is_some_and(|classes| classes.contains(&l.class))
     {
-        a.state = LeaseState::Running;
+        a.state = LeaseState::Held;
     }
     a
 }

@@ -17,6 +17,8 @@ fn host(id: &str) -> DroneState {
         trust: Trust::Shared,
         cost_permille: OWNED_COST_PERMILLE,
         live: LiveFacts::default(),
+        work_free_mib: None,
+        disk_floor_mib: BTreeMap::new(),
     }
 }
 
@@ -1014,6 +1016,8 @@ fn never_over_grants_across_a_demand_sweep() {
             trust: Trust::Shared,
             cost_permille: OWNED_COST_PERMILLE,
             live: LiveFacts::default(),
+            work_free_mib: None,
+            disk_floor_mib: BTreeMap::new(),
         },
         DroneState {
             id: "c".into(),
@@ -1030,6 +1034,8 @@ fn never_over_grants_across_a_demand_sweep() {
             trust: Trust::Shared,
             cost_permille: OWNED_COST_PERMILLE,
             live: LiveFacts::default(),
+            work_free_mib: None,
+            disk_floor_mib: BTreeMap::new(),
         },
     ];
     for lm in 0..3 {
@@ -2742,4 +2748,103 @@ fn aged_light_work_is_released_from_the_hold_in_main_and_pull_request_turns() {
             a.grants
         );
     }
+}
+
+/// borg-main-1 on 2026-11-20: 32 vCPU, 120 GiB budget, 69 GiB free on its
+/// work filesystem; heavy needs 32 GiB free to start, medium 10.
+fn disk_bound_main_1() -> DroneState {
+    DroneState {
+        vcpu: 32,
+        mem_mib: 120 * 1024,
+        work_free_mib: Some(69 * 1024),
+        disk_floor_mib: [
+            (Class::Light, 10 * 1024),
+            (Class::Medium, 10 * 1024),
+            (Class::Heavy, 32 * 1024),
+        ]
+        .into_iter()
+        .collect(),
+        ..host("borg-main-1")
+    }
+}
+
+#[test]
+fn one_free_disk_reading_is_not_promised_to_more_leases_than_it_holds() {
+    // Memory and vCPU fit five heavy leases; 69 GiB of disk fits two 32 GiB
+    // floors, and the 5 GiB left is below medium's 10.
+    let i = input(
+        &[
+            (Class::Heavy, Scope::Main, 5),
+            (Class::Medium, Scope::Main, 3),
+        ],
+        vec![disk_bound_main_1()],
+    );
+    let a = allocate(&i);
+    assert_eq!(count(&a, Class::Heavy, Scope::Main), 2, "{:?}", a.grants);
+    assert_eq!(count(&a, Class::Medium, Scope::Main), 0);
+    let refused = a
+        .decisions
+        .iter()
+        .filter(|d| d.winner.is_none())
+        .flat_map(|d| &d.candidates)
+        .all(|c| c.rejection_reasons.contains(&Rejection::Disk));
+    assert!(refused);
+}
+
+#[test]
+fn a_granted_lease_not_yet_running_holds_its_disk_floor() {
+    // A pending heavy lease will still write its 32 GiB; a running one is
+    // already in the measured free space.
+    // A held lease (withheld, or another queue's placement) covers no demand
+    // but has not started either, so it holds its floor like a pending one.
+    for (state, heavy) in [
+        (LeaseState::Pending, 1),
+        (LeaseState::Held, 1),
+        (LeaseState::Running, 2),
+    ] {
+        let i = AllocatorInput {
+            leases: vec![lease("borg-main-1", Class::Heavy, Scope::Main, state)],
+            ..input(&[(Class::Heavy, Scope::Main, 4)], vec![disk_bound_main_1()])
+        };
+        let a = allocate(&i);
+        assert_eq!(
+            count(&a, Class::Heavy, Scope::Main),
+            heavy,
+            "{state:?}: {:?}",
+            a.grants
+        );
+    }
+}
+
+#[test]
+fn idle_slots_leave_out_disk_already_promised() {
+    // 69 GiB less one pending heavy's 32 holds one more heavy floor, though
+    // memory and vCPU have room for more. Burst demand and the starvation
+    // alarm read this figure.
+    let i = input(&[], vec![disk_bound_main_1()]);
+    let held = [lease(
+        "borg-main-1",
+        Class::Heavy,
+        Scope::Main,
+        LeaseState::Pending,
+    )];
+    let idle = idle_after(&i.drones, &held, &i.classes, None);
+    let heavy = idle
+        .iter()
+        .find(|c| c.class == Class::Heavy)
+        .expect("heavy");
+    assert_eq!(heavy.idle_slots, 1);
+}
+
+#[test]
+fn a_drone_without_a_disk_reading_or_floors_places_as_before() {
+    // Four heavy leases fill its 32 vCPU.
+    let mut d = disk_bound_main_1();
+    d.work_free_mib = None;
+    let a = allocate(&input(&[(Class::Heavy, Scope::Main, 5)], vec![d]));
+    assert_eq!(count(&a, Class::Heavy, Scope::Main), 4);
+    let mut e = disk_bound_main_1();
+    e.disk_floor_mib.clear();
+    let b = allocate(&input(&[(Class::Heavy, Scope::Main, 5)], vec![e]));
+    assert_eq!(count(&b, Class::Heavy, Scope::Main), 4);
 }
