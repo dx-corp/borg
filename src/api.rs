@@ -61,6 +61,14 @@ pub struct HeartbeatRequest {
     /// False while the drone drains or yields to its owner.
     #[serde(default = "yes")]
     pub accepting: bool,
+    /// Whether the drone is set up to take leases at all; false only for a
+    /// reclaim-only host. `accepting` also goes false while the drone is
+    /// under the disk floor, fails a host invariant, drains or updates, and
+    /// none of those changes which classes its hardware hosts, so the reclaim
+    /// floor is decided by this. Older drones omit it and the queen reads
+    /// `accepting` for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takes_leases: Option<bool>,
     /// Lease ids the drone currently holds; acknowledges their JIT configs.
     #[serde(default)]
     pub active_leases: Vec<String>,
@@ -179,7 +187,9 @@ pub struct HeartbeatResponse {
     pub min_free_disk_bytes: u64,
     /// The free space this drone's reclaim keeps: the largest disk floor of
     /// the classes its hardware can host (`reclaim_floor_bytes` in
-    /// `envcontract`). Absent for a drone that takes no leases and from older
+    /// `envcontract`). Sent to a drone that is set up to take leases even while
+    /// it is not accepting them: a heavy host under the disk floor needs the
+    /// heavy floor most then. Absent for a reclaim-only drone and from older
     /// queens; the drone then reclaims to `min_free_disk_bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reclaim_floor_bytes: Option<u64>,
@@ -742,9 +752,17 @@ async fn heartbeat(
     };
     Ok(Json(HeartbeatResponse {
         min_free_disk_bytes: queen.config().env_contract.min_cache_dir_free_bytes,
-        reclaim_floor_bytes: req.accepting.then(|| {
+        reclaim_floor_bytes: req.takes_leases.unwrap_or(req.accepting).then(|| {
             let cfg = queen.config();
-            let state = DroneState::from_capacity(drone.clone(), &req.capacity, &req.caps);
+            let mut state = DroneState::from_capacity(drone.clone(), &req.capacity, &req.caps);
+            // An installed Docker whose daemon is down is an outage, not a host
+            // without Docker: the host still hosts its Docker classes for reclaim.
+            state.docker |= req.env_facts.as_ref().is_some_and(|facts| {
+                facts
+                    .host_invariant_failures
+                    .iter()
+                    .any(|failure| failure.check == "docker_daemon")
+            });
             cfg.env_contract
                 .reclaim_floor_bytes(|class| max_slots(&state, cfg.classes.spec(class)) > 0)
         }),

@@ -511,11 +511,54 @@ async fn reclaim_floor_is_the_disk_floor_of_the_largest_class_the_drone_hosts() 
         "a host too small for a heavy lease keeps the admission floor"
     );
 
-    let reclaim_only = h.heartbeat_with(&token, json!({"accepting": false})).await;
-    assert!(
-        reclaim_only.get("reclaim_floor_bytes").is_none(),
-        "a drone that takes no leases keeps its own floor: {reclaim_only}"
+    // A drone that takes leases but cannot right now (under the disk floor, a failed
+    // invariant, draining) still hosts heavy leases, and needs the heavy floor to recover.
+    let blocked = h
+        .heartbeat_with(&token, json!({"accepting": false, "takes_leases": true}))
+        .await;
+    assert_eq!(
+        blocked["reclaim_floor_bytes"],
+        32u64 << 30,
+        "a blocked heavy host keeps the heavy floor: {blocked}"
     );
+    // So does a host whose Docker daemon is down: the drone reports the invariant failure, and
+    // a daemon outage does not turn a heavy host into one that hosts no Docker class.
+    let mut no_docker = serde_json::to_value(support::capacity()).unwrap();
+    no_docker["docker_usable"] = json!(false);
+    let daemon_down = h
+        .heartbeat_with(
+            &token,
+            json!({
+                "capacity": no_docker,
+                "accepting": false,
+                "takes_leases": true,
+                "env_facts": {"observed_at": 0, "host_invariant_failures": [
+                    {"check": "docker_daemon", "detail": "the daemon does not answer"}
+                ]},
+            }),
+        )
+        .await;
+    assert_eq!(
+        daemon_down["reclaim_floor_bytes"],
+        32u64 << 30,
+        "a Docker outage keeps the heavy floor: {daemon_down}"
+    );
+    // A host with no Docker at all hosts no Docker class and keeps the admission floor.
+    let without_docker = h
+        .heartbeat_with(&token, json!({"capacity": no_docker, "takes_leases": true}))
+        .await;
+    assert_eq!(without_docker["reclaim_floor_bytes"], 10u64 << 30);
+    for reclaim_only in [
+        json!({"accepting": false, "takes_leases": false}),
+        // A drone from before `takes_leases`: the queen can only read `accepting`.
+        json!({"accepting": false}),
+    ] {
+        let response = h.heartbeat_with(&token, reclaim_only).await;
+        assert!(
+            response.get("reclaim_floor_bytes").is_none(),
+            "a drone that takes no leases keeps its own floor: {response}"
+        );
+    }
 }
 
 #[tokio::test]

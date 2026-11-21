@@ -631,9 +631,12 @@ percentage, and a pressure cycle then frees at least back to twice the floor.
 The floor is the queen's disk floor for the largest class the drone's hardware
 can host (`reclaim_floor_bytes` in the heartbeat response): a drone that hosts
 heavy leases keeps the heavy floor (`env_contract.classes.heavy`) free, because
-under it the queen stops placing heavy leases there. A drone that takes no
-leases, and any drone of an older queen, uses the queen's disk admission floor
-(`min_free_disk_bytes`, 10 GiB by default). The Docker tier always uses the
+under it the queen stops placing heavy leases there. The drone keeps that floor
+while it is not accepting leases (under the disk floor, a failed host
+invariant such as a Docker daemon that is installed but down, draining): its heartbeat says whether it is set up to take leases
+(`takes_leases`), and that decides the floor, not `accepting`. A reclaim-only
+drone (`accept_leases: false`), and any drone of an older queen, uses the
+queen's disk admission floor (`min_free_disk_bytes`, 10 GiB by default). The Docker tier always uses the
 admission floor. CI slot tool homes
 (`<cache_root>/<ns>/slots/<slot>/mise-home`) are a `cache_dir` tier between
 cargo targets and worktrees; one is busy while the drone runs any lease, because
@@ -2047,7 +2050,10 @@ slot and any other lease the highest (`slots` in the drone config, default
 `max_leases`, else 16; it is also the most leases that run at once). Jobs keep
 a cargo target and a tool home per slot, so a drone's heavy leases reuse as
 many low slots as it runs heavy leases at once and do not leave a target in
-every slot a smaller lease left free. The path never contains the lease id, concurrent
+every slot a smaller lease left free. This is an order, not a reservation:
+when smaller leases have filled the drone down into the low slots, a heavy
+lease takes the lowest slot still free and leaves a target there, which
+reclaim later evicts as the least recently used cache slot. The path never contains the lease id, concurrent
 leases always get distinct slots, and a slot is fully cleaned before it is
 reused, so the next lease in a slot sees exactly the same absolute paths. The
 lease-to-slot mapping is logged (`lease X -> slot N`) and kept in drone state.

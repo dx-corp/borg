@@ -240,6 +240,11 @@ impl Drone {
         }
     }
 
+    /// The free space build-filesystem reclaim keeps right now, as last learned from the queen.
+    pub fn reclaim_floor_bytes(&self) -> u64 {
+        self.reclaim_floor.load(Ordering::Relaxed)
+    }
+
     /// `(slot, lease id)` for every lease currently holding a slot.
     pub fn slot_assignments(&self) -> Vec<(usize, String)> {
         self.slots.assignments()
@@ -425,6 +430,7 @@ impl Drone {
             capacity,
             caps: self.cfg.host_caps(),
             accepting,
+            takes_leases: Some(self.cfg.accept_leases),
             active_leases: self.lease_ids(),
             cache_stats: self.caches.stats(),
             version: Some(

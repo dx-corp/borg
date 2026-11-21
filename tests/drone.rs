@@ -342,6 +342,50 @@ async fn owner_lease_cap_is_advertised_and_respected() {
     assert_eq!(rig.lease_state().await, ["pending=0 running=0"]);
 }
 
+/// Review finding on #24485: a heavy host that stopped accepting leases was sent no class floor, so
+/// its reclaim fell back to the 10 GiB admission floor exactly while it needed heavy headroom back.
+#[tokio::test]
+async fn a_heavy_host_that_cannot_take_leases_right_now_keeps_reclaiming_to_the_heavy_floor() {
+    let heavy_floor = 32u64 << 30;
+    let rig = Rig::with_queen(json!({"env_contract": {
+        "enabled": false,
+        "classes": {"heavy": {"min_cache_dir_free_bytes": heavy_floor}}
+    }}))
+    .await;
+    rig.install_runner("exit 0");
+    let forwarding = Arc::new(Mutex::new("1\n"));
+    let drone = rig.drone_on(
+        json!({}),
+        Arc::clone(&rig.exec) as Arc<dyn Exec>,
+        Arc::new(ForwardingHost(Arc::clone(&forwarding))),
+    );
+    let mut tasks = JoinSet::new();
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    assert_eq!(drone.reclaim_floor_bytes(), heavy_floor);
+
+    // The host fails an invariant and reports that it is not accepting.
+    *forwarding.lock().unwrap() = "0\n";
+    drone.heartbeat_once(true, &mut tasks).await.unwrap();
+    assert_eq!(rig.h.status().await["drones"][0]["accepting"], false);
+    assert_eq!(
+        drone.reclaim_floor_bytes(),
+        heavy_floor,
+        "not accepting is not the same as hosting nothing"
+    );
+    // So does a drain.
+    drone.heartbeat_once(false, &mut tasks).await.unwrap();
+    assert_eq!(drone.reclaim_floor_bytes(), heavy_floor);
+
+    // A reclaim-only host takes no lease of any class and keeps the admission floor.
+    let reclaim_only = rig.drone(json!({"accept_leases": false}));
+    reclaim_only
+        .heartbeat_once(false, &mut tasks)
+        .await
+        .unwrap();
+    assert_eq!(reclaim_only.reclaim_floor_bytes(), 10u64 << 30);
+    drain(&mut tasks).await;
+}
+
 #[tokio::test]
 async fn a_reclaim_only_drone_heartbeats_but_never_takes_a_lease() {
     let rig = Rig::new().await;

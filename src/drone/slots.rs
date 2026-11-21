@@ -11,7 +11,12 @@
 //! five heavy leases at once and ran `merge-gate` in seven different slots in
 //! eight hours on 2026-11-20, each with its own retained target, and its
 //! 400 GB disk fell under the heavy disk floor. Now a drone's heavy leases
-//! reuse as many low slots as it runs heavy leases at once.
+//! reuse as many low slots as it runs heavy leases at once, as long as those
+//! slots are free. No slot is held back for a class: when smaller leases have
+//! filled the drone down into the low slots, a heavy lease takes the lowest
+//! slot still free, which can be one no heavy lease used before. That target
+//! is then an ordinary cache slot, and reclaim evicts the least recently used
+//! ones to keep the drone's disk floor.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
