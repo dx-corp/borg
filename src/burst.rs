@@ -142,6 +142,36 @@ pub struct BurstSettings {
     scale_up: ScaleUpSettings,
     scale_down: ScaleDownSettings,
     pub(super) gce: GceSettings,
+    /// The founder's approval to create Compute Engine drones, with its end.
+    /// Absent (the default) or expired, the queen creates no VM even with
+    /// `enabled` set, and logs each refusal. Only the config file sets it; the
+    /// control API cannot.
+    #[serde(default)]
+    pub(super) allowance: Option<Allowance>,
+}
+
+/// A founder-approved, expiring permission to create burst VMs (founder,
+/// 2026-11-21: "you also need to stop them from getting auto-created").
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Allowance {
+    /// Who approved it: the founder's handle.
+    pub(super) approved_by: String,
+    /// The founder's words or a link to them.
+    pub(super) approval: String,
+    /// RFC 3339 UTC end, such as `2026-11-22T03:00:00Z`.
+    pub(super) expires_at: String,
+}
+
+impl Allowance {
+    fn expires_unix(&self) -> Option<i64> {
+        OffsetDateTime::parse(
+            &self.expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .ok()
+        .map(OffsetDateTime::unix_timestamp)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -299,8 +329,34 @@ fn dns_label(s: &str) -> bool {
 }
 
 impl BurstSettings {
+    // formal: begin burst_allowance/check_allowance.create_refusal
+    /// Why no VM may be created at `now`, or `None` under an unexpired,
+    /// founder-approved allowance.
+    pub(super) fn create_refusal(&self, now: i64) -> Option<String> {
+        let Some(a) = &self.allowance else {
+            return Some("no founder-approved burst allowance is recorded".to_owned());
+        };
+        match a.expires_unix() {
+            Some(end) if now < end => None,
+            Some(_) => Some(format!("the burst allowance expired at {}", a.expires_at)),
+            None => Some(format!(
+                "the burst allowance end {:?} is not RFC 3339",
+                a.expires_at
+            )),
+        }
+    }
+    // formal: end burst_allowance/check_allowance.create_refusal
+
     pub(super) fn validate(&self) -> Result<(), String> {
         let bad = |m: &str| Err(format!("burst: {m}"));
+        if let Some(a) = &self.allowance {
+            if a.approved_by.trim().is_empty() || a.approval.trim().is_empty() {
+                return bad("allowance needs approved_by and approval");
+            }
+            if a.expires_unix().is_none() {
+                return bad("allowance.expires_at must be an RFC 3339 time");
+            }
+        }
         let (b, up, down, gce) = (&self.budget, &self.scale_up, &self.scale_down, &self.gce);
         if !(1..=10).contains(&self.max_drones) {
             return bad("max_drones must be between 1 and 10");
@@ -757,9 +813,11 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
     let max_run = cfg.gce.max_run_secs;
     let up = &cfg.scale_up;
     let down = &cfg.scale_down;
-    // Turned off (in the config or through the control API): create
-    // nothing; drain the drones this queen made and delete them once empty.
-    let disabled = !cfg.enabled;
+    // Turned off (in the config or through the control API), or with no
+    // unexpired founder allowance: create nothing; drain the drones this
+    // queen made and delete them once empty.
+    let refusal = cfg.create_refusal(now);
+    let disabled = !cfg.enabled || refusal.is_some();
 
     let weighted = weighted_unmet(up, obs.unmet, obs.idle);
     let holds = weighted >= up.min_weighted_unmet;
@@ -870,8 +928,13 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
         .unwrap_or(usize::MAX)
         .saturating_sub(counted);
 
-    let (outcome, reason) = if disabled {
+    let (outcome, reason) = if !cfg.enabled {
         ("disabled", "burst is disabled".to_owned())
+    } else if let Some(why) = refusal {
+        if holds {
+            tracing::warn!("burst: refused to create a Compute Engine drone: {why}");
+        }
+        ("no_allowance", why)
     } else if obs.breaker_tripped || never_enrolled_deletes(&actions, &live_vms) >= obs.breaker_room
     {
         (
@@ -1298,6 +1361,7 @@ mod tests {
 
     const BLOCK: &str = r#"{
       "enabled": true, "max_drones": 3,
+      "allowance": {"approved_by": "founder", "approval": "test", "expires_at": "2030-01-01T00:00:00Z"},
       "budget": {"drone_hours_per_day": 24, "drone_hours_per_month": 150},
       "scale_up": {"classes": ["heavy", "medium"], "weights": {"main": 3, "pr": 1},
                    "min_weighted_unmet": 6, "sustained_secs": 600},
@@ -1376,6 +1440,56 @@ mod tests {
     }
 
     const T0: i64 = 1_800_000_000; // 2027-01-15, mid-day not required
+
+    fn sustained_heavy_demand(c: &BurstSettings) -> Plan {
+        let mut st = BurstState::default();
+        let need = [unmet(Class::Heavy, Scope::Main, 9)];
+        run(c, &mut st, T0, &need, &[], &[]);
+        run(c, &mut st, T0 + 600, &need, &[], &[])
+    }
+
+    #[test]
+    fn nothing_is_created_without_an_unexpired_allowance() {
+        assert_eq!(sustained_heavy_demand(&live_cfg()).outcome, "create");
+
+        let mut none = live_cfg();
+        none.allowance = None;
+        let p = sustained_heavy_demand(&none);
+        assert_eq!(p.outcome, "no_allowance");
+        assert!(p.reason.contains("no founder-approved"), "{}", p.reason);
+        assert!(!p.actions.iter().any(|a| matches!(a, Action::Create { .. })));
+
+        let mut expired = live_cfg();
+        if let Some(a) = expired.allowance.as_mut() {
+            a.expires_at = "2027-01-15T00:00:00Z".to_owned();
+        }
+        let p = sustained_heavy_demand(&expired);
+        assert_eq!(p.outcome, "no_allowance");
+        assert!(p.reason.contains("expired"), "{}", p.reason);
+        assert!(!p.actions.iter().any(|a| matches!(a, Action::Create { .. })));
+    }
+
+    #[test]
+    fn an_expired_allowance_drains_the_drones_it_made() {
+        let mut c = live_cfg();
+        c.allowance = None;
+        let mut st = BurstState::default();
+        let vms = [vm("gcp-burst-a", "us-central1-a", T0 - 60)];
+        let p = run(&c, &mut st, T0, &[], &[drone("gcp-burst-a", true, 0)], &vms);
+        assert!(p.actions.iter().any(|a| matches!(a, Action::Drain { .. })));
+    }
+
+    #[test]
+    fn a_malformed_allowance_is_rejected() {
+        let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
+        block["allowance"]["expires_at"] = serde_json::json!("tomorrow");
+        let c: BurstSettings = serde_json::from_value(block.clone()).unwrap();
+        assert!(c.validate().is_err());
+        block["allowance"]["expires_at"] = serde_json::json!("2030-01-01T00:00:00Z");
+        block["allowance"]["approval"] = serde_json::json!(" ");
+        let c: BurstSettings = serde_json::from_value(block).unwrap();
+        assert!(c.validate().is_err());
+    }
 
     #[test]
     fn defaults_are_off_and_dry_run_and_validation_rejects_nonsense() {

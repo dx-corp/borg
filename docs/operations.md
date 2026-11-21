@@ -1236,7 +1236,25 @@ these configured dollar estimates without credentials.
 
 The `burst` block decides when the queen adds or removes burst drones. With
 `dry_run` (the default) it only logs and simulates; with `dry_run: false` it
-creates and deletes VMs (see "Live burst drones" below). Each pass it:
+creates and deletes VMs (see "Live burst drones" below).
+
+**No VM without a founder allowance.** Since 2026-11-21 (founder: "you also
+need to stop them from getting auto-created") the queen creates nothing unless
+the config file records an unexpired allowance:
+
+```json
+"allowance": {"approved_by": "haasonsaas", "approval": "<the founder's words or a link>",
+              "expires_at": "2026-11-22T03:00:00Z"}
+```
+
+Without one, or once `expires_at` has passed, burst behaves as disabled: it
+drains and deletes only the drones it made and creates none. `/status`
+`burst.outcome` is `no_allowance` with the reason, and each refused create is
+logged as a warning while demand holds. The create site checks again before a
+VM can exist. `borg queen-ctl burst` can change `enabled` but cannot set an
+allowance. Model: `docs/formal/burst_allowance`.
+
+Each pass it:
 
 - weighs the unmet jobs borg must place in `scale_up.classes` (`main` and `pr`
   weights; deploy jobs never count, because burst drones have shared trust),

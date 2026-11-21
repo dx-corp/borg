@@ -2712,6 +2712,19 @@ impl Queen {
         now: i64,
     ) -> Result<Option<String>, String> {
         let short = |e: &dyn std::fmt::Display| e.to_string().chars().take(300).collect::<String>();
+        // formal: begin burst_allowance/check_allowance.create_site_guard
+        // The plan never asks for a create without an allowance; this is the
+        // last check before a VM can exist. It also checks the wall clock:
+        // `now` is the tick's start, and an allowance may end mid-tick.
+        let wall = OffsetDateTime::now_utc().unix_timestamp();
+        if let Some(why) = cfg
+            .create_refusal(now)
+            .or_else(|| cfg.create_refusal(wall.max(now)))
+        {
+            tracing::warn!("burst: refused to create {zone}/{vm}: {why}");
+            return Err(format!("refused: {why}"));
+        }
+        // formal: end burst_allowance/check_allowance.create_site_guard
         let g = cfg.gce();
         let key_path = g
             .tailscale_authkey_path

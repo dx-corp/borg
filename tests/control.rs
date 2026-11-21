@@ -16,6 +16,7 @@ fn config(token_path: &std::path::Path) -> Value {
         "control": {"token_path": token_path},
         "burst": {
             "enabled": true, "max_drones": 2,
+            "allowance": {"approved_by": "founder", "approval": "test", "expires_at": "2099-01-01T00:00:00Z"},
             "budget": {"drone_hours_per_day": 24, "drone_hours_per_month": 150},
             "ceilings": {"max_drones": 4, "drone_hours_per_day": 48, "drone_hours_per_month": 300},
             "scale_up": {"classes": ["heavy"], "weights": {"main": 3, "pr": 1},
