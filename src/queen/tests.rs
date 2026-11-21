@@ -24,6 +24,14 @@ fn admission_pressure_is_the_mean_of_the_fresh_window() {
     assert_eq!(pressure_window_mean(&[(1000, 5000)], 1000, 180), Some(1000));
 }
 
+/// Classes due a pull-request turn.
+fn pr_turn_classes(counts: &BTreeMap<Class, u32>, between: u32) -> Vec<Class> {
+    Class::ALL
+        .into_iter()
+        .filter(|c| counts.get(c).copied().unwrap_or(0) >= between)
+        .collect()
+}
+
 #[test]
 fn pr_turns_come_after_consecutive_main_grants() {
     let grant = |class, scope| crate::allocator::Grant {
@@ -58,8 +66,64 @@ fn pr_turns_come_after_consecutive_main_grants() {
         ],
         2,
     );
-    assert!(pr_turn_classes(&counts, 2).is_empty());
+    // The main grant after the pull request starts the next run.
+    assert_eq!(counts[&Class::Heavy], 1);
     assert_eq!(pr_turn_classes(&counts, 0), Class::ALL);
+    // Grants count in the order placed: one pass that frees several slots
+    // leaves main's run since its last pull-request grant, not zero.
+    advance_pr_turns(
+        &mut counts,
+        &[
+            grant(Class::Heavy, Scope::Pr),
+            grant(Class::Heavy, Scope::Main),
+            grant(Class::Heavy, Scope::Main),
+        ],
+        2,
+    );
+    assert_eq!(pr_turn_classes(&counts, 2), [Class::Heavy]);
+}
+
+/// `config/borg/queen.json` sets `main_grants_between: 1`: while pull
+/// requests starve, grants of a class alternate between main and them.
+#[test]
+fn one_main_grant_between_alternates_main_and_pull_request_grants() {
+    let grant = |scope| crate::allocator::Grant {
+        drone_id: "a".into(),
+        class: Class::Heavy,
+        scope,
+        labels: vec![],
+        mem_mib: 0,
+        vcpu: 0,
+    };
+    let mut counts = BTreeMap::new();
+    let mut order = Vec::new();
+    for _ in 0..6 {
+        // One heavy slot frees per pass; the turn decides who takes it.
+        let scope = if pr_turn_classes(&counts, 1).contains(&Class::Heavy) {
+            Scope::Pr
+        } else {
+            Scope::Main
+        };
+        advance_pr_turns(&mut counts, &[grant(scope)], 1);
+        order.push(scope);
+    }
+    assert_eq!(
+        order,
+        [
+            Scope::Main,
+            Scope::Pr,
+            Scope::Main,
+            Scope::Pr,
+            Scope::Main,
+            Scope::Pr
+        ]
+    );
+    // Deploy grants neither earn nor spend a turn, and other classes keep their own count.
+    let mut counts = BTreeMap::new();
+    advance_pr_turns(&mut counts, &[grant(Scope::Deploy)], 1);
+    assert!(pr_turn_classes(&counts, 1).is_empty());
+    advance_pr_turns(&mut counts, &[grant(Scope::Main)], 1);
+    assert_eq!(pr_turn_classes(&counts, 1), [Class::Heavy]);
 }
 
 #[test]
@@ -235,6 +299,8 @@ fn the_queued_family_picks_the_owned_host_that_runs_it_fastest() {
         cpu_load_pm: None,
         cost_permille: crate::allocator::OWNED_COST_PERMILLE,
         live: crate::allocator::LiveFacts::default(),
+        work_free_mib: None,
+        disk_floor_mib: std::collections::BTreeMap::new(),
     };
     let winner = |queued: &[(&str, u32)], family_aware: bool| {
         let mut by_key = BTreeMap::new();
@@ -268,6 +334,7 @@ fn the_queued_family_picks_the_owned_host_that_runs_it_fastest() {
             weights: ScoreWeights::default(),
             admission: None,
             pr_turn: PrTurn::default(),
+            larger_hold: crate::allocator::LargerHold::default(),
         });
         a.grants[0].drone_id.clone()
     };

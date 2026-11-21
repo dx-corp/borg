@@ -106,6 +106,22 @@ pub struct JanitorSettings {
     /// red publish run was cancelled before its catch-up re-dispatch ran).
     #[serde(default)]
     pub(crate) superseded_push_workflows: Vec<String>,
+    /// Jobs of those workflows, by name (a parenthesized matrix or display
+    /// suffix also matches: `full-rust-test-shard` covers
+    /// `full-rust-test-shard (platform-api)`), that attest closure verdicts
+    /// on success. A started superseded push run with a failed job is kept
+    /// while one of them is unfinished, so the units it tests get a verdict
+    /// and the next main run need not test them again (2026-11-20: 97 of 100
+    /// main platform-ci runs were cancelled by unrelated failures before any
+    /// test shard attested). Empty: cancel at the first failure, as before.
+    #[serde(default)]
+    pub(crate) verdict_jobs: Vec<String>,
+    /// Upper bound, from the run's first failed job, on keeping a red
+    /// superseded push run for its `verdict_jobs`. Past it the run is
+    /// cancelled anyway, so on a starved fleet a red run cannot hold the
+    /// branch's concurrency group for hours.
+    #[serde(default = "default_verdict_wait")]
+    pub(crate) verdict_wait_secs: u64,
     /// Cancel `merge_group` runs whose merge-queue branch
     /// (`gh-readonly-queue/...`) no longer exists: the queue entry merged or
     /// left the queue, so the run's verdict is moot. Running ones too only
@@ -217,6 +233,9 @@ fn default_janitor_interval() -> u64 {
 }
 fn default_janitor_max() -> u32 {
     20
+}
+fn default_verdict_wait() -> u64 {
+    3600
 }
 
 /// Cost-aware placement. A paid cloud drone (one whose name matches
@@ -469,6 +488,49 @@ fn default_pr_fairness() -> Option<PrFairnessSettings> {
     })
 }
 
+/// Each lease runs under a memory limit of its class's memory plus
+/// `headroom_pct`, with `memory.high` at `high_pct` of that limit
+/// ([`crate::drone::memlimit`]). One job over it is OOM-killed alone instead
+/// of taking the whole host or container with it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LeaseMemorySettings {
+    pub(crate) headroom_pct: u32,
+    pub(crate) high_pct: u32,
+}
+
+impl Default for LeaseMemorySettings {
+    fn default() -> Self {
+        Self {
+            headroom_pct: 50,
+            high_pct: 90,
+        }
+    }
+}
+
+impl LeaseMemorySettings {
+    /// The limit of a lease whose class reserves `class_mem_mib`.
+    pub(crate) fn limit(&self, class_mem_mib: u64) -> crate::drone::memlimit::LeaseMemory {
+        let max_mib = class_mem_mib.saturating_mul(100 + u64::from(self.headroom_pct)) / 100;
+        let max_bytes = max_mib.saturating_mul(1 << 20);
+        crate::drone::memlimit::LeaseMemory {
+            max_bytes,
+            high_bytes: max_bytes / 100 * u64::from(self.high_pct),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !(1..=100).contains(&self.high_pct) {
+            return Err("lease_memory.high_pct must be between 1 and 100".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn default_lease_memory() -> Option<LeaseMemorySettings> {
+    Some(LeaseMemorySettings::default())
+}
+
 /// `false`/`null` turns a settings block off; `true` is an error.
 fn settings_or_off<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
@@ -535,6 +597,10 @@ pub struct QueenConfig {
     /// (900 s, 2 main grants between). `false` (or JSON `null`) disables it.
     #[serde(default = "default_pr_fairness", deserialize_with = "settings_or_off")]
     pub(crate) pr_fairness: Option<PrFairnessSettings>,
+    /// The memory limit sent with each lease grant; on by default. `false`
+    /// (or JSON `null`) sends none, so leases run without a limit.
+    #[serde(default = "default_lease_memory", deserialize_with = "settings_or_off")]
+    pub(crate) lease_memory: Option<LeaseMemorySettings>,
     #[serde(default)]
     pub classes: Classes,
     #[serde(default = "default_warm_floors")]
@@ -579,6 +645,11 @@ pub struct QueenConfig {
     /// Host-health thresholds, decay and cooldown; see [`crate::health`].
     #[serde(default)]
     pub health: HealthSettings,
+    /// Jobs whose runner host was lost: classification, the suspect
+    /// cool-down and the one automatic rerun; on by default. See
+    /// [`crate::hostlost`].
+    #[serde(default)]
+    pub host_lost: crate::hostlost::HostLostSettings,
     /// Job telemetry older than this is deleted.
     #[serde(default = "default_telemetry_days")]
     pub telemetry_retention_days: u32,
@@ -783,9 +854,13 @@ impl QueenConfig {
         self.units.validate().map_err(ConfigError::Invalid)?;
         self.wake.validate().map_err(ConfigError::Invalid)?;
         self.rollout.validate().map_err(ConfigError::Invalid)?;
+        if let Some(m) = &self.lease_memory {
+            m.validate().map_err(ConfigError::Invalid)?;
+        }
         self.profiles.validate().map_err(ConfigError::Invalid)?;
         self.homeostasis.validate().map_err(ConfigError::Invalid)?;
         self.health.validate().map_err(ConfigError::Invalid)?;
+        self.host_lost.validate().map_err(ConfigError::Invalid)?;
         if let Some(a) = &self.admission {
             a.validate().map_err(ConfigError::Invalid)?;
         }
@@ -919,6 +994,26 @@ mod tests {
         ] {
             assert!(QueenConfig::from_json(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn host_lost_is_on_by_default_and_rejects_unknown_keys_and_bad_values() {
+        let c = QueenConfig::from_json(MIN).unwrap();
+        assert!(c.host_lost.rerun && !c.host_lost.dry_run);
+        let with = |block: &str| {
+            QueenConfig::from_json(
+                &MIN.replace("\"repos\"", &format!("\"host_lost\":{block},\"repos\"")),
+            )
+        };
+        let c = with(r#"{"rerun":false,"max_reruns_per_run_per_hour":1}"#).unwrap();
+        assert!(!c.host_lost.rerun);
+        assert_eq!(c.host_lost.max_reruns_per_run_per_hour, 1);
+        assert_eq!(
+            c.host_lost.backoff_secs, 60,
+            "unset keys keep their defaults"
+        );
+        assert!(with(r#"{"reruns":3}"#).is_err());
+        assert!(with(r#"{"interval_secs":0}"#).is_err());
     }
 
     #[test]
@@ -1160,7 +1255,7 @@ mod tests {
                 "budget":{{"drone_hours_per_day":24,"drone_hours_per_month":150}},
                 "scale_up":{{"classes":["heavy"],"weights":{{"main":3,"pr":1}},"min_weighted_unmet":6,"sustained_secs":600}},
                 "scale_down":{{"idle_secs":900}},
-                "gce":{{"project":"p","network":"n","subnet":"s","zones":["us-west1-b"],"machine_type":"c2d-highcpu-56"}}}}"#
+                "gce":{{"project":"p","network":"n","subnet":"s","zones":["us-central1-b"],"machine_type":"c2d-highcpu-56"}}}}"#
             )
         };
         let with = |expiry: &str, extra: &str| {
@@ -1177,6 +1272,35 @@ mod tests {
         };
         assert!(err(with("", "")).contains("drone_expiry.burst_prefixes"));
         assert!(err(with(expiry, r#""dry_run":false,"#)).contains("credentials_path"));
+    }
+
+    #[test]
+    fn lease_memory_limits_follow_the_class_with_headroom_and_turn_off() {
+        let c = QueenConfig::from_json(MIN).unwrap();
+        let m = c.lease_memory.as_ref().unwrap();
+        // Heavy (20 GiB) gets 30 GiB, throttled from 27 GiB.
+        let heavy = m.limit(20 << 10);
+        assert_eq!(heavy.max_bytes, 30u64 << 30);
+        assert_eq!(heavy.high_bytes, (30u64 << 30) / 100 * 90);
+        let off =
+            QueenConfig::from_json(&MIN.replace("\"repos\"", "\"lease_memory\":false,\"repos\""))
+                .unwrap();
+        assert!(off.lease_memory.is_none());
+        let custom = QueenConfig::from_json(&MIN.replace(
+            "\"repos\"",
+            "\"lease_memory\":{\"headroom_pct\":25,\"high_pct\":80},\"repos\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            custom.lease_memory.unwrap().limit(8 << 10).max_bytes,
+            10u64 << 30
+        );
+        assert!(
+            QueenConfig::from_json(
+                &MIN.replace("\"repos\"", "\"lease_memory\":{\"high_pct\":0},\"repos\"")
+            )
+            .is_err()
+        );
     }
 
     #[test]

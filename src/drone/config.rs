@@ -249,8 +249,9 @@ pub struct DroneConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) host_metrics_url: Option<String>,
     /// Number of slot directories (`<work_root>/slot-<N>`) leases run in. A
-    /// lease takes the lowest free slot, so its path never contains the lease
-    /// id and a reused slot has an identical path. Also the most leases that
+    /// heavy lease takes the lowest free slot and any other the highest, so
+    /// its path never contains the lease id and a reused slot has an
+    /// identical path. Also the most leases that
     /// run at once. Default: `max_leases`, else 16.
     #[serde(default)]
     pub slots: Option<u32>,
@@ -343,7 +344,8 @@ impl DroneConfig {
             path: path.to_owned(),
             source,
         })?;
-        let cfg: Self = crate::configfile::parse(path, &text)?;
+        let mut cfg: Self = crate::configfile::parse(path, &text)?;
+        cfg.reclaim = cfg.reclaim.upgraded();
         cfg.validate()?;
         Ok(cfg)
     }

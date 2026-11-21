@@ -21,6 +21,7 @@ mod github_quota;
 mod github_quota_cli;
 mod health;
 mod hostdiag_wire;
+mod hostlost;
 mod janitor;
 mod janitor_postmerge_reruns;
 mod job_user;

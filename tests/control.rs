@@ -21,8 +21,8 @@ fn config(token_path: &std::path::Path) -> Value {
             "scale_up": {"classes": ["heavy"], "weights": {"main": 3, "pr": 1},
                          "min_weighted_unmet": 6, "sustained_secs": 600},
             "scale_down": {"idle_secs": 900},
-            "gce": {"project": "p", "network": "borg-burst", "subnet": "borg-burst-usw1",
-                    "zones": ["us-west1-b"], "machine_type": "c2d-highcpu-56"}
+            "gce": {"project": "p", "network": "borg-burst", "subnet": "borg-burst-usc1",
+                    "zones": ["us-central1-b"], "machine_type": "c2d-highcpu-56"}
         }
     })
 }

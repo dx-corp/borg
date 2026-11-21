@@ -121,8 +121,11 @@ fn frees_room_for(
         .map(|(_, l)| l.clone())
         .collect();
     let room = free_room(drone, &rest, input.classes);
+    // A running victim's writes are already in the free reading, so ending
+    // it frees no promised disk: a disk shortage is never cancelled away.
     !drone.blocked_classes.contains(&class)
         && free_slots(drone, &room, input.classes.spec(class)) > 0
+        && drone.disk_admits(&rest, class)
 }
 
 /// Up to `max_per_pass` leases to cancel. Deterministic.
@@ -141,6 +144,7 @@ pub fn select(input: &PreemptInput<'_>) -> Vec<Victim> {
                     class: r.class,
                     scope: r.scope,
                     state: LeaseState::Running,
+                    disk_mib: None,
                 },
             )
         }))
@@ -252,6 +256,8 @@ mod tests {
             cpu_load_pm: None,
             cost_permille: crate::allocator::OWNED_COST_PERMILLE,
             live: crate::allocator::LiveFacts::default(),
+            work_free_mib: None,
+            disk_floor_mib: std::collections::BTreeMap::new(),
         }
     }
 
@@ -348,6 +354,20 @@ mod tests {
             ),
             ["a"]
         );
+    }
+
+    #[test]
+    fn a_disk_shortage_is_never_cancelled_away() {
+        // The drone's free disk is below medium's floor. A running lease's
+        // writes are already in that reading, so cancelling it frees none.
+        let mut d = sized_for("host-a", Class::Medium, 1);
+        d.work_free_mib = Some(5 * 1024);
+        d.disk_floor_mib = [(Class::Medium, 10 * 1024)].into_iter().collect();
+        let running = [run("a", "host-a", Class::Medium, Scope::Pr, 0)];
+        let demand = starving(&[MEDIUM_MAIN], 600);
+        assert!(pick(&settings(), &[d.clone()], &running, &demand).is_empty());
+        d.work_free_mib = Some(20 * 1024);
+        assert_eq!(pick(&settings(), &[d], &running, &demand), ["a"]);
     }
 
     #[test]

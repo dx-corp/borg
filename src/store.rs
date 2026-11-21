@@ -211,6 +211,26 @@ CREATE TABLE IF NOT EXISTS preemptions (
     at           INTEGER NOT NULL,
     requeued_at  INTEGER
 );
+-- Leases that ended because their drone was lost, and what the queen did
+-- about the job each was running; see hostlost.rs. `outcome` is NULL until
+-- the job is re-run or left alone.
+CREATE TABLE IF NOT EXISTS host_lost (
+    lease_id     TEXT PRIMARY KEY,
+    drone        TEXT NOT NULL,
+    class        TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    repo         TEXT,
+    run_id       INTEGER,
+    job_id       INTEGER,
+    job_name     TEXT,
+    at           INTEGER NOT NULL,
+    silent_secs  INTEGER NOT NULL,
+    outcome      TEXT,
+    reason       TEXT,
+    decided_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS host_lost_at ON host_lost(at);
+CREATE INDEX IF NOT EXISTS host_lost_run ON host_lost(repo, run_id);
 CREATE TABLE IF NOT EXISTS burst_vms (
     drone        TEXT PRIMARY KEY,
     vm           TEXT NOT NULL,
@@ -335,6 +355,12 @@ pub struct DroneRow {
     /// The drone's last heartbeat said it runs work units. Drones older than
     /// the drone half of units never say so and are never given one.
     pub runs_units: bool,
+    /// The drone's newest silence the queen saw end: the last heartbeat
+    /// before it and the heartbeat that ended it. See [`crate::hostlost`].
+    pub silence: Option<(i64, i64)>,
+    /// Set when a lease on this drone ended because the host was lost: no
+    /// new leases until then.
+    pub suspect_until: Option<i64>,
 }
 
 impl DroneRow {
@@ -371,10 +397,15 @@ impl DroneRow {
         }
     }
 
+    /// Inside the cool-down after a host-lost lease.
+    pub fn suspect(&self, now: i64) -> bool {
+        self.suspect_until.is_some_and(|until| now < until)
+    }
+
     /// The allocator's view of a fresh drone with a known capacity.
     pub fn allocator_state(&self, cap: &Capacity, now: i64) -> DroneState {
         let mut s = DroneState::from_capacity(self.name.clone(), cap, &self.caps);
-        s.accepting = self.schedulable();
+        s.accepting = self.schedulable() && !self.suspect(now);
         s.trust = self.trust;
         if self.on_probation() {
             s.max_leases = Some(s.max_leases.map_or(1, |m| m.min(1)));
@@ -442,11 +473,31 @@ pub struct PreemptionRow {
     pub requeued_at: Option<i64>,
 }
 
+/// What [`Store::finish_lease`] did with a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Finish {
+    /// No lease of this id belongs to the drone.
+    NotOwned,
+    /// This result ended the lease.
+    Ended,
+    /// The lease had already ended (a retried result): nothing changed.
+    AlreadyEnded,
+}
+
+impl Finish {
+    /// The drone owns the lease, whether or not this result ended it.
+    pub fn owned(self) -> bool {
+        self != Self::NotOwned
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LeaseResult {
     pub exit_code: i32,
     pub duration_secs: u64,
     pub peak_rss_mib: Option<u64>,
+    /// The kernel OOM-killed a job process at the lease's memory limit.
+    pub oom_killed: bool,
 }
 
 #[derive(Clone)]
@@ -478,14 +529,14 @@ fn from_text<T: DeserializeOwned>(s: &str) -> Result<T, StoreError> {
     serde_json::from_str(s).map_err(|e| StoreError::Corrupt(e.to_string()))
 }
 
-fn enum_text<T: Serialize>(v: &T) -> Result<String, StoreError> {
+pub(crate) fn enum_text<T: Serialize>(v: &T) -> Result<String, StoreError> {
     match serde_json::to_value(v) {
         Ok(serde_json::Value::String(s)) => Ok(s),
         _ => Err(StoreError::Corrupt("enum is not a string".to_owned())),
     }
 }
 
-fn enum_from<T: DeserializeOwned>(s: &str) -> Result<T, StoreError> {
+pub(crate) fn enum_from<T: DeserializeOwned>(s: &str) -> Result<T, StoreError> {
     from_text(&format!("\"{s}\""))
 }
 
@@ -643,10 +694,18 @@ impl Store {
             "ALTER TABLE drones ADD COLUMN trust TEXT NOT NULL DEFAULT 'shared'",
             "ALTER TABLE units ADD COLUMN scope TEXT NOT NULL DEFAULT 'pr'",
             "ALTER TABLE units ADD COLUMN supersede_key TEXT",
+            "ALTER TABLE leases ADD COLUMN oom_killed INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE units ADD COLUMN record INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE clients ADD COLUMN max_scope TEXT NOT NULL DEFAULT 'pr'",
             "ALTER TABLE clients ADD COLUMN expires_at INTEGER",
             "ALTER TABLE drones ADD COLUMN runs_units INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE drones ADD COLUMN silent_from INTEGER",
+            "ALTER TABLE drones ADD COLUMN silent_until INTEGER",
+            "ALTER TABLE drones ADD COLUMN suspect_until INTEGER",
+            // 1 while a host-lost rerun claim waits for GitHub's answer.
+            "ALTER TABLE host_lost ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
+            // 1 once the lease's drone reported its result, whatever was decided.
+            "ALTER TABLE host_lost ADD COLUMN reported INTEGER NOT NULL DEFAULT 0",
         ] {
             // sqlx-runtime-query: one-off additive migration, no data involved
             if let Err(e) = sqlx::query(ddl).execute(&mut *conn).await
@@ -780,7 +839,7 @@ impl Store {
     pub async fn drones(&self) -> Result<Vec<DroneRow>, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         let rows = sqlx::query(
-            "SELECT name, last_heartbeat, capacity, caps, accepting, cache_stats, quarantined, quarantine_reason, version, extra_labels, bids, quarantine_source, quarantined_at, probation_since, quarantine_strikes, health_cleared_at, version_since, reclaim, env_facts, trust, runs_units FROM drones ORDER BY name",
+            "SELECT name, last_heartbeat, capacity, caps, accepting, cache_stats, quarantined, quarantine_reason, version, extra_labels, bids, quarantine_source, quarantined_at, probation_since, quarantine_strikes, health_cleared_at, version_since, reclaim, env_facts, trust, runs_units, silent_from, silent_until, suspect_until FROM drones ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -815,6 +874,10 @@ impl Store {
                         .unwrap_or_default(),
                     trust: enum_from(&r.get::<String, _>("trust"))?,
                     runs_units: r.get::<i64, _>("runs_units") != 0,
+                    silence: r
+                        .get::<Option<i64>, _>("silent_from")
+                        .zip(r.get::<Option<i64>, _>("silent_until")),
+                    suspect_until: r.get("suspect_until"),
                     quarantine_source: r.get("quarantine_source"),
                     quarantined_at: r.get("quarantined_at"),
                     probation_since: r.get("probation_since"),
@@ -1336,6 +1399,19 @@ impl Store {
         Ok(())
     }
 
+    pub async fn env_facts(&self, name: &str) -> Result<Option<EnvFacts>, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let row = sqlx::query("SELECT env_facts FROM drones WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let facts: Option<String> = row.get("env_facts");
+        facts.as_deref().map(from_text).transpose()
+    }
+
     /// Replace the bids a drone last reported.
     pub async fn set_bids(&self, name: &str, bids: &[DroneBid]) -> Result<(), StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
@@ -1531,7 +1607,7 @@ impl Store {
         drone: &str,
         result: &LeaseResult,
         now: i64,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Finish, StoreError> {
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
         let owned = sqlx::query("SELECT 1 FROM leases WHERE id = ? AND drone = ?")
             .bind(id)
@@ -1540,21 +1616,27 @@ impl Store {
             .await?
             .is_some();
         if !owned {
-            return Ok(false);
+            return Ok(Finish::NotOwned);
         }
         // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
-        sqlx::query(
-            "UPDATE leases SET state = 'done', finished_at = ?, jit_config = NULL, exit_code = ?, duration_secs = ?, peak_rss_mib = ?
+        let ended = sqlx::query(
+            "UPDATE leases SET state = 'done', finished_at = ?, jit_config = NULL, exit_code = ?, duration_secs = ?, peak_rss_mib = ?, oom_killed = ?
              WHERE id = ? AND state IN ('standby', 'pending', 'running', 'expired')",
         )
         .bind(now)
         .bind(i64::from(result.exit_code))
         .bind(i64::try_from(result.duration_secs).unwrap_or(i64::MAX))
         .bind(result.peak_rss_mib.map(|v| i64::try_from(v).unwrap_or(i64::MAX)))
+        .bind(result.oom_killed)
         .bind(id)
         .execute(&self.pool)
-        .await?;
-        Ok(true)
+        .await?
+        .rows_affected();
+        Ok(if ended == 0 {
+            Finish::AlreadyEnded
+        } else {
+            Finish::Ended
+        })
     }
 
     /// Mark an active lease preempted and record the job it was running, once.
@@ -1891,10 +1973,21 @@ VALUES ('l1', 'd1', 'medium', 'pr', '[\"a\"]', 'borg-d1-l1', 7, 'jit', 'pending'
             exit_code: 0,
             duration_secs: 5,
             peak_rss_mib: Some(100),
+            oom_killed: false,
         };
-        assert!(!s.finish_lease("l1", "d2", &r, 500).await.unwrap());
-        assert!(s.finish_lease("l1", "d1", &r, 500).await.unwrap());
-        assert!(s.finish_lease("l1", "d1", &r, 600).await.unwrap());
+        assert_eq!(
+            s.finish_lease("l1", "d2", &r, 500).await.unwrap(),
+            Finish::NotOwned
+        );
+        assert_eq!(
+            s.finish_lease("l1", "d1", &r, 500).await.unwrap(),
+            Finish::Ended
+        );
+        // A retried result is accepted and changes nothing.
+        assert_eq!(
+            s.finish_lease("l1", "d1", &r, 600).await.unwrap(),
+            Finish::AlreadyEnded
+        );
         let l = s.lease("l1").await.unwrap().unwrap();
         assert_eq!(l.state, LeaseStatus::Done);
         assert!(l.jit_config.is_none(), "secret dropped when the lease ends");

@@ -652,7 +652,7 @@ mod tests {
                          "min_weighted_unmet": 6, "sustained_secs": 600},
             "scale_down": {"idle_secs": 900},
             "gce": {"project": "p", "network": "n", "subnet": "s",
-                    "zones": ["us-west1-b"], "machine_type": "c2d-highcpu-56"}
+                    "zones": ["us-central1-b"], "machine_type": "c2d-highcpu-56"}
         });
         if let Some(c) = ceilings {
             b["ceilings"] = c;

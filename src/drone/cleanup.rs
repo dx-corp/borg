@@ -244,13 +244,16 @@ pub(crate) mod testing {
     use std::io;
     use std::sync::Mutex;
 
-    use crate::drone::exec::{Exec, Output};
+    use crate::drone::exec::{Diagnosed, Exec, Output};
 
     /// Scripted commands: key is the program plus space-joined args; any key
-    /// not present is a successful command with empty output.
+    /// not present is a successful command with empty output. `diagnosed`
+    /// scripts `run_diagnosed` (exit code and stderr) and falls back to
+    /// `script`.
     #[derive(Default)]
     pub struct FakeExec {
         pub script: Mutex<HashMap<String, Output>>,
+        pub diagnosed: Mutex<HashMap<String, Diagnosed>>,
         pub calls: Mutex<Vec<String>>,
     }
 
@@ -292,6 +295,22 @@ pub(crate) mod testing {
                     success: true,
                     stdout: String::new(),
                 }))
+        }
+
+        fn run_diagnosed(&self, program: &str, args: &[&str]) -> io::Result<Diagnosed> {
+            let key = format!("{program} {}", args.join(" "));
+            let scripted = self.diagnosed.lock().unwrap().get(&key).cloned();
+            match scripted {
+                Some(d) => {
+                    self.calls.lock().unwrap().push(key);
+                    Ok(d)
+                }
+                None => self.run(program, args).map(|output| Diagnosed {
+                    output,
+                    code: None,
+                    stderr: String::new(),
+                }),
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 use crate::support;
 
 use borg::allocator::{
-    AllocatorInput, Demand, DroneState, HostCaps, PlacementDecision, PrTurn, allocate,
+    AllocatorInput, Demand, DroneState, HostCaps, LargerHold, PlacementDecision, PrTurn, allocate,
 };
 use borg::bid::ScoreWeights;
 use borg::classes::{Class, Classes, Scope};
@@ -31,6 +31,7 @@ fn decision() -> PlacementDecision {
         weights: ScoreWeights::default(),
         admission: None,
         pr_turn: PrTurn::default(),
+        larger_hold: LargerHold::default(),
     })
     .decisions
     .remove(0)

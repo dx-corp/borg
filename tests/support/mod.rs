@@ -106,6 +106,9 @@ pub struct MockState {
     pub rerun_status: HashMap<u64, u16>,
     /// Reads of a single run (janitor or requeuer).
     pub run_reads: u32,
+    /// When set, the next single-run read signals the first `Notify` and
+    /// waits on the second before it answers: a test acts in between.
+    pub hold_run_read: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     next_runner_id: u64,
     /// Fake Compute Engine: live instances as `{name, zone, body}`.
     pub gce_instances: Vec<Value>,
@@ -115,6 +118,13 @@ pub struct MockState {
     pub gce_set_metadata: Vec<Value>,
     /// The next instance insert fails with this operation error code.
     pub gce_fail_create: Option<String>,
+    /// Instance template reads answer 404, as for a deleted template.
+    pub gce_template_missing: bool,
+    /// Instance template reads served.
+    pub gce_template_reads: u32,
+    /// The template's `maxRunDuration`; 43200 (the queen's default
+    /// `max_run_secs`) unless a test sets another.
+    pub gce_template_max_run_secs: Option<i64>,
     /// Operation waits answer with this HTTP status (the VM is still made).
     pub gce_wait_status: Option<u16>,
     /// Instance deletes answer 500 and keep the instance.
@@ -369,6 +379,11 @@ async fn one_run(
     Path((_o, _r, id)): Path<(String, String, u64)>,
 ) -> Result<Json<Value>, StatusCode> {
     check_janitor(&h)?;
+    let hold = lock(&s).hold_run_read.take();
+    if let Some((reached, release)) = hold {
+        reached.notify_one();
+        release.notified().await;
+    }
     let mut st = lock(&s);
     st.run_reads += 1;
     let mut run = st
@@ -385,6 +400,32 @@ async fn one_run(
         run["run_started_at"] = json!(started);
     }
     Ok(Json(run))
+}
+
+/// `GET /actions/workflows/{id}/runs?branch=&event=`: the listed runs of one
+/// workflow, as the host-lost rerunner reads them for a newer push.
+async fn workflow_runs(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((_o, _r, workflow)): Path<(String, String, u64)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, StatusCode> {
+    check_janitor(&h)?;
+    let runs: Vec<Value> = lock(&s)
+        .pr_runs
+        .iter()
+        .filter(|r| r["workflow_id"].as_u64() == Some(workflow))
+        .filter(|r| {
+            q.get("event")
+                .is_none_or(|e| r["event"].as_str() == Some(e))
+        })
+        .filter(|r| {
+            q.get("branch")
+                .is_none_or(|b| r["head_branch"].as_str() == Some(b))
+        })
+        .cloned()
+        .collect();
+    Ok(Json(json!({"workflow_runs": runs})))
 }
 
 async fn cancel_run(
@@ -594,6 +635,8 @@ pub struct Harness {
 }
 
 pub const GCE_TOKEN: &str = "gce-token-for-tests";
+/// The instance template the fake Compute Engine serves.
+pub const GCE_TEMPLATE: &str = "projects/p/global/instanceTemplates/borg-burst-v1";
 pub const TS_AUTHKEY: &str = "tskey-auth-for-tests";
 pub const TOOLCHAIN_SCRIPT: &str = "#!/bin/bash\necho toolchain-for-tests\n";
 
@@ -658,6 +701,10 @@ impl Harness {
                 "/repos/{owner}/{repo}/actions/runs/{run}/force-cancel",
                 post(force_cancel_run),
             )
+            .route(
+                "/repos/{owner}/{repo}/actions/workflows/{workflow}/runs",
+                get(workflow_runs),
+            )
             .route("/repos/{owner}/{repo}/compare/{range}", get(compare))
             .route(
                 "/repos/{owner}/{repo}/actions/jobs/{id}/rerun",
@@ -691,6 +738,10 @@ impl Harness {
             .route(
                 "/compute/v1/projects/{project}/zones/{zone}/instances",
                 post(gce_insert),
+            )
+            .route(
+                "/compute/v1/projects/{project}/global/instanceTemplates/{name}",
+                get(gce_template),
             )
             .route(
                 "/compute/v1/projects/{project}/aggregated/instances",
@@ -750,6 +801,7 @@ impl Harness {
                 ("queen_url", json!("https://queen.example.test")),
                 ("tailscale_authkey_path", json!(ts)),
                 ("toolchain_script_path", json!(toolchain)),
+                ("instance_template", json!(GCE_TEMPLATE)),
             ] {
                 if gce.get(k).is_none() {
                     gce[k] = v;
@@ -810,6 +862,13 @@ impl Harness {
         if let Some(r) = requeuer {
             queen = queen.with_requeuer(r);
         }
+        let host_lost = borg::hostlost::HostLostRerunner::new(
+            &gh_url,
+            borg::github::TokenSource::Static(borg::secret::Secret::new(JANITOR_TOKEN)),
+            queen.config().host_lost.clone(),
+        )
+        .unwrap();
+        queen = queen.with_host_lost(host_lost);
         if let Some(settings) = queen.config().tailnet_enroll.clone() {
             queen = queen.with_tailnet_enroll(borg::tailnet::TailnetEnroll {
                 verifier: Arc::new(identities),
@@ -1092,13 +1151,49 @@ async fn gce_token(State(s): State<Shared>, body: String) -> Result<Json<Value>,
     ))
 }
 
+/// `instanceTemplates.get` for the one template the fake project has: the
+/// shape of the CI host template (labels and access metadata; the host
+/// properties the queen must never send itself).
+async fn gce_template(
+    State(s): State<Shared>,
+    h: HeaderMap,
+    Path((project, name)): Path<(String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    gce_check(&h)?;
+    let mut st = lock(&s);
+    st.gce_template_reads += 1;
+    if st.gce_template_missing
+        || format!("projects/{project}/global/instanceTemplates/{name}") != GCE_TEMPLATE
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(json!({
+        "name": name,
+        "properties": {
+            "machineType": "c2d-highcpu-56",
+            "labels": {"owner": "platform", "purpose": "borg-burst-drone", "lane": "burst"},
+            "metadata": {"items": [
+                {"key": "enable-oslogin", "value": "TRUE"},
+                {"key": "block-project-ssh-keys", "value": "TRUE"},
+            ]},
+            "scheduling": {"provisioningModel": "STANDARD", "instanceTerminationAction": "DELETE",
+                           "maxRunDuration": {"seconds": st.gce_template_max_run_secs.unwrap_or(43_200).to_string()}},
+        }
+    })))
+}
+
 async fn gce_insert(
     State(s): State<Shared>,
     h: HeaderMap,
     Path((_project, zone)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
     gce_check(&h)?;
+    // A VM is made from the instance template or not at all.
+    let Some(template) = query.get("sourceInstanceTemplate").cloned() else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
     let mut st = lock(&s);
     let name = body["name"].as_str().unwrap_or_default().to_owned();
     if let Some(code) = st.gce_fail_create.take() {
@@ -1109,7 +1204,7 @@ async fn gce_insert(
         return Err(StatusCode::CONFLICT);
     }
     st.gce_instances
-        .push(json!({"name": name, "zone": zone, "body": body}));
+        .push(json!({"name": name, "zone": zone, "body": body, "template": template}));
     Ok(Json(
         json!({"name": format!("op-{name}"), "status": "RUNNING"}),
     ))

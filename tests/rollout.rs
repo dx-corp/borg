@@ -395,6 +395,8 @@ async fn a_new_queen_finishes_the_persisted_rollout_before_starting_its_own() {
         started_at: r.base - 100,
         stage_started_at: r.base,
         update_started_at: Default::default(),
+        drain_started_at: Default::default(),
+        cordoned: Vec::new(),
         halted_reason: None,
     };
     r.h.queen
@@ -460,4 +462,54 @@ async fn an_explicit_target_still_replaces_an_active_rollout_immediately() {
     assert_eq!(state.target, "2.0.0");
     assert_eq!(state.phase, Phase::Canary);
     assert_eq!(r.desired("l1", "1.0.0").await.as_deref(), Some("2.0.0"));
+}
+
+#[tokio::test]
+async fn a_told_drone_still_busy_after_the_drain_timeout_is_granted_nothing_new() {
+    let mut cfg = gated();
+    cfg["rollout"]["canary_oses"] = json!(["linux"]);
+    cfg["rollout"]["drain_timeout_secs"] = json!(120);
+    let r = Rig::new(cfg).await;
+    let runner = "borg-l1-busy";
+    r.h.state().runners.push(json!({
+        "id": 93, "name": runner, "status": "online", "busy": true, "labels": []
+    }));
+    let lease = |id: &str, drone: &str, state, jit: Option<&str>, at: i64| LeaseRow {
+        id: id.into(),
+        drone: drone.into(),
+        class: Class::Light,
+        scope: Scope::Pr,
+        labels: vec![],
+        runner_name: format!("runner-{id}"),
+        runner_id: 93,
+        jit_config: jit.map(borg::secret::Secret::new),
+        state,
+        created_at: at,
+        expires_at: at + 900,
+    };
+    let mut running = lease("busy", "l1", LeaseStatus::Running, None, r.base);
+    running.runner_name = runner.into();
+    r.h.queen.store().insert_lease(&running).await.unwrap();
+
+    r.tick(0).await;
+    r.tick(120).await;
+    let gate = &r.h.status().await["rollout"]["gate"];
+    assert!(gate["state"].get("cordoned").is_none(), "{gate}");
+    r.tick(121).await;
+    let gate = r.h.status().await["rollout"]["gate"].clone();
+    assert_eq!(gate["state"]["cordoned"], json!(["l1"]), "{gate}");
+    assert_eq!(gate["state"]["phase"], "canary");
+    assert!(gate["waiting"].as_str().unwrap().contains("l1 (cordoned)"));
+
+    // Leases already minted are held back from the cordoned drone only; its
+    // running job is left alone.
+    for (id, drone) in [("for-l1", "l1"), ("for-l2", "l2")] {
+        let pending = lease(id, drone, LeaseStatus::Pending, Some("jit"), r.base + 121);
+        r.h.queen.store().insert_lease(&pending).await.unwrap();
+    }
+    let l1 = r.beat("l1", "1.0.0").await;
+    assert_eq!(l1["leases"], json!([]), "{l1}");
+    assert!(l1["cancel_leases"].as_array().unwrap().is_empty());
+    let l2 = r.beat("l2", "1.0.0").await;
+    assert_eq!(l2["leases"].as_array().unwrap().len(), 1, "{l2}");
 }

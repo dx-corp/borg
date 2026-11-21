@@ -140,6 +140,8 @@ mod tests {
             runner_name: format!("borg-host-a-{id}"),
             jit_config: Secret::new("jit"),
             expires_at: i64::MAX,
+            min_free_disk_bytes: None,
+            memory: None,
         }
     }
 

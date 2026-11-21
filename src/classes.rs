@@ -18,6 +18,40 @@ pub const MAX_EXTRA_LABELS: usize = 16;
 const PR_SUFFIX: &str = "-pr";
 /// Suffix marking deploy-path demand.
 const DEPLOY_SUFFIX: &str = "-deploy";
+/// A job label asking for free work disk on top of its class:
+/// `borg-disk-<N>g` needs N GiB free when the job starts. No drone carries it:
+/// the queen places the job where the disk fits and mints its runner with the
+/// label, so GitHub hands that runner the job.
+const DISK_LABEL_PREFIX: &str = "borg-disk-";
+/// The largest disk label the queen honors, GiB.
+const MAX_DISK_LABEL_GIB: u64 = 4096;
+
+/// The free work disk a `borg-disk-<N>g` label asks for, GiB.
+pub fn parse_disk_label(label: &str) -> Option<u64> {
+    let lower = label.to_ascii_lowercase();
+    let gib = lower.strip_prefix(DISK_LABEL_PREFIX)?.strip_suffix('g')?;
+    if gib.is_empty() || !gib.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    gib.parse()
+        .ok()
+        .filter(|&g| g > 0 && g <= MAX_DISK_LABEL_GIB)
+}
+
+/// The free work disk a job's or runner's labels ask for, MiB: the largest
+/// `borg-disk-<N>g` among them.
+pub fn disk_labels_mib(labels: &[String]) -> Option<u64> {
+    labels
+        .iter()
+        .filter_map(|l| parse_disk_label(l))
+        .max()
+        .map(|gib| gib << 10)
+}
+
+/// The label that asks for `gib` GiB of free work disk.
+pub fn disk_label(gib: u64) -> String {
+    format!("{DISK_LABEL_PREFIX}{gib}g")
+}
 
 /// A runner size class. Ordered smallest to largest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -284,7 +318,10 @@ impl Classes {
     pub fn sanitize_extra_labels(&self, labels: &[String]) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for label in labels {
-            if valid_extra_label(label) && self.parse_label(label).is_none() && !out.contains(label)
+            if valid_extra_label(label)
+                && self.parse_label(label).is_none()
+                && parse_disk_label(label).is_none()
+                && !out.contains(label)
             {
                 out.push(label.clone());
             }

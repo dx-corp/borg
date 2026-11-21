@@ -23,26 +23,34 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+mod handoff;
+mod sanitize;
+mod wire;
+pub use wire::{LeaseGrant, ResultRequest};
+
 use crate::allocator::{
-    ActiveLease, AdmissionState, HostCaps, LeaseState, Reservation, Unmet, free_room, free_slots,
+    ActiveLease, AdmissionState, DroneState, HostCaps, Reservation, Unmet, free_room, free_slots,
     max_slots,
 };
 use crate::bid::{ClassPressure, DroneBid};
 use crate::classes::{Class, Scope, Trust};
 use crate::enroll::hash_token;
-use crate::envcontract::{CheckState, EnvFacts, Need, Verdict, blocked_classes, evaluate};
+use crate::envcontract::{
+    CheckState, EnvFacts, Need, Verdict, blocked_classes, evaluate, fresh_disk_admissions,
+    merge_blocked_classes,
+};
 use crate::health::{DroneHealth, HealthState};
 use crate::homeostasis::KeyReport;
-use crate::hostdiag::{JobHostView, LeaseHostReport};
+use crate::hostdiag::JobHostView;
 use crate::probe::Capacity;
 use crate::queen::RolloutView;
 use crate::queen::{Queen, QueenError, QueueEntry};
 use crate::reclaim::ReclaimStats;
 use crate::rollout::Phase as RolloutPhase;
 use crate::secret::Secret;
-use crate::store::{LeaseResult, LeaseStatus, StoreError};
+use crate::store::{Finish, LeaseResult, LeaseStatus, StoreError};
 use crate::tailnet::drone_name_for;
-use crate::telemetry::{JobTelemetry, MAX_REPORT_ROWS, Report, build_report};
+use crate::telemetry::{MAX_REPORT_ROWS, Report, build_report};
 use crate::units::UnitGrant;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,6 +61,14 @@ pub struct HeartbeatRequest {
     /// False while the drone drains or yields to its owner.
     #[serde(default = "yes")]
     pub accepting: bool,
+    /// Whether the drone is set up to take leases at all; false only for a
+    /// reclaim-only host. `accepting` also goes false while the drone is
+    /// under the disk floor, fails a host invariant, drains or updates, and
+    /// none of those changes which classes its hardware hosts, so the reclaim
+    /// floor is decided by this. Older drones omit it and the queen reads
+    /// `accepting` for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takes_leases: Option<bool>,
     /// Lease ids the drone currently holds; acknowledges their JIT configs.
     #[serde(default)]
     pub active_leases: Vec<String>,
@@ -95,80 +111,6 @@ pub struct HeartbeatRequest {
     /// Facts about the drone's build environment; see [`crate::envcontract`].
     #[serde(default)]
     pub env_facts: Option<EnvFacts>,
-}
-
-/// Bound the free text a drone reports; the observation time cannot be in the
-/// future.
-fn sanitize_facts(f: &EnvFacts, now: i64) -> EnvFacts {
-    let clip = |s: &String| {
-        s.chars()
-            .filter(|c| !c.is_control())
-            .take(300)
-            .collect::<String>()
-    };
-    let mut out = f.clone();
-    out.observed_at = out.observed_at.min(now);
-    out.cpu_busy_pm = out.cpu_busy_pm.map(|b| b.min(1000));
-    out.cpu_psi_some_avg10_pm = out.cpu_psi_some_avg10_pm.map(|p| p.min(1000));
-    out.mem_psi_some_avg10_pm = out.mem_psi_some_avg10_pm.map(|p| p.min(1000));
-    out.host_key = out.host_key.filter(|k| {
-        !k.is_empty()
-            && k.len() <= 64
-            && k.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
-    });
-    for fact in out.capabilities.values_mut() {
-        fact.observed_at = fact.observed_at.min(now);
-    }
-    out.rustc_wrapper = out.rustc_wrapper.as_ref().map(clip);
-    out.host_invariant_failures.truncate(16);
-    for f in &mut out.host_invariant_failures {
-        f.check = f
-            .check
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .take(40)
-            .collect();
-        f.detail = clip(&f.detail);
-    }
-    out.sccache_dir = out.sccache_dir.as_ref().map(clip);
-    if let Some(list) = &mut out.toolchains {
-        list.truncate(32);
-        for t in list {
-            t.channel = clip(&t.channel);
-            t.rustc_version = clip(&t.rustc_version);
-        }
-    }
-    // Only probe-list names, with bounded printable versions.
-    out.tools = out.tools.as_ref().map(|m| {
-        m.iter()
-            .filter(|(k, _)| crate::envcontract::PROBE_TOOLS.contains(&k.as_str()))
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    v.chars().filter(|c| !c.is_control()).take(80).collect(),
-                )
-            })
-            .collect()
-    });
-    out
-}
-
-/// At most one bid per key (the first), clamped, at most one per key overall.
-fn sanitize_bids(bids: &[DroneBid]) -> Vec<DroneBid> {
-    let mut out: Vec<DroneBid> = Vec::new();
-    for b in bids {
-        if !out.iter().any(|o| o.class == b.class && o.scope == b.scope) {
-            out.push(b.clamped());
-        }
-    }
-    out
-}
-
-/// A drone-reported version is shown in metric labels, so accept only short
-/// printable ASCII.
-fn sanitize_version(v: Option<&str>) -> Option<&str> {
-    v.filter(|v| !v.is_empty() && v.len() <= 64 && v.bytes().all(|b| b.is_ascii_graphic()))
 }
 
 /// One host cache as measured by its drone.
@@ -228,17 +170,6 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LeaseGrant {
-    pub lease_id: String,
-    pub class: Class,
-    pub scope: Scope,
-    pub labels: Vec<String>,
-    pub runner_name: String,
-    pub jit_config: Secret,
-    pub expires_at: i64,
-}
-
 /// A drone's report of an update it ran.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateReport {
@@ -254,6 +185,14 @@ pub struct HeartbeatResponse {
     /// Existing Queen disk floor; older Queens omit it and drones use 10 GiB.
     #[serde(default = "crate::envcontract::default_min_disk_free_bytes")]
     pub min_free_disk_bytes: u64,
+    /// The free space this drone's reclaim keeps: the largest disk floor of
+    /// the classes its hardware can host (`reclaim_floor_bytes` in
+    /// `envcontract`). Sent to a drone that is set up to take leases even while
+    /// it is not accepting them: a heavy host under the disk floor needs the
+    /// heavy floor most then. Absent for a reclaim-only drone and from older
+    /// queens; the drone then reclaims to `min_free_disk_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaim_floor_bytes: Option<u64>,
     pub leases: Vec<LeaseGrant>,
     /// Work units to run (resent until acknowledged in `active_units`).
     #[serde(default)]
@@ -288,24 +227,6 @@ pub struct HeartbeatResponse {
     /// memory only and never log it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror_credential: Option<crate::mirror_auth::MirrorCredential>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ResultRequest {
-    pub exit_code: i32,
-    pub duration_secs: u64,
-    #[serde(default)]
-    pub peak_rss_mib: Option<u64>,
-    /// Compact per-job summary; see [`crate::telemetry`] for the wire format.
-    #[serde(default)]
-    pub telemetry: Option<JobTelemetry>,
-    /// The drone stopped the job because the queen preempted the lease.
-    #[serde(default)]
-    pub preempted: bool,
-    /// Host load when the runner started and when it exited; see
-    /// [`crate::hostdiag`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) host: Option<LeaseHostReport>,
 }
 
 #[derive(Debug)]
@@ -669,18 +590,26 @@ async fn heartbeat(
     let drone = authenticate(&queen, &headers).await?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let store = queen.store();
-    let disk = crate::envcontract::disk_admission(
-        queen.config().env_contract.min_cache_dir_free_bytes,
+    let stored_facts = if req.env_facts.is_none() {
+        store.env_facts(&drone).await?
+    } else {
+        None
+    };
+    let disk = fresh_disk_admissions(
+        &queen.config().env_contract,
         req.capacity.free_disk_mib,
-        req.env_facts
-            .as_ref()
-            .filter(|facts| {
-                (0..=queen.config().env_contract.facts_max_age_secs)
-                    .contains(&(now - facts.observed_at))
-            })
-            .and_then(|facts| facts.cache_dir_free_bytes),
+        req.env_facts.as_ref().or(stored_facts.as_ref()),
+        now,
     );
-    let accepting = req.accepting && !disk.blocked();
+    let accepting = req.accepting && !disk.global.blocked();
+    store
+        .note_silence(
+            &drone,
+            now,
+            queen.started_at(),
+            queen.config().drone_stale_secs,
+        )
+        .await?;
     store
         .record_heartbeat(
             &drone,
@@ -692,20 +621,24 @@ async fn heartbeat(
         )
         .await?;
     store
-        .set_version(&drone, sanitize_version(req.version.as_deref()), now)
+        .set_version(&drone, sanitize::version(req.version.as_deref()), now)
         .await?;
     store.set_extra_labels(&drone, &req.extra_labels).await?;
     store.set_trust(&drone, req.trust).await?;
     store.set_runs_units(&drone, req.runs_units).await?;
-    store.set_bids(&drone, &sanitize_bids(&req.bids)).await?;
+    store.set_bids(&drone, &sanitize::bids(&req.bids)).await?;
     if let Some(facts) = &req.env_facts {
-        let facts = sanitize_facts(facts, now);
+        let facts = sanitize::facts(facts, now);
         queen.note_cpu_pressure(&drone, facts.observed_at, facts.cpu_psi_some_avg10_pm);
         store.set_env_facts(&drone, &facts).await?;
     }
     if let Some(stats) = &req.reclaim {
         store.record_reclaim(&drone, stats).await?;
     }
+    // A drone the rollout cordoned starts nothing new (leases, standbys or
+    // units) until it drains; what it runs finishes. Its own `accepting` is
+    // still what the store records.
+    let accepting = accepting && !queen.rollout_cordoned().contains(&drone);
     store.acknowledge(&drone, &req.active_leases).await?;
     store
         .promote_standby(
@@ -717,9 +650,12 @@ async fn heartbeat(
         .await?;
     let standby_rows = store.standby_leases(&drone).await?;
     let start = queen.snapshot().start_standby;
+    // No job reaches a drone inside its host-lost cool-down: not a new
+    // lease, not a standby, not a lease minted before it went quiet.
+    let grants = accepting && !store.drone_suspect(&drone, now).await?;
     let start_standby: Vec<String> = standby_rows
         .iter()
-        .filter(|l| accepting && start.contains(&l.id))
+        .filter(|l| grants && start.contains(&l.id) && !disk.classes[&l.class].blocked())
         .map(|l| l.id.clone())
         .collect();
     let drop_standby: Vec<String> = req
@@ -731,6 +667,7 @@ async fn heartbeat(
     let standby: Vec<LeaseGrant> = standby_rows
         .into_iter()
         .filter(|l| !req.held_standby.contains(&l.id))
+        .filter(|l| !disk.classes[&l.class].blocked())
         .filter_map(|l| {
             Some(LeaseGrant {
                 lease_id: l.id,
@@ -740,6 +677,13 @@ async fn heartbeat(
                 runner_name: l.runner_name,
                 jit_config: l.jit_config?,
                 expires_at: l.expires_at,
+                memory: lease_memory(&queen, l.class),
+                min_free_disk_bytes: Some(
+                    queen
+                        .config()
+                        .env_contract
+                        .min_cache_dir_free_bytes_for(l.class),
+                ),
             })
         })
         .collect();
@@ -758,7 +702,7 @@ async fn heartbeat(
             .unacked_units(&drone)
             .await?
             .into_iter()
-            .filter(|_| accepting)
+            .filter(|u| accepting && !disk.classes[&u.class].blocked())
             .map(|u| UnitGrant {
                 unit_id: u.id,
                 repo: u.repo,
@@ -775,11 +719,13 @@ async fn heartbeat(
     } else {
         (Vec::new(), Vec::new())
     };
+    let mut disk_left = req.capacity.free_disk_mib;
     let leases = store
         .undelivered(&drone)
         .await?
         .into_iter()
-        .filter(|_| accepting)
+        .filter(|l| grants && !disk.classes[&l.class].blocked())
+        .filter(|l| handoff::fits(&mut disk_left, &l.labels))
         .filter_map(|l| {
             Some(LeaseGrant {
                 lease_id: l.id,
@@ -789,6 +735,8 @@ async fn heartbeat(
                 runner_name: l.runner_name,
                 jit_config: l.jit_config?,
                 expires_at: l.expires_at,
+                min_free_disk_bytes: None,
+                memory: lease_memory(&queen, l.class),
             })
         })
         .collect();
@@ -804,6 +752,20 @@ async fn heartbeat(
     };
     Ok(Json(HeartbeatResponse {
         min_free_disk_bytes: queen.config().env_contract.min_cache_dir_free_bytes,
+        reclaim_floor_bytes: req.takes_leases.unwrap_or(req.accepting).then(|| {
+            let cfg = queen.config();
+            let mut state = DroneState::from_capacity(drone.clone(), &req.capacity, &req.caps);
+            // An installed Docker whose daemon is down is an outage, not a host
+            // without Docker: the host still hosts its Docker classes for reclaim.
+            state.docker |= req.env_facts.as_ref().is_some_and(|facts| {
+                facts
+                    .host_invariant_failures
+                    .iter()
+                    .any(|failure| failure.check == "docker_daemon")
+            });
+            cfg.env_contract
+                .reclaim_floor_bytes(|class| max_slots(&state, cfg.classes.spec(class)) > 0)
+        }),
         leases,
         units,
         cancel_units,
@@ -822,6 +784,13 @@ async fn heartbeat(
     }))
 }
 
+/// The memory limit a lease of `class` runs under, if limits are on.
+fn lease_memory(queen: &Queen, class: Class) -> Option<crate::drone::memlimit::LeaseMemory> {
+    let cfg = queen.config();
+    let mem = cfg.classes.spec(class).mem_mib;
+    cfg.lease_memory.as_ref().map(|m| m.limit(mem))
+}
+
 async fn lease_result(
     State(queen): State<Arc<Queen>>,
     headers: HeaderMap,
@@ -833,13 +802,35 @@ async fn lease_result(
         exit_code: req.exit_code,
         duration_secs: req.duration_secs,
         peak_rss_mib: req.peak_rss_mib,
+        oom_killed: req.oom_killed,
     };
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    if queen
+    let finish = queen
         .store()
         .finish_lease(&id, &drone, &result, now)
-        .await?
-    {
+        .await?;
+    if finish.owned() {
+        // Only the result that ended the lease records the kill: a drone
+        // retries a result whose response it lost.
+        if result.oom_killed && finish == Finish::Ended {
+            // The job outgrew its memory limit and was killed alone: its own
+            // outcome, recorded for the fleet, never a host failure.
+            let reason = format!("lease {id}: a job process was OOM-killed at its memory limit");
+            queen
+                .store()
+                .record_health_event(now, &drone, "oom_killed", &reason)
+                .await?;
+        }
+        // A drone that reports its lease's result was not lost, whether or
+        // not the rerunner already decided the record.
+        if queen.store().withdraw_host_lost(&id, now).await? {
+            let cooldown =
+                i64::try_from(queen.config().host_lost.suspect_cooldown_secs).unwrap_or(i64::MAX);
+            queen
+                .store()
+                .clear_suspect(&drone, &id, now.saturating_sub(cooldown))
+                .await?;
+        }
         if let Some(lease) = queen.store().lease(&id).await?
             && let Err(e) = queen
                 .store()
@@ -880,8 +871,15 @@ pub struct ClassStatus {
     /// capacity, not what is free).
     pub slots: u32,
     /// Leases of this class that fit right now: capacity minus every active
-    /// lease, on drones that are fresh and take new leases.
+    /// lease, on drones that are fresh and take new leases. Whatever the
+    /// scope: it counts deploy-only drones and drones CPU pressure has closed
+    /// to pull requests, so queued main or pull-request jobs can wait while
+    /// this is above zero. `free_slots_by_scope` is what a job can use.
     pub free_slots: u32,
+    /// `free_slots` a job of each scope could be placed on: only drones whose
+    /// trust admits the scope and whose admission state at the last pass
+    /// takes this class and scope.
+    pub free_slots_by_scope: BTreeMap<Scope, u32>,
     pub demand_deploy: ScopeDemand,
     pub demand_main: ScopeDemand,
     pub demand_pr: ScopeDemand,
@@ -949,6 +947,8 @@ pub struct DroneStatus {
     pub accepting: bool,
     /// Enforced independently of the optional environment contract.
     pub disk_admission: crate::envcontract::DiskAdmission,
+    /// Per-class disk admission, independent of the optional environment contract.
+    pub class_disk_admission: BTreeMap<Class, crate::envcontract::DiskAdmission>,
     /// `shared` or `deploy`: which scopes the drone may run.
     pub trust: Trust,
     /// The drone runs work units; only such drones are given one.
@@ -1021,6 +1021,20 @@ pub struct CapacityStatus {
     /// Free slots on drones that admit every scope of the class, after the
     /// last pass's grants: the room `capacity_starved` judges.
     admitting_free_slots: u32,
+}
+
+/// Free slots of `class` on the drones a job of `scope` can be placed on.
+fn usable_free_slots(drones: &[DroneStatus], class: Class, scope: Scope) -> u32 {
+    drones
+        .iter()
+        .filter(|d| d.trust.admits(scope))
+        .filter(|d| {
+            d.admission
+                .as_ref()
+                .is_none_or(|a| a.state.admits(class, scope))
+        })
+        .map(|d| d.free_slots.get(&class).copied().unwrap_or(0))
+        .sum()
 }
 
 /// What CPU pressure currently lets this drone take.
@@ -1128,6 +1142,8 @@ pub struct Status {
     /// Present when preempted jobs are re-run (preemption and the janitor
     /// are both configured).
     pub requeue: Option<crate::requeue::RequeueView>,
+    /// Automatic reruns of jobs whose runner host was lost.
+    pub host_lost: Option<crate::hostlost::HostLostView>,
     /// The newest quarantine and health audit entries.
     pub health_events: Vec<crate::store::HealthLogRow>,
     /// The newest leases cancelled for higher-priority demand.
@@ -1244,12 +1260,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
 
     let mut held: Vec<ActiveLease> = active
         .iter()
-        .map(|l| ActiveLease {
-            drone_id: l.drone.clone(),
-            class: l.class,
-            scope: l.scope,
-            state: LeaseState::Running,
-        })
+        .map(|l| ActiveLease::running(l.drone.clone(), l.class, l.scope))
         .collect();
     // Placed work units hold capacity like running leases.
     if cfg.units.enabled {
@@ -1260,12 +1271,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             .await?
         {
             if let Some(drone_id) = u.drone {
-                held.push(ActiveLease {
-                    drone_id,
-                    class: u.class,
-                    scope: Scope::Pr,
-                    state: LeaseState::Running,
-                });
+                held.push(ActiveLease::running(drone_id, u.class, Scope::Pr));
             }
         }
     }
@@ -1275,32 +1281,30 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
     for d in &rows {
         let age = d.last_heartbeat.map(|t| now - t);
         let fresh = age.is_some_and(|a| a <= cfg.drone_stale_secs);
-        let disk = crate::envcontract::disk_admission(
-            cfg.env_contract.min_cache_dir_free_bytes,
+        let disk = fresh_disk_admissions(
+            &cfg.env_contract,
             d.capacity
                 .as_ref()
                 .filter(|_| fresh)
                 .and_then(|cap| cap.free_disk_mib),
-            d.env_facts
-                .as_ref()
-                .filter(|facts| {
-                    (0..=cfg.env_contract.facts_max_age_secs).contains(&(now - facts.observed_at))
-                })
-                .and_then(|facts| facts.cache_dir_free_bytes),
+            d.env_facts.as_ref(),
+            now,
         );
         let mut budget = None;
         let mut free_slots_here = BTreeMap::new();
         let mut theoretical_here = BTreeMap::new();
         if let (true, Some(cap)) = (fresh, &d.capacity) {
             let mut state = d.allocator_state(cap, now);
-            state.accepting &= !disk.blocked();
-            state.blocked_classes = blocked_classes(
+            state.accepting &= !disk.global.blocked();
+            let mut blocked = blocked_classes(
                 &cfg.env_contract,
                 d.env_facts.as_ref(),
                 &cfg.classes,
                 None,
                 now,
             );
+            merge_blocked_classes(&mut blocked, disk.blocked_classes.iter().copied());
+            state.blocked_classes = blocked;
             let room = free_room(&state, &held, &cfg.classes);
             for class in Class::ALL {
                 let spec = cfg.classes.spec(class);
@@ -1312,7 +1316,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
                 free_slots_here.insert(class, free);
                 theoretical_here.insert(
                     class,
-                    if state.accepting {
+                    if state.accepting && !state.blocked_classes.contains(&class) {
                         max_slots(&state, spec)
                     } else {
                         0
@@ -1341,8 +1345,9 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
                 }
                 _ => None,
             },
-            accepting: d.accepting && !disk.blocked(),
-            disk_admission: disk,
+            accepting: d.accepting && !disk.global.blocked(),
+            disk_admission: disk.global,
+            class_disk_admission: disk.classes,
             trust: d.trust,
             runs_units: d.runs_units,
             hostname: d.capacity.as_ref().map(|c| c.hostname.clone()),
@@ -1469,6 +1474,10 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
                 oldest_age_secs_pr: entry(Scope::Pr).map_or(0, |q| q.oldest_age_secs),
                 slots: slots.get(&class).copied().unwrap_or(0),
                 free_slots: free_by_class.get(&class).copied().unwrap_or(0),
+                free_slots_by_scope: Scope::ALL
+                    .into_iter()
+                    .map(|scope| (scope, usable_free_slots(&drones, class, scope)))
+                    .collect(),
                 demand_deploy: scope_demand(&snap, cfg, class, Scope::Deploy),
                 demand_main: scope_demand(&snap, cfg, class, Scope::Main),
                 demand_pr: scope_demand(&snap, cfg, class, Scope::Pr),
@@ -1566,6 +1575,9 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             crate::mirror_auth::MirrorAuth::view,
         ),
         requeue: queen.requeuer().map(crate::requeue::Requeuer::view),
+        host_lost: queen
+            .host_lost()
+            .map(crate::hostlost::HostLostRerunner::view),
         reclaim: ReclaimSummary {
             reclaimed_bytes_logged: queen.store().reclaim_bytes_logged().await?,
             events: queen.store().reclaim_log(20).await?,
@@ -1596,8 +1608,13 @@ async fn report(
         .store()
         .telemetry_since(now - window, MAX_REPORT_ROWS)
         .await?;
+    let lost = queen
+        .store()
+        .host_lost_since(now - window, MAX_REPORT_ROWS)
+        .await?;
     Ok(Json(build_report(
         &rows,
+        &lost,
         now,
         window,
         q.limit.unwrap_or(20).min(500),
@@ -1770,6 +1787,22 @@ pub fn render_metrics(status: &Status) -> String {
             .classes
             .iter()
             .map(|(c, s)| (format!("class=\"{c}\""), f64::from(s.free_slots)))
+            .collect(),
+    );
+    gauge(
+        "borg_class_free_slots_usable",
+        "Free slots of a class on drones that take the scope (trust and CPU-pressure admission).",
+        status
+            .classes
+            .iter()
+            .flat_map(|(c, s)| {
+                s.free_slots_by_scope.iter().map(move |(scope, n)| {
+                    (
+                        format!("class=\"{c}\",scope=\"{}\"", scope.as_str()),
+                        f64::from(*n),
+                    )
+                })
+            })
             .collect(),
     );
     gauge(
@@ -2625,6 +2658,11 @@ pub fn render_metrics(status: &Status) -> String {
                 t.started_push,
             ),
             (
+                "awaiting_verdicts",
+                "Red superseded push runs kept until their verdict jobs finish",
+                t.awaiting_verdicts,
+            ),
+            (
                 "raced",
                 "Runs that changed state before the janitor cancelled them",
                 t.raced,
@@ -2714,6 +2752,9 @@ pub fn render_metrics(status: &Status) -> String {
                 vec![(String::new(), f64::from(v))],
             );
         }
+    }
+    for (name, help, v) in status.host_lost.iter().flat_map(|h| h.metrics()) {
+        gauge(&name, &help, vec![(String::new(), f64::from(v))]);
     }
     gauge(
         "borg_reservations",
@@ -2879,6 +2920,7 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let stop_rx_janitor = stop_rx.clone();
+    let stop_rx_host_lost = stop_rx.clone();
     let ticker = {
         let queen = Arc::clone(&queen);
         tokio::spawn(async move {
@@ -2904,6 +2946,7 @@ pub async fn serve(
             }
         })
     };
+    let host_lost_task = crate::hostlost::spawn_passes(Arc::clone(&queen), stop_rx_host_lost);
     let janitor_task = queen.janitor().map(|_| {
         let queen = Arc::clone(&queen);
         let mut stop_rx = stop_rx_janitor;
@@ -2943,6 +2986,9 @@ pub async fn serve(
     .await;
     let _ = ticker.await;
     if let Some(task) = janitor_task {
+        let _ = task.await;
+    }
+    if let Some(task) = host_lost_task {
         let _ = task.await;
     }
     served

@@ -220,6 +220,9 @@ pub fn render_systemd_unit(
          # SIGTERM goes to the drone only, so in-flight jobs can finish while it\n\
          # drains; leftovers are killed once the drone exits.\n\
          KillMode=mixed\n\
+         # Hand the drone its cgroup subtree: each lease runs in a child cgroup\n\
+         # with its own memory limit (drone/memlimit.rs).\n\
+         Delegate=yes\n\
          TimeoutStopSec={stop}\n\
          \n\
          [Install]\n\
@@ -840,6 +843,7 @@ impl Installer<'_> {
             .and_then(|v| v.get("reclaim").cloned())
             .and_then(|r| serde_json::from_value::<crate::reclaim::ReclaimSettings>(r).ok())
             .filter(|r| !r.is_legacy_default())
+            .map(crate::reclaim::ReclaimSettings::upgraded)
             .unwrap_or_else(|| {
                 if accept_leases {
                     crate::reclaim::ReclaimSettings::default()

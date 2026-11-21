@@ -253,6 +253,13 @@ fn own_cgroup(host: &dyn Host) -> Option<std::path::PathBuf> {
     if rel.contains("..") {
         return None;
     }
+    // A drone with lease memory limits lives in a `drone` leaf beside its
+    // lease cgroups (see drone::memlimit); the service cgroup above holds
+    // them all, so the drone's CPU figures include its jobs as before.
+    let rel = rel
+        .strip_suffix(crate::drone::memlimit::DRONE_LEAF)
+        .and_then(|r| r.strip_suffix('/'))
+        .unwrap_or(rel);
     Some(Path::new("/sys/fs/cgroup").join(rel))
 }
 
@@ -802,6 +809,15 @@ mod tests {
         assert_eq!(own_cgroup(&h), None);
         h.files.insert("/proc/self/cgroup".into(), "0::/\n".into());
         assert_eq!(own_cgroup(&h), Some(Path::new("/sys/fs/cgroup").into()));
+        // The drone's leaf reads as its service cgroup, which holds the leases.
+        h.files.insert(
+            "/proc/self/cgroup".into(),
+            "0::/system.slice/borg-drone.service/drone\n".into(),
+        );
+        assert_eq!(
+            own_cgroup(&h),
+            Some(Path::new("/sys/fs/cgroup/system.slice/borg-drone.service").into())
+        );
     }
 
     #[test]
@@ -908,6 +924,7 @@ mod tests {
             exit_code: 1,
             duration_secs: 90,
             peak_rss_mib: None,
+            oom_killed: false,
         };
         let start = HostSample {
             at: 110,
