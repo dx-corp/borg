@@ -141,6 +141,10 @@ pub struct Drone {
     credwipe: Option<Arc<credwipe::CredWiper>>,
     /// Per-lease memory cgroups; `None` without a delegated cgroup v2 tree.
     cgroups: Option<Arc<memlimit::LeaseCgroups>>,
+    /// Launch order and OOM scores of the running leases.
+    oom_order: Arc<memlimit::OomOrder>,
+    /// Leases the host memory guard killed, reported as OOM-killed.
+    guard_killed: Arc<Mutex<HashSet<String>>>,
     /// The version reported to the queen, with the binary's hash once
     /// measured (see `selfupdate::running_build_version`).
     reported_version: Arc<std::sync::OnceLock<String>>,
@@ -223,6 +227,8 @@ impl Drone {
             reclaimer,
             credwipe,
             cgroups: None,
+            oom_order: Arc::default(),
+            guard_killed: Arc::default(),
             reported_version: Arc::default(),
             client: Arc::new(client),
             host,
@@ -628,6 +634,8 @@ impl Drone {
             credwipe: self.credwipe.clone(),
             reclaimer: self.reclaimer.clone(),
             cgroups: self.cgroups.clone(),
+            oom_order: Arc::clone(&self.oom_order),
+            guard_killed: Arc::clone(&self.guard_killed),
             slot,
             held,
         })
@@ -658,6 +666,51 @@ impl Drone {
     /// `host_invariants.interval_secs`, or a minute after a probe that failed
     /// (`invariants::next_probe_delay`); heartbeats use the latest result, so
     /// the drone takes no lease from a failed probe until one passes.
+    /// With `host_memory_guard_mib`, kill the newest lease's cgroup whenever
+    /// the host's available memory falls below it, so an older job with more
+    /// work to lose, the drone and the host's services never meet the kernel
+    /// OOM killer, which would weigh memory use over age.
+    fn spawn_memory_guard(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let floor = self.cfg.host_memory_guard_mib?;
+        let Some(cgroups) = self.cgroups.clone() else {
+            tracing::warn!(
+                "host_memory_guard_mib is set but leases have no cgroups; the guard is off"
+            );
+            return None;
+        };
+        let (order, killed, meminfo) = (
+            Arc::clone(&self.oom_order),
+            Arc::clone(&self.guard_killed),
+            self.proc_root.join("meminfo"),
+        );
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(GUARD_EVERY).await;
+                let Some(available) = std::fs::read_to_string(&meminfo)
+                    .ok()
+                    .and_then(|m| memlimit::mem_available_mib(&m))
+                else {
+                    continue;
+                };
+                let Some(victim) = guard_victim(available, floor, &order) else {
+                    continue;
+                };
+                if cgroups.kill(&victim) {
+                    tracing::warn!(
+                        "host memory guard: {available} MiB available, below {floor} MiB; killed the newest lease {victim}"
+                    );
+                    if let Ok(mut k) = killed.lock() {
+                        k.insert(victim.clone());
+                    }
+                    // A killed lease frees its memory as it exits; do not
+                    // take a second one before that shows.
+                    order.release(&victim);
+                    tokio::time::sleep(GUARD_COOLDOWN).await;
+                }
+            }
+        }))
+    }
+
     fn spawn_network_probe(&self) -> Option<tokio::task::JoinHandle<()>> {
         let s = self.cfg.host_invariants.clone();
         if !s.enabled || !s.container_network {
@@ -811,6 +864,7 @@ impl Drone {
         let cache_background = self.caches.spawn_background();
         let reclaim_background = self.reclaimer.as_ref().map(reclaim::Reclaimer::spawn);
         let network_background = self.spawn_network_probe();
+        let guard_background = self.spawn_memory_guard();
         let held = Arc::clone(&self.held);
         let credwipe_background = self
             .credwipe
@@ -885,7 +939,23 @@ impl Drone {
         if let Some(n) = network_background {
             n.abort();
         }
+        if let Some(g) = guard_background {
+            g.abort();
+        }
     }
+}
+
+/// How often the host memory guard reads `/proc/meminfo`.
+const GUARD_EVERY: Duration = Duration::from_secs(1);
+/// After a kill, how long the guard waits for the memory to come back.
+const GUARD_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// The lease the host memory guard kills when `available_mib` is below
+/// `floor_mib`: the newest running one.
+fn guard_victim(available_mib: u64, floor_mib: u64, order: &memlimit::OomOrder) -> Option<String> {
+    (available_mib < floor_mib)
+        .then(|| order.newest())
+        .flatten()
 }
 
 struct LeaseContext {
@@ -903,6 +973,8 @@ struct LeaseContext {
     credwipe: Option<Arc<credwipe::CredWiper>>,
     reclaimer: Option<Arc<reclaim::Reclaimer>>,
     cgroups: Option<Arc<memlimit::LeaseCgroups>>,
+    oom_order: Arc<memlimit::OomOrder>,
+    guard_killed: Arc<Mutex<HashSet<String>>>,
     /// Dropped before `held`, so the slot is free whenever the id is.
     slot: SlotGuard,
     held: HeldGuard,
@@ -1005,6 +1077,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         proc_root: &ctx.proc_root,
         cgroups: ctx.cgroups.as_deref(),
         memory: grant.memory,
+        oom_score: Some(ctx.oom_order.assign(&grant.lease_id)),
     };
     let host_start = sample_host(&ctx).await;
     let outcome = run_lease(
@@ -1016,6 +1089,11 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     )
     .await;
     let host_end = sample_host(&ctx).await;
+    ctx.oom_order.release(&grant.lease_id);
+    let guard_killed = ctx
+        .guard_killed
+        .lock()
+        .is_ok_and(|mut k| k.remove(&grant.lease_id));
     if let Some(r) = &ctx.reclaimer {
         r.note_slot_use(slot).await;
     }
@@ -1041,7 +1119,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
             peak_rss_mib: o.peak_rss_mib,
             telemetry: None,
             preempted: o.preempted,
-            oom_killed: o.oom_killed,
+            oom_killed: o.oom_killed || guard_killed,
             host,
         },
         Err(e) => {
@@ -1123,6 +1201,18 @@ fn fail_open_floor(grant: &LeaseGrant, global: u64) -> u64 {
 #[cfg(test)]
 mod disk_tests {
     use super::*;
+
+    #[test]
+    fn the_memory_guard_takes_the_newest_lease_only_below_its_floor() {
+        let order = memlimit::OomOrder::default();
+        assert_eq!(guard_victim(100, 4096, &order), None, "nothing running");
+        order.assign("old");
+        order.assign("new");
+        assert_eq!(guard_victim(8192, 4096, &order), None, "above the floor");
+        assert_eq!(guard_victim(4000, 4096, &order).as_deref(), Some("new"));
+        order.release("new");
+        assert_eq!(guard_victim(4000, 4096, &order).as_deref(), Some("old"));
+    }
     use crate::classes::{Class, Scope as JobScope};
     use crate::drone::exec::Output;
     use crate::secret::Secret;

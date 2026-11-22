@@ -73,6 +73,10 @@ pub struct RunSpec<'a> {
     /// lease's memory limit from its grant. Both are needed for a limit.
     pub cgroups: Option<&'a LeaseCgroups>,
     pub memory: Option<LeaseMemory>,
+    /// The lease's `oom_score_adj` from [`crate::drone::memlimit::OomOrder`];
+    /// applied with or without a cgroup, so a job never inherits a protective
+    /// score from the drone's unit.
+    pub oom_score: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,18 +228,27 @@ pub async fn run_lease(
     };
     // The job runs inside its own memory-limited cgroup when the drone can
     // make one; otherwise without a limit, as before.
+    let score = spec
+        .oom_score
+        .unwrap_or(crate::drone::memlimit::LEASE_OOM_BASE);
     let cgroup = match (spec.cgroups, spec.memory) {
-        (Some(cgroups), Some(limit)) => match cgroups.create(spec.lease_id, limit) {
-            Ok(cgroup) => {
-                (program, leading) = cgroup.wrap(&program, &leading);
-                Some(cgroup)
-            }
+        (Some(cgroups), Some(limit)) => match cgroups.create(spec.lease_id, limit, score) {
+            Ok(cgroup) => Some(cgroup),
             Err(e) => {
                 tracing::warn!("lease {}: no memory limit: {e}", spec.lease_id);
                 None
             }
         },
         _ => None,
+    };
+    (program, leading) = match &cgroup {
+        Some(cgroup) => cgroup.wrap(&program, &leading),
+        None => crate::drone::memlimit::score_wrap(
+            &program,
+            &leading,
+            score,
+            &spec.proc_root.join("self/oom_score_adj"),
+        ),
     };
     #[allow(
         clippy::disallowed_methods,
@@ -424,6 +437,7 @@ mod tests {
             proc_root: Path::new("/proc"),
             cgroups: None,
             memory: None,
+            oom_score: None,
         };
         let (_ptx, prx) = tokio::sync::watch::channel(false);
         let out = run_lease(
@@ -545,6 +559,7 @@ mod tests {
             proc_root: Path::new("/proc"),
             cgroups: None,
             memory: None,
+            oom_score: None,
         };
         let (_ptx, prx) = tokio::sync::watch::channel(false);
         let abort = tokio::spawn(async move {
@@ -588,6 +603,7 @@ mod tests {
             proc_root: Path::new("/proc"),
             cgroups: None,
             memory: None,
+            oom_score: None,
         };
         let stop = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -629,6 +645,7 @@ mod tests {
             proc_root: Path::new("/proc"),
             cgroups: None,
             memory: None,
+            oom_score: None,
         };
         let (_ptx, prx) = tokio::sync::watch::channel(false);
         assert!(
@@ -719,6 +736,7 @@ mod tests {
                 max_bytes: 30 << 30,
                 high_bytes: 27 << 30,
             }),
+            oom_score: Some(125),
         };
         let out = run_lease(
             &spec,

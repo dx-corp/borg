@@ -882,6 +882,10 @@ impl Installer<'_> {
             max_mem_mib: o.max_mem_mib,
             max_leases: o.max_leases,
             reserve_mem_mib: crate::allocator::HostCaps::default().reserve_mem_mib,
+            host_memory_guard_mib: on_disk
+                .as_ref()
+                .and_then(|v| v.get("host_memory_guard_mib"))
+                .and_then(serde_json::Value::as_u64),
             host_metrics_url: None,
             slots: None,
             state_dir: Some(self.layout.data.clone()),

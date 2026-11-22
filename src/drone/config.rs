@@ -242,6 +242,12 @@ pub struct DroneConfig {
     pub max_leases: Option<u32>,
     #[serde(default = "default_reserve")]
     pub reserve_mem_mib: u64,
+    /// Kill the newest lease's cgroup whenever the host's available memory
+    /// falls below this (MiB), before earlyoom or the kernel OOM killer, which
+    /// weigh memory use over age, pick a victim. Off when unset; needs lease
+    /// cgroups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_guard_mib: Option<u64>,
     /// The node's Prometheus `node_exporter` (`http://<node>:9100/metrics`)
     /// for a drone in a container, which lxcfs keeps from seeing the node's
     /// memory and pressure. Older drones can still read the config when this
@@ -376,6 +382,9 @@ impl DroneConfig {
         }
         if self.preempt_grace_secs == 0 {
             return bad("preempt_grace_secs must be positive");
+        }
+        if self.host_memory_guard_mib == Some(0) {
+            return bad("host_memory_guard_mib must be positive when set");
         }
         if self.max_vcpu == Some(0) || self.max_mem_mib == Some(0) || self.max_leases == Some(0) {
             return bad("owner caps must be positive when set");
