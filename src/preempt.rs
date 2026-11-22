@@ -124,7 +124,7 @@ fn frees_room_for(
     // A running victim's writes are already in the free reading, so ending
     // it frees no promised disk: a disk shortage is never cancelled away.
     !drone.blocked_classes.contains(&class)
-        && free_slots(drone, &room, input.classes.spec(class)) > 0
+        && free_slots(drone, &room, class, input.classes.spec(class)) > 0
         && drone.disk_admits(&rest, class)
 }
 
@@ -248,6 +248,7 @@ mod tests {
             docker: true,
             accepting: true,
             max_leases: None,
+            class_caps: std::collections::BTreeMap::new(),
             bids: Vec::new(),
             profiles: Vec::new(),
             blocked_classes: Vec::new(),

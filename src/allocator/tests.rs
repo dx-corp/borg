@@ -9,6 +9,7 @@ fn host(id: &str) -> DroneState {
         docker: true,
         accepting: true,
         max_leases: None,
+        class_caps: BTreeMap::new(),
         bids: vec![],
         profiles: vec![],
         blocked_classes: vec![],
@@ -276,24 +277,32 @@ fn free_room_and_slots_subtract_what_the_drone_already_holds() {
     assert_eq!(room.vcpu, d.vcpu - heavy.vcpu);
     // Theoretical: one heavy fits an empty host; with one held, none do.
     let empty = free_room(&d, &[], &classes);
-    assert_eq!(free_slots(&d, &empty, heavy), max_slots(&d, heavy));
-    assert_eq!(free_slots(&d, &room, heavy), 0);
-    assert!(free_slots(&d, &room, classes.spec(Class::Light)) > 0);
+    assert_eq!(
+        free_slots(&d, &empty, Class::Heavy, heavy),
+        max_slots(&d, Class::Heavy, heavy)
+    );
+    assert_eq!(free_slots(&d, &room, Class::Heavy, heavy), 0);
+    assert!(free_slots(&d, &room, Class::Light, classes.spec(Class::Light)) > 0);
     // A draining drone and a docker-less one have no free slots.
     let draining = DroneState {
         accepting: false,
         ..host("c")
     };
-    assert_eq!(free_slots(&draining, &empty, heavy), 0);
+    assert_eq!(free_slots(&draining, &empty, Class::Heavy, heavy), 0);
     let nodocker = DroneState {
         docker: false,
         ..host("e")
     };
     assert_eq!(
-        free_slots(&nodocker, &empty, classes.spec(Class::Medium)),
+        free_slots(
+            &nodocker,
+            &empty,
+            Class::Medium,
+            classes.spec(Class::Medium)
+        ),
         0
     );
-    assert!(free_slots(&nodocker, &empty, classes.spec(Class::Light)) > 0);
+    assert!(free_slots(&nodocker, &empty, Class::Light, classes.spec(Class::Light)) > 0);
     // The lease cap counts too.
     let capped = DroneState {
         max_leases: Some(1),
@@ -304,6 +313,7 @@ fn free_room_and_slots_subtract_what_the_drone_already_holds() {
         free_slots(
             &capped,
             &free_room(&capped, &one, &classes),
+            Class::Light,
             classes.spec(Class::Light)
         ),
         0
@@ -1009,6 +1019,7 @@ fn never_over_grants_across_a_demand_sweep() {
             docker: false,
             accepting: true,
             max_leases: Some(2),
+            class_caps: BTreeMap::new(),
             bids: vec![],
             profiles: vec![],
             blocked_classes: vec![],
@@ -1027,6 +1038,7 @@ fn never_over_grants_across_a_demand_sweep() {
             docker: true,
             accepting: true,
             max_leases: None,
+            class_caps: BTreeMap::new(),
             bids: vec![],
             profiles: vec![],
             blocked_classes: vec![],
@@ -1339,7 +1351,7 @@ fn without_a_cost_a_faster_burst_drone_takes_work_from_an_idle_owned_host() {
 fn a_costed_burst_drone_gets_only_what_owned_hosts_have_no_room_for() {
     for class in Class::ALL {
         let owned = profiled("build-heavy-1", class, 500, 1000, 1000);
-        let slots = max_slots(&owned, Classes::default().spec(class));
+        let slots = max_slots(&owned, class, Classes::default().spec(class));
         let i = input(
             &[(class, Scope::Main, slots + 2)],
             vec![owned, burst("gcp-burst-a", class, 5000)],
@@ -2850,4 +2862,135 @@ fn a_drone_without_a_disk_reading_or_floors_places_as_before() {
     e.disk_floor_mib.clear();
     let b = allocate(&input(&[(Class::Heavy, Scope::Main, 5)], vec![e]));
     assert_eq!(count(&b, Class::Heavy, Scope::Main), 4);
+}
+
+#[test]
+fn a_class_cap_holds_heavy_and_lends_the_rest_to_light() {
+    // Memory and CPU alone would hold five heavy (24 GiB, 8 vCPU) leases.
+    let d = DroneState {
+        mem_mib: 120 * 1024,
+        vcpu: 40,
+        class_caps: BTreeMap::from([(Class::Heavy, 2)]),
+        ..host("big")
+    };
+    let classes = Classes::default();
+    let heavy = classes.spec(Class::Heavy);
+    let light = classes.spec(Class::Light);
+    assert_eq!(max_slots(&d, Class::Heavy, heavy), 2);
+    assert_eq!(max_slots(&d, Class::Light, light), 20);
+
+    // Waiting heavy work does not hold the rest of the host once the cap is
+    // reached: light fills what two heavy leave (24 vCPU / 2 = 12).
+    let i = input(
+        &[
+            (Class::Heavy, Scope::Main, 5),
+            (Class::Light, Scope::Pr, 40),
+        ],
+        vec![d.clone()],
+    );
+    let a = allocate(&i);
+    let count = |c: Class| a.grants.iter().filter(|g| g.class == c).count();
+    assert_eq!(count(Class::Heavy), 2);
+    assert_eq!(count(Class::Light), 12);
+    assert_within_budget(&i, &a);
+
+    // Two heavy running: no third, however much room is left.
+    let held = vec![
+        lease("big", Class::Heavy, Scope::Main, LeaseState::Running),
+        lease("big", Class::Heavy, Scope::Pr, LeaseState::Running),
+    ];
+    let room = free_room(&d, &held, &classes);
+    assert_eq!(room.class_left.get(&Class::Heavy), Some(&0));
+    assert_eq!(free_slots(&d, &room, Class::Heavy, heavy), 0);
+    assert!(free_slots(&d, &room, Class::Light, light) > 0);
+    let mut i = input(&[(Class::Heavy, Scope::Main, 3)], vec![d.clone()]);
+    i.leases = held;
+    let a = allocate(&i);
+    assert!(a.grants.is_empty());
+    assert!(
+        a.decisions
+            .iter()
+            .flat_map(|dec| &dec.candidates)
+            .any(|c| c.rejection_reasons.contains(&Rejection::ClassCap)),
+        "the explanation names the class cap"
+    );
+
+    // A cap of zero means never that class.
+    let none = DroneState {
+        class_caps: BTreeMap::from([(Class::Heavy, 0)]),
+        ..d
+    };
+    assert_eq!(max_slots(&none, Class::Heavy, heavy), 0);
+    assert!(
+        allocate(&input(&[(Class::Heavy, Scope::Main, 1)], vec![none]))
+            .grants
+            .is_empty()
+    );
+}
+
+#[test]
+fn starvation_never_reserves_a_drone_at_its_class_cap() {
+    let d = DroneState {
+        mem_mib: 120 * 1024,
+        vcpu: 40,
+        class_caps: BTreeMap::from([(Class::Heavy, 2)]),
+        ..host("big")
+    };
+    let mut i = input(
+        &[(Class::Heavy, Scope::Main, 1), (Class::Light, Scope::Pr, 4)],
+        vec![d],
+    );
+    i.leases = vec![
+        lease("big", Class::Heavy, Scope::Main, LeaseState::Running),
+        lease("big", Class::Heavy, Scope::Main, LeaseState::Running),
+    ];
+    // The heavy job has waited past the starvation threshold.
+    i.starvation_after_secs = Some(120);
+    i.queue_ages = vec![QueueAge {
+        class: Class::Heavy,
+        scope: Scope::Main,
+        oldest_age_secs: 900,
+    }];
+    let a = allocate(&i);
+    assert!(a.reserved_for.is_empty(), "{:?}", a.reserved_for);
+    assert_eq!(
+        a.grants.iter().filter(|g| g.class == Class::Light).count(),
+        4
+    );
+}
+
+#[test]
+fn caps_reach_the_allocator_from_the_host_caps() {
+    let caps = HostCaps {
+        max_class_leases: BTreeMap::from([(Class::Heavy, 3)]),
+        ..HostCaps::default()
+    };
+    let capacity = Capacity {
+        hostname: "h".into(),
+        os: "linux".into(),
+        arch: "x86_64".into(),
+        kind: crate::probe::HostKind::Wsl,
+        vcpu: 32,
+        mem_mib: 128 * 1024,
+        free_disk_mib: None,
+        docker_usable: true,
+        mise_version: None,
+        git_version: None,
+    };
+    let d = DroneState::from_capacity("h", &capacity, &caps);
+    assert_eq!(d.class_cap(Class::Heavy), Some(3));
+    assert_eq!(d.class_cap(Class::Light), None);
+}
+
+#[test]
+fn class_caps_round_trip_and_stay_off_the_wire_when_unset() {
+    let caps = HostCaps {
+        max_class_leases: BTreeMap::from([(Class::Heavy, 3)]),
+        ..HostCaps::default()
+    };
+    let json = serde_json::to_value(&caps).unwrap();
+    assert_eq!(json["max_class_leases"]["heavy"], 3);
+    assert_eq!(serde_json::from_value::<HostCaps>(json).unwrap(), caps);
+    let plain = serde_json::to_value(HostCaps::default()).unwrap();
+    assert!(plain.get("max_class_leases").is_none(), "{plain}");
 }

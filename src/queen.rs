@@ -1309,7 +1309,7 @@ impl Queen {
                 let spec = self.cfg.classes.spec(class);
                 for _ in have..usize::try_from(st.per_drone).unwrap_or(usize::MAX) {
                     let room = free_room(drone, &held, &self.cfg.classes);
-                    if free_slots(drone, &room, spec) == 0 {
+                    if free_slots(drone, &room, class, spec) == 0 {
                         break;
                     }
                     let lease_id = new_lease_id();
@@ -1634,7 +1634,7 @@ impl Queen {
                             && d.trust.admits(u.scope)
                             && d.admission(admission).admits(u.class, u.scope)
                             && !d.blocked_classes.contains(&u.class)
-                            && max_slots(d, self.cfg.classes.spec(u.class)) > 0
+                            && max_slots(d, u.class, self.cfg.classes.spec(u.class)) > 0
                             && (d.bids.is_empty()
                                 || d.bids.iter().any(|b| {
                                     b.class == u.class
@@ -1649,9 +1649,15 @@ impl Queen {
             .iter()
             .filter(|d| eligible.contains(d.id.as_str()))
             .fold((0u64, 0u64, 0u64), |(c, m, slots), d| {
+                // The lease slots the drone offers to a mix of classes: class
+                // caps bound single classes, not the mix, so they are left out.
+                let uncapped = crate::allocator::DroneState {
+                    class_caps: std::collections::BTreeMap::new(),
+                    ..d.clone()
+                };
                 let capacity = Class::ALL
                     .into_iter()
-                    .map(|class| max_slots(d, self.cfg.classes.spec(class)))
+                    .map(|class| max_slots(&uncapped, class, self.cfg.classes.spec(class)))
                     .max()
                     .unwrap_or(0);
                 (
@@ -2880,7 +2886,7 @@ impl Queen {
                     drones
                         .iter()
                         .filter(|d| d.accepting && !d.blocked_classes.contains(&c))
-                        .map(|d| max_slots(d, spec))
+                        .map(|d| max_slots(d, c, spec))
                         .sum(),
                 )
             })

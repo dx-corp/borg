@@ -65,7 +65,7 @@ impl Queen {
                         let state = d.allocator_state(cap, now);
                         Class::ALL
                             .into_iter()
-                            .map(|c| (c, max_slots(&state, self.cfg.classes.spec(c))))
+                            .map(|c| (c, max_slots(&state, c, self.cfg.classes.spec(c))))
                             .filter(|&(_, n)| n > 0)
                             .collect()
                     })

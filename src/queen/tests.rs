@@ -291,6 +291,7 @@ fn the_queued_family_picks_the_owned_host_that_runs_it_fastest() {
         docker: true,
         accepting: true,
         max_leases: None,
+        class_caps: BTreeMap::new(),
         bids: vec![],
         profiles: vec![],
         blocked_classes: vec![],

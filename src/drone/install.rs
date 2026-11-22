@@ -881,6 +881,11 @@ impl Installer<'_> {
             max_vcpu: o.max_vcpu,
             max_mem_mib: o.max_mem_mib,
             max_leases: o.max_leases,
+            max_class_leases: on_disk
+                .as_ref()
+                .and_then(|v| v.get("max_class_leases").cloned())
+                .and_then(|r| serde_json::from_value(r).ok())
+                .unwrap_or_default(),
             reserve_mem_mib: crate::allocator::HostCaps::default().reserve_mem_mib,
             host_memory_guard_mib: on_disk
                 .as_ref()

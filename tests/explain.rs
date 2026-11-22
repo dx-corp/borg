@@ -88,6 +88,7 @@ fn traces_owner_net_capacity_blocked_environment_and_nonaccepting_hosts() {
             max_mem_mib: Some(1000),
             max_leases: Some(0),
             reserve_mem_mib: 2048,
+            ..HostCaps::default()
         },
     );
     let mut blocked = host("blocked");

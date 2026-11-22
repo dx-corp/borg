@@ -764,7 +764,7 @@ async fn heartbeat(
                     .any(|failure| failure.check == "docker_daemon")
             });
             cfg.env_contract
-                .reclaim_floor_bytes(|class| max_slots(&state, cfg.classes.spec(class)) > 0)
+                .reclaim_floor_bytes(|class| max_slots(&state, class, cfg.classes.spec(class)) > 0)
         }),
         leases,
         units,
@@ -1311,13 +1311,13 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
                 let free = if state.blocked_classes.contains(&class) {
                     0
                 } else {
-                    free_slots(&state, &room, spec)
+                    free_slots(&state, &room, class, spec)
                 };
                 free_slots_here.insert(class, free);
                 theoretical_here.insert(
                     class,
                     if state.accepting && !state.blocked_classes.contains(&class) {
-                        max_slots(&state, spec)
+                        max_slots(&state, class, spec)
                     } else {
                         0
                     },
@@ -1354,10 +1354,10 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             kind: d.capacity.as_ref().map(|c| c.kind),
             vcpu: d.capacity.as_ref().map(|c| c.vcpu),
             mem_mib: d.capacity.as_ref().map(|c| c.mem_mib),
-            budget_mem_mib: budget.map(|b| b.0),
-            budget_vcpu: budget.map(|b| b.1),
-            free_mem_mib: budget.map(|b| b.2.mem_mib),
-            free_vcpu: budget.map(|b| b.2.vcpu),
+            budget_mem_mib: budget.as_ref().map(|b| b.0),
+            budget_vcpu: budget.as_ref().map(|b| b.1),
+            free_mem_mib: budget.as_ref().map(|b| b.2.mem_mib),
+            free_vcpu: budget.as_ref().map(|b| b.2.vcpu),
             free_slots: free_slots_here,
             theoretical_slots: theoretical_here,
             active_leases: u32::try_from(active.iter().filter(|l| l.drone == d.name).count())

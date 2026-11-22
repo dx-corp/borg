@@ -48,6 +48,12 @@ pub struct HostCaps {
     pub max_leases: Option<u32>,
     /// Memory kept back for the operating system and the drone itself.
     pub reserve_mem_mib: u64,
+    /// Most concurrent leases of a class ("at most 3 heavy"), so a host can
+    /// lend a large memory budget to light and medium work without taking
+    /// more heavy jobs than it can hold at their peaks. Omitted when empty,
+    /// so a queen that predates it still reads the caps.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub max_class_leases: BTreeMap<Class, u32>,
 }
 
 impl Default for HostCaps {
@@ -57,6 +63,7 @@ impl Default for HostCaps {
             max_mem_mib: None,
             max_leases: None,
             reserve_mem_mib: 2048,
+            max_class_leases: BTreeMap::new(),
         }
     }
 }
@@ -71,6 +78,9 @@ pub struct DroneState {
     /// False while the drone drains (SIGTERM) or yields to its owner.
     pub accepting: bool,
     pub max_leases: Option<u32>,
+    /// Most concurrent leases per class; see [`HostCaps::max_class_leases`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub class_caps: BTreeMap<Class, u32>,
     /// Live (unexpired) bids. Empty means a legacy drone: always eligible,
     /// neutral score. See [`crate::bid`].
     #[serde(default)]
@@ -380,6 +390,7 @@ impl DroneState {
             docker: capacity.docker_usable,
             accepting: true,
             max_leases: caps.max_leases,
+            class_caps: caps.max_class_leases.clone(),
             bids: Vec::new(),
             profiles: Vec::new(),
             blocked_classes: Vec::new(),
@@ -642,6 +653,9 @@ pub enum Rejection {
     HostMemory,
     Vcpu,
     LeaseCap,
+    /// The drone already runs (or was just granted) as many leases of this
+    /// class as its `max_class_leases` allows.
+    ClassCap,
     Reserved,
     /// Held for larger waiting work: this lease would take room that becomes
     /// a larger slot once the drone's smaller leases end. See [`LargerHold`].
@@ -789,26 +803,36 @@ pub struct ClassIdle {
     pub idle_slots: u32,
 }
 
-/// How many leases of `spec` this drone could hold if it were empty.
-pub fn max_slots(drone: &DroneState, spec: &ClassSpec) -> u32 {
+/// How many leases of `class` (sized `spec`) this drone could hold if it
+/// were empty.
+pub fn max_slots(drone: &DroneState, class: Class, spec: &ClassSpec) -> u32 {
     if spec.docker && !drone.docker {
         return 0;
     }
     let by_mem = drone.mem_mib / spec.mem_mib.max(1);
     let by_cpu = u64::from(drone.vcpu / spec.vcpu.max(1));
     let by_cap = drone.max_leases.map_or(u64::MAX, u64::from);
-    u32::try_from(by_mem.min(by_cpu).min(by_cap)).unwrap_or(u32::MAX)
+    let by_class = drone.class_cap(class).map_or(u64::MAX, u64::from);
+    u32::try_from(by_mem.min(by_cpu).min(by_cap).min(by_class)).unwrap_or(u32::MAX)
 }
 
 /// What is left of a drone's budget after the leases it holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Room {
     pub mem_mib: u64,
     pub vcpu: u32,
     pub leases_left: Option<u32>,
+    /// Leases left per capped class; see [`HostCaps::max_class_leases`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub class_left: BTreeMap<Class, u32>,
 }
 
 impl DroneState {
+    /// The most leases of `class` this drone runs at once, if capped.
+    pub(crate) fn class_cap(&self, class: Class) -> Option<u32> {
+        self.class_caps.get(&class).copied()
+    }
+
     /// Free work-filesystem space `class` needs to start, MiB; 0 when unset.
     pub(crate) fn disk_floor(&self, class: Class) -> u64 {
         self.disk_floor_mib.get(&class).copied().unwrap_or(0)
@@ -836,26 +860,34 @@ pub fn free_room(drone: &DroneState, held: &[ActiveLease], classes: &Classes) ->
         mem_mib: drone.mem_mib,
         vcpu: drone.vcpu,
         leases_left: drone.max_leases,
+        class_left: drone.class_caps.clone(),
     };
     for l in held.iter().filter(|l| l.drone_id == drone.id) {
         let spec = classes.spec(l.class);
         room.mem_mib = room.mem_mib.saturating_sub(spec.mem_mib);
         room.vcpu = room.vcpu.saturating_sub(spec.vcpu);
         room.leases_left = room.leases_left.map(|n| n.saturating_sub(1));
+        if let Some(n) = room.class_left.get_mut(&l.class) {
+            *n = n.saturating_sub(1);
+        }
     }
     room
 }
 
-/// Whole leases of `spec` that fit in `room` right now; 0 if the drone takes
-/// no new leases or lacks Docker for the class.
-pub fn free_slots(drone: &DroneState, room: &Room, spec: &ClassSpec) -> u32 {
+/// Whole leases of `class` (sized `spec`) that fit in `room` right now; 0 if
+/// the drone takes no new leases or lacks Docker for the class.
+pub fn free_slots(drone: &DroneState, room: &Room, class: Class, spec: &ClassSpec) -> u32 {
     if !drone.accepting || (spec.docker && !drone.docker) {
         return 0;
     }
     let by_mem = room.mem_mib / spec.mem_mib.max(1);
     let by_cpu = u64::from(room.vcpu / spec.vcpu.max(1));
     let by_cap = room.leases_left.map_or(u64::MAX, u64::from);
-    u32::try_from(by_mem.min(by_cpu).min(by_cap)).unwrap_or(u32::MAX)
+    let by_class = room
+        .class_left
+        .get(&class)
+        .map_or(u64::MAX, |&n| u64::from(n));
+    u32::try_from(by_mem.min(by_cpu).min(by_cap).min(by_class)).unwrap_or(u32::MAX)
 }
 
 /// Whole leases of `spec` in `mem` MiB, `cpu` vCPU and `leases` lease slots.
@@ -973,6 +1005,7 @@ impl Free<'_> {
         if self.in_flight != 1 {
             return false;
         }
+        let reserved_key = reserved;
         let reserved = classes.spec(reserved);
         let candidate = classes.spec(class);
         let mut mem = u128::from(reserved.mem_mib) + u128::from(candidate.mem_mib);
@@ -984,12 +1017,41 @@ impl Free<'_> {
             cpu += u128::from(count) * u128::from(spec.vcpu);
             leases += u128::from(count);
         }
+        let reserved_class = |c: Class| {
+            u32::from(c == reserved_key)
+                + u32::from(c == class)
+                + self
+                    .granted
+                    .iter()
+                    .filter(|&(&(g, _), _)| g == c)
+                    .map(|(_, &n)| n)
+                    .sum::<u32>()
+        };
         mem <= u128::from(self.drone.mem_mib)
             && cpu <= u128::from(self.drone.vcpu)
             && self
                 .drone
                 .max_leases
                 .is_none_or(|cap| leases <= u128::from(cap))
+            && self
+                .drone
+                .class_caps
+                .iter()
+                .all(|(&c, &cap)| reserved_class(c) <= cap)
+    }
+
+    /// Leases of `class` this drone may still take under its class cap:
+    /// the cap less those running and those granted this pass.
+    fn class_left(&self, class: Class) -> Option<u32> {
+        let cap = self.drone.class_cap(class)?;
+        let held = self.in_flight_by.get(&class).copied().unwrap_or(0);
+        let granted: u32 = self
+            .granted
+            .iter()
+            .filter(|&(&(c, _), _)| c == class)
+            .map(|(_, &n)| n)
+            .sum();
+        Some(cap.saturating_sub(held.saturating_add(granted)))
     }
 
     /// Eligibility and scores are evaluated once, for both selection and its
@@ -1040,6 +1102,9 @@ impl Free<'_> {
         if self.leases_left == Some(0) {
             reasons.push(Rejection::LeaseCap);
         }
+        if self.class_left(class) == Some(0) {
+            reasons.push(Rejection::ClassCap);
+        }
         if reserved_for.is_some_and(|key| {
             key != (class, scope) && !self.preserves_reservation(&input.classes, key.0, class)
         }) {
@@ -1053,11 +1118,18 @@ impl Free<'_> {
                 mem_mib: self.drone.mem_mib,
                 vcpu: self.drone.vcpu,
                 leases_left: self.drone.max_leases,
+                class_left: self.drone.class_caps.clone(),
             },
             room: Room {
                 mem_mib: self.mem_room(),
                 vcpu: self.vcpu,
                 leases_left: self.leases_left,
+                class_left: self
+                    .drone
+                    .class_caps
+                    .keys()
+                    .filter_map(|&c| self.class_left(c).map(|n| (c, n)))
+                    .collect(),
             },
             accepting: self.drone.accepting,
             trust: self.drone.trust,
@@ -1087,31 +1159,34 @@ impl Free<'_> {
             .map_or(self.mem_mib, |p| p.get().min(self.mem_mib))
     }
 
-    fn fits(&self, spec: &ClassSpec) -> bool {
+    fn fits(&self, class: Class, spec: &ClassSpec) -> bool {
         self.drone.accepting
             && self.admission != AdmissionState::Closed
             && (!spec.docker || self.drone.docker)
             && self.mem_room() >= spec.mem_mib
             && self.vcpu >= spec.vcpu
             && self.leases_left != Some(0)
+            && self.class_left(class) != Some(0)
     }
 
-    /// Could this drone ever hold `spec` if it were empty?
-    /// Whole leases of `spec` the remaining room holds.
-    fn slots(&self, spec: &ClassSpec) -> u32 {
+    /// Whole leases of `class` (sized `spec`) the remaining room holds.
+    fn slots(&self, class: Class, spec: &ClassSpec) -> u32 {
         let by_mem = self.mem_room() / spec.mem_mib.max(1);
         let by_cpu = u64::from(self.vcpu / spec.vcpu.max(1));
         let by_cap = self.leases_left.map_or(u64::MAX, u64::from);
-        u32::try_from(by_mem.min(by_cpu).min(by_cap)).unwrap_or(u32::MAX)
+        let by_class = self.class_left(class).map_or(u64::MAX, u64::from);
+        u32::try_from(by_mem.min(by_cpu).min(by_cap).min(by_class)).unwrap_or(u32::MAX)
     }
 
-    fn could_ever_fit(&self, spec: &ClassSpec) -> bool {
+    /// Could this drone ever hold `class` (sized `spec`) if it were empty?
+    fn could_ever_fit(&self, class: Class, spec: &ClassSpec) -> bool {
         self.drone.accepting
             && self.admission != AdmissionState::Closed
             && (!spec.docker || self.drone.docker)
             && self.drone.mem_mib >= spec.mem_mib
             && self.drone.vcpu >= spec.vcpu
             && self.drone.max_leases != Some(0)
+            && self.drone.class_cap(class) != Some(0)
     }
 
     /// Whether `(class, scope)` work may ever run here: trust, size,
@@ -1124,7 +1199,7 @@ impl Free<'_> {
         pressure: &BTreeMap<Class, u16>,
     ) -> bool {
         self.drone.trust.admits(scope)
-            && self.could_ever_fit(input.classes.spec(class))
+            && self.could_ever_fit(class, input.classes.spec(class))
             && self.admission.admits(class, scope)
             && !self.drone.blocked_classes.contains(&class)
             && self
@@ -1164,7 +1239,9 @@ impl Free<'_> {
             cpu += u128::from(n) * u128::from(spec.vcpu);
             leases = leases.map(|l| l + u128::from(n));
         }
-        slots_in(mem, cpu, leases, classes.spec(larger))
+        // Smaller leases ending never lift the larger class's own cap.
+        let capped = self.class_left(larger).map_or(u64::MAX, u64::from);
+        slots_in(mem, cpu, leases, classes.spec(larger)).min(capped)
     }
 
     /// Whether a lease of `small` here leaves the drone's room holding every
@@ -1178,7 +1255,8 @@ impl Free<'_> {
             u128::from(self.vcpu).saturating_sub(u128::from(small.vcpu)),
             self.leases_left.map(|l| u128::from(l).saturating_sub(1)),
             classes.spec(larger),
-        );
+        )
+        .min(self.class_left(larger).map_or(u64::MAX, u64::from));
         after >= self.drained_slots(classes, larger)
     }
 
@@ -1303,12 +1381,12 @@ fn class_idle(free: &BTreeMap<&str, Free<'_>>, class: Class, spec: &ClassSpec) -
     let mut pools: BTreeMap<*const Cell<u64>, u64> = BTreeMap::new();
     let mut idle = 0u32;
     for f in free.values().filter(|f| {
-        f.fits(spec)
+        f.fits(class, spec)
             && !f.drone.blocked_classes.contains(&class)
             && Scope::ALL.iter().all(|s| f.admission.admits(class, *s))
     }) {
         // Room the disk floors have already promised away is not idle.
-        let mut slots = f.slots(spec).min(f.disk_slots(class));
+        let mut slots = f.slots(class, spec).min(f.disk_slots(class));
         if let Some(p) = &f.pool {
             let left = pools.entry(Rc::as_ptr(p)).or_insert_with(|| p.get());
             slots = slots.min(u32::try_from(*left / spec.mem_mib.max(1)).unwrap_or(u32::MAX));
@@ -1970,6 +2048,11 @@ fn allocate_inner(
                                 .as_ref()
                                 .is_some_and(|p| draining.contains(&Rc::as_ptr(p))))
                         && f.could_host(class, scope, input, &pressure)
+                        // A drone at its cap for this class gets a slot back
+                        // only when one of those leases ends, and that lease
+                        // hands back its own room; holding the rest of the
+                        // drone would only idle it.
+                        && f.class_left(class) != Some(0)
                 })
                 .min_by_key(|(id, f)| (f.in_flight, **id))
                 .map(|(id, _)| (*id).to_owned());

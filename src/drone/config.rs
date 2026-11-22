@@ -240,6 +240,12 @@ pub struct DroneConfig {
     pub max_mem_mib: Option<u64>,
     #[serde(default)]
     pub max_leases: Option<u32>,
+    /// Most concurrent leases per class (`{"heavy": 3}`), so `max_mem_mib`
+    /// can lend the rest of a big host to light and medium work without
+    /// adding heavy slots. Sent to the queen with the caps; omitted when
+    /// empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub max_class_leases: BTreeMap<crate::classes::Class, u32>,
     #[serde(default = "default_reserve")]
     pub reserve_mem_mib: u64,
     /// Kill the newest lease's cgroup whenever the host's available memory
@@ -550,6 +556,7 @@ impl DroneConfig {
             max_mem_mib: self.max_mem_mib,
             max_leases: self.max_leases,
             reserve_mem_mib: self.reserve_mem_mib,
+            max_class_leases: self.max_class_leases.clone(),
         }
     }
 
