@@ -898,6 +898,7 @@ impl Installer<'_> {
                 name: name.to_owned(),
                 home: self.layout.job_home.clone(),
                 priv_bin: "setpriv".to_owned(),
+                groups: None,
             }),
             extra_labels: o.extra_labels.clone(),
             trust: o.trust,
@@ -910,6 +911,11 @@ impl Installer<'_> {
             host_invariants: on_disk
                 .as_ref()
                 .and_then(|v| v.get("host_invariants").cloned())
+                .and_then(|r| serde_json::from_value(r).ok())
+                .unwrap_or_default(),
+            docker_proxy: on_disk
+                .as_ref()
+                .and_then(|v| v.get("docker_proxy").cloned())
                 .and_then(|r| serde_json::from_value(r).ok())
                 .unwrap_or_default(),
             caches: crate::drone::config::CachesConfig {

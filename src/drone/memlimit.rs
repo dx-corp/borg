@@ -20,9 +20,11 @@
 //! lease cgroup before it `exec`s the runner, so every process the job starts
 //! is inside the limit from its first instruction.
 //!
-//! Docker containers a job starts are not covered: dockerd creates them in
-//! its own cgroup, not under the lease's, so their memory is outside
-//! `memory.max` (see `docs/operations/borg.md`).
+//! The job's processes live in a `job` leaf of the lease cgroup, so the
+//! lease cgroup itself can hold children: with the per-lease Docker endpoint
+//! ([`crate::drone::dockerproxy`]) dockerd creates the job's containers
+//! beside that leaf, inside the lease's `memory.max`. Without the endpoint,
+//! containers run in dockerd's own cgroup, outside the limit.
 //!
 //! The same shell also raises its `oom_score_adj` one step above every lease
 //! still running ([`OomOrder`]), so when the whole host runs short of memory
@@ -49,6 +51,8 @@ pub struct LeaseMemory {
 
 /// The leaf cgroup the drone process itself lives in.
 pub(crate) const DRONE_LEAF: &str = "drone";
+/// The leaf of a lease cgroup its job's processes live in.
+pub(crate) const JOB_LEAF: &str = "job";
 
 /// `oom_score_adj` of a lease started while no other lease runs.
 pub(crate) const LEASE_OOM_BASE: i32 = 100;
@@ -60,6 +64,8 @@ const OOM_SCORE_ADJ_MAX: i32 = 1000;
 /// Where the drone creates lease cgroups: its own service cgroup.
 #[derive(Debug, Clone)]
 pub struct LeaseCgroups {
+    /// The cgroup v2 mount (`/sys/fs/cgroup`).
+    root: PathBuf,
     base: PathBuf,
     /// `/proc`, or a stand-in in tests.
     proc_root: PathBuf,
@@ -102,6 +108,7 @@ impl LeaseCgroups {
             )));
         }
         Ok(Self {
+            root: cgroup_root.to_path_buf(),
             base,
             proc_root: PathBuf::from("/proc"),
         })
@@ -130,9 +137,10 @@ impl LeaseCgroups {
         fs::write(self.base.join("cgroup.subtree_control"), "+memory")
     }
 
-    /// A fresh cgroup for `lease_id` with `limit` applied, whose processes
-    /// run with `oom_score_adj` (from [`OomOrder::assign`]). A leftover of the
-    /// same lease (a drone restart mid-lease) is reused.
+    /// A fresh cgroup for `lease_id` with `limit` applied, and its empty
+    /// `job` leaf; its processes run with `oom_score_adj` (from
+    /// [`OomOrder::assign`]). A leftover of the same lease (a drone restart
+    /// mid-lease) is reused.
     pub fn create(
         &self,
         lease_id: &str,
@@ -140,28 +148,39 @@ impl LeaseCgroups {
         oom_score_adj: i32,
     ) -> io::Result<LeaseCgroup> {
         let dir = self.base.join(format!("lease-{lease_id}"));
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(dir.join(JOB_LEAF))?;
+        let rel = dir
+            .strip_prefix(&self.root)
+            .map(|r| format!("/{}", r.to_string_lossy()))
+            .unwrap_or_default();
         let cgroup = LeaseCgroup {
             dir,
+            rel,
             oom_score_adj,
             self_oom_score_adj: self.proc_root.join("self/oom_score_adj"),
         };
         // High first: a max below an existing high is rejected on some kernels.
         fs::write(cgroup.dir.join("memory.high"), limit.high_bytes.to_string())?;
         fs::write(cgroup.dir.join("memory.max"), limit.max_bytes.to_string())?;
+        // Containers placed beside the job leaf get their own memory
+        // accounting (and `docker run --memory` works there). Refused only
+        // while processes sit in the lease cgroup itself (a lease an older
+        // drone started), which leaves containers charged to the lease.
+        if let Err(e) = fs::write(cgroup.dir.join("cgroup.subtree_control"), "+memory") {
+            tracing::debug!("lease {lease_id}: no memory controller for children: {e}");
+        }
         Ok(cgroup)
     }
 
     /// Kill every process of `lease_id`'s cgroup at once (`cgroup.kill`).
     /// Whether the kill was delivered.
+    /// Only a cgroup with processes in it (`populated 1` in `cgroup.events`)
+    /// counts: an empty one, a lease still setting up, is left alone.
     pub fn kill(&self, lease_id: &str) -> bool {
-        fs::write(
-            self.base
-                .join(format!("lease-{lease_id}"))
-                .join("cgroup.kill"),
-            "1",
-        )
-        .is_ok()
+        let dir = self.base.join(format!("lease-{lease_id}"));
+        let populated = fs::read_to_string(dir.join("cgroup.events"))
+            .is_ok_and(|e| e.lines().any(|l| l.trim() == "populated 1"));
+        populated && fs::write(dir.join("cgroup.kill"), "1").is_ok()
     }
 }
 
@@ -220,11 +239,18 @@ impl OomOrder {
 
     /// The most recently started lease still running.
     pub fn newest(&self) -> Option<String> {
-        let st = self.inner.lock().ok()?;
-        st.running
-            .iter()
-            .max_by_key(|(_, v)| v.0)
-            .map(|(id, _)| id.clone())
+        self.newest_first().into_iter().next()
+    }
+
+    /// The leases running now, most recently started first.
+    pub fn newest_first(&self) -> Vec<String> {
+        let Ok(st) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut ids: Vec<(u64, String)> =
+            st.running.iter().map(|(id, v)| (v.0, id.clone())).collect();
+        ids.sort_by_key(|&(seq, _)| std::cmp::Reverse(seq));
+        ids.into_iter().map(|(_, id)| id).collect()
     }
 }
 
@@ -264,6 +290,9 @@ pub fn mem_available_mib(meminfo: &str) -> Option<u64> {
 #[derive(Debug)]
 pub struct LeaseCgroup {
     dir: PathBuf,
+    /// `dir` from the cgroup root, as `/proc/<pid>/cgroup` and dockerd's
+    /// `CgroupParent` name it (`/system.slice/borg-drone.service/lease-<id>`).
+    rel: String,
     /// The score the lease's processes run with; see [`OomOrder`].
     oom_score_adj: i32,
     /// `/proc/self/oom_score_adj` as the wrapping shell sees it.
@@ -281,7 +310,11 @@ impl LeaseCgroup {
             r#"{ echo 0 > "$1"; } 2>/dev/null; { echo "$3" > "$2"; } 2>/dev/null; shift 3; exec "$@""#
                 .to_owned(),
             "borg-lease".to_owned(),
-            self.dir.join("cgroup.procs").to_string_lossy().into_owned(),
+            self.dir
+                .join(JOB_LEAF)
+                .join("cgroup.procs")
+                .to_string_lossy()
+                .into_owned(),
             self.self_oom_score_adj.to_string_lossy().into_owned(),
             self.oom_score_adj.to_string(),
             program.to_string_lossy().into_owned(),
@@ -290,9 +323,21 @@ impl LeaseCgroup {
         (PathBuf::from("/bin/sh"), wrapped)
     }
 
+    /// The lease cgroup from the cgroup root (`/system.slice/...`).
+    pub fn rel_path(&self) -> &str {
+        &self.rel
+    }
+
     /// The score the lease's processes run with.
     pub fn oom_score_adj(&self) -> i32 {
         self.oom_score_adj
+    }
+
+    /// The memory the lease (its processes and any containers under it)
+    /// holds that the kernel cannot simply drop: `memory.current` less the
+    /// inactive page cache, the "working set" `docker stats` reports.
+    pub fn working_set_bytes(&self) -> Option<u64> {
+        working_set(&self.dir)
     }
 
     /// Whether the kernel OOM-killed a process of this lease.
@@ -300,13 +345,18 @@ impl LeaseCgroup {
         fs::read_to_string(self.dir.join("memory.events")).is_ok_and(|e| oom_kills(&e) > 0)
     }
 
-    /// Kill whatever is left in the cgroup and remove it. Best effort: a
-    /// cgroup that cannot be removed now is reused by the same lease id or
-    /// left empty.
+    /// Kill whatever is left in the cgroup (the job and any container under
+    /// it) and remove it with its children. Best effort: a cgroup that cannot
+    /// be removed now is reused by the same lease id or left empty.
     pub fn remove(self) {
-        let _ = fs::write(self.dir.join("cgroup.kill"), "1");
+        // cgroupfs has no file creation, so this only ever writes the
+        // kernel's own interface file (5.14+).
+        let kill = self.dir.join("cgroup.kill");
+        if kill.exists() {
+            let _ = fs::write(kill, "1");
+        }
         for _ in 0..20 {
-            if fs::remove_dir(&self.dir).is_ok() || !self.dir.exists() {
+            if remove_tree(&self.dir) || !self.dir.exists() {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -317,6 +367,38 @@ impl LeaseCgroup {
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }
+}
+
+/// `memory.current` less `inactive_file` from `memory.stat` in `dir`.
+pub(crate) fn working_set(dir: &Path) -> Option<u64> {
+    let current: u64 = fs::read_to_string(dir.join("memory.current"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let inactive = fs::read_to_string(dir.join("memory.stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.lines()
+                .find_map(|l| l.strip_prefix("inactive_file "))
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    Some(current.saturating_sub(inactive))
+}
+
+/// Remove the cgroup directory `dir` after its child cgroups (cgroupfs
+/// removes a cgroup with `rmdir`, and only once it has no children).
+/// Whether `dir` is gone.
+fn remove_tree(dir: &Path) -> bool {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                remove_tree(&entry.path());
+            }
+        }
+    }
+    fs::remove_dir(dir).is_ok()
 }
 
 #[cfg(test)]
@@ -392,6 +474,52 @@ mod tests {
         assert!(!lease.oom_killed());
         fs::write(lease.dir().join("memory.events"), "oom 1\noom_kill 1\n").unwrap();
         assert!(lease.oom_killed());
+        // The job gets its own leaf; children of the lease get memory.
+        assert!(lease.dir().join("job").is_dir());
+        assert_eq!(
+            fs::read_to_string(lease.dir().join("cgroup.subtree_control")).unwrap(),
+            "+memory"
+        );
+        // Named as dockerd's CgroupParent and /proc/<pid>/cgroup name it.
+        assert_eq!(
+            lease.rel_path(),
+            "/system.slice/borg-drone.service/lease-l1"
+        );
+        // The working set leaves out the inactive page cache.
+        assert_eq!(lease.working_set_bytes(), None);
+        fs::write(lease.dir().join("memory.current"), "5000\n").unwrap();
+        fs::write(
+            lease.dir().join("memory.stat"),
+            "anon 3000\nactive_file 800\ninactive_file 1200\n",
+        )
+        .unwrap();
+        assert_eq!(lease.working_set_bytes(), Some(3800));
+    }
+
+    #[test]
+    fn removal_takes_child_cgroups_first() {
+        let root = tempfile::tempdir().unwrap();
+        let cg = service(root.path());
+        let lease = cg
+            .create(
+                "l4",
+                LeaseMemory {
+                    max_bytes: 1 << 30,
+                    high_bytes: 1 << 29,
+                },
+                LEASE_OOM_BASE,
+            )
+            .unwrap();
+        let dir = lease.dir().to_path_buf();
+        // A container cgroup dockerd made beside the job leaf. Plain
+        // directories stand in for cgroupfs, where rmdir ignores the
+        // interface files; drop the files the test wrote so rmdir works.
+        fs::create_dir_all(dir.join("abc123")).unwrap();
+        for f in ["memory.high", "memory.max", "cgroup.subtree_control"] {
+            fs::remove_file(dir.join(f)).unwrap();
+        }
+        lease.remove();
+        assert!(!dir.exists());
     }
 
     #[test]
@@ -423,9 +551,9 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert_eq!(fs::read_to_string(&out).unwrap(), "ran\n");
-        // The shell wrote itself ("0" means the writer) into cgroup.procs.
+        // The shell wrote itself ("0" means the writer) into the job leaf.
         assert_eq!(
-            fs::read_to_string(lease.dir().join("cgroup.procs")).unwrap(),
+            fs::read_to_string(lease.dir().join("job/cgroup.procs")).unwrap(),
             "0\n"
         );
     }
@@ -474,6 +602,11 @@ mod tests {
                 LEASE_OOM_BASE,
             )
             .unwrap();
+        // Empty (still setting up): left alone.
+        fs::write(lease.dir().join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert!(!cg.kill("k1"));
+        assert!(!lease.dir().join("cgroup.kill").exists());
+        fs::write(lease.dir().join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
         assert!(cg.kill("k1"));
         assert_eq!(
             fs::read_to_string(lease.dir().join("cgroup.kill")).unwrap(),

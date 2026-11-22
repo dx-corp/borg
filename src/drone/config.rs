@@ -319,6 +319,16 @@ pub struct DroneConfig {
     /// [`crate::drone::invariants`].
     #[serde(default)]
     pub(crate) host_invariants: crate::drone::invariants::InvariantSettings,
+    /// A Docker endpoint per lease that puts the job's containers in its
+    /// memory cgroup, labels them for cleanup and refuses host-level access
+    /// to jobs whose scope does not allow it; off by default. See
+    /// [`crate::drone::dockerproxy`]. Omitted when off, so older drones can
+    /// still read a config written by a newer one.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::drone::dockerproxy::DockerProxySettings::is_off"
+    )]
+    pub docker_proxy: crate::drone::dockerproxy::DockerProxySettings,
 }
 
 /// Slot directories when neither `slots` nor `max_leases` is set.
@@ -351,6 +361,14 @@ fn default_reserve() -> u64 {
 }
 
 impl DroneConfig {
+    /// Where the per-lease Docker endpoints listen; `None` leaves them off.
+    pub fn docker_endpoint_dir(&self) -> Option<PathBuf> {
+        self.docker_proxy
+            .socket_dir
+            .clone()
+            .or_else(|| self.state_dir.as_ref().map(|d| d.join("docker-endpoints")))
+    }
+
     pub fn load(path: &Path) -> Result<Self, DroneConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| DroneConfigError::Read {
             path: path.to_owned(),
@@ -412,6 +430,12 @@ impl DroneConfig {
         self.host_invariants
             .validate()
             .map_err(DroneConfigError::Invalid)?;
+        self.docker_proxy
+            .validate()
+            .map_err(DroneConfigError::Invalid)?;
+        if self.docker_proxy.enabled && self.docker_endpoint_dir().is_none() {
+            return bad("docker_proxy needs docker_proxy.socket_dir or state_dir");
+        }
         self.validate_caches()
     }
 

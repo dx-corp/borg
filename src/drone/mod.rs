@@ -14,6 +14,7 @@ pub mod client;
 pub mod config;
 pub mod credwipe;
 pub mod docker_reclaim;
+pub mod dockerproxy;
 pub mod exec;
 pub mod fsops;
 pub(crate) mod hostview;
@@ -145,6 +146,8 @@ pub struct Drone {
     oom_order: Arc<memlimit::OomOrder>,
     /// Leases the host memory guard killed, reported as OOM-killed.
     guard_killed: Arc<Mutex<HashSet<String>>>,
+    /// The job user's groups without `docker` (see `docker_proxy`).
+    groups_without_docker: Option<Vec<u32>>,
     /// The version reported to the queen, with the binary's hash once
     /// measured (see `selfupdate::running_build_version`).
     reported_version: Arc<std::sync::OnceLock<String>>,
@@ -159,6 +162,23 @@ impl Drone {
     ) -> Self {
         let (abort, _) = tokio::sync::watch::channel(false);
         let slot_count = cfg.slot_count();
+        // The job user's groups without `docker`, for leases that must reach
+        // dockerd only through their endpoint. The capability probe and work
+        // units keep the account's own groups.
+        let groups_without_docker = cfg
+            .job_user
+            .as_ref()
+            .filter(|_| cfg.docker_proxy.enabled)
+            .and_then(|user| {
+                let groups = user.groups_without_docker(exec.as_ref());
+                if groups.is_none() {
+                    tracing::warn!(
+                        "docker_proxy: could not read {}'s groups; leases without host access get no Docker",
+                        user.name
+                    );
+                }
+                groups
+            });
         let cfg = Arc::new(cfg);
         let (job_exec, fs_ops): (Arc<dyn Exec>, Arc<dyn FsOps>) = match &cfg.job_user {
             Some(user) => {
@@ -229,6 +249,7 @@ impl Drone {
             cgroups: None,
             oom_order: Arc::default(),
             guard_killed: Arc::default(),
+            groups_without_docker,
             reported_version: Arc::default(),
             client: Arc::new(client),
             host,
@@ -636,6 +657,7 @@ impl Drone {
             cgroups: self.cgroups.clone(),
             oom_order: Arc::clone(&self.oom_order),
             guard_killed: Arc::clone(&self.guard_killed),
+            groups_without_docker: self.groups_without_docker.clone(),
             slot,
             held,
         })
@@ -692,10 +714,14 @@ impl Drone {
                 else {
                     continue;
                 };
-                let Some(victim) = guard_victim(available, floor, &order) else {
+                // A lease still setting up has an empty cgroup; skip it.
+                let Some(victim) = guard_victims(available, floor, &order)
+                    .into_iter()
+                    .find(|id| cgroups.kill(id))
+                else {
                     continue;
                 };
-                if cgroups.kill(&victim) {
+                {
                     tracing::warn!(
                         "host memory guard: {available} MiB available, below {floor} MiB; killed the newest lease {victim}"
                     );
@@ -952,10 +978,14 @@ const GUARD_COOLDOWN: Duration = Duration::from_secs(15);
 
 /// The lease the host memory guard kills when `available_mib` is below
 /// `floor_mib`: the newest running one.
-fn guard_victim(available_mib: u64, floor_mib: u64, order: &memlimit::OomOrder) -> Option<String> {
-    (available_mib < floor_mib)
-        .then(|| order.newest())
-        .flatten()
+/// The leases the host memory guard may kill when `available_mib` is below
+/// `floor_mib`, newest first; it takes the first that has processes.
+fn guard_victims(available_mib: u64, floor_mib: u64, order: &memlimit::OomOrder) -> Vec<String> {
+    if available_mib < floor_mib {
+        order.newest_first()
+    } else {
+        Vec::new()
+    }
 }
 
 struct LeaseContext {
@@ -975,6 +1005,8 @@ struct LeaseContext {
     cgroups: Option<Arc<memlimit::LeaseCgroups>>,
     oom_order: Arc<memlimit::OomOrder>,
     guard_killed: Arc<Mutex<HashSet<String>>>,
+    /// The job user's groups without `docker` (see `docker_proxy`).
+    groups_without_docker: Option<Vec<u32>>,
     /// Dropped before `held`, so the slot is free whenever the id is.
     slot: SlotGuard,
     held: HeldGuard,
@@ -1048,6 +1080,93 @@ async fn cleanup_slot(ctx: &LeaseContext, id: &str) {
     }
 }
 
+/// The lease's memory-limited cgroup, when this host delegates one and the
+/// grant carries a limit; otherwise the job runs without a limit, as before.
+fn lease_cgroup(
+    ctx: &LeaseContext,
+    grant: &LeaseGrant,
+    oom_score: i32,
+) -> Option<memlimit::LeaseCgroup> {
+    let (cgroups, limit) = (ctx.cgroups.as_deref()?, grant.memory?);
+    cgroups
+        .create(&grant.lease_id, limit, oom_score)
+        .map_err(|e| tracing::warn!("lease {}: no memory limit: {e}", grant.lease_id))
+        .ok()
+}
+
+/// Host paths no job without host access may bind into a container: the
+/// system ones plus the drone's own config, token and state.
+fn protected_paths(cfg: &DroneConfig) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = dockerproxy::PROTECTED_ROOTS
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    paths.extend(cfg.state_dir.iter().cloned());
+    paths.extend(
+        [&cfg.token_file, &cfg.ca_cert_path]
+            .into_iter()
+            .flatten()
+            .filter_map(|f| f.parent().map(Path::to_path_buf)),
+    );
+    paths
+}
+
+/// Start the lease's own Docker endpoint when `docker_proxy` is on and the
+/// lease has a cgroup to put containers in.
+async fn start_docker_endpoint(
+    ctx: &LeaseContext,
+    grant: &LeaseGrant,
+    slot: usize,
+    cgroup: Option<&memlimit::LeaseCgroup>,
+) -> Option<dockerproxy::LeaseEndpoint> {
+    let settings = &ctx.cfg.docker_proxy;
+    if !settings.enabled {
+        return None;
+    }
+    let id = &grant.lease_id;
+    let Some(cgroup) = cgroup else {
+        tracing::warn!("lease {id}: no Docker endpoint without a lease cgroup");
+        return None;
+    };
+    let dir = ctx.cfg.docker_endpoint_dir()?;
+    let upstream = dockerproxy::default_upstream();
+    // Containers can join the lease cgroup only with the cgroupfs driver;
+    // with any other (or a dockerd that does not answer) the lease gets no
+    // endpoint, and a job without host access then gets no Docker at all.
+    let cgroup_parent = match dockerproxy::cgroup_driver(&upstream).await.as_deref() {
+        Some("cgroupfs") => cgroup.rel_path().to_owned(),
+        other => {
+            tracing::warn!(
+                "lease {id}: dockerd's cgroup driver is {other:?}, not cgroupfs; no Docker endpoint"
+            );
+            return None;
+        }
+    };
+    let policy = dockerproxy::LeasePolicy {
+        labels: [
+            (dockerproxy::LEASE_LABEL, id.as_str()),
+            ("borg.scope", grant.scope.as_str()),
+            ("borg.class", grant.class.as_str()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect(),
+        cgroup_parent: Some(cgroup_parent),
+        oom_score_adj: Some(cgroup.oom_score_adj()),
+        host_access: settings.host_access(grant.scope),
+        socket: dir.join(format!("slot-{slot}.sock")),
+        upstream,
+        protected: protected_paths(&ctx.cfg),
+    };
+    let peers = dockerproxy::PeerCheck {
+        proc_root: ctx.proc_root.to_path_buf(),
+        cgroup: cgroup.rel_path().to_owned(),
+    };
+    dockerproxy::LeaseEndpoint::start(policy, peers)
+        .map_err(|e| tracing::warn!("lease {id}: Docker endpoint did not start: {e}"))
+        .ok()
+}
+
 /// Run one lease, clean up unconditionally, report the result.
 async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     // Held for the whole lease: cache garbage collection waits for it.
@@ -1064,6 +1183,20 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     let mut extra_env = ctx.cfg.runner_environment();
     extra_env.extend(ctx.caches.prepare_lease(&lease_dir).await);
     extra_env.push(("BORG_SLOT".to_owned(), slot.to_string()));
+    let oom_score = ctx.oom_order.assign(&grant.lease_id);
+    let cgroup = lease_cgroup(&ctx, &grant, oom_score);
+    let endpoint = start_docker_endpoint(&ctx, &grant, slot, cgroup.as_ref()).await;
+    // With docker_proxy on, a job reaches dockerd only through its endpoint;
+    // when the endpoint could not start, only a job whose scope has host
+    // access falls back to dockerd's own socket, the rest get no Docker.
+    let docker_direct = !ctx.cfg.docker_proxy.enabled
+        || (endpoint.is_none() && ctx.cfg.docker_proxy.host_access(grant.scope));
+    let job_user = ctx.cfg.job_user.clone().map(|mut u| {
+        if !docker_direct {
+            u.groups = Some(ctx.groups_without_docker.clone().unwrap_or_default());
+        }
+        u
+    });
     let spec = RunSpec {
         lease_id: &grant.lease_id,
         jit_config: &grant.jit_config,
@@ -1073,11 +1206,11 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         extra_env: &extra_env,
         max_job: Duration::from_secs(ctx.cfg.max_job_secs),
         preempt_grace: Duration::from_secs(ctx.cfg.preempt_grace_secs),
-        job_user: ctx.cfg.job_user.as_ref(),
+        job_user: job_user.as_ref(),
         proc_root: &ctx.proc_root,
-        cgroups: ctx.cgroups.as_deref(),
-        memory: grant.memory,
-        oom_score: Some(ctx.oom_order.assign(&grant.lease_id)),
+        cgroup: cgroup.as_ref(),
+        oom_score: Some(oom_score),
+        docker_host: endpoint.as_ref().map(dockerproxy::LeaseEndpoint::socket),
     };
     let host_start = sample_host(&ctx).await;
     let outcome = run_lease(
@@ -1102,8 +1235,16 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         end: host_end,
     });
 
-    // Runs whether the job passed, failed, timed out, was aborted or never started.
+    // Runs whether the job passed, failed, timed out, was aborted or never
+    // started. The endpoint stops first so the job cannot add containers
+    // meanwhile; the cgroup goes last, after the containers under it.
+    if let Some(endpoint) = endpoint {
+        endpoint.stop().await;
+    }
     cleanup_slot(&ctx, &grant.lease_id).await;
+    if let Some(cgroup) = cgroup {
+        let _ = tokio::task::spawn_blocking(move || cgroup.remove()).await;
+    }
 
     // Between leases: let the caches re-measure and, if nothing else is
     // running, evict. Skipped by `maintain` itself while another lease holds
@@ -1205,13 +1346,19 @@ mod disk_tests {
     #[test]
     fn the_memory_guard_takes_the_newest_lease_only_below_its_floor() {
         let order = memlimit::OomOrder::default();
-        assert_eq!(guard_victim(100, 4096, &order), None, "nothing running");
+        assert!(
+            guard_victims(100, 4096, &order).is_empty(),
+            "nothing running"
+        );
         order.assign("old");
         order.assign("new");
-        assert_eq!(guard_victim(8192, 4096, &order), None, "above the floor");
-        assert_eq!(guard_victim(4000, 4096, &order).as_deref(), Some("new"));
+        assert!(
+            guard_victims(8192, 4096, &order).is_empty(),
+            "above the floor"
+        );
+        assert_eq!(guard_victims(4000, 4096, &order), ["new", "old"]);
         order.release("new");
-        assert_eq!(guard_victim(4000, 4096, &order).as_deref(), Some("old"));
+        assert_eq!(guard_victims(4000, 4096, &order), ["old"]);
     }
     use crate::classes::{Class, Scope as JobScope};
     use crate::drone::exec::Output;

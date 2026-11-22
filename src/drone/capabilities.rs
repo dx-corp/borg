@@ -515,6 +515,7 @@ mod tests {
                 name: "borg-job".into(),
                 home: "/home/borg-job".into(),
                 priv_bin: "setpriv".into(),
+                groups: None,
             },
         );
         CapabilityCache::default().get(&exec, &config(), 100);
