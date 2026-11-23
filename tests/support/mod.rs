@@ -132,6 +132,12 @@ pub struct MockState {
     /// Labeled instance listings served.
     pub gce_lists: u32,
     pub gce_token_requests: u32,
+    /// The fake tailnet waits this long before it answers a key mint.
+    pub ts_mint_delay_ms: u64,
+    /// Tailnet devices the fake lists, as `{id, hostname, tags}`.
+    pub ts_devices: Vec<Value>,
+    /// Tailnet device ids deleted, in order.
+    pub ts_deleted: Vec<String>,
 }
 
 async fn scripted_reply(
@@ -742,14 +748,27 @@ impl Harness {
             )
             .route(
                 "/ts/tailnet/-/keys",
-                post(|Json(body): Json<Value>| async move {
+                post(|State(state): State<Shared>, Json(body): Json<Value>| async move {
+                    let delay = lock(&state).ts_mint_delay_ms;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     let create = body["capabilities"]["devices"]["create"].clone();
                     Json(json!({"key": TS_AUTHKEY, "capabilities": {"devices": {"create": create}}}))
                 }),
             )
             .route(
                 "/ts/tailnet/-/devices",
-                get(|| async { Json(json!({"devices": []})) }),
+                get(|State(state): State<Shared>| async move {
+                    Json(json!({"devices": lock(&state).ts_devices.clone()}))
+                }),
+            )
+            .route(
+                "/ts/device/{id}",
+                delete(
+                    |State(state): State<Shared>, Path(id): Path<String>| async move {
+                        lock(&state).ts_deleted.push(id);
+                        ""
+                    },
+                ),
             )
             .route(
                 "/compute/v1/projects/{project}/zones/{zone}/instances",

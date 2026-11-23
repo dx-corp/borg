@@ -411,6 +411,59 @@ async fn a_failed_create_undoes_the_enrollment_and_moves_to_another_zone() {
 }
 
 #[tokio::test]
+async fn an_allowance_that_ends_while_the_join_key_is_minted_creates_no_vm() {
+    // The allowance ends three seconds from now, and the tailnet takes longer
+    // than that to answer the key mint.
+    let start = OffsetDateTime::now_utc();
+    let end = (start + time::Duration::seconds(3))
+        .replace_nanosecond(0)
+        .unwrap();
+    let mut c = live_config();
+    c["burst"]["allowance"]["expires_at"] = json!(
+        end.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    );
+    let h = Harness::start(c).await;
+    h.queue_job(1, "borg-ci-heavy", 5);
+    h.queue_job(2, "borg-ci-heavy", 5);
+    h.state().ts_mint_delay_ms = 3500;
+
+    h.queen
+        .tick(start - time::Duration::seconds(600))
+        .await
+        .unwrap();
+    h.queen.tick(start).await.unwrap();
+    let s = status_at(&h, start).await;
+    assert_eq!(burst_events(&s), ["burst_create_failed"], "{}", s["burst"]);
+    assert!(
+        h.state().gce_instances.is_empty(),
+        "no VM is requested once the allowance has ended"
+    );
+    assert_eq!(s["burst"]["drones"]["managed"], 0);
+    assert_eq!(
+        s["drones"],
+        json!([]),
+        "the enrollment made for the VM is undone"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_vm_whose_drone_was_removed_also_removes_its_tailnet_device() {
+    let h = Harness::start(live_config()).await;
+    // The drone booted and joined the tailnet; then its enrollment was
+    // removed, so the queen deletes the VM as an orphan.
+    h.state().gce_instances = vec![orphan("borg-burst-q1c7f304", "us-central1-a")];
+    h.state().ts_devices = vec![
+        json!({"id": "dev-1", "hostname": "gcp-burst-q1c7f304", "tags": ["tag:borg-drone"]}),
+        json!({"id": "dev-2", "hostname": "gcp-burst-other", "tags": ["tag:borg-drone"]}),
+        json!({"id": "dev-3", "hostname": "borg-burst-q1c7f304", "tags": ["tag:borg-drone"]}),
+    ];
+    h.queen.tick(OffsetDateTime::now_utc()).await.unwrap();
+    assert_eq!(h.state().gce_deleted, ["borg-burst-q1c7f304"]);
+    assert_eq!(h.state().ts_deleted, ["dev-1"]);
+}
+
+#[tokio::test]
 async fn without_the_instance_template_nothing_is_created_or_enrolled() {
     let h = Harness::start(live_config()).await;
     h.queue_job(1, "borg-ci-heavy", 5);
