@@ -1522,6 +1522,110 @@ async fn queued_deploy_demand_starts_the_standby_instead_of_minting_and_a_replac
     assert_eq!(h.state().mints.len(), 2);
 }
 
+/// 2026-11-22: borg-deploy-1 ran a heavy publish and held a medium standby,
+/// which left too little room for a light lease, so the light-deploy IaC
+/// apply waited behind heavy builds for hours. The idle standby now gives its
+/// room to the unmet light job: the queen ends it, mints no replacement while
+/// the light job waits, and places the light job on the next pass.
+#[tokio::test]
+async fn an_idle_standby_yields_its_room_to_unmet_deploy_work_of_another_class() {
+    let mut cfg = standby_cfg();
+    cfg["classes"] = json!({
+        "label_prefix": "borg-ci-",
+        "light": {"mem_mib": 2048, "vcpu": 1, "docker": false},
+        "medium": {"mem_mib": 8192, "vcpu": 2, "docker": true},
+        "heavy": {"mem_mib": 20480, "vcpu": 4, "docker": true},
+    });
+    let h = Harness::start(cfg).await;
+    let dep = h.enroll("dep").await;
+    standby_beat(&h, &dep, &[], &[]).await;
+    h.tick().await;
+    let standby = standby_beat(&h, &dep, &[], &[]).await["standby"][0]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // A heavy publish takes the rest of the 28 GiB budget and runs.
+    h.queue_job(1, "borg-ci-heavy-deploy", 600);
+    h.tick().await;
+    let body = standby_beat(&h, &dep, &[&standby], &[]).await;
+    let heavy = body["leases"][0]["lease_id"].as_str().unwrap().to_owned();
+    standby_beat(&h, &dep, &[&standby], &[&heavy]).await;
+    h.set_runner(&format!("borg-dep-{heavy}"), "online", true);
+    h.state().jobs.clear();
+    h.tick().await;
+    assert_eq!(h.state().mints.len(), 2);
+
+    // A light deploy job queues: no room beside the build and the standby.
+    h.queue_job(2, "borg-ci-light-deploy", 600);
+    h.tick().await;
+    let lease = h.queen.store().lease(&standby).await.unwrap().unwrap();
+    assert_eq!(lease.state, borg::store::LeaseStatus::Expired);
+    assert_eq!(
+        h.state().mints.len(),
+        2,
+        "no light grant yet, no new standby"
+    );
+    let body = standby_beat(&h, &dep, &[&standby], &[&heavy]).await;
+    assert_eq!(body["drop_standby"], json!([standby]));
+    let lease = h.queen.store().lease(&heavy).await.unwrap().unwrap();
+    assert_eq!(
+        lease.state,
+        borg::store::LeaseStatus::Running,
+        "the build is untouched"
+    );
+
+    // The next pass places the light job in the room the standby held.
+    h.tick().await;
+    let mints = h.state().mints.clone();
+    assert_eq!(mints.len(), 3);
+    assert_eq!(
+        labels(&mints[2]),
+        ["self-hosted", "Linux", "X64", "borg-ci-light-deploy"]
+    );
+}
+
+#[tokio::test]
+async fn a_standby_on_a_drone_in_its_host_lost_cool_down_neither_starts_nor_covers_demand() {
+    let h = Harness::start(standby_cfg()).await;
+    let dep1 = h.enroll("dep1").await;
+    standby_beat(&h, &dep1, &[], &[]).await;
+    h.tick().await;
+    let id = standby_beat(&h, &dep1, &[], &[]).await["standby"][0]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // dep1 lost a job: it is in its cool-down and still holds its standby.
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    h.queen
+        .store()
+        .suspect_drone("dep1", now + 900)
+        .await
+        .unwrap();
+    let dep2 = h.enroll("dep2").await;
+    standby_beat(&h, &dep2, &[], &[]).await;
+    standby_beat(&h, &dep1, &[&id], &[]).await;
+
+    h.queue_job(1, "borg-ci-medium-deploy", 5);
+    h.tick().await;
+    let body = standby_beat(&h, &dep1, &[&id], &[]).await;
+    assert_eq!(
+        body["start_standby"],
+        json!([]),
+        "the suspect drone starts nothing"
+    );
+    assert_eq!(body["leases"], json!([]));
+    let lease = h.queen.store().lease(&id).await.unwrap().unwrap();
+    assert_eq!(lease.state, borg::store::LeaseStatus::Standby);
+
+    // The job is covered on the healthy drone instead.
+    let body = standby_beat(&h, &dep2, &[], &[]).await;
+    let started =
+        body["leases"].as_array().unwrap().len() + body["start_standby"].as_array().unwrap().len();
+    assert_eq!(started, 1, "{body}");
+}
+
 #[tokio::test]
 async fn a_standby_started_during_an_outage_is_reconciled_when_the_queen_returns() {
     let h = Harness::start(standby_cfg()).await;

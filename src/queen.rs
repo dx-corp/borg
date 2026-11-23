@@ -25,23 +25,27 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::allocator::{
     ActiveLease, AdmissionState, AllocatorInput, ClassIdle, Demand, DroneAdmission, DroneState,
-    LeaseState, PlacementDecision, PrTurn, Promotion, QueueAge, Reservation, Unmet, WarmFloor,
-    allocate_reserved, allocate_reserved_with_backlog, allocate_scope, free_room, free_slots,
-    max_slots,
+    LargerHold, LeaseState, PlacementDecision, PrTurn, QueueAge, Reservation, ServedAge, Unmet,
+    WarmFloor, allocate_reserved, allocate_reserved_with_backlog, allocate_scope, free_room,
+    free_slots, max_slots, uncovered_demand,
 };
 use crate::bid::{ClassPressure, ScoreWeights};
 use crate::burst::{
     Action as BurstAction, BurstSettings, BurstState, BurstView, BurstVm,
     Decision as BurstDecision, ObservedDrone, ZONE_COOLDOWN_SECS,
 };
-use crate::classes::{Class, Scope};
+use crate::classes::{Class, Scope, disk_labels_mib};
 use crate::config::{QueenConfig, StandbySettings};
-use crate::envcontract::{CheckKind, CheckState, Mode, Need, blocked_classes, capability_states};
+use crate::envcontract::{
+    CheckKind, CheckState, Mode, Need, blocked_classes, capability_states, fresh_disk_admissions,
+    merge_blocked_classes,
+};
 use crate::explain::{MAX_HISTORY, PlacementKind, PlacementOutcome, PlacementRecord};
 use crate::gce::{GceClient, GceError, SECRET_METADATA_KEYS, VmSpec};
 use crate::github::{GithubClient, GithubError, QueuedJob, Runner, WorkflowJob};
 use crate::health::{DroneHealth, DroneInfo, Outcome, OutcomeKind, evaluate};
 use crate::homeostasis::{Controller, KeyInput, KeyReport};
+use crate::hostlost::HostLostRerunner;
 use crate::janitor::Janitor;
 use crate::mirror_auth::MirrorAuth;
 use crate::preempt::{PreemptInput, Running, select as select_victims};
@@ -49,8 +53,7 @@ use crate::probe::Capacity;
 use crate::profile::{ClassProfile, QueuedFamilies, build_profiles, family_of};
 use crate::requeue::Requeuer;
 use crate::rollout::{
-    Check as RolloutCheck, DroneView, Observed as RolloutObserved, RolloutState, advance,
-    desired_for,
+    Check as RolloutCheck, Observed as RolloutObserved, RolloutState, desired_for,
 };
 use crate::store::{DroneRow, LeaseRow, LeaseStatus, PreemptionRow, Store, StoreError};
 use crate::tailnet::TailnetEnroll;
@@ -138,40 +141,27 @@ struct FleetWatch {
     /// Main grants per class since that class last granted a pull request,
     /// capped at `pr_fairness.main_grants_between`.
     main_grants_since_pr: BTreeMap<Class, u32>,
+    /// When borg last served each key: minted a runner for it or started a
+    /// standby of it. Feeds [`crate::allocator::ServedAge`].
+    last_served: BTreeMap<(Class, Scope), i64>,
 }
 
-/// Classes whose next grant goes to starving pull-request demand: main has
-/// taken `between` grants in a row.
-fn pr_turn_classes(main_grants_since_pr: &BTreeMap<Class, u32>, between: u32) -> Vec<Class> {
-    Class::ALL
-        .into_iter()
-        .filter(|c| main_grants_since_pr.get(c).copied().unwrap_or(0) >= between)
-        .collect()
-}
-
-/// Account this pass's grants: a pull-request grant resets its class, main
-/// grants count up to `between`. Deploy grants are neither.
+/// Account this pass's grants in the order they were placed: a pull-request
+/// grant resets its class, a main grant counts up to `between`. Deploy grants
+/// are neither, so the count left is main's run since the class's last
+/// pull-request grant.
 fn advance_pr_turns(
     main_grants_since_pr: &mut BTreeMap<Class, u32>,
     grants: &[crate::allocator::Grant],
     between: u32,
 ) {
-    for class in Class::ALL {
-        let of = |scope| {
-            u32::try_from(
-                grants
-                    .iter()
-                    .filter(|g| g.class == class && g.scope == scope)
-                    .count(),
-            )
-            .unwrap_or(u32::MAX)
-        };
-        let count = main_grants_since_pr.entry(class).or_default();
-        *count = if of(Scope::Pr) > 0 {
-            0
-        } else {
-            count.saturating_add(of(Scope::Main)).min(between)
-        };
+    for g in grants {
+        let count = main_grants_since_pr.entry(g.class).or_default();
+        match g.scope {
+            Scope::Pr => *count = 0,
+            Scope::Main => *count = count.saturating_add(1).min(between),
+            Scope::Deploy => {}
+        }
     }
 }
 
@@ -328,6 +318,8 @@ struct UnitPlacementPolicy<'a> {
     share: Option<u8>,
     reserved: &'a [Reservation],
     spent_bids: &'a [ActiveLease],
+    /// Runner demand on the same drones that smaller units make room for.
+    larger: &'a [Demand],
 }
 
 /// Heartbeat bids describe additional slots, so grants made earlier in the
@@ -354,6 +346,7 @@ pub struct Queen {
     snapshot: RwLock<Snapshot>,
     janitor: Option<Janitor>,
     requeuer: Option<Requeuer>,
+    host_lost: Option<HostLostRerunner>,
     tailnet: Option<TailnetEnroll>,
     mirror_auth: Option<MirrorAuth>,
     homeostasis: std::sync::Mutex<Controller>,
@@ -381,28 +374,6 @@ pub struct Queen {
     /// Per drone, the admission state its last pass settled in; the next pass
     /// relaxes from it only past the hysteresis margin.
     admission_prev: std::sync::Mutex<BTreeMap<String, AdmissionState>>,
-}
-
-/// The full label set a JIT runner is registered with: the labels GitHub
-/// assigns to every self-hosted runner, then the grant's class labels. They
-/// are sent explicitly because the API documents only "custom" labels.
-pub fn jit_labels(os: &str, arch: &str, extra: &[String], class_labels: &[String]) -> Vec<String> {
-    let mut labels = vec!["self-hosted".to_owned()];
-    match os {
-        "linux" => labels.push("Linux".to_owned()),
-        "macos" => labels.push("macOS".to_owned()),
-        "windows" => labels.push("Windows".to_owned()),
-        _ => {}
-    }
-    match arch {
-        "x86_64" | "x86" => labels.push("X64".to_owned()),
-        "aarch64" | "arm64" => labels.push("ARM64".to_owned()),
-        "arm" => labels.push("ARM".to_owned()),
-        _ => {}
-    }
-    labels.extend(extra.iter().cloned());
-    labels.extend(class_labels.iter().cloned());
-    labels
 }
 
 /// Reclaim audit entries are kept this long (90 days).
@@ -451,19 +422,6 @@ fn new_lease_id() -> String {
     hex::encode(b)
 }
 
-fn as_active(l: &LeaseRow) -> ActiveLease {
-    ActiveLease {
-        drone_id: l.drone.clone(),
-        class: l.class,
-        scope: l.scope,
-        state: match l.state {
-            LeaseStatus::Running => LeaseState::Running,
-            LeaseStatus::Standby => LeaseState::Standby,
-            _ => LeaseState::Pending,
-        },
-    }
-}
-
 /// Where a preemptible lease's job lives: repo, run id, job id.
 type JobRef<'a> = (&'a str, u64, u64);
 
@@ -509,35 +467,6 @@ struct StandbyView<'a> {
     serves_deploy: &'a BTreeSet<String>,
 }
 
-/// The standby leases to start now: per promoted class, the oldest standby
-/// leases on fresh drones.
-fn promotions(
-    promote: &[Promotion],
-    active: &[LeaseRow],
-    fresh: &HashMap<String, Capacity>,
-) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for p in promote {
-        let mut standby: Vec<&LeaseRow> = active
-            .iter()
-            .filter(|l| {
-                l.state == LeaseStatus::Standby
-                    && l.scope == Scope::Deploy
-                    && l.class == p.class
-                    && fresh.contains_key(&l.drone)
-            })
-            .collect();
-        standby.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
-        out.extend(
-            standby
-                .into_iter()
-                .take(usize::try_from(p.count).unwrap_or(usize::MAX))
-                .map(|l| l.id.clone()),
-        );
-    }
-    out
-}
-
 fn age_secs(now: OffsetDateTime, then: OffsetDateTime) -> u64 {
     u64::try_from((now - then).whole_seconds()).unwrap_or(0)
 }
@@ -552,6 +481,7 @@ impl Queen {
             snapshot: RwLock::new(Snapshot::default()),
             janitor: None,
             requeuer: None,
+            host_lost: None,
             tailnet: None,
             mirror_auth: None,
             homeostasis: std::sync::Mutex::new(Controller::new()),
@@ -718,6 +648,20 @@ impl Queen {
         &self.cfg
     }
 
+    /// How long ago borg last served each key; see [`ServedAge`]. A lease
+    /// still pending or running counts as served at its creation, so the
+    /// first pass after a restart already knows what the fleet runs.
+    fn served(&self, now: i64, active: &[LeaseRow]) -> Vec<ServedAge> {
+        let mut w = self.watch.lock().expect("fleet watch lock");
+        served_ages(&mut w.last_served, now, active)
+    }
+
+    /// Remember that borg served `(class, scope)` at `now`.
+    fn note_served(&self, class: Class, scope: Scope, now: i64) {
+        let mut w = self.watch.lock().expect("fleet watch lock");
+        w.last_served.insert((class, scope), now);
+    }
+
     /// The pull-request turns this pass; see [`PrTurn`].
     fn pr_turn(&self) -> PrTurn {
         let Some(f) = &self.cfg.pr_fairness else {
@@ -726,7 +670,8 @@ impl Queen {
         let w = self.watch.lock().expect("fleet watch lock");
         PrTurn {
             after_secs: Some(f.after_secs),
-            classes: pr_turn_classes(&w.main_grants_since_pr, f.main_grants_between),
+            between: f.main_grants_between,
+            main_grants_since_pr: w.main_grants_since_pr.clone(),
         }
     }
 
@@ -795,7 +740,7 @@ impl Queen {
         if let Err(e) = self.assess_health(now_ts).await {
             tracing::warn!("health assessment failed: {e}");
         }
-        if let Err(e) = self.advance_rollout(now_ts, &active).await {
+        if let Err(e) = self.advance_rollout(now_ts, &active, &queue_ages).await {
             tracing::warn!("rollout pass failed: {e}");
         }
         let profiles = self.profiles(now_ts).await;
@@ -803,11 +748,16 @@ impl Queen {
             tracing::warn!("drone expiry failed: {e}");
         }
         let drone_rows = self.store.drones().await?;
+        let cordoned = self.rollout_cordoned();
         let mut fresh_names: BTreeSet<String> = BTreeSet::new();
         let mut capacities: HashMap<String, Capacity> = HashMap::new();
         let mut extra_labels: HashMap<String, Vec<String>> = HashMap::new();
         let mut serves_deploy: BTreeSet<String> = BTreeSet::new();
         let mut drones = Vec::new();
+        // Per fresh drone, the classes whose undelivered leases its heartbeat
+        // would withhold (every class while it is cordoned, suspect or not
+        // accepting).
+        let mut withheld: HashMap<String, Vec<Class>> = HashMap::new();
         for d in &drone_rows {
             let fresh = d
                 .last_heartbeat
@@ -817,25 +767,36 @@ impl Queen {
             }
             if let (true, Some(cap)) = (fresh, &d.capacity) {
                 let mut state = d.allocator_state(cap, now_ts);
-                state.accepting &= !crate::envcontract::disk_admission(
-                    self.cfg.env_contract.min_cache_dir_free_bytes,
+                let disk = fresh_disk_admissions(
+                    &self.cfg.env_contract,
                     cap.free_disk_mib,
-                    d.env_facts
-                        .as_ref()
-                        .filter(|facts| {
-                            (0..=self.cfg.env_contract.facts_max_age_secs)
-                                .contains(&(now_ts - facts.observed_at))
-                        })
-                        .and_then(|facts| facts.cache_dir_free_bytes),
-                )
-                .blocked();
-                state.blocked_classes = blocked_classes(
+                    d.env_facts.as_ref(),
+                    now_ts,
+                );
+                state.disk_floor_mib = disk
+                    .classes
+                    .iter()
+                    .map(|(&c, a)| (c, a.minimum_free_bytes >> 20))
+                    .collect();
+                state.accepting &= !disk.global.blocked();
+                state.accepting &= !cordoned.contains(&d.name);
+                withheld.insert(
+                    d.name.clone(),
+                    if !d.accepting || d.suspect(now_ts) || cordoned.contains(&d.name) {
+                        Class::ALL.to_vec()
+                    } else {
+                        disk.blocked_classes.clone()
+                    },
+                );
+                let mut blocked = blocked_classes(
                     &self.cfg.env_contract,
                     d.env_facts.as_ref(),
                     &self.cfg.classes,
                     None,
                     now_ts,
                 );
+                merge_blocked_classes(&mut blocked, disk.blocked_classes);
+                state.blocked_classes = blocked;
                 if let Some(a) = &self.cfg.admission
                     && let Some(f) = d
                         .env_facts
@@ -870,6 +831,14 @@ impl Queen {
                 );
             }
         }
+        let (demand, queue_ages, pinned_groups) = pinned::split_demand(
+            &jobs,
+            &self.cfg.classes,
+            &extra_labels,
+            (demand, queue_ages),
+            now,
+            |j| self.summarize(j, now),
+        );
         let schedulable_slots = self.class_slots(&drones);
         if let Err(e) = self.advance_units(now_ts, &fresh_names).await {
             tracing::warn!("unit pass failed: {e}");
@@ -877,7 +846,7 @@ impl Queen {
         let unit_leases = self.unit_leases().await;
         let leases = active
             .iter()
-            .map(as_active)
+            .map(|l| as_placed(l, &withheld))
             .chain(unit_leases.iter().cloned())
             .collect::<Vec<ActiveLease>>();
         let schedule_floors = self
@@ -895,10 +864,12 @@ impl Queen {
             leases,
             warm_floors: warm_floors.clone(),
             queue_ages,
+            served: self.served(now_ts, &active),
             starvation_after_secs: self.cfg.starvation_after_secs,
             weights: ScoreWeights::default(),
             admission: self.cfg.admission.as_ref().map(|a| a.thresholds()),
             pr_turn: self.pr_turn(),
+            larger_hold: LargerHold::default(),
         };
         let mut unit_reserved = Vec::new();
         let mut deploy_grants = Vec::new();
@@ -918,6 +889,7 @@ impl Queen {
                 class: g.class,
                 scope: g.scope,
                 state: LeaseState::Pending,
+                disk_mib: disk_labels_mib(&g.labels),
             }));
             held.extend(spent_bids.iter().cloned());
             let units = self
@@ -930,6 +902,7 @@ impl Queen {
                         share: Some(self.cfg.units.capacity_share_percent),
                         reserved: &deploy.reserved_for,
                         spent_bids: &spent_bids,
+                        larger: &uncovered_demand(&runner_input, &spent_bids),
                     },
                 )
                 .await?;
@@ -939,7 +912,7 @@ impl Queen {
             // offsetting runner demand.
             placement_leases = active
                 .iter()
-                .map(as_active)
+                .map(|l| as_placed(l, &withheld))
                 .chain(self.unit_leases().await)
                 .collect();
             runner_input.leases = placement_leases.clone();
@@ -950,11 +923,16 @@ impl Queen {
                     class: g.class,
                     scope: g.scope,
                     state: LeaseState::Pending,
+                    disk_mib: disk_labels_mib(&g.labels),
                 }));
             // A starving unit needs contiguous room as existing work drains.
             // Do not refill its eligible reserved host with new CI this tick.
             spend_bids(&mut runner_input.drones, &spent_bids);
         }
+        let (mut pinned_grants, mut pinned_decisions) =
+            pinned::place(&pinned_groups, &mut runner_input, &unit_reserved, |j| {
+                self.summarize(j, now)
+            });
         let mut allocation = allocate_reserved(&runner_input, &unit_reserved);
         // Dry-run: the same pure pass with paid drones costed, for comparison
         // only. Its grants are never minted.
@@ -975,11 +953,23 @@ impl Queen {
                 f.main_grants_between,
             );
         }
+        deploy_grants.append(&mut pinned_grants);
         deploy_grants.append(&mut allocation.grants);
         allocation.grants = deploy_grants;
+        deploy_decisions.append(&mut pinned_decisions);
         deploy_decisions.append(&mut allocation.decisions);
         allocation.decisions = deploy_decisions;
         allocation.reserved_for.extend(unit_reserved);
+        // Runner demand this pass could not place, which units make room for.
+        let runner_unmet: Vec<Demand> = allocation
+            .unmet
+            .iter()
+            .map(|u| Demand {
+                class: u.class,
+                scope: u.scope,
+                count: u.count,
+            })
+            .collect();
         let mut held = placement_leases.clone();
         let runner_spent: Vec<ActiveLease> = allocation
             .grants
@@ -989,6 +979,7 @@ impl Queen {
                 class: g.class,
                 scope: g.scope,
                 state: LeaseState::Pending,
+                disk_mib: disk_labels_mib(&g.labels),
             })
             .collect();
         held.extend(runner_spent.iter().cloned());
@@ -1008,6 +999,7 @@ impl Queen {
                     share: None,
                     reserved: &allocation.reserved_for,
                     spent_bids: &spent_bids,
+                    larger: &runner_unmet,
                 },
             )
             .await
@@ -1017,7 +1009,7 @@ impl Queen {
         let unit_leases = self.unit_leases().await;
         placement_leases = active
             .iter()
-            .map(as_active)
+            .map(|l| as_placed(l, &withheld))
             .chain(unit_leases.iter().cloned())
             .collect();
         // Demand that idle non-borg runners will take is not borg's to wake
@@ -1045,6 +1037,7 @@ impl Queen {
             class: g.class,
             scope: g.scope,
             state: LeaseState::Pending,
+            disk_mib: disk_labels_mib(&g.labels),
         }));
         let idle_after = crate::allocator::idle_after(
             &runner_input.drones,
@@ -1135,6 +1128,7 @@ impl Queen {
                 break;
             }
             persisted.insert(order);
+            self.note_served(grant.class, grant.scope, now_ts);
         }
         for decision in &allocation.decisions {
             let key = self.cfg.classes.job_label(decision.class, decision.scope);
@@ -1159,7 +1153,70 @@ impl Queen {
             return Err(e.into());
         }
 
-        let start_standby = promotions(&allocation.promote, &active, &capacities);
+        let accepting: BTreeMap<&str, &[Class]> = placement_drones
+            .iter()
+            .filter(|d| d.accepting)
+            .map(|d| (d.id.as_str(), d.blocked_classes.as_slice()))
+            .collect();
+        let start_standby = promotions(&allocation.promote, &active, &capacities, &accepting);
+        for id in &start_standby {
+            if let Some(l) = active.iter().find(|l| &l.id == id) {
+                self.note_served(l.class, l.scope, now_ts);
+            }
+        }
+        // Idle standbys give their room to unmet deploy work of another
+        // class, and a drone that could run such work mints no new standby.
+        let queued_deploy: BTreeSet<Class> = runner_input
+            .demand
+            .iter()
+            .filter(|d| d.scope == Scope::Deploy && d.count > 0)
+            .map(|d| d.class)
+            .collect();
+        let yielded = standbys_to_yield(
+            &allocation.unmet,
+            &queued_deploy,
+            &active,
+            &placement_drones,
+            &mut held_after,
+            &self.cfg.classes,
+            |l| {
+                ours.get(l.runner_name.as_str())
+                    .is_none_or(|r| !r.busy && r.status != "online")
+            },
+        );
+        let mut freed: Vec<Class> = Vec::new();
+        for (id, for_class) in &yielded {
+            let Some(l) = active.iter().find(|l| &l.id == id) else {
+                continue;
+            };
+            // A heartbeat may have started it since the runner list was read.
+            if self.store.expire_standby(id, now_ts).await? {
+                tracing::info!(
+                    "ending {} standby {id} on {}: {for_class} deploy work needs its room",
+                    l.class,
+                    l.drone
+                );
+                if let Some(r) = ours.get(l.runner_name.as_str())
+                    && let Err(e) = self.github.delete_runner(r.id).await
+                {
+                    tracing::warn!("delete runner {} failed: {e}", r.name);
+                }
+                freed.push(*for_class);
+            }
+        }
+        // Room a released standby opened is not preempted for as well.
+        let preempt_unmet = less_freed(&unmet_placeable, &freed);
+        let standby_active: Vec<LeaseRow> = active
+            .iter()
+            .filter(|l| !yielded.iter().any(|(id, _)| id == &l.id))
+            .cloned()
+            .collect();
+        let standby_drones = standby_hosts(
+            &serves_deploy,
+            &placement_drones,
+            &allocation.unmet,
+            &self.cfg.classes,
+        );
         if mint_error.is_none()
             && let Some(st) = &self.cfg.standby
         {
@@ -1168,11 +1225,11 @@ impl Queen {
                 .top_up_standby(
                     st,
                     &StandbyView {
-                        active: &active,
+                        active: &standby_active,
                         drones: &placement_drones,
                         capacities: &capacities,
                         extra_labels: &extra_labels,
-                        serves_deploy: &serves_deploy,
+                        serves_deploy: &standby_drones,
                     },
                     held,
                     &prefix,
@@ -1195,7 +1252,7 @@ impl Queen {
                 drones: &placement_drones,
                 others: &others,
                 running: &running,
-                unmet: &unmet_placeable,
+                unmet: &preempt_unmet,
                 queue_ages: &preempt_ages,
                 now: now_ts,
             });
@@ -1329,7 +1386,7 @@ impl Queen {
                 let spec = self.cfg.classes.spec(class);
                 for _ in have..usize::try_from(st.per_drone).unwrap_or(usize::MAX) {
                     let room = free_room(drone, &held, &self.cfg.classes);
-                    if free_slots(drone, &room, spec) == 0 {
+                    if free_slots(drone, &room, class, spec) == 0 {
                         break;
                     }
                     let lease_id = new_lease_id();
@@ -1379,6 +1436,7 @@ impl Queen {
                         class,
                         scope: Scope::Deploy,
                         state: LeaseState::Standby,
+                        disk_mib: None,
                     });
                 }
             }
@@ -1407,100 +1465,6 @@ impl Queen {
             .map(|r| desired_for(&r.state, drone).to_owned())
     }
 
-    /// One pass of the quorum rollout gate (only when both the target and
-    /// `rollout.previous_version` are configured).
-    async fn advance_rollout(&self, now: i64, active: &[LeaseRow]) -> Result<(), QueenError> {
-        let Some(target) = self.rollout_target() else {
-            return Ok(());
-        };
-        if self.cfg.rollout.previous_version.is_none() && !self.cfg.rollout.follow_queen {
-            return Ok(());
-        }
-        let stored = self.store.rollout_state().await?;
-        let target = self.settled_target(target, stored.as_ref());
-        let rows = self.store.drones().await?;
-        let busy_drones: HashSet<&str> = active
-            .iter()
-            .filter(|lease| lease.state != LeaseStatus::Standby)
-            .map(|lease| lease.drone.as_str())
-            .collect();
-        let views: Vec<DroneView> = rows
-            .iter()
-            .map(|d| DroneView {
-                name: d.name.clone(),
-                os: d
-                    .capacity
-                    .as_ref()
-                    .map(|c| c.os.clone())
-                    .unwrap_or_default(),
-                fresh: d
-                    .last_heartbeat
-                    .is_some_and(|t| now - t <= self.cfg.drone_stale_secs),
-                held: d.held(),
-                maintenance: d.hold() == crate::health::Hold::Operator,
-                has_active_leases: busy_drones.contains(d.name.as_str()),
-                version: d.version.clone(),
-                version_since: d.version_since,
-                shared: d.trust == crate::classes::Trust::Shared,
-                runs_jobs: d.accepting,
-            })
-            .collect();
-        let Some(previous) = self
-            .cfg
-            .rollout
-            .previous_version
-            .clone()
-            .or_else(|| crate::rollout::previous_for(&target, stored.as_ref(), &views))
-        else {
-            // A reset can leave no baseline when all fresh drones already run
-            // the target. Clear the old view and its heartbeat instructions.
-            self.update_snapshot(|s| s.rollout = None);
-            return Ok(());
-        };
-        let since = stored
-            .as_ref()
-            .filter(|s| s.target == target)
-            .map_or(now.saturating_sub(86_400), |s| s.started_at);
-        let outcomes: Vec<Outcome> = self
-            .store
-            .telemetry_since(since, MAX_REPORT_ROWS)
-            .await?
-            .iter()
-            .filter_map(outcome_of)
-            .collect();
-        let adv = advance(
-            now,
-            &self.cfg.rollout,
-            &previous,
-            &target,
-            stored.clone(),
-            &views,
-            &outcomes,
-        );
-        if stored.as_ref() != Some(&adv.state)
-            && !self
-                .store
-                .save_rollout_state_if_current(stored.as_ref(), &adv.state, now)
-                .await?
-        {
-            return Ok(());
-        }
-        for e in &adv.events {
-            tracing::warn!("rollout: {e}");
-            self.store.log_rollout(now, e).await?;
-        }
-        self.update_snapshot(|s| {
-            s.rollout = Some(RolloutView {
-                state: adv.state,
-                checks: adv.checks,
-                waiting: adv.waiting,
-                new_group: adv.new_group,
-                control_group: adv.control_group,
-            });
-        });
-        Ok(())
-    }
-
     /// Units already placed hold capacity like running leases.
     async fn unit_leases(&self) -> Vec<ActiveLease> {
         if !self.cfg.units.enabled {
@@ -1518,7 +1482,14 @@ impl Queen {
                         drone_id: u.drone?,
                         class: u.class,
                         scope: u.scope,
-                        state: LeaseState::Running,
+                        // A unit placed and not yet acknowledged has not
+                        // started writing: it holds its disk floor.
+                        state: if u.state == UnitState::Running {
+                            LeaseState::Running
+                        } else {
+                            LeaseState::Held
+                        },
+                        disk_mib: None,
                     })
                 })
                 .collect(),
@@ -1689,7 +1660,7 @@ impl Queen {
                     .filter(|d| admission::unit_host(&d.id, capacities, &rows_by_id, &u.platform))
                     .map(|d| {
                         let mut d = d.clone();
-                        d.blocked_classes = blocked_classes(
+                        let mut blocked = blocked_classes(
                             &self.cfg.env_contract,
                             rows_by_id
                                 .get(d.id.as_str())
@@ -1698,8 +1669,25 @@ impl Queen {
                             u.rust_toolchain.as_deref(),
                             now,
                         );
-                        d.blocked_classes
-                            .extend(self.cfg.units.disallowed_classes(&d.id));
+                        if let Some(cap) = capacities.get(&d.id) {
+                            let facts = rows_by_id
+                                .get(d.id.as_str())
+                                .and_then(|row| row.env_facts.as_ref());
+                            blocked.extend(
+                                fresh_disk_admissions(
+                                    &self.cfg.env_contract,
+                                    cap.free_disk_mib,
+                                    facts,
+                                    now,
+                                )
+                                .blocked_classes,
+                            );
+                        }
+                        merge_blocked_classes(
+                            &mut blocked,
+                            self.cfg.units.disallowed_classes(&d.id),
+                        );
+                        d.blocked_classes = blocked;
                         d
                     })
                     .collect();
@@ -1723,7 +1711,7 @@ impl Queen {
                             && d.trust.admits(u.scope)
                             && d.admission(admission).admits(u.class, u.scope)
                             && !d.blocked_classes.contains(&u.class)
-                            && max_slots(d, self.cfg.classes.spec(u.class)) > 0
+                            && max_slots(d, u.class, self.cfg.classes.spec(u.class)) > 0
                             && (d.bids.is_empty()
                                 || d.bids.iter().any(|b| {
                                     b.class == u.class
@@ -1738,9 +1726,15 @@ impl Queen {
             .iter()
             .filter(|d| eligible.contains(d.id.as_str()))
             .fold((0u64, 0u64, 0u64), |(c, m, slots), d| {
+                // The lease slots the drone offers to a mix of classes: class
+                // caps bound single classes, not the mix, so they are left out.
+                let uncapped = crate::allocator::DroneState {
+                    class_caps: std::collections::BTreeMap::new(),
+                    ..d.clone()
+                };
                 let capacity = Class::ALL
                     .into_iter()
-                    .map(|class| max_slots(d, self.cfg.classes.spec(class)))
+                    .map(|class| max_slots(&uncapped, class, self.cfg.classes.spec(class)))
                     .max()
                     .unwrap_or(0);
                 (
@@ -1838,7 +1832,9 @@ impl Queen {
                         .iter()
                         .cloned()
                         .map(|mut l| {
-                            l.state = LeaseState::Running;
+                            if l.state != LeaseState::Running {
+                                l.state = LeaseState::Held;
+                            }
                             l
                         })
                         .collect(),
@@ -1849,10 +1845,12 @@ impl Queen {
                         oldest_age_secs: u64::try_from(now.saturating_sub(u.created_at))
                             .unwrap_or(0),
                     }],
+                    served: Vec::new(),
                     starvation_after_secs: self.cfg.starvation_after_secs,
                     weights: ScoreWeights::default(),
                     admission,
                     pr_turn: PrTurn::default(),
+                    larger_hold: LargerHold::with_elsewhere(policy.larger.to_vec()),
                 },
                 &reservations,
                 &backlog,
@@ -1911,7 +1909,8 @@ impl Queen {
                     drone_id: g.drone_id.clone(),
                     class: g.class,
                     scope: g.scope,
-                    state: LeaseState::Running,
+                    state: LeaseState::Held,
+                    disk_mib: None,
                 };
                 base.push(lease.clone());
                 placed.leases.push(lease);
@@ -2205,6 +2204,7 @@ impl Queen {
         now: i64,
     ) -> Result<Vec<LeaseRow>, QueenError> {
         let mut still_active = Vec::new();
+        let mut drones = None;
         for mut lease in self.store.active_leases().await? {
             let runner = ours.get(lease.runner_name.as_str());
             let overdue = now - lease.created_at > self.cfg.lease_max_secs;
@@ -2215,6 +2215,7 @@ impl Queen {
                 !standby && now > lease.expires_at && runner.is_none_or(|r| r.status != "online");
             match runner {
                 _ if overdue => {
+                    self.note_unreported_end(&lease, now, &mut drones).await;
                     self.end(&lease, runner.copied(), LeaseStatus::Expired, now)
                         .await?
                 }
@@ -2231,11 +2232,15 @@ impl Queen {
                 // A standby whose registration is gone was started and has
                 // finished (or GitHub dropped it): the next tick mints another.
                 None if matches!(lease.state, LeaseStatus::Running | LeaseStatus::Standby) => {
+                    self.note_unreported_end(&lease, now, &mut drones).await;
                     self.store
                         .set_state(&lease.id, LeaseStatus::Done, now)
                         .await?;
                 }
+                // A running lease whose runner went offline (not busy, still
+                // registered) is ended here too: classify it like the others.
                 _ if never_came_online => {
+                    self.note_unreported_end(&lease, now, &mut drones).await;
                     self.end(&lease, runner.copied(), LeaseStatus::Expired, now)
                         .await?
                 }
@@ -2343,37 +2348,6 @@ impl Queen {
         (queue, demand, ages, families_by_class(&families))
     }
 
-    /// Per-class totals for status and metrics: slots the fleet could hold.
-    /// Remove drones silent past their `drone_expiry` window (never one named
-    /// in `wake.hosts`, never one that has not heartbeated yet) and log each
-    /// removal as a `drone_expired` health event.
-    async fn expire_drones(&self, now: i64) -> Result<(), StoreError> {
-        for d in self.store.drones().await? {
-            let Some(last) = d.last_heartbeat else {
-                continue;
-            };
-            let Some(after) = self.cfg.drone_expiry.expiry_for(&d.name) else {
-                continue;
-            };
-            let silent = now - last;
-            if silent <= after.max(self.cfg.drone_stale_secs)
-                || self.cfg.wake.hosts.iter().any(|h| h.name == d.name)
-            {
-                continue;
-            }
-            if let Some(dropped) = self.store.remove_drone(&d.name).await? {
-                let reason = format!(
-                    "no heartbeat for {silent}s (expiry {after}s); {dropped} unfinished leases dropped"
-                );
-                tracing::warn!("expired drone {}: {reason}", d.name);
-                self.store
-                    .record_health_event(now, &d.name, "drone_expired", &reason)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
     /// Log drones that went stale since the last pass, and raise or clear the
     /// capacity alarm per class. Returns the alarm state for the snapshot.
     async fn watch_fleet(
@@ -2386,11 +2360,7 @@ impl Queen {
         unmet: &[Unmet],
     ) -> (BTreeMap<Class, i64>, BTreeSet<Class>) {
         let alarm = &self.cfg.capacity_alarm;
-        let stale: Vec<&str> = rows
-            .iter()
-            .filter(|d| !fresh.contains(&d.name))
-            .map(|d| d.name.as_str())
-            .collect();
+        let stale = capacity_alarm::stale_drones(rows, fresh, now);
         let mut events: Vec<(String, &'static str, String)> = Vec::new();
         let state = {
             let mut w = self.watch.lock().expect("fleet watch lock");
@@ -2441,9 +2411,8 @@ impl Queen {
                             "fleet".to_owned(),
                             "capacity_starved",
                             format!(
-                                "{class}: {main} main jobs unmet for {}s with {have} free admitting slots; stale drones: [{}]",
+                                "{class}: {main} main jobs unmet for {}s with {have} free admitting slots; stale drones: {stale}",
                                 now - since,
-                                stale.join(", ")
                             ),
                         ));
                     }
@@ -2796,6 +2765,7 @@ impl Queen {
                     match gce.delete_instance(&zone, &vm).await {
                         Ok(existed) => {
                             crate::burst::set(vms, drone, |v| v.ended_at = Some(now));
+                            crate::tskey::remove_device(cfg.gce(), drone).await;
                             if let Err(e) = self.store.remove_drone(drone).await {
                                 tracing::warn!("burst: remove drone {drone}: {e}");
                             }
@@ -2827,33 +2797,42 @@ impl Queen {
         now: i64,
     ) -> Result<Option<String>, String> {
         let short = |e: &dyn std::fmt::Display| e.to_string().chars().take(300).collect::<String>();
+        // formal: begin burst_allowance/check_allowance.create_site_guard
+        // The plan never asks for a create without an allowance; this is the
+        // last check before a VM can exist. It also checks the wall clock:
+        // `now` is the tick's start, and an allowance may end mid-tick.
+        let wall = OffsetDateTime::now_utc().unix_timestamp();
+        if let Some(why) = cfg
+            .create_refusal(now)
+            .or_else(|| cfg.create_refusal(wall.max(now)))
+        {
+            tracing::warn!("burst: refused to create {zone}/{vm}: {why}");
+            return Err(format!("refused: {why}"));
+        }
+        // formal: end burst_allowance/check_allowance.create_site_guard
         let g = cfg.gce();
-        let key_path = g
-            .tailscale_authkey_path
-            .as_ref()
-            .ok_or("gce.tailscale_authkey_path is not set")?;
-        let authkey = tokio::fs::read_to_string(key_path)
-            .await
-            .map_err(|e| format!("read {}: {e}", key_path.display()))?;
+        let authkey = crate::tskey::mint_for_vm(g, vm).await?;
+        // Read before enrolling: with no template the queen creates nothing.
+        let (template_ref, template) = gce.burst_template(g).await?;
         let token = crate::admin::enroll_drone(&self.store, drone, now)
             .await
             .map_err(|e| format!("enroll {drone}: {e}"))?;
         let body = crate::gce::instance_body(
             g,
             &VmSpec {
-                zone,
                 vm,
                 drone,
-                tailscale_authkey: authkey.trim(),
+                tailscale_authkey: &authkey,
                 enroll_token: &token,
             },
+            &template,
         );
         let undo = || async {
             if let Err(e) = self.store.remove_drone(drone).await {
                 tracing::warn!("burst: undo enrollment of {drone}: {e}");
             }
         };
-        let op = match gce.insert_instance(zone, &body).await {
+        let op = match gce.insert_instance(zone, &template_ref, &body).await {
             Ok(op) => op,
             Err(e) => {
                 undo().await;
@@ -2979,8 +2958,8 @@ impl Queen {
                     c,
                     drones
                         .iter()
-                        .filter(|d| d.accepting)
-                        .map(|d| max_slots(d, spec))
+                        .filter(|d| d.accepting && !d.blocked_classes.contains(&c))
+                        .map(|d| max_slots(d, c, spec))
                         .sum(),
                 )
             })
@@ -2990,11 +2969,20 @@ impl Queen {
 
 mod admission;
 mod build;
+mod capacity_alarm;
+mod coverage;
 mod families;
+mod hostlost;
+mod pinned;
+mod rollout_pass;
 #[cfg(test)]
 use admission::pressure_window_mean;
 pub use build::QueenBuild;
+use coverage::{
+    as_active, as_placed, less_freed, promotions, served_ages, standby_hosts, standbys_to_yield,
+};
 use families::{families_by_class, placement_profiles};
+pub use pinned::jit_labels;
 
 #[cfg(test)]
 mod tests;

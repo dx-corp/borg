@@ -47,7 +47,7 @@ pub enum GceError {
     #[error("unexpected response: {0}")]
     Decode(String),
     /// The create operation finished with an error (for example a zone out
-    /// of Spot capacity).
+    /// of capacity).
     #[error("operation failed: {0}")]
     Operation(String),
 }
@@ -250,15 +250,51 @@ impl GceClient {
     pub(crate) async fn insert_instance(
         &self,
         zone: &str,
+        template: &str,
         body: &Value,
     ) -> Result<Option<String>, GceError> {
         let path = self.zone_path(zone, "instances");
-        let rb = self.request(Method::POST, &path).await?.json(body);
+        let rb = self
+            .request(Method::POST, &path)
+            .await?
+            .query(&[("sourceInstanceTemplate", template)])
+            .json(body);
         let (_, op) = self.send("POST", &path, rb).await?;
         if let Some(e) = operation_error(&op) {
             return Err(GceError::Operation(e));
         }
         Ok(op.get("name").and_then(Value::as_str).map(str::to_owned))
+    }
+
+    /// The instance template every burst VM is created from, as the
+    /// reference to pass to `insert_instance` and the template itself for
+    /// `instance_body`. Every burst VM comes from it: with none configured,
+    /// or one that cannot be read, this is an error and the caller creates
+    /// nothing; the queen never builds a host from its own settings. Needs
+    /// `compute.instanceTemplates.get`.
+    pub(crate) async fn burst_template(
+        &self,
+        gce: &GceSettings,
+    ) -> Result<(String, Value), String> {
+        let name = gce
+            .instance_template
+            .as_deref()
+            .ok_or("gce.instance_template is not set; burst VMs are created only from it")?;
+        let path = instance_template_path(name)
+            .ok_or("gce.instance_template is not an instance template name")?;
+        let template = async {
+            let rb = self.request(Method::GET, &path).await?;
+            self.send("GET", &path, rb).await
+        }
+        .await
+        .map_err(|e: GceError| {
+            let why: String = e.to_string().chars().take(300).collect();
+            format!("instance template {name}: {why}")
+        })?
+        .1;
+        template_matches_plan(&template, gce)
+            .map_err(|why| format!("instance template {name}: {why}; no VM was created"))?;
+        Ok((path.trim_start_matches('/').to_owned(), template))
     }
 
     /// Wait (bounded) for an insert operation. `Err(Operation)` means the
@@ -432,65 +468,135 @@ fn operation_error(op: &Value) -> Option<String> {
     Some(format!("{code}: {msg}"))
 }
 
-/// The region a zone belongs to (`us-west1-b` -> `us-west1`).
-fn region_of(zone: &str) -> &str {
-    zone.rsplit_once('-').map_or(zone, |(r, _)| r)
-}
-
 /// What a burst drone needs at creation.
 pub(crate) struct VmSpec<'a> {
-    pub(crate) zone: &'a str,
     pub(crate) vm: &'a str,
     pub(crate) drone: &'a str,
     pub(crate) tailscale_authkey: &'a str,
     pub(crate) enroll_token: &'a str,
 }
 
-/// The `instances.insert` body for one burst VM: Spot (unless configured
-/// otherwise), a hard maximum run time that deletes the VM, an ephemeral
-/// external address on the burst network, no service account and no API
-/// scopes, and the bootstrap script plus its secrets in metadata.
-pub(crate) fn instance_body(gce: &GceSettings, spec: &VmSpec<'_>) -> Value {
-    let (provisioning, restart) = if gce.spot {
-        ("SPOT", false)
-    } else {
-        ("STANDARD", true)
+/// The API path of an instance template named as
+/// `projects/<project>/global/instanceTemplates/<name>`, with or without the
+/// `https://www.googleapis.com/compute/v1/` prefix, or as the regional form
+/// `projects/<project>/regions/<region>/instanceTemplates/<name>`. `None`
+/// when `template` is neither.
+pub(crate) fn instance_template_path(template: &str) -> Option<String> {
+    let rest = template
+        .strip_prefix("https://www.googleapis.com/compute/v1/")
+        .unwrap_or(template);
+    let parts: Vec<&str> = rest.split('/').collect();
+    let label = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     };
+    let ok = match parts.as_slice() {
+        ["projects", project, "global", "instanceTemplates", name] => label(project) && label(name),
+        [
+            "projects",
+            project,
+            "regions",
+            region,
+            "instanceTemplates",
+            name,
+        ] => label(project) && label(region) && label(name),
+        _ => false,
+    };
+    ok.then(|| format!("/{rest}"))
+}
+
+/// Whether the template gives a VM the lifetime the queen plans with. The
+/// template owns scheduling, but the planner retires drones, counts drone
+/// hours and stops tracking a VM by `gce.max_run_secs`: a template that
+/// deletes sooner would cut running jobs off, and one that deletes later, or
+/// never, would leave a VM running that the queen no longer counts or
+/// deletes. So the template must be STANDARD, delete on termination, and run
+/// for exactly `max_run_secs`. Checked before a drone is enrolled.
+pub(crate) fn template_matches_plan(template: &Value, gce: &GceSettings) -> Result<(), String> {
+    let scheduling = template.pointer("/properties/scheduling");
+    let field = |name: &str| scheduling.and_then(|s| s.get(name)).and_then(Value::as_str);
+    if let Some(model) = field("provisioningModel")
+        && model != "STANDARD"
+    {
+        return Err(format!(
+            "provisioningModel is {model}, and burst VMs are STANDARD only"
+        ));
+    }
+    if scheduling.and_then(|s| s.get("preemptible")) == Some(&Value::Bool(true)) {
+        return Err("it is preemptible, and burst VMs are STANDARD only".to_owned());
+    }
+    match field("instanceTerminationAction") {
+        Some("DELETE") => {}
+        other => {
+            return Err(format!(
+                "instanceTerminationAction is {}, and a burst VM must be deleted at the end of its run",
+                other.unwrap_or("not set")
+            ));
+        }
+    }
+    // The API writes int64 as a string; accept a number too.
+    let seconds = scheduling
+        .and_then(|s| s.pointer("/maxRunDuration/seconds"))
+        .and_then(|v| match v {
+            Value::String(s) => s.parse::<i64>().ok(),
+            other => other.as_i64(),
+        });
+    match seconds {
+        Some(s) if s == gce.max_run_secs => Ok(()),
+        Some(s) => Err(format!(
+            "maxRunDuration is {s}s but gce.max_run_secs is {}s; they must be equal, because the queen retires and counts drones by max_run_secs",
+            gce.max_run_secs
+        )),
+        None => Err(format!(
+            "it has no maxRunDuration; it must be {}s (gce.max_run_secs) so no VM outlives the queen's record of it",
+            gce.max_run_secs
+        )),
+    }
+}
+
+/// The `instances.insert` body for one burst VM made from an instance
+/// template (`sourceInstanceTemplate`). The template decides everything about
+/// the host: provisioning model, machine type, disk, image, network, address
+/// and identity. The body carries only what differs per VM: its name, and the
+/// template's labels and metadata with the queen's own added. Labels and
+/// metadata are sent whole because a field given in the body replaces the
+/// template's field; `template` is the template as `instanceTemplates.get`
+/// returned it. A queen key wins over a template key of the same name.
+pub(crate) fn instance_body(gce: &GceSettings, spec: &VmSpec<'_>, template: &Value) -> Value {
+    let mut labels = template
+        .pointer("/properties/labels")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    labels.insert(BURST_LABEL.to_owned(), json!(BURST_LABEL_VALUE));
+    labels.insert(DRONE_LABEL.to_owned(), json!(spec.drone));
+
+    let ours = [
+        (STARTUP_SCRIPT_KEY, render_bootstrap(gce, spec.drone)),
+        (SECRET_METADATA_KEYS[0], spec.tailscale_authkey.to_owned()),
+        (SECRET_METADATA_KEYS[1], spec.enroll_token.to_owned()),
+    ];
+    let mut items: Vec<Value> = template
+        .pointer("/properties/metadata/items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            let key = item.get("key").and_then(Value::as_str);
+            !ours.iter().any(|(k, _)| Some(*k) == key)
+        })
+        .cloned()
+        .collect();
+    items.extend(
+        ours.iter()
+            .map(|(key, value)| json!({"key": key, "value": value})),
+    );
+
     json!({
         "name": spec.vm,
-        "machineType": format!("zones/{}/machineTypes/{}", spec.zone, gce.machine_type),
-        "scheduling": {
-            "provisioningModel": provisioning,
-            "instanceTerminationAction": "DELETE",
-            "maxRunDuration": {"seconds": gce.max_run_secs.to_string()},
-            "automaticRestart": restart,
-            "onHostMaintenance": "TERMINATE",
-        },
-        "disks": [{
-            "boot": true,
-            "autoDelete": true,
-            "initializeParams": {
-                "sourceImage": format!(
-                    "projects/{}/global/images/family/{}", gce.image_project, gce.image_family
-                ),
-                "diskSizeGb": gce.boot_disk_gb.to_string(),
-                "diskType": format!("zones/{}/diskTypes/{}", spec.zone, gce.boot_disk_type),
-            },
-        }],
-        "networkInterfaces": [{
-            "network": format!("global/networks/{}", gce.network),
-            "subnetwork": format!(
-                "regions/{}/subnetworks/{}", region_of(spec.zone), gce.subnet
-            ),
-            "accessConfigs": [{"type": "ONE_TO_ONE_NAT", "name": "External NAT"}],
-        }],
-        "serviceAccounts": [],
-        "labels": {BURST_LABEL: BURST_LABEL_VALUE, DRONE_LABEL: spec.drone},
-        "metadata": {"items": [
-            {"key": STARTUP_SCRIPT_KEY, "value": render_bootstrap(gce, spec.drone)},
-            {"key": SECRET_METADATA_KEYS[0], "value": spec.tailscale_authkey},
-            {"key": SECRET_METADATA_KEYS[1], "value": spec.enroll_token},
-        ]},
+        "labels": labels,
+        "metadata": {"items": items},
     })
 }
 
@@ -522,8 +628,8 @@ mod tests {
 
     fn gce() -> GceSettings {
         serde_json::from_str(
-            r#"{"project": "p", "network": "borg-burst", "subnet": "borg-burst-usw1",
-                "zones": ["us-west1-b"], "machine_type": "c2d-highcpu-56",
+            r#"{"project": "p", "network": "borg-burst", "subnet": "borg-burst-usc1",
+                "zones": ["us-central1-b"], "machine_type": "c2d-highcpu-56",
                 "queen_url": "https://queen.example.test", "drone_max_vcpu": 52,
                 "drone_max_mem_mib": 104448}"#,
         )
@@ -545,61 +651,72 @@ mod tests {
         assert_eq!(req.headers()[reqwest::header::CONTENT_LENGTH], "0");
     }
 
-    #[test]
-    fn region_is_the_zone_without_its_letter() {
-        assert_eq!(region_of("us-west1-b"), "us-west1");
-        assert_eq!(region_of("europe-west4-a"), "europe-west4");
-        assert_eq!(region_of("nozone"), "nozone");
+    fn template() -> Value {
+        json!({
+            "name": "borg-burst-v1",
+            "properties": {
+                "machineType": "c2d-highcpu-56",
+                "labels": {"owner": "platform", "purpose": "borg-burst-drone", "lane": "burst"},
+                "metadata": {"items": [
+                    {"key": "enable-oslogin", "value": "TRUE"},
+                    {"key": "block-project-ssh-keys", "value": "TRUE"},
+                    {"key": "startup-script", "value": "echo from the template"},
+                ]},
+                "scheduling": {"provisioningModel": "STANDARD"},
+            }
+        })
+    }
+
+    fn spec() -> VmSpec<'static> {
+        VmSpec {
+            vm: "borg-burst-q1",
+            drone: "gcp-burst-q1",
+            tailscale_authkey: "tskey-x",
+            enroll_token: "tok-y",
+        }
     }
 
     #[test]
-    fn instance_body_is_spot_self_deleting_credential_free_and_carries_bootstrap() {
-        let g = gce();
-        let body = instance_body(
-            &g,
-            &VmSpec {
-                zone: "us-west1-b",
-                vm: "borg-burst-q1",
-                drone: "gcp-burst-q1",
-                tailscale_authkey: "tskey-x",
-                enroll_token: "tok-y",
-            },
+    fn instance_body_names_the_vm_and_leaves_the_host_to_the_template() {
+        let body = instance_body(&gce(), &spec(), &template());
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["labels", "metadata", "name"],
+            "nothing that shapes the host (machine type, disk, image, network, scheduling, identity) is sent"
         );
         assert_eq!(body["name"], "borg-burst-q1");
+    }
+
+    #[test]
+    fn instance_body_keeps_template_labels_and_metadata_and_adds_the_queens() {
+        let body = instance_body(&gce(), &spec(), &template());
         assert_eq!(
-            body["machineType"],
-            "zones/us-west1-b/machineTypes/c2d-highcpu-56"
-        );
-        assert_eq!(body["scheduling"]["provisioningModel"], "SPOT");
-        assert_eq!(body["scheduling"]["instanceTerminationAction"], "DELETE");
-        assert_eq!(body["scheduling"]["maxRunDuration"]["seconds"], "43200");
-        assert_eq!(body["scheduling"]["automaticRestart"], false);
-        assert_eq!(body["serviceAccounts"], json!([]));
-        assert_eq!(
-            body["disks"][0]["initializeParams"]["sourceImage"],
-            "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
-        );
-        assert_eq!(body["disks"][0]["initializeParams"]["diskSizeGb"], "1000");
-        assert_eq!(
-            body["networkInterfaces"][0]["subnetwork"],
-            "regions/us-west1/subnetworks/borg-burst-usw1"
-        );
-        assert_eq!(
-            body["networkInterfaces"][0]["accessConfigs"][0]["type"],
-            "ONE_TO_ONE_NAT"
+            body["labels"],
+            json!({"owner": "platform", "purpose": "borg-burst-drone", "lane": "burst",
+                   "borg-burst": "queen", "borg-drone": "gcp-burst-q1"})
         );
         let items = body["metadata"]["items"].as_array().unwrap();
         let item = |k: &str| {
-            items
-                .iter()
-                .find(|i| i["key"] == k)
-                .map(|i| i["value"].as_str().unwrap().to_owned())
-                .unwrap()
+            let found: Vec<&Value> = items.iter().filter(|i| i["key"] == k).collect();
+            assert_eq!(found.len(), 1, "{k} appears once");
+            found[0]["value"].as_str().unwrap().to_owned()
         };
+        assert_eq!(item("enable-oslogin"), "TRUE");
+        assert_eq!(item("block-project-ssh-keys"), "TRUE");
         assert_eq!(item("borg-ts-authkey"), "tskey-x");
         assert_eq!(item("borg-enroll-token"), "tok-y");
         let script = item("startup-script");
-        assert!(script.starts_with("#!/bin/bash"));
+        assert!(
+            script.starts_with("#!/bin/bash"),
+            "the queen's bootstrap replaces a template startup script"
+        );
         assert!(script.contains("QUEEN_URL='https://queen.example.test'"));
         assert!(script.contains("DRONE='gcp-burst-q1'"));
         assert!(script.contains("TAG='tag:borg-drone'"));
@@ -613,22 +730,115 @@ mod tests {
     }
 
     #[test]
-    fn standard_provisioning_restarts_and_still_self_deletes() {
-        let mut g = gce();
-        g.spot = false;
-        let body = instance_body(
-            &g,
-            &VmSpec {
-                zone: "us-west1-b",
-                vm: "v",
-                drone: "d",
-                tailscale_authkey: "k",
-                enroll_token: "t",
-            },
+    fn instance_body_tolerates_a_template_without_labels_or_metadata() {
+        let body = instance_body(&gce(), &spec(), &json!({"properties": {}}));
+        assert_eq!(
+            body["labels"],
+            json!({"borg-burst": "queen", "borg-drone": "gcp-burst-q1"})
         );
-        assert_eq!(body["scheduling"]["provisioningModel"], "STANDARD");
-        assert_eq!(body["scheduling"]["automaticRestart"], true);
-        assert_eq!(body["scheduling"]["instanceTerminationAction"], "DELETE");
+        assert_eq!(body["metadata"]["items"].as_array().unwrap().len(), 3);
+    }
+
+    fn template_with_scheduling(scheduling: Value) -> Value {
+        json!({"properties": {"scheduling": scheduling}})
+    }
+
+    #[test]
+    fn a_template_with_the_planned_lifetime_is_accepted() {
+        let g = gce();
+        assert_eq!(g.max_run_secs, 43_200);
+        for seconds in [json!("43200"), json!(43200)] {
+            let t = template_with_scheduling(json!({
+                "provisioningModel": "STANDARD", "instanceTerminationAction": "DELETE",
+                "maxRunDuration": {"seconds": seconds}}));
+            assert_eq!(template_matches_plan(&t, &g), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_template_whose_lifetime_differs_from_the_plan_is_refused() {
+        let g = gce();
+        let with = |seconds: &str| {
+            template_with_scheduling(json!({
+                "provisioningModel": "STANDARD", "instanceTerminationAction": "DELETE",
+                "maxRunDuration": {"seconds": seconds}}))
+        };
+        // Shorter: GCE would delete the VM under a running job before the
+        // queen retires it.
+        let shorter = template_matches_plan(&with("21600"), &g).unwrap_err();
+        assert!(
+            shorter.contains("21600s") && shorter.contains("43200s"),
+            "{shorter}"
+        );
+        // Longer: the VM would outlive the queen's record of it.
+        let longer = template_matches_plan(&with("86400"), &g).unwrap_err();
+        assert!(longer.contains("86400s"), "{longer}");
+        // Absent: nothing would ever delete it.
+        let absent = template_matches_plan(
+            &template_with_scheduling(
+                json!({"provisioningModel": "STANDARD", "instanceTerminationAction": "DELETE"}),
+            ),
+            &g,
+        )
+        .unwrap_err();
+        assert!(absent.contains("no maxRunDuration"), "{absent}");
+        let none = template_matches_plan(&json!({"properties": {}}), &g).unwrap_err();
+        assert!(
+            none.contains("instanceTerminationAction is not set"),
+            "{none}"
+        );
+    }
+
+    #[test]
+    fn a_template_that_stops_instead_of_deleting_or_is_not_standard_is_refused() {
+        let g = gce();
+        let stop = template_matches_plan(
+            &template_with_scheduling(json!({
+                "provisioningModel": "STANDARD", "instanceTerminationAction": "STOP",
+                "maxRunDuration": {"seconds": "43200"}})),
+            &g,
+        )
+        .unwrap_err();
+        assert!(stop.contains("instanceTerminationAction is STOP"), "{stop}");
+        for scheduling in [
+            json!({"provisioningModel": "SPOT", "instanceTerminationAction": "DELETE",
+                   "maxRunDuration": {"seconds": "43200"}}),
+            json!({"preemptible": true, "instanceTerminationAction": "DELETE",
+                   "maxRunDuration": {"seconds": "43200"}}),
+        ] {
+            let e = template_matches_plan(&template_with_scheduling(scheduling), &g).unwrap_err();
+            assert!(e.contains("STANDARD only"), "{e}");
+        }
+    }
+
+    #[test]
+    fn instance_template_path_accepts_only_template_names() {
+        let p = "projects/example-project/global/instanceTemplates/borg-burst-v1";
+        assert_eq!(
+            instance_template_path(p).as_deref(),
+            Some(&*format!("/{p}"))
+        );
+        assert_eq!(
+            instance_template_path(&format!("https://www.googleapis.com/compute/v1/{p}"))
+                .as_deref(),
+            Some(&*format!("/{p}"))
+        );
+        assert_eq!(
+            instance_template_path("projects/p/regions/us-central1/instanceTemplates/t").as_deref(),
+            Some("/projects/p/regions/us-central1/instanceTemplates/t")
+        );
+        for bad in [
+            "",
+            "borg-burst-v1",
+            "global/instanceTemplates/borg-burst-v1",
+            "projects/p/global/instanceTemplates/",
+            "projects/p/global/instanceTemplates/a/b",
+            "projects/p/global/instanceTemplates/a?x=1",
+            "projects/p/zones/us-central1-a/instances/vm",
+            "https://example.test/projects/p/global/instanceTemplates/t",
+        ] {
+            assert_eq!(instance_template_path(bad), None, "{bad}");
+        }
     }
 
     #[test]

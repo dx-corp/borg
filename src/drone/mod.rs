@@ -14,12 +14,14 @@ pub mod client;
 pub mod config;
 pub mod credwipe;
 pub mod docker_reclaim;
+pub mod dockerproxy;
 pub mod exec;
 pub mod fsops;
 pub(crate) mod hostview;
 pub mod install;
 pub mod invariants;
 pub mod jobuser;
+pub mod memlimit;
 pub mod pins;
 pub mod reclaim;
 pub(crate) mod registry_fault;
@@ -38,6 +40,7 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 
 use crate::api::{HeartbeatRequest, LeaseGrant, ResultRequest};
+use crate::classes::Class;
 use crate::probe::{self, Host};
 use caches::Caches;
 use cleanup::{Scope, cleanup_docker, remove_lease_dir, sweep_work_root, valid_lease_id};
@@ -124,9 +127,12 @@ pub struct Drone {
     invariant_failures: Mutex<Vec<crate::envcontract::InvariantFailure>>,
     /// The last container network probe (`None`: passed or not run yet).
     network_probe: Arc<Mutex<Option<crate::envcontract::InvariantFailure>>>,
-    /// Last Queen floor, retained while the Queen is unreachable (shared
-    /// with reclaim, which treats free space below it as critical).
+    /// Last Queen floor, retained while the Queen is unreachable.
     disk_floor: Arc<AtomicU64>,
+    /// The free space reclaim keeps (shared with reclaim, which treats free
+    /// space below it as critical): the Queen's floor for the largest class
+    /// this drone hosts, never under `disk_floor`.
+    reclaim_floor: Arc<AtomicU64>,
     capability_cache: capabilities::CapabilityCache,
     /// Busy-cores rate of the host, fed by heartbeats and lease samples.
     cpu_meter: Arc<crate::hostdiag::CpuMeter>,
@@ -134,6 +140,14 @@ pub struct Drone {
     reclaimer: Option<Arc<reclaim::Reclaimer>>,
     /// Job-credential wipe; `None` when off or unsupported here.
     credwipe: Option<Arc<credwipe::CredWiper>>,
+    /// Per-lease memory cgroups; `None` without a delegated cgroup v2 tree.
+    cgroups: Option<Arc<memlimit::LeaseCgroups>>,
+    /// Launch order and OOM scores of the running leases.
+    oom_order: Arc<memlimit::OomOrder>,
+    /// Leases the host memory guard killed, reported as OOM-killed.
+    guard_killed: Arc<Mutex<HashSet<String>>>,
+    /// The job user's groups without `docker` (see `docker_proxy`).
+    groups_without_docker: Option<Vec<u32>>,
     /// The version reported to the queen, with the binary's hash once
     /// measured (see `selfupdate::running_build_version`).
     reported_version: Arc<std::sync::OnceLock<String>>,
@@ -148,6 +162,23 @@ impl Drone {
     ) -> Self {
         let (abort, _) = tokio::sync::watch::channel(false);
         let slot_count = cfg.slot_count();
+        // The job user's groups without `docker`, for leases that must reach
+        // dockerd only through their endpoint. The capability probe and work
+        // units keep the account's own groups.
+        let groups_without_docker = cfg
+            .job_user
+            .as_ref()
+            .filter(|_| cfg.docker_proxy.enabled)
+            .and_then(|user| {
+                let groups = user.groups_without_docker(exec.as_ref());
+                if groups.is_none() {
+                    tracing::warn!(
+                        "docker_proxy: could not read {}'s groups; leases without host access get no Docker",
+                        user.name
+                    );
+                }
+                groups
+            });
         let cfg = Arc::new(cfg);
         let (job_exec, fs_ops): (Arc<dyn Exec>, Arc<dyn FsOps>) = match &cfg.job_user {
             Some(user) => {
@@ -174,6 +205,9 @@ impl Drone {
         let disk_floor = Arc::new(AtomicU64::new(
             crate::envcontract::DEFAULT_MIN_DISK_FREE_BYTES,
         ));
+        let reclaim_floor = Arc::new(AtomicU64::new(
+            crate::envcontract::DEFAULT_MIN_DISK_FREE_BYTES,
+        ));
         let slots = Slots::new(slot_count);
         let reclaimer = reclaim::Reclaimer::new(
             &cfg,
@@ -181,6 +215,7 @@ impl Drone {
             Arc::clone(&held),
             Arc::clone(&slots),
             Arc::clone(&disk_floor),
+            Arc::clone(&reclaim_floor),
         );
         let setpriv = cfg
             .job_user
@@ -206,10 +241,15 @@ impl Drone {
             network_probe: Arc::default(),
             tools_cache: probe::ToolsCache::default(),
             disk_floor,
+            reclaim_floor,
             capability_cache: capabilities::CapabilityCache::default(),
             cpu_meter: Arc::default(),
             reclaimer,
             credwipe,
+            cgroups: None,
+            oom_order: Arc::default(),
+            guard_killed: Arc::default(),
+            groups_without_docker,
             reported_version: Arc::default(),
             client: Arc::new(client),
             host,
@@ -225,6 +265,11 @@ impl Drone {
             abort,
             proc_root: Arc::from(Path::new("/proc")),
         }
+    }
+
+    /// The free space build-filesystem reclaim keeps right now, as last learned from the queen.
+    pub fn reclaim_floor_bytes(&self) -> u64 {
+        self.reclaim_floor.load(Ordering::Relaxed)
     }
 
     /// `(slot, lease id)` for every lease currently holding a slot.
@@ -375,19 +420,7 @@ impl Drone {
             // the next ten-minute tick: no job is admitted until then.
             r.kick();
         }
-        let failures = if self.cfg.host_invariants.enabled {
-            let mut f =
-                invariants::fast_checks(self.host.as_ref(), capacity.docker_usable, disk_blocked);
-            if let Ok(p) = self.network_probe.lock()
-                && let Some(n) = p.as_ref()
-            {
-                f.push(n.clone());
-            }
-            f.sort();
-            f
-        } else {
-            Vec::new()
-        };
+        let failures = self.host_invariant_failures(capacity.docker_usable, disk_blocked);
         if let Ok(mut last) = self.invariant_failures.lock() {
             invariants::log_change(&last, &failures);
             last.clone_from(&failures);
@@ -424,6 +457,7 @@ impl Drone {
             capacity,
             caps: self.cfg.host_caps(),
             accepting,
+            takes_leases: Some(self.cfg.accept_leases),
             active_leases: self.lease_ids(),
             cache_stats: self.caches.stats(),
             version: Some(
@@ -451,6 +485,10 @@ impl Drone {
         let resp = self.client.heartbeat(&req).await?;
         self.disk_floor
             .store(resp.min_free_disk_bytes, Ordering::Relaxed);
+        self.reclaim_floor.store(
+            reclaim_floor(resp.min_free_disk_bytes, resp.reclaim_floor_bytes),
+            Ordering::Relaxed,
+        );
         let accepting = accepting
             && !crate::envcontract::disk_admission(
                 resp.min_free_disk_bytes,
@@ -532,17 +570,32 @@ impl Drone {
         else {
             return;
         };
-        if crate::envcontract::disk_admission(
-            self.disk_floor.load(Ordering::Relaxed),
-            work_free,
-            cache_free,
-        )
-        .blocked()
-        {
-            tracing::warn!("disk below admission floor: leaving standby runners unstarted");
+        let global = self.disk_floor.load(Ordering::Relaxed);
+        let ids = self.standbys.ids();
+        let admitted: Vec<String> = ids
+            .iter()
+            .filter(|id| {
+                self.standbys.get(id).is_some_and(|g| {
+                    !crate::envcontract::disk_admission(
+                        fail_open_floor(&g, global),
+                        work_free,
+                        cache_free,
+                    )
+                    .blocked()
+                })
+            })
+            .cloned()
+            .collect();
+        if admitted.len() < ids.len() {
+            tracing::warn!(
+                "disk below admission floor: leaving {} standby runner(s) unstarted",
+                ids.len() - admitted.len()
+            );
+        }
+        if admitted.is_empty() {
             return;
         }
-        let started = self.start_standbys(None, tasks);
+        let started = self.start_standbys(Some(&admitted), tasks);
         if started > 0 {
             tracing::warn!("queen unreachable: started {started} standby deploy runner(s)");
         }
@@ -551,7 +604,7 @@ impl Drone {
     /// Claim a slot for `grant` and run it as a lease. Returns whether it
     /// started.
     fn start_lease(&self, grant: LeaseGrant, tasks: &mut JoinSet<()>) -> bool {
-        let Some(ctx) = self.claim(&grant.lease_id, false) else {
+        let Some(ctx) = self.claim(&grant.lease_id, grant.class, false) else {
             return false;
         };
         tasks.spawn(handle_lease(ctx, grant));
@@ -560,16 +613,16 @@ impl Drone {
 
     /// Claim a slot for a work unit and run it. Returns whether it started.
     fn start_unit(&self, grant: crate::units::UnitGrant, tasks: &mut JoinSet<()>) -> bool {
-        let Some(ctx) = self.claim(&grant.unit_id, true) else {
+        let Some(ctx) = self.claim(&grant.unit_id, grant.class, true) else {
             return false;
         };
         tasks.spawn(units::handle_unit(ctx, grant));
         true
     }
 
-    /// Admit `id` and give it a slot, a cancel switch and the shared job
-    /// machinery. `None` when it may not start now.
-    fn claim(&self, id: &str, unit: bool) -> Option<LeaseContext> {
+    /// Admit `id` and give it a slot for its class, a cancel switch and the
+    /// shared job machinery. `None` when it may not start now.
+    fn claim(&self, id: &str, class: Class, unit: bool) -> Option<LeaseContext> {
         if !self.admit(id, unit) {
             return None;
         }
@@ -583,7 +636,7 @@ impl Drone {
         if let Ok(mut preempts) = self.preempts.lock() {
             preempts.insert(id.to_owned(), preempt_tx);
         }
-        let Some(slot) = self.slots.acquire(id) else {
+        let Some(slot) = self.slots.acquire(id, class) else {
             tracing::warn!("no free slot for {id}; leaving it unstarted");
             return None;
         };
@@ -601,49 +654,104 @@ impl Drone {
             caches: Arc::clone(&self.caches),
             credwipe: self.credwipe.clone(),
             reclaimer: self.reclaimer.clone(),
+            cgroups: self.cgroups.clone(),
+            oom_order: Arc::clone(&self.oom_order),
+            guard_killed: Arc::clone(&self.guard_killed),
+            groups_without_docker: self.groups_without_docker.clone(),
             slot,
             held,
         })
     }
 
+    /// The host invariants a heartbeat reports: the cheap checks run now
+    /// plus the latest container network probe. Any failure but `disk`
+    /// keeps the drone from taking leases.
+    fn host_invariant_failures(
+        &self,
+        docker_usable: bool,
+        disk_blocked: bool,
+    ) -> Vec<crate::envcontract::InvariantFailure> {
+        if !self.cfg.host_invariants.enabled {
+            return Vec::new();
+        }
+        let mut f = invariants::fast_checks(self.host.as_ref(), docker_usable, disk_blocked);
+        if let Ok(p) = self.network_probe.lock()
+            && let Some(n) = p.as_ref()
+        {
+            f.push(n.clone());
+        }
+        f.sort();
+        f
+    }
+
     /// Probe container networking end to end now and every
-    /// `host_invariants.interval_secs`; heartbeats use the latest result.
+    /// `host_invariants.interval_secs`, or a minute after a probe that failed
+    /// (`invariants::next_probe_delay`); heartbeats use the latest result, so
+    /// the drone takes no lease from a failed probe until one passes.
+    /// With `host_memory_guard_mib`, kill the newest lease's cgroup whenever
+    /// the host's available memory falls below it, so an older job with more
+    /// work to lose, the drone and the host's services never meet the kernel
+    /// OOM killer, which would weigh memory use over age.
+    fn spawn_memory_guard(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let floor = self.cfg.host_memory_guard_mib?;
+        let Some(cgroups) = self.cgroups.clone() else {
+            tracing::warn!(
+                "host_memory_guard_mib is set but leases have no cgroups; the guard is off"
+            );
+            return None;
+        };
+        let (order, killed, meminfo) = (
+            Arc::clone(&self.oom_order),
+            Arc::clone(&self.guard_killed),
+            self.proc_root.join("meminfo"),
+        );
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(GUARD_EVERY).await;
+                let Some(available) = std::fs::read_to_string(&meminfo)
+                    .ok()
+                    .and_then(|m| memlimit::mem_available_mib(&m))
+                else {
+                    continue;
+                };
+                // A lease still setting up has an empty cgroup; skip it.
+                let Some(victim) = guard_victims(available, floor, &order)
+                    .into_iter()
+                    .find(|id| cgroups.kill(id))
+                else {
+                    continue;
+                };
+                {
+                    tracing::warn!(
+                        "host memory guard: {available} MiB available, below {floor} MiB; killed the newest lease {victim}"
+                    );
+                    if let Ok(mut k) = killed.lock() {
+                        k.insert(victim.clone());
+                    }
+                    // A killed lease frees its memory as it exits; do not
+                    // take a second one before that shows.
+                    order.release(&victim);
+                    tokio::time::sleep(GUARD_COOLDOWN).await;
+                }
+            }
+        }))
+    }
+
     fn spawn_network_probe(&self) -> Option<tokio::task::JoinHandle<()>> {
         let s = self.cfg.host_invariants.clone();
         if !s.enabled || !s.container_network {
             return None;
         }
-        let (exec, docker, out) = (
+        let (exec, host, out) = (
             Arc::clone(&self.exec),
-            self.cfg.docker_bin.clone(),
+            Arc::clone(&self.host),
             Arc::clone(&self.network_probe),
         );
-        let host = Arc::clone(&self.host);
+        let docker = self.cfg.docker_bin.clone();
         Some(tokio::spawn(async move {
-            let mut every = tokio::time::interval(Duration::from_secs(s.interval_secs.max(60)));
-            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                every.tick().await;
-                let (exec, docker, s2, host) = (
-                    Arc::clone(&exec),
-                    docker.clone(),
-                    s.clone(),
-                    Arc::clone(&host),
-                );
-                let result = tokio::task::spawn_blocking(move || {
-                    // No docker here: nothing to probe.
-                    host.run(&docker, &["--version"])?;
-                    invariants::container_network(exec.as_ref(), &docker, &s2)
-                })
-                .await;
-                match result {
-                    Ok(r) => {
-                        if let Ok(mut slot) = out.lock() {
-                            *slot = r;
-                        }
-                    }
-                    Err(e) => tracing::warn!("container network probe panicked: {e}"),
-                }
+                let wait = network_probe_round(&exec, &host, &docker, &s, &out).await;
+                tokio::time::sleep(wait).await;
             }
         }))
     }
@@ -764,12 +872,25 @@ impl Drone {
     }
 
     /// Heartbeat until `shutdown` resolves, then drain.
+    /// Run each lease in its own memory-limited cgroup when this host
+    /// delegates a cgroup v2 tree with the memory controller to the drone
+    /// (see [`memlimit`]); otherwise say why and run without limits.
+    #[must_use]
+    pub fn with_lease_cgroups(mut self) -> Self {
+        match memlimit::LeaseCgroups::system() {
+            Ok(c) => self.cgroups = Some(Arc::new(c)),
+            Err(e) => tracing::warn!("leases run without memory limits: {e}"),
+        }
+        self
+    }
+
     pub async fn run(self, shutdown: impl std::future::Future<Output = ()>) {
         self.startup_sweep().await;
         let mut tasks = JoinSet::new();
         let cache_background = self.caches.spawn_background();
         let reclaim_background = self.reclaimer.as_ref().map(reclaim::Reclaimer::spawn);
         let network_background = self.spawn_network_probe();
+        let guard_background = self.spawn_memory_guard();
         let held = Arc::clone(&self.held);
         let credwipe_background = self
             .credwipe
@@ -844,6 +965,26 @@ impl Drone {
         if let Some(n) = network_background {
             n.abort();
         }
+        if let Some(g) = guard_background {
+            g.abort();
+        }
+    }
+}
+
+/// How often the host memory guard reads `/proc/meminfo`.
+const GUARD_EVERY: Duration = Duration::from_secs(1);
+/// After a kill, how long the guard waits for the memory to come back.
+const GUARD_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// The lease the host memory guard kills when `available_mib` is below
+/// `floor_mib`: the newest running one.
+/// The leases the host memory guard may kill when `available_mib` is below
+/// `floor_mib`, newest first; it takes the first that has processes.
+fn guard_victims(available_mib: u64, floor_mib: u64, order: &memlimit::OomOrder) -> Vec<String> {
+    if available_mib < floor_mib {
+        order.newest_first()
+    } else {
+        Vec::new()
     }
 }
 
@@ -861,6 +1002,11 @@ struct LeaseContext {
     caches: Arc<Caches>,
     credwipe: Option<Arc<credwipe::CredWiper>>,
     reclaimer: Option<Arc<reclaim::Reclaimer>>,
+    cgroups: Option<Arc<memlimit::LeaseCgroups>>,
+    oom_order: Arc<memlimit::OomOrder>,
+    guard_killed: Arc<Mutex<HashSet<String>>>,
+    /// The job user's groups without `docker` (see `docker_proxy`).
+    groups_without_docker: Option<Vec<u32>>,
     /// Dropped before `held`, so the slot is free whenever the id is.
     slot: SlotGuard,
     held: HeldGuard,
@@ -934,6 +1080,93 @@ async fn cleanup_slot(ctx: &LeaseContext, id: &str) {
     }
 }
 
+/// The lease's memory-limited cgroup, when this host delegates one and the
+/// grant carries a limit; otherwise the job runs without a limit, as before.
+fn lease_cgroup(
+    ctx: &LeaseContext,
+    grant: &LeaseGrant,
+    oom_score: i32,
+) -> Option<memlimit::LeaseCgroup> {
+    let (cgroups, limit) = (ctx.cgroups.as_deref()?, grant.memory?);
+    cgroups
+        .create(&grant.lease_id, limit, oom_score)
+        .map_err(|e| tracing::warn!("lease {}: no memory limit: {e}", grant.lease_id))
+        .ok()
+}
+
+/// Host paths no job without host access may bind into a container: the
+/// system ones plus the drone's own config, token and state.
+fn protected_paths(cfg: &DroneConfig) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = dockerproxy::PROTECTED_ROOTS
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    paths.extend(cfg.state_dir.iter().cloned());
+    paths.extend(
+        [&cfg.token_file, &cfg.ca_cert_path]
+            .into_iter()
+            .flatten()
+            .filter_map(|f| f.parent().map(Path::to_path_buf)),
+    );
+    paths
+}
+
+/// Start the lease's own Docker endpoint when `docker_proxy` is on and the
+/// lease has a cgroup to put containers in.
+async fn start_docker_endpoint(
+    ctx: &LeaseContext,
+    grant: &LeaseGrant,
+    slot: usize,
+    cgroup: Option<&memlimit::LeaseCgroup>,
+) -> Option<dockerproxy::LeaseEndpoint> {
+    let settings = &ctx.cfg.docker_proxy;
+    if !settings.enabled {
+        return None;
+    }
+    let id = &grant.lease_id;
+    let Some(cgroup) = cgroup else {
+        tracing::warn!("lease {id}: no Docker endpoint without a lease cgroup");
+        return None;
+    };
+    let dir = ctx.cfg.docker_endpoint_dir()?;
+    let upstream = dockerproxy::default_upstream();
+    // Containers can join the lease cgroup only with the cgroupfs driver;
+    // with any other (or a dockerd that does not answer) the lease gets no
+    // endpoint, and a job without host access then gets no Docker at all.
+    let cgroup_parent = match dockerproxy::cgroup_driver(&upstream).await.as_deref() {
+        Some("cgroupfs") => cgroup.rel_path().to_owned(),
+        other => {
+            tracing::warn!(
+                "lease {id}: dockerd's cgroup driver is {other:?}, not cgroupfs; no Docker endpoint"
+            );
+            return None;
+        }
+    };
+    let policy = dockerproxy::LeasePolicy {
+        labels: [
+            (dockerproxy::LEASE_LABEL, id.as_str()),
+            ("borg.scope", grant.scope.as_str()),
+            ("borg.class", grant.class.as_str()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect(),
+        cgroup_parent: Some(cgroup_parent),
+        oom_score_adj: Some(cgroup.oom_score_adj()),
+        host_access: settings.host_access(grant.scope),
+        socket: dir.join(format!("slot-{slot}.sock")),
+        upstream,
+        protected: protected_paths(&ctx.cfg),
+    };
+    let peers = dockerproxy::PeerCheck {
+        proc_root: ctx.proc_root.to_path_buf(),
+        cgroup: cgroup.rel_path().to_owned(),
+    };
+    dockerproxy::LeaseEndpoint::start(policy, peers)
+        .map_err(|e| tracing::warn!("lease {id}: Docker endpoint did not start: {e}"))
+        .ok()
+}
+
 /// Run one lease, clean up unconditionally, report the result.
 async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     // Held for the whole lease: cache garbage collection waits for it.
@@ -950,6 +1183,20 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     let mut extra_env = ctx.cfg.runner_environment();
     extra_env.extend(ctx.caches.prepare_lease(&lease_dir).await);
     extra_env.push(("BORG_SLOT".to_owned(), slot.to_string()));
+    let oom_score = ctx.oom_order.assign(&grant.lease_id);
+    let cgroup = lease_cgroup(&ctx, &grant, oom_score);
+    let endpoint = start_docker_endpoint(&ctx, &grant, slot, cgroup.as_ref()).await;
+    // With docker_proxy on, a job reaches dockerd only through its endpoint;
+    // when the endpoint could not start, only a job whose scope has host
+    // access falls back to dockerd's own socket, the rest get no Docker.
+    let docker_direct = !ctx.cfg.docker_proxy.enabled
+        || (endpoint.is_none() && ctx.cfg.docker_proxy.host_access(grant.scope));
+    let job_user = ctx.cfg.job_user.clone().map(|mut u| {
+        if !docker_direct {
+            u.groups = Some(ctx.groups_without_docker.clone().unwrap_or_default());
+        }
+        u
+    });
     let spec = RunSpec {
         lease_id: &grant.lease_id,
         jit_config: &grant.jit_config,
@@ -959,8 +1206,11 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         extra_env: &extra_env,
         max_job: Duration::from_secs(ctx.cfg.max_job_secs),
         preempt_grace: Duration::from_secs(ctx.cfg.preempt_grace_secs),
-        job_user: ctx.cfg.job_user.as_ref(),
+        job_user: job_user.as_ref(),
         proc_root: &ctx.proc_root,
+        cgroup: cgroup.as_ref(),
+        oom_score: Some(oom_score),
+        docker_host: endpoint.as_ref().map(dockerproxy::LeaseEndpoint::socket),
     };
     let host_start = sample_host(&ctx).await;
     let outcome = run_lease(
@@ -972,6 +1222,11 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     )
     .await;
     let host_end = sample_host(&ctx).await;
+    ctx.oom_order.release(&grant.lease_id);
+    let guard_killed = ctx
+        .guard_killed
+        .lock()
+        .is_ok_and(|mut k| k.remove(&grant.lease_id));
     if let Some(r) = &ctx.reclaimer {
         r.note_slot_use(slot).await;
     }
@@ -980,8 +1235,16 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
         end: host_end,
     });
 
-    // Runs whether the job passed, failed, timed out, was aborted or never started.
+    // Runs whether the job passed, failed, timed out, was aborted or never
+    // started. The endpoint stops first so the job cannot add containers
+    // meanwhile; the cgroup goes last, after the containers under it.
+    if let Some(endpoint) = endpoint {
+        endpoint.stop().await;
+    }
     cleanup_slot(&ctx, &grant.lease_id).await;
+    if let Some(cgroup) = cgroup {
+        let _ = tokio::task::spawn_blocking(move || cgroup.remove()).await;
+    }
 
     // Between leases: let the caches re-measure and, if nothing else is
     // running, evict. Skipped by `maintain` itself while another lease holds
@@ -997,6 +1260,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
             peak_rss_mib: o.peak_rss_mib,
             telemetry: None,
             preempted: o.preempted,
+            oom_killed: o.oom_killed || guard_killed,
             host,
         },
         Err(e) => {
@@ -1007,6 +1271,7 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
                 peak_rss_mib: None,
                 telemetry: None,
                 preempted: false,
+                oom_killed: false,
                 host,
             }
         }
@@ -1025,9 +1290,76 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     }
 }
 
+/// Run one container network probe, store its result for heartbeats, and
+/// return how long to wait before the next. A probe that panicked leaves the
+/// last result in force, and a failure still in force is retried sooner.
+async fn network_probe_round(
+    exec: &Arc<dyn Exec>,
+    host: &Arc<dyn Host + Send + Sync>,
+    docker: &str,
+    s: &invariants::InvariantSettings,
+    out: &Mutex<Option<crate::envcontract::InvariantFailure>>,
+) -> Duration {
+    let (exec, host, docker, s2) = (
+        Arc::clone(exec),
+        Arc::clone(host),
+        docker.to_owned(),
+        s.clone(),
+    );
+    let result = tokio::task::spawn_blocking(move || {
+        // No docker here: nothing to probe.
+        host.run(&docker, &["--version"])?;
+        invariants::container_network(exec.as_ref(), &docker, &s2)
+    })
+    .await;
+    match result {
+        Ok(r) => {
+            if let Ok(mut slot) = out.lock() {
+                *slot = r;
+            }
+        }
+        Err(e) => tracing::warn!("container network probe panicked: {e}"),
+    }
+    let failing = out.lock().map(|slot| slot.is_some()).unwrap_or(false);
+    invariants::next_probe_delay(s, failing)
+}
+
+/// The free space reclaim keeps on the build filesystems: the queen's floor
+/// for the largest class this drone hosts when it sends one, never below the
+/// floor under which the drone takes no lease at all. An older queen sends
+/// only that floor.
+fn reclaim_floor(admission_floor: u64, class_floor: Option<u64>) -> u64 {
+    class_floor.unwrap_or(0).max(admission_floor)
+}
+
+/// The free-disk floor a held standby must clear to start while the queen is
+/// unreachable: its class's floor as the queen sent it with the standby, never
+/// below the last global floor the queen gave.
+fn fail_open_floor(grant: &LeaseGrant, global: u64) -> u64 {
+    grant.min_free_disk_bytes.unwrap_or(0).max(global)
+}
+
 #[cfg(test)]
 mod disk_tests {
     use super::*;
+
+    #[test]
+    fn the_memory_guard_takes_the_newest_lease_only_below_its_floor() {
+        let order = memlimit::OomOrder::default();
+        assert!(
+            guard_victims(100, 4096, &order).is_empty(),
+            "nothing running"
+        );
+        order.assign("old");
+        order.assign("new");
+        assert!(
+            guard_victims(8192, 4096, &order).is_empty(),
+            "above the floor"
+        );
+        assert_eq!(guard_victims(4000, 4096, &order), ["new", "old"]);
+        order.release("new");
+        assert_eq!(guard_victims(4000, 4096, &order), ["old"]);
+    }
     use crate::classes::{Class, Scope as JobScope};
     use crate::drone::exec::Output;
     use crate::secret::Secret;
@@ -1070,6 +1402,17 @@ mod disk_tests {
         }
     }
 
+    #[test]
+    fn reclaim_keeps_the_class_floor_and_never_less_than_the_admission_floor() {
+        assert_eq!(reclaim_floor(10 << 30, Some(32 << 30)), 32 << 30);
+        assert_eq!(
+            reclaim_floor(10 << 30, None),
+            10 << 30,
+            "an older queen sends only the admission floor"
+        );
+        assert_eq!(reclaim_floor(10 << 30, Some(5 << 30)), 10 << 30);
+    }
+
     #[tokio::test]
     async fn fail_open_retains_standby_and_active_lease_below_learned_queen_floor() {
         // This fixture tests disk admission, not reclaim's startup probes.
@@ -1086,6 +1429,8 @@ mod disk_tests {
             runner_name: "standby".into(),
             jit_config: Secret::new("jit".to_owned()),
             expires_at: i64::MAX,
+            min_free_disk_bytes: None,
+            memory: None,
         });
         let mut tasks = JoinSet::new();
         drone.fail_open(&mut tasks).await;
@@ -1096,6 +1441,55 @@ mod disk_tests {
         assert!(!*drone.abort.subscribe().borrow());
     }
 
+    fn standby(id: &str, class: Class, floor: Option<u64>) -> LeaseGrant {
+        LeaseGrant {
+            lease_id: id.into(),
+            class,
+            scope: JobScope::Deploy,
+            labels: vec![],
+            runner_name: id.into(),
+            jit_config: Secret::new("jit".to_owned()),
+            expires_at: i64::MAX,
+            min_free_disk_bytes: floor,
+            memory: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_open_leaves_a_heavy_standby_below_its_class_floor_unstarted() {
+        // 20 GiB free on /work: above the 10 GiB global floor, below the
+        // 32 GiB heavy floor the queen sent with the standby.
+        let cfg = DroneConfig::from_json(r#"{"queen_url":"http://127.0.0.1:1","allow_insecure":true,"runner_dir":"/runner","work_root":"/work","cache_root":"/cache","reclaim":{"enabled":false}}"#).unwrap();
+        let client = QueenClient::new(&cfg, Secret::new("test".to_owned())).unwrap();
+        let drone = Drone::new(cfg, client, Arc::new(DiskHost), Arc::new(NoExec));
+        drone.disk_floor.store(10 << 30, Ordering::Relaxed);
+        drone
+            .standbys
+            .insert(standby("heavy", Class::Heavy, Some(32 << 30)));
+        let mut tasks = JoinSet::new();
+        drone.fail_open(&mut tasks).await;
+        assert!(tasks.is_empty());
+        assert_eq!(drone.standbys.ids(), vec!["heavy"]);
+        assert!(drone.slot_assignments().is_empty());
+    }
+
+    #[test]
+    fn the_fail_open_floor_is_the_class_floor_and_never_below_the_global_one() {
+        let heavy = standby("h", Class::Heavy, Some(32 << 30));
+        assert_eq!(fail_open_floor(&heavy, 10 << 30), 32 << 30);
+        // An older queen sent no class floor: the global floor alone.
+        let old = standby("o", Class::Heavy, None);
+        assert_eq!(fail_open_floor(&old, 10 << 30), 10 << 30);
+        // A class floor below a raised global floor does not lower it.
+        let light = standby("l", Class::Light, Some(10 << 30));
+        assert_eq!(fail_open_floor(&light, 16 << 30), 16 << 30);
+        // The floor is kept with the persisted standby.
+        let json = serde_json::to_value(&heavy).unwrap();
+        assert_eq!(json["min_free_disk_bytes"], 32u64 << 30);
+        let back: LeaseGrant = serde_json::from_value(json).unwrap();
+        assert_eq!(back.min_free_disk_bytes, Some(32 << 30));
+    }
+
     #[test]
     fn older_queen_response_keeps_default_floor_and_new_response_carries_configured_floor() {
         let mut response = serde_json::json!({"leases": []});
@@ -1104,5 +1498,90 @@ mod disk_tests {
         response["min_free_disk_bytes"] = serde_json::json!(32u64 << 30);
         let new: crate::api::HeartbeatResponse = serde_json::from_value(response).unwrap();
         assert_eq!(new.min_free_disk_bytes, 32 << 30);
+    }
+}
+
+#[cfg(test)]
+mod network_probe_tests {
+    use super::*;
+    use crate::drone::exec::Output;
+    use crate::secret::Secret;
+
+    /// A Linux docker host with IPv4 forwarding on.
+    struct DockerHost;
+    impl Host for DockerHost {
+        fn read_to_string(&self, path: &Path) -> Option<String> {
+            (path == Path::new("/proc/sys/net/ipv4/ip_forward")).then(|| "1\n".to_owned())
+        }
+        fn exists(&self, _: &Path) -> bool {
+            false
+        }
+        fn run(&self, program: &str, _: &[&str]) -> Option<String> {
+            (program == "docker").then(|| "Docker version 29".to_owned())
+        }
+        fn os(&self) -> &'static str {
+            "linux"
+        }
+        fn arch(&self) -> &'static str {
+            "x86_64"
+        }
+        fn available_parallelism(&self) -> Option<u32> {
+            Some(8)
+        }
+    }
+
+    /// Answers each probe container run with the next scripted outcome:
+    /// `Some(stdout)` is the container's output, `None` panics the probe.
+    struct ScriptedProbe(Mutex<std::collections::VecDeque<Option<&'static str>>>);
+    impl Exec for ScriptedProbe {
+        fn run(&self, program: &str, _: &[&str]) -> std::io::Result<Output> {
+            assert_eq!(program, "timeout", "only the probe container runs");
+            let next = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("a scripted probe");
+            let stdout = next.expect("the probe panics");
+            Ok(Output {
+                success: true,
+                stdout: stdout.to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_probe_blocks_leases_survives_a_panic_and_clears_on_the_retry() {
+        let cfg = DroneConfig::from_json(r#"{"queen_url":"http://127.0.0.1:1","allow_insecure":true,"runner_dir":"/runner","work_root":"/work","cache_root":"/cache","reclaim":{"enabled":false}}"#).unwrap();
+        let client = QueenClient::new(&cfg, Secret::new("test".to_owned())).unwrap();
+        let exec: Arc<dyn Exec> = Arc::new(ScriptedProbe(Mutex::new(
+            [Some("connect-fail"), None, Some("ok")].into(),
+        )));
+        let host: Arc<dyn Host + Send + Sync> = Arc::new(DockerHost);
+        let drone = Drone::new(cfg, client, Arc::clone(&host), Arc::clone(&exec));
+        let s = drone.cfg.host_invariants.clone();
+        assert!(s.enabled && s.container_network);
+        let docker = drone.cfg.docker_bin.clone();
+        let round = || network_probe_round(&exec, &host, &docker, &s, &drone.network_probe);
+        let checks = || {
+            drone
+                .host_invariant_failures(true, false)
+                .into_iter()
+                .map(|f| f.check)
+                .collect::<Vec<_>>()
+        };
+        assert!(checks().is_empty(), "nothing probed yet");
+
+        // The probe fails: heartbeats report it, so no lease is taken, and
+        // the next probe runs in a minute, not a whole interval.
+        assert_eq!(round().await, Duration::from_secs(invariants::RETRY_SECS));
+        assert_eq!(checks(), ["container_network"]);
+        // The retry panics: the failure stays in force and is retried again.
+        assert_eq!(round().await, Duration::from_secs(invariants::RETRY_SECS));
+        assert_eq!(checks(), ["container_network"]);
+        // The next retry passes: leases resume and probes return to the
+        // configured interval.
+        assert_eq!(round().await, Duration::from_secs(s.interval_secs));
+        assert!(checks().is_empty());
     }
 }

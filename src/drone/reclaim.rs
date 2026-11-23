@@ -140,7 +140,15 @@ fn namespace_roots(cfg: &DroneConfig) -> Vec<PathBuf> {
 
 /// Subdirectories of a static runner user's home that its tools fill and
 /// re-create on demand.
-const RUNNER_USER_CACHES: &[&str] = &[".cache/go-build", ".npm", ".pnpm-store", "go/pkg/mod/cache"];
+/// `.bun/install/cache` is bun's package download cache: 2.4 GB per runner
+/// on internal-runner-burst-01 on 2026-11-18, and bun refetches what it lacks.
+const RUNNER_USER_CACHES: &[&str] = &[
+    ".cache/go-build",
+    ".npm",
+    ".pnpm-store",
+    "go/pkg/mod/cache",
+    ".bun/install/cache",
+];
 
 /// The roots a host's static GitHub runners give reclaim: each runner's
 /// `_work` checkouts, its tool cache and `_diag` logs, the caches in its
@@ -365,6 +373,15 @@ impl Commands {
         self.run_as_owner_of(anchor, secs, &["sh", "-c", script, "reclaim", &p])
     }
 
+    /// Whether `path` exists, asked as its owner when the drone cannot see
+    /// it: a static runner's home is private (mode 700 on
+    /// internal-runner-burst-01), so the drone's own check called every
+    /// candidate in it gone and reclaim never freed a runner's tool cache,
+    /// user caches or checkouts.
+    pub(crate) fn exists(&self, path: &Path) -> bool {
+        path.exists() || self.sh(path, PROBE_SECS, r#"test -e "$1""#).is_ok()
+    }
+
     /// The `uid` of `path`'s owner (or nearest stat-able ancestor's).
     pub(crate) fn owner_uid(&self, path: &Path) -> Result<String, String> {
         self.owner(path).map(|(u, _)| u)
@@ -503,7 +520,8 @@ pub struct LiveHost<'a> {
     sizes: &'a Mutex<HashMap<PathBuf, (i64, u64)>>,
     /// Common git dir of each worktree probed, for `worktree prune`.
     common: Mutex<HashMap<PathBuf, PathBuf>>,
-    /// The queen's disk admission floor (0 when unknown).
+    /// The free space the build filesystems keep: the queen's disk floor for
+    /// the largest class this drone hosts (0 when unknown).
     floor: u64,
     /// Leases the drone is running now: a CI slot's tool home or a shared
     /// namespace cache is busy while any lease runs (its tools execute from
@@ -790,7 +808,7 @@ impl ReclaimHost for LiveHost<'_> {
 
     fn probe(&self, c: &Candidate) -> Safety {
         let mut s = Safety::default();
-        if !c.path.exists() {
+        if !self.cmd.exists(&c.path) {
             s.unknown = Some("gone".into());
             return s;
         }
@@ -960,8 +978,12 @@ pub struct Reclaimer {
     slots: Arc<Slots>,
     work_root: PathBuf,
     cache_root: PathBuf,
-    /// The queen's disk admission floor (shared with the drone).
+    /// The queen's disk admission floor (shared with the drone). The Docker
+    /// tier frees to this one: Docker often has its own small volume.
     floor: Arc<AtomicU64>,
+    /// The free space the build filesystems keep (shared with the drone): the
+    /// disk floor of the largest class this drone hosts.
+    build_floor: Arc<AtomicU64>,
     stats: Mutex<ReclaimStats>,
     seq: Mutex<u64>,
     sizes: Mutex<HashMap<PathBuf, (i64, u64)>>,
@@ -984,6 +1006,7 @@ impl Reclaimer {
         leases: Arc<Mutex<HashSet<String>>>,
         slots: Arc<Slots>,
         floor: Arc<AtomicU64>,
+        build_floor: Arc<AtomicU64>,
     ) -> Option<Arc<Self>> {
         let settings = cfg.reclaim.clone();
         if !settings.enabled {
@@ -1052,6 +1075,7 @@ impl Reclaimer {
             work_root: cfg.work_root.clone(),
             cache_root: cfg.cache_root.clone(),
             floor,
+            build_floor,
             seq: Mutex::new(seq),
             sizes: Mutex::new(HashMap::new()),
             kick: tokio::sync::Notify::new(),
@@ -1135,7 +1159,7 @@ impl Reclaimer {
                 size_floor_secs: self.settings.critical_min_age_secs,
                 sizes: &self.sizes,
                 common: Mutex::new(HashMap::new()),
-                floor: self.floor.load(Ordering::Relaxed),
+                floor: self.build_floor.load(Ordering::Relaxed),
                 leases: &self.leases,
                 slots: &self.slots,
                 work_root: &self.work_root,
@@ -1578,6 +1602,10 @@ mod tests {
                     "runner_user_cache"
                 ),
                 (
+                    "/home/runner1/.bun/install/cache".to_owned(),
+                    "runner_user_cache"
+                ),
+                (
                     "/home/runner2/actions-runner/_work".to_owned(),
                     "runner_work"
                 ),
@@ -1593,6 +1621,56 @@ mod tests {
             ]
         );
         assert!(static_runner_roots(&[]).is_empty());
+    }
+
+    #[test]
+    fn static_runner_roots_never_reach_credentials_config_or_toolchains() {
+        use crate::drone::credwipe::StaticRunner;
+        let runner = StaticRunner {
+            unit: "actions.runner.dx-corp.gce-internal-01-1.service".into(),
+            root: "/home/runner1/actions-runner".into(),
+            user: Some("runner1".into()),
+            home: Some("/home/runner1".into()),
+        };
+        let roots = static_runner_roots(&[runner]);
+        // What a runner host keeps that is not regenerable CI output: the
+        // runner's registration, its user's credentials and config, and the
+        // installed toolchains jobs run with. No root may be one of these or
+        // contain one.
+        let kept = [
+            "/home/runner1",
+            "/home/runner1/actions-runner",
+            "/home/runner1/actions-runner/.credentials",
+            "/home/runner1/actions-runner/.runner",
+            "/home/runner1/.ssh",
+            "/home/runner1/.config",
+            "/home/runner1/.docker/config.json",
+            "/home/runner1/.rustup",
+            "/home/runner1/.bun/bin",
+            "/home/runner1/.cache",
+            "/home/runner1/go",
+        ];
+        for root in &roots {
+            for k in kept {
+                let k = Path::new(k);
+                assert!(
+                    root.path != k && !k.starts_with(&root.path),
+                    "{} ({}) would reach {}",
+                    root.path.display(),
+                    root.kind.as_str(),
+                    k.display()
+                );
+            }
+        }
+        // Every user-home root is one of the named regenerable caches.
+        for root in roots.iter().filter(|r| r.kind == Kind::RunnerUserCache) {
+            let rel = root.path.strip_prefix("/home/runner1").unwrap();
+            assert!(
+                RUNNER_USER_CACHES.iter().any(|c| Path::new(c) == rel),
+                "{}",
+                rel.display()
+            );
+        }
     }
 
     /// A `_diag` candidate is dated by its oldest log, sized by the logs
@@ -1721,7 +1799,9 @@ mod tests {
         let held = found.iter().find(|c| c.path == slot).unwrap();
         let unrelated = found.iter().find(|c| c.path == other).unwrap();
 
-        let pause = slots.acquire("paused-lease").unwrap();
+        let pause = slots
+            .acquire("paused-lease", crate::classes::Class::Heavy)
+            .unwrap();
         assert_eq!(pause.index(), 0);
         leases.lock().unwrap().insert("paused-lease".into());
         assert_eq!(
@@ -1875,6 +1955,39 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|c| c.starts_with("timeout ") && c.contains("--reuid 1006"))
+        );
+    }
+
+    #[test]
+    fn a_path_in_a_private_home_exists_when_its_owner_sees_it() {
+        use crate::drone::exec::Output;
+        // The drone cannot see into /home/runner6 (mode 700); its owner can.
+        struct PrivateHome(Mutex<Vec<String>>);
+        impl Exec for PrivateHome {
+            fn run(&self, program: &str, args: &[&str]) -> std::io::Result<Output> {
+                let call = format!("{program} {}", args.join(" "));
+                self.0.lock().unwrap().push(call.clone());
+                let out = |success: bool, stdout: &str| {
+                    Ok(Output {
+                        success,
+                        stdout: stdout.to_owned(),
+                    })
+                };
+                if program == "stat" {
+                    return out(true, "1006:1006");
+                }
+                let seen = call.contains("--reuid 1006")
+                    && call.contains("test -e")
+                    && call.ends_with(" /home/runner6/.cache/go-build");
+                out(seen, "")
+            }
+        }
+        let exec = Arc::new(PrivateHome(Mutex::new(Vec::new())));
+        let cmd = Commands::new(Arc::clone(&exec) as Arc<dyn Exec>, "setpriv".into());
+        assert!(cmd.exists(Path::new("/home/runner6/.cache/go-build")));
+        assert!(
+            !cmd.exists(Path::new("/home/runner6/.npm")),
+            "a path the owner does not see either is gone"
         );
     }
 

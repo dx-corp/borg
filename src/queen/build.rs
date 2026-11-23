@@ -49,6 +49,11 @@ impl Queen {
         self.build.as_ref()
     }
 
+    /// When this process started listening for heartbeats, if recorded.
+    pub(crate) fn started_at(&self) -> Option<i64> {
+        self.build.as_ref().map(|b| b.started_at)
+    }
+
     /// The version drones are rolled out to: the configured target, or with
     /// `rollout.follow_queen` the build this queen runs.
     pub(crate) fn rollout_target(&self) -> Option<String> {
@@ -64,11 +69,33 @@ impl Queen {
     /// The target this pass, held while a rollout is in flight when the
     /// target only follows the queen's own build; see
     /// [`crate::rollout::settled_target`]. A configured target applies at once.
-    pub(super) fn settled_target(&self, target: String, stored: Option<&RolloutState>) -> String {
+    pub(super) fn settled_target(
+        &self,
+        target: String,
+        stored: Option<&RolloutState>,
+        now: i64,
+    ) -> String {
         if self.cfg.rollout_target_version.is_some() || !self.cfg.rollout.follow_queen {
             return target;
         }
-        crate::rollout::settled_target(target, stored)
+        crate::rollout::settled_target(target, stored, now, &self.cfg.rollout)
+    }
+
+    /// Drones the gated rollout has cordoned: told the target, still holding
+    /// leases past `rollout.drain_timeout_secs`. They get no new leases,
+    /// standby starts or units; their running jobs finish.
+    pub fn rollout_cordoned(&self) -> std::collections::BTreeSet<String> {
+        self.snapshot()
+            .rollout
+            .map(|r| {
+                r.state
+                    .cordoned
+                    .iter()
+                    .filter(|n| crate::rollout::cordoned(&r.state, n))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// After a pass that succeeded, tell the updater this binary works: write

@@ -353,6 +353,7 @@ async fn execute(
             max_job: Duration::from_secs(max_job),
             preempt_grace: Duration::from_secs(ctx.cfg.preempt_grace_secs),
             proc_root: &ctx.proc_root,
+            cgroup: None,
         },
         ctx.abort.clone(),
         ctx.preempt.clone(),

@@ -16,13 +16,14 @@ fn config(token_path: &std::path::Path) -> Value {
         "control": {"token_path": token_path},
         "burst": {
             "enabled": true, "max_drones": 2,
+            "allowance": {"approved_by": "founder", "approval": "test", "expires_at": "2099-01-01T00:00:00Z"},
             "budget": {"drone_hours_per_day": 24, "drone_hours_per_month": 150},
             "ceilings": {"max_drones": 4, "drone_hours_per_day": 48, "drone_hours_per_month": 300},
             "scale_up": {"classes": ["heavy"], "weights": {"main": 3, "pr": 1},
                          "min_weighted_unmet": 6, "sustained_secs": 600},
             "scale_down": {"idle_secs": 900},
-            "gce": {"project": "p", "network": "borg-burst", "subnet": "borg-burst-usw1",
-                    "zones": ["us-west1-b"], "machine_type": "c2d-highcpu-56"}
+            "gce": {"project": "p", "network": "borg-burst", "subnet": "borg-burst-usc1",
+                    "zones": ["us-central1-b"], "machine_type": "c2d-highcpu-56"}
         }
     })
 }

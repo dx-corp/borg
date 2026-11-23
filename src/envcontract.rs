@@ -249,6 +249,7 @@ pub struct DiskAdmission {
     pub minimum_free_bytes: u64,
     pub work_free_bytes: Option<u64>,
     pub cache_free_bytes: Option<u64>,
+    pub reason: String,
 }
 
 impl DiskAdmission {
@@ -270,29 +271,134 @@ pub fn disk_admission(
     cache_free_bytes: Option<u64>,
 ) -> DiskAdmission {
     let work_free_bytes = work_free_mib.map(|mib| mib.saturating_mul(1 << 20));
-    let low = [work_free_bytes, cache_free_bytes]
-        .into_iter()
-        .flatten()
-        .any(|free| free < minimum_free_bytes);
-    let state = if low {
+    let mut low = Vec::new();
+    if let Some(free) = work_free_bytes.filter(|free| *free < minimum_free_bytes) {
+        low.push(format!(
+            "work filesystem has {free} bytes free, below the floor of {minimum_free_bytes} bytes"
+        ));
+    }
+    if let Some(free) = cache_free_bytes.filter(|free| *free < minimum_free_bytes) {
+        low.push(format!(
+            "cache directory has {free} bytes free, below the floor of {minimum_free_bytes} bytes"
+        ));
+    }
+    let state = if !low.is_empty() {
         CheckState::Fail
     } else if work_free_bytes.is_none() || cache_free_bytes.is_none() {
         CheckState::Unknown
     } else {
         CheckState::Pass
     };
+    let reason = match &state {
+        CheckState::Fail => low.join("; "),
+        CheckState::Unknown => {
+            let unknown = [
+                work_free_bytes.is_none().then_some("work filesystem"),
+                cache_free_bytes.is_none().then_some("cache directory"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" and ");
+            format!("{unknown} free-space measurement unknown; unknown remains compatible")
+        }
+        CheckState::Pass => "all reported filesystems meet the free-space floor".to_owned(),
+    };
     DiskAdmission {
         state,
         minimum_free_bytes,
         work_free_bytes,
         cache_free_bytes,
+        reason,
     }
+}
+
+pub fn fresh_cache_dir_free_bytes(
+    settings: &ContractSettings,
+    facts: Option<&EnvFacts>,
+    now: i64,
+) -> Option<u64> {
+    facts
+        .filter(|facts| (0..=settings.facts_max_age_secs).contains(&(now - facts.observed_at)))
+        .and_then(|facts| facts.cache_dir_free_bytes)
+}
+
+pub fn class_disk_admissions(
+    settings: &ContractSettings,
+    work_free_mib: Option<u64>,
+    cache_free_bytes: Option<u64>,
+) -> BTreeMap<Class, DiskAdmission> {
+    Class::ALL
+        .into_iter()
+        .map(|class| {
+            (
+                class,
+                disk_admission(
+                    settings.min_cache_dir_free_bytes_for(class),
+                    work_free_mib,
+                    cache_free_bytes,
+                ),
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+pub struct DiskAdmissions {
+    pub global: DiskAdmission,
+    pub classes: BTreeMap<Class, DiskAdmission>,
+    pub blocked_classes: Vec<Class>,
+}
+
+pub fn disk_admissions(
+    settings: &ContractSettings,
+    work_free_mib: Option<u64>,
+    cache_free_bytes: Option<u64>,
+) -> DiskAdmissions {
+    let classes = class_disk_admissions(settings, work_free_mib, cache_free_bytes);
+    let blocked_classes = classes
+        .iter()
+        .filter_map(|(class, disk)| disk.blocked().then_some(*class))
+        .collect();
+    DiskAdmissions {
+        global: disk_admission(
+            settings.min_cache_dir_free_bytes,
+            work_free_mib,
+            cache_free_bytes,
+        ),
+        classes,
+        blocked_classes,
+    }
+}
+
+pub fn fresh_disk_admissions(
+    settings: &ContractSettings,
+    work_free_mib: Option<u64>,
+    facts: Option<&EnvFacts>,
+    now: i64,
+) -> DiskAdmissions {
+    disk_admissions(
+        settings,
+        work_free_mib,
+        fresh_cache_dir_free_bytes(settings, facts, now),
+    )
+}
+
+pub fn merge_blocked_classes(
+    blocked: &mut Vec<Class>,
+    disk_blocked: impl IntoIterator<Item = Class>,
+) {
+    blocked.extend(disk_blocked);
+    blocked.sort_unstable();
+    blocked.dedup();
 }
 
 /// Settings of one class (or the defaults for all).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClassContract {
+    /// Minimum free cache-directory space required to admit this class.
+    pub min_cache_dir_free_bytes: Option<u64>,
     /// Check modes overriding the global ones.
     pub checks: BTreeMap<CheckKind, Mode>,
     /// The Rust toolchain every build of this class needs.
@@ -366,6 +472,29 @@ impl Default for ContractSettings {
 }
 
 impl ContractSettings {
+    pub fn min_cache_dir_free_bytes_for(&self, class: Class) -> u64 {
+        self.min_cache_dir_free_bytes.max(
+            self.classes
+                .get(&class)
+                .and_then(|contract| contract.min_cache_dir_free_bytes)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The free space reclaim keeps on a drone: the largest disk floor among
+    /// the classes it `hosts`. A drone that hosts heavy leases must stay above
+    /// the heavy floor or the queen stops placing them there, so its reclaim
+    /// frees build caches at that floor and not at the global one, under which
+    /// the drone takes no lease at all. A class the drone cannot hold does not
+    /// raise it.
+    pub fn reclaim_floor_bytes(&self, hosts: impl Fn(Class) -> bool) -> u64 {
+        Class::ALL
+            .into_iter()
+            .filter(|class| hosts(*class))
+            .map(|class| self.min_cache_dir_free_bytes_for(class))
+            .fold(self.min_cache_dir_free_bytes, u64::max)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.facts_max_age_secs <= 0
             || self.allowed_wrappers.is_empty()
@@ -962,6 +1091,60 @@ mod tests {
             CheckState::Unknown
         );
         assert!(!disk_admission(floor, None, None).blocked());
+    }
+
+    #[test]
+    fn class_disk_floor_is_the_maximum_of_global_and_class_values() {
+        let mut settings = ContractSettings::default();
+        settings.classes.insert(
+            Class::Heavy,
+            ClassContract {
+                min_cache_dir_free_bytes: Some(32 << 30),
+                ..ClassContract::default()
+            },
+        );
+        settings.classes.insert(
+            Class::Medium,
+            ClassContract {
+                min_cache_dir_free_bytes: Some(5 << 30),
+                ..ClassContract::default()
+            },
+        );
+
+        assert_eq!(
+            settings.min_cache_dir_free_bytes_for(Class::Light),
+            10 << 30
+        );
+        assert_eq!(
+            settings.min_cache_dir_free_bytes_for(Class::Medium),
+            10 << 30
+        );
+        assert_eq!(
+            settings.min_cache_dir_free_bytes_for(Class::Heavy),
+            32 << 30
+        );
+    }
+
+    #[test]
+    fn reclaim_keeps_the_floor_of_the_largest_class_a_drone_hosts() {
+        // borg-main-1 on 2026-11-20: reclaim freed to the 10 GiB global floor
+        // while heavy needs 32 GiB, so free space swung between 26 and 35 GiB
+        // and its five heavy slots dropped out of the fleet and came back.
+        let mut settings = ContractSettings::default();
+        settings.classes.insert(
+            Class::Heavy,
+            ClassContract {
+                min_cache_dir_free_bytes: Some(32 << 30),
+                ..ClassContract::default()
+            },
+        );
+        assert_eq!(settings.reclaim_floor_bytes(|_| true), 32 << 30);
+        assert_eq!(
+            settings.reclaim_floor_bytes(|class| class != Class::Heavy),
+            10 << 30,
+            "a drone too small for heavy keeps the global floor"
+        );
+        assert_eq!(settings.reclaim_floor_bytes(|_| false), 10 << 30);
     }
 
     const NOW: i64 = 10_000;

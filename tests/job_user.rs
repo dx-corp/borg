@@ -48,6 +48,7 @@ fn a_lease_runs_as_a_different_uid_without_access_to_the_drone_token_or_any_capa
             name: JOB_ID.to_owned(),
             home: "/nonexistent".into(),
             priv_bin: "setpriv".to_owned(),
+            groups: None,
         },
     );
 

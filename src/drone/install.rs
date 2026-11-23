@@ -220,6 +220,9 @@ pub fn render_systemd_unit(
          # SIGTERM goes to the drone only, so in-flight jobs can finish while it\n\
          # drains; leftovers are killed once the drone exits.\n\
          KillMode=mixed\n\
+         # Hand the drone its cgroup subtree: each lease runs in a child cgroup\n\
+         # with its own memory limit (drone/memlimit.rs).\n\
+         Delegate=yes\n\
          TimeoutStopSec={stop}\n\
          \n\
          [Install]\n\
@@ -840,6 +843,7 @@ impl Installer<'_> {
             .and_then(|v| v.get("reclaim").cloned())
             .and_then(|r| serde_json::from_value::<crate::reclaim::ReclaimSettings>(r).ok())
             .filter(|r| !r.is_legacy_default())
+            .map(crate::reclaim::ReclaimSettings::upgraded)
             .unwrap_or_else(|| {
                 if accept_leases {
                     crate::reclaim::ReclaimSettings::default()
@@ -877,7 +881,16 @@ impl Installer<'_> {
             max_vcpu: o.max_vcpu,
             max_mem_mib: o.max_mem_mib,
             max_leases: o.max_leases,
+            max_class_leases: on_disk
+                .as_ref()
+                .and_then(|v| v.get("max_class_leases").cloned())
+                .and_then(|r| serde_json::from_value(r).ok())
+                .unwrap_or_default(),
             reserve_mem_mib: crate::allocator::HostCaps::default().reserve_mem_mib,
+            host_memory_guard_mib: on_disk
+                .as_ref()
+                .and_then(|v| v.get("host_memory_guard_mib"))
+                .and_then(serde_json::Value::as_u64),
             host_metrics_url: None,
             slots: None,
             state_dir: Some(self.layout.data.clone()),
@@ -885,6 +898,7 @@ impl Installer<'_> {
                 name: name.to_owned(),
                 home: self.layout.job_home.clone(),
                 priv_bin: "setpriv".to_owned(),
+                groups: None,
             }),
             extra_labels: o.extra_labels.clone(),
             trust: o.trust,
@@ -897,6 +911,11 @@ impl Installer<'_> {
             host_invariants: on_disk
                 .as_ref()
                 .and_then(|v| v.get("host_invariants").cloned())
+                .and_then(|r| serde_json::from_value(r).ok())
+                .unwrap_or_default(),
+            docker_proxy: on_disk
+                .as_ref()
+                .and_then(|v| v.get("docker_proxy").cloned())
                 .and_then(|r| serde_json::from_value(r).ok())
                 .unwrap_or_default(),
             caches: crate::drone::config::CachesConfig {

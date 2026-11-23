@@ -29,6 +29,12 @@ pub struct JobUser {
     /// The `setpriv` binary (util-linux).
     #[serde(default = "default_priv")]
     pub priv_bin: String,
+    /// Supplementary groups jobs get instead of the account's own, set at
+    /// drone start (never configured): with the per-lease Docker endpoint the
+    /// `docker` group is left out, so a job reaches dockerd only through its
+    /// endpoint.
+    #[serde(skip)]
+    pub groups: Option<Vec<u32>>,
 }
 
 fn default_priv() -> String {
@@ -39,17 +45,59 @@ impl JobUser {
     /// `setpriv` arguments that become the job user, load its supplementary
     /// groups (for example `docker`) and drop every capability, ending in `--`.
     pub fn setpriv_args(&self) -> Vec<String> {
-        vec![
+        let mut groups = match &self.groups {
+            None => vec!["--init-groups".to_owned()],
+            Some(g) if g.is_empty() => vec!["--clear-groups".to_owned()],
+            Some(g) => vec![
+                "--groups".to_owned(),
+                g.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
+            ],
+        };
+        let mut args = vec![
             "--reuid".to_owned(),
             self.name.clone(),
             "--regid".to_owned(),
             self.name.clone(),
-            "--init-groups".to_owned(),
+        ];
+        args.append(&mut groups);
+        args.extend([
             "--inh-caps=-all".to_owned(),
             "--ambient-caps=-all".to_owned(),
             "--bounding-set=-all".to_owned(),
             "--".to_owned(),
-        ]
+        ]);
+        args
+    }
+
+    /// The account's supplementary groups without `docker`, from `id -G` and
+    /// `getent group docker`; `None` when either cannot be read.
+    pub fn groups_without_docker(&self, exec: &dyn Exec) -> Option<Vec<u32>> {
+        let ids = exec
+            .run("id", &["-G", &self.name])
+            .ok()
+            .filter(|o| o.success)?;
+        let docker = exec
+            .run("getent", &["group", "docker"])
+            .ok()
+            .filter(|o| o.success)
+            .and_then(|o| {
+                o.stdout
+                    .split(':')
+                    .nth(2)
+                    .and_then(|g| g.trim().parse::<u32>().ok())
+            });
+        let primary = exec
+            .run("id", &["-g", &self.name])
+            .ok()
+            .filter(|o| o.success)
+            .and_then(|o| o.stdout.trim().parse::<u32>().ok())?;
+        Some(
+            ids.stdout
+                .split_whitespace()
+                .filter_map(|g| g.parse::<u32>().ok())
+                .filter(|g| Some(*g) != docker && *g != primary)
+                .collect(),
+        )
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -127,7 +175,32 @@ mod tests {
             name: "borg-job".into(),
             home: "/var/lib/borg-job".into(),
             priv_bin: "setpriv".into(),
+            groups: None,
         }
+    }
+
+    #[test]
+    fn the_docker_group_can_be_left_out() {
+        let fake = FakeExec::default();
+        fake.on("id -G borg-job", "1001 998 27\n");
+        fake.on("id -g borg-job", "1001\n");
+        fake.on("getent group docker", "docker:x:998:borg,borg-job\n");
+        let groups = user().groups_without_docker(&fake).unwrap();
+        assert_eq!(groups, [27]);
+        let args = JobUser {
+            groups: Some(groups),
+            ..user()
+        }
+        .setpriv_args();
+        assert!(args.windows(2).any(|w| w == ["--groups", "27"]), "{args:?}");
+        assert!(!args.contains(&"--init-groups".to_owned()));
+        let none = JobUser {
+            groups: Some(Vec::new()),
+            ..user()
+        }
+        .setpriv_args();
+        assert!(none.contains(&"--clear-groups".to_owned()));
+        assert!(user().setpriv_args().contains(&"--init-groups".to_owned()));
     }
 
     #[test]

@@ -37,7 +37,7 @@
 //!
 //! Spend is counted from the queen's own records as the time from creation to
 //! deletion, capped at the maximum run time (the cloud deletes the VM then),
-//! which is an upper bound: a spot VM reclaimed early is still counted until
+//! which is an upper bound: a VM deleted early is still counted until
 //! the queen deletes its record. Drones created by hand are counted toward
 //! `max_drones` but are never drained, deleted or billed here.
 //!
@@ -94,24 +94,13 @@ fn default_vm_prefix() -> String {
 fn default_max_run() -> i64 {
     12 * 3600
 }
-fn default_true_spot() -> bool {
-    true
-}
-fn default_disk_gb() -> u32 {
-    1000
-}
-fn default_disk_type() -> String {
-    "pd-balanced".to_owned()
-}
-fn default_image_family() -> String {
-    "ubuntu-2204-lts".to_owned()
-}
-fn default_image_project() -> String {
-    "ubuntu-os-cloud".to_owned()
-}
 fn default_api_base() -> String {
     "https://compute.googleapis.com/compute/v1".to_owned()
 }
+fn default_tailscale_api_base() -> String {
+    crate::tskey::DEFAULT_API_BASE.to_owned()
+}
+
 fn default_tailscale_tag() -> String {
     "tag:borg-drone".to_owned()
 }
@@ -157,6 +146,36 @@ pub struct BurstSettings {
     scale_up: ScaleUpSettings,
     scale_down: ScaleDownSettings,
     pub(super) gce: GceSettings,
+    /// The founder's approval to create Compute Engine drones, with its end.
+    /// Absent (the default) or expired, the queen creates no VM even with
+    /// `enabled` set, and logs each refusal. Only the config file sets it; the
+    /// control API cannot.
+    #[serde(default)]
+    pub(super) allowance: Option<Allowance>,
+}
+
+/// A founder-approved, expiring permission to create burst VMs (founder,
+/// 2026-11-21: "you also need to stop them from getting auto-created").
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Allowance {
+    /// Who approved it: the founder's handle.
+    pub(super) approved_by: String,
+    /// The founder's words or a link to them.
+    pub(super) approval: String,
+    /// RFC 3339 UTC end, such as `2026-11-22T03:00:00Z`.
+    pub(super) expires_at: String,
+}
+
+impl Allowance {
+    fn expires_unix(&self) -> Option<i64> {
+        OffsetDateTime::parse(
+            &self.expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .ok()
+        .map(OffsetDateTime::unix_timestamp)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -236,19 +255,24 @@ pub struct GceSettings {
     /// Instance names; the queen's service account is allowed only these.
     #[serde(default = "default_vm_prefix")]
     vm_prefix: String,
-    #[serde(default = "default_true_spot")]
+    /// Accepted only as `false`, for configs written before Spot was banned:
+    /// burst VMs are always STANDARD (founder, 2026-11-18: Spot drones cost
+    /// more in egress than they saved). `true` fails validation.
+    #[serde(default)]
     pub(crate) spot: bool,
     /// Hard lifetime; the cloud deletes the VM then.
     #[serde(default = "default_max_run")]
     pub(crate) max_run_secs: i64,
-    #[serde(default = "default_disk_gb")]
-    pub(crate) boot_disk_gb: u32,
-    #[serde(default = "default_disk_type")]
-    pub(crate) boot_disk_type: String,
-    #[serde(default = "default_image_family")]
-    pub(crate) image_family: String,
-    #[serde(default = "default_image_project")]
-    pub(crate) image_project: String,
+    /// Accepted and ignored, for configs written before burst VMs came from
+    /// an instance template: the template decides the disk and the image.
+    #[serde(default, rename = "boot_disk_gb")]
+    _boot_disk_gb: serde::de::IgnoredAny,
+    #[serde(default, rename = "boot_disk_type")]
+    _boot_disk_type: serde::de::IgnoredAny,
+    #[serde(default, rename = "image_family")]
+    _image_family: serde::de::IgnoredAny,
+    #[serde(default, rename = "image_project")]
+    _image_project: serde::de::IgnoredAny,
     /// Service-account key file (JSON) the queen creates and deletes VMs
     /// with. Required unless `dry_run`.
     #[serde(default)]
@@ -260,10 +284,20 @@ pub struct GceSettings {
     /// script fetches the drone binary from it. Required unless `dry_run`.
     #[serde(default)]
     pub(crate) queen_url: Option<String>,
-    /// File on the queen holding a reusable, ephemeral, pre-authorized
-    /// tailnet auth key for `tailscale_tag`. Required unless `dry_run`.
+    /// Accepted and ignored, for configs written before per-VM keys: the
+    /// queen never puts a reusable tailnet key in a VM's metadata.
+    #[serde(default, rename = "tailscale_authkey_path")]
+    _tailscale_authkey_path: serde::de::IgnoredAny,
+    /// JSON file on the queen with the tailnet OAuth client
+    /// (`{"client_id", "client_secret"}`). For every burst VM the queen mints
+    /// a single-use, one-hour, non-ephemeral key for `tailscale_tag` with it
+    /// ([`crate::tskey`]), and deletes the VM's tailnet device when it deletes
+    /// the VM. Required unless `dry_run`.
     #[serde(default)]
-    pub tailscale_authkey_path: Option<PathBuf>,
+    pub tailscale_oauth_path: Option<PathBuf>,
+    /// Tailscale API base; tests point it at a fake.
+    #[serde(default = "default_tailscale_api_base")]
+    pub tailscale_api_base: String,
     #[serde(default = "default_tailscale_tag")]
     pub(crate) tailscale_tag: String,
     /// File on the queen served to drones as their toolchain installer
@@ -275,6 +309,31 @@ pub struct GceSettings {
     pub(crate) drone_max_vcpu: u32,
     #[serde(default = "default_drone_max_mem_mib")]
     pub(crate) drone_max_mem_mib: u64,
+    /// The instance template every burst VM is created from
+    /// (`projects/<project>/global/instanceTemplates/<name>`, or its full
+    /// URL): the CI host template, which fixes provisioning, region, network,
+    /// image, disk and labels. The queen adds only the VM name, its own
+    /// labels and the bootstrap metadata. `network`, `subnet` and
+    /// `machine_type` are still required, for configs and log lines written
+    /// before the template, but no VM is shaped by them. Live burst creates
+    /// nothing without a template.
+    #[serde(default)]
+    pub instance_template: Option<String>,
+}
+
+/// The only region burst VMs may run in: Artifact Registry, the sccache
+/// bucket and GKE are in us-central1, so a drone elsewhere pays cross-region
+/// transfer on every image and cache pull.
+pub(crate) const DATA_REGION: &str = "us-central1";
+
+/// `<region>-<letter>`, e.g. `us-central1-a`, returning the region.
+fn zone_region(zone: &str) -> Option<&str> {
+    let (region, letter) = zone.rsplit_once('-')?;
+    let ok = letter.len() == 1
+        && letter.bytes().all(|b| b.is_ascii_lowercase())
+        && region.contains('-')
+        && dns_label(region);
+    ok.then_some(region)
 }
 
 fn dns_label(s: &str) -> bool {
@@ -284,8 +343,34 @@ fn dns_label(s: &str) -> bool {
 }
 
 impl BurstSettings {
+    // formal: begin burst_allowance/check_allowance.create_refusal
+    /// Why no VM may be created at `now`, or `None` under an unexpired,
+    /// founder-approved allowance.
+    pub(super) fn create_refusal(&self, now: i64) -> Option<String> {
+        let Some(a) = &self.allowance else {
+            return Some("no founder-approved burst allowance is recorded".to_owned());
+        };
+        match a.expires_unix() {
+            Some(end) if now < end => None,
+            Some(_) => Some(format!("the burst allowance expired at {}", a.expires_at)),
+            None => Some(format!(
+                "the burst allowance end {:?} is not RFC 3339",
+                a.expires_at
+            )),
+        }
+    }
+    // formal: end burst_allowance/check_allowance.create_refusal
+
     pub(super) fn validate(&self) -> Result<(), String> {
         let bad = |m: &str| Err(format!("burst: {m}"));
+        if let Some(a) = &self.allowance {
+            if a.approved_by.trim().is_empty() || a.approval.trim().is_empty() {
+                return bad("allowance needs approved_by and approval");
+            }
+            if a.expires_unix().is_none() {
+                return bad("allowance.expires_at must be an RFC 3339 time");
+            }
+        }
         let (b, up, down, gce) = (&self.budget, &self.scale_up, &self.scale_down, &self.gce);
         if !(1..=10).contains(&self.max_drones) {
             return bad("max_drones must be between 1 and 10");
@@ -353,6 +438,32 @@ impl BurstSettings {
         if gce.zones.is_empty() || gce.zones.iter().any(|z| !dns_label(z)) {
             return bad("gce.zones must name at least one zone");
         }
+        if gce
+            .zones
+            .iter()
+            .any(|z| zone_region(z) != Some(DATA_REGION))
+        {
+            return bad(&format!(
+                "gce.zones must all be {DATA_REGION} zones (<region>-<letter>), where the registry and caches are"
+            ));
+        }
+        if let Some(template) = &gce.instance_template {
+            let Some(path) = crate::gce::instance_template_path(template) else {
+                return bad(
+                    "gce.instance_template looks like projects/<project>/global/instanceTemplates/<name>",
+                );
+            };
+            if path.contains("/regions/") && !path.contains(&format!("/regions/{DATA_REGION}/")) {
+                return bad(&format!(
+                    "gce.instance_template must be global or a {DATA_REGION} template"
+                ));
+            }
+        }
+        if gce.spot {
+            return bad(
+                "gce.spot is not supported: Spot VMs are banned (egress and cost, founder 2026-11-18); burst drones are STANDARD",
+            );
+        }
         for (name, v) in [
             ("project", &gce.project),
             ("network", &gce.network),
@@ -376,10 +487,7 @@ impl BurstSettings {
             for (name, present) in [
                 ("credentials_path", gce.credentials_path.is_some()),
                 ("queen_url", gce.queen_url.is_some()),
-                (
-                    "tailscale_authkey_path",
-                    gce.tailscale_authkey_path.is_some(),
-                ),
+                ("tailscale_oauth_path", gce.tailscale_oauth_path.is_some()),
                 ("toolchain_script_path", gce.toolchain_script_path.is_some()),
             ] {
                 if !present {
@@ -392,6 +500,11 @@ impl BurstSettings {
                 .is_some_and(|u| u.starts_with("https://") || u.starts_with("http://"))
             {
                 return bad("gce.queen_url must be an http(s) URL");
+            }
+            if self.enabled && gce.instance_template.is_none() {
+                return bad(
+                    "gce.instance_template is required to run burst live: burst VMs are created from the CI host template, never from settings in this file",
+                );
             }
         }
         Ok(())
@@ -711,9 +824,11 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
     let max_run = cfg.gce.max_run_secs;
     let up = &cfg.scale_up;
     let down = &cfg.scale_down;
-    // Turned off (in the config or through the control API): create
-    // nothing; drain the drones this queen made and delete them once empty.
-    let disabled = !cfg.enabled;
+    // Turned off (in the config or through the control API), or with no
+    // unexpired founder allowance: create nothing; drain the drones this
+    // queen made and delete them once empty.
+    let refusal = cfg.create_refusal(now);
+    let disabled = !cfg.enabled || refusal.is_some();
 
     let weighted = weighted_unmet(up, obs.unmet, obs.idle);
     let holds = weighted >= up.min_weighted_unmet;
@@ -824,8 +939,13 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
         .unwrap_or(usize::MAX)
         .saturating_sub(counted);
 
-    let (outcome, reason) = if disabled {
+    let (outcome, reason) = if !cfg.enabled {
         ("disabled", "burst is disabled".to_owned())
+    } else if let Some(why) = refusal {
+        if holds {
+            tracing::warn!("burst: refused to create a Compute Engine drone: {why}");
+        }
+        ("no_allowance", why)
     } else if obs.breaker_tripped || never_enrolled_deletes(&actions, &live_vms) >= obs.breaker_room
     {
         (
@@ -1252,12 +1372,13 @@ mod tests {
 
     const BLOCK: &str = r#"{
       "enabled": true, "max_drones": 3,
+      "allowance": {"approved_by": "founder", "approval": "test", "expires_at": "2030-01-01T00:00:00Z"},
       "budget": {"drone_hours_per_day": 24, "drone_hours_per_month": 150},
       "scale_up": {"classes": ["heavy", "medium"], "weights": {"main": 3, "pr": 1},
                    "min_weighted_unmet": 6, "sustained_secs": 600},
       "scale_down": {"idle_secs": 900},
-      "gce": {"project": "p", "network": "borg-burst", "subnet": "borg-burst-usw1",
-              "zones": ["us-west1-b", "us-west1-a"], "machine_type": "c2d-highcpu-56"}
+      "gce": {"project": "p", "network": "borg-burst", "subnet": "borg-burst-usc1",
+              "zones": ["us-central1-b", "us-central1-a"], "machine_type": "c2d-highcpu-56"}
     }"#;
 
     fn cfg() -> BurstSettings {
@@ -1284,14 +1405,17 @@ mod tests {
         }
     }
 
+    const TEMPLATE: &str = "projects/p/global/instanceTemplates/borg-burst-v1";
+
     /// A live configuration: dry-run off with every provisioning input.
     fn live_cfg() -> BurstSettings {
         let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
         block["dry_run"] = serde_json::json!(false);
         block["gce"]["credentials_path"] = serde_json::json!("/etc/borg/gce-sa.json");
         block["gce"]["queen_url"] = serde_json::json!("https://queen.example.test");
-        block["gce"]["tailscale_authkey_path"] = serde_json::json!("/etc/borg/drone-ts.key");
+        block["gce"]["tailscale_oauth_path"] = serde_json::json!("/etc/borg/tailscale-oauth.json");
         block["gce"]["toolchain_script_path"] = serde_json::json!("/etc/borg/toolchain.sh");
+        block["gce"]["instance_template"] = serde_json::json!(TEMPLATE);
         serde_json::from_value(block).unwrap()
     }
 
@@ -1328,6 +1452,56 @@ mod tests {
 
     const T0: i64 = 1_800_000_000; // 2027-01-15, mid-day not required
 
+    fn sustained_heavy_demand(c: &BurstSettings) -> Plan {
+        let mut st = BurstState::default();
+        let need = [unmet(Class::Heavy, Scope::Main, 9)];
+        run(c, &mut st, T0, &need, &[], &[]);
+        run(c, &mut st, T0 + 600, &need, &[], &[])
+    }
+
+    #[test]
+    fn nothing_is_created_without_an_unexpired_allowance() {
+        assert_eq!(sustained_heavy_demand(&live_cfg()).outcome, "create");
+
+        let mut none = live_cfg();
+        none.allowance = None;
+        let p = sustained_heavy_demand(&none);
+        assert_eq!(p.outcome, "no_allowance");
+        assert!(p.reason.contains("no founder-approved"), "{}", p.reason);
+        assert!(!p.actions.iter().any(|a| matches!(a, Action::Create { .. })));
+
+        let mut expired = live_cfg();
+        if let Some(a) = expired.allowance.as_mut() {
+            a.expires_at = "2027-01-15T00:00:00Z".to_owned();
+        }
+        let p = sustained_heavy_demand(&expired);
+        assert_eq!(p.outcome, "no_allowance");
+        assert!(p.reason.contains("expired"), "{}", p.reason);
+        assert!(!p.actions.iter().any(|a| matches!(a, Action::Create { .. })));
+    }
+
+    #[test]
+    fn an_expired_allowance_drains_the_drones_it_made() {
+        let mut c = live_cfg();
+        c.allowance = None;
+        let mut st = BurstState::default();
+        let vms = [vm("gcp-burst-a", "us-central1-a", T0 - 60)];
+        let p = run(&c, &mut st, T0, &[], &[drone("gcp-burst-a", true, 0)], &vms);
+        assert!(p.actions.iter().any(|a| matches!(a, Action::Drain { .. })));
+    }
+
+    #[test]
+    fn a_malformed_allowance_is_rejected() {
+        let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
+        block["allowance"]["expires_at"] = serde_json::json!("tomorrow");
+        let c: BurstSettings = serde_json::from_value(block.clone()).unwrap();
+        assert!(c.validate().is_err());
+        block["allowance"]["expires_at"] = serde_json::json!("2030-01-01T00:00:00Z");
+        block["allowance"]["approval"] = serde_json::json!(" ");
+        let c: BurstSettings = serde_json::from_value(block).unwrap();
+        assert!(c.validate().is_err());
+    }
+
     #[test]
     fn defaults_are_off_and_dry_run_and_validation_rejects_nonsense() {
         let c = cfg();
@@ -1345,7 +1519,7 @@ mod tests {
             ("\"min_weighted_unmet\": 6", "\"min_weighted_unmet\": 0"),
             ("\"idle_secs\": 900", "\"idle_secs\": 0"),
             (
-                "\"zones\": [\"us-west1-b\", \"us-west1-a\"]",
+                "\"zones\": [\"us-central1-b\", \"us-central1-a\"]",
                 "\"zones\": []",
             ),
             ("\"pr\": 1", "\"pr\": 0, \"extra\": 1"),
@@ -1360,6 +1534,114 @@ mod tests {
     }
 
     #[test]
+    fn spot_is_rejected_and_false_is_still_accepted() {
+        let spot = |v: bool| {
+            let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
+            block["gce"]["spot"] = serde_json::json!(v);
+            serde_json::from_value::<BurstSettings>(block).unwrap()
+        };
+        let err = spot(true).validate().unwrap_err();
+        assert!(err.contains("gce.spot is not supported"), "{err}");
+        assert!(spot(false).validate().is_ok());
+        assert!(!cfg().gce.spot, "Spot is off when the key is absent");
+    }
+
+    #[test]
+    fn zones_must_be_in_the_data_region() {
+        let zones = |z: &str| {
+            serde_json::from_str::<BurstSettings>(&BLOCK.replace(
+                "\"zones\": [\"us-central1-b\", \"us-central1-a\"]",
+                &format!("\"zones\": {z}"),
+            ))
+            .unwrap()
+            .validate()
+        };
+        assert!(
+            zones(r#"["us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f"]"#)
+                .is_ok()
+        );
+        for bad in [
+            r#"["us-west1-b", "us-west1-a"]"#,
+            r#"["us-central1-a", "us-west1-a"]"#,
+            r#"["us-central1"]"#,
+            r#"["us-central1-ab"]"#,
+            r#"["central1-a"]"#,
+        ] {
+            let err = zones(bad).unwrap_err();
+            assert!(err.contains("us-central1 zones"), "{bad}: {err}");
+        }
+        assert_eq!(zone_region("us-central1-f"), Some(DATA_REGION));
+    }
+
+    #[test]
+    fn live_burst_needs_the_instance_template() {
+        let with = |enabled: bool, dry_run: bool, template: Option<&str>| {
+            let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
+            block["enabled"] = serde_json::json!(enabled);
+            block["dry_run"] = serde_json::json!(dry_run);
+            for (k, v) in [
+                ("credentials_path", "/k.json"),
+                ("queen_url", "https://q"),
+                ("tailscale_oauth_path", "/ts.json"),
+                ("toolchain_script_path", "/t.sh"),
+            ] {
+                block["gce"][k] = serde_json::json!(v);
+            }
+            if let Some(t) = template {
+                block["gce"]["instance_template"] = serde_json::json!(t);
+            }
+            serde_json::from_value::<BurstSettings>(block)
+                .unwrap()
+                .validate()
+        };
+        let missing = with(true, false, None).unwrap_err();
+        assert!(
+            missing.contains("gce.instance_template is required"),
+            "{missing}"
+        );
+        assert!(with(true, false, Some(TEMPLATE)).is_ok());
+        // A queen with burst off, or simulating, still starts without one.
+        assert!(with(false, false, None).is_ok());
+        assert!(with(true, true, None).is_ok());
+        // A malformed name or a template in another region is refused wherever it appears.
+        for bad in [
+            "borg-burst-v1",
+            "projects/p/zones/us-central1-a/instances/vm",
+            "projects/p/regions/us-west1/instanceTemplates/borg-burst-v1",
+        ] {
+            let e = with(false, true, Some(bad)).unwrap_err();
+            assert!(e.contains("gce.instance_template"), "{bad}: {e}");
+        }
+        assert!(
+            with(
+                true,
+                false,
+                Some("projects/p/regions/us-central1/instanceTemplates/t")
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_reusable_key_file_is_ignored_and_never_enough() {
+        // An old config naming the shared key file still parses, but a live
+        // queen needs the OAuth client: no reusable key goes into metadata.
+        let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
+        block["dry_run"] = serde_json::json!(false);
+        for (k, v) in [
+            ("credentials_path", "/k.json"),
+            ("queen_url", "https://q"),
+            ("tailscale_authkey_path", "/ts.key"),
+            ("toolchain_script_path", "/t.sh"),
+        ] {
+            block["gce"][k] = serde_json::json!(v);
+        }
+        let parsed: BurstSettings = serde_json::from_value(block).unwrap();
+        let err = parsed.validate().unwrap_err();
+        assert!(err.contains("tailscale_oauth_path"), "{err}");
+    }
+
+    #[test]
     fn live_mode_needs_every_provisioning_input() {
         let live = live_cfg();
         assert!(live.validate().is_ok() && live.live());
@@ -1367,7 +1649,7 @@ mod tests {
         for missing in [
             "credentials_path",
             "queen_url",
-            "tailscale_authkey_path",
+            "tailscale_oauth_path",
             "toolchain_script_path",
         ] {
             let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
@@ -1375,7 +1657,7 @@ mod tests {
             for (k, v) in [
                 ("credentials_path", "/k.json"),
                 ("queen_url", "https://q"),
-                ("tailscale_authkey_path", "/ts.key"),
+                ("tailscale_oauth_path", "/ts.json"),
                 ("toolchain_script_path", "/t.sh"),
             ] {
                 if k != missing {
@@ -1418,21 +1700,15 @@ mod tests {
         let parsed: BurstSettings = serde_json::from_value(block.clone()).unwrap();
         parsed.validate().unwrap();
         assert!(!parsed.gce.spot);
-        assert_eq!(parsed.gce.boot_disk_gb, 250);
-        assert_eq!(parsed.gce.boot_disk_type, "pd-ssd");
-        assert_eq!(parsed.gce.image_family, "custom-family");
-        assert_eq!(parsed.gce.image_project, "custom-project");
+        // The disk and image keys of older configs still load; the instance
+        // template decides both.
         assert_eq!(
             parsed.gce.credentials_path,
             Some(PathBuf::from("/nonexistent/borg/credentials.json"))
         );
 
         let defaults = cfg();
-        assert!(defaults.gce.spot);
-        assert_eq!(defaults.gce.boot_disk_gb, 1000);
-        assert_eq!(defaults.gce.boot_disk_type, "pd-balanced");
-        assert_eq!(defaults.gce.image_family, "ubuntu-2204-lts");
-        assert_eq!(defaults.gce.image_project, "ubuntu-os-cloud");
+        assert!(!defaults.gce.spot);
         assert_eq!(defaults.gce.credentials_path, None);
         assert_eq!(defaults.gce.tailscale_tag, "tag:borg-drone");
         assert_eq!(
@@ -1454,7 +1730,7 @@ mod tests {
     #[test]
     fn live_drones_are_scrubbed_once_after_they_enroll_and_never_in_dry_run() {
         let live = live_cfg();
-        let vms = [vm("gcp-burst-qa", "us-west1-b", T0 - 600)];
+        let vms = [vm("gcp-burst-qa", "us-central1-b", T0 - 600)];
         let mut st = BurstState::default();
         assert!(
             run(
@@ -1479,7 +1755,7 @@ mod tests {
         );
         let scrubbed = [BurstVm {
             scrubbed_at: Some(T0),
-            ..vm("gcp-burst-qa", "us-west1-b", T0 - 600)
+            ..vm("gcp-burst-qa", "us-central1-b", T0 - 600)
         }];
         assert!(
             run(&live, &mut st, T0 + 60, &[], &up, &scrubbed)
@@ -1498,34 +1774,34 @@ mod tests {
         let c = cfg();
         let heavy = [unmet(Class::Heavy, Scope::Main, 2)];
         let mut st = BurstState::default();
-        st.cool_zone("us-west1-b", T0 + ZONE_COOLDOWN_SECS);
+        st.cool_zone("us-central1-b", T0 + ZONE_COOLDOWN_SECS);
         run(&c, &mut st, T0, &heavy, &[], &[]);
         let p = run(&c, &mut st, T0 + 600, &heavy, &[], &[]);
         assert_eq!(
             p.actions,
             [Action::Create {
-                zone: "us-west1-a".to_owned()
+                zone: "us-central1-a".to_owned()
             }]
         );
         // Every zone cooling down: the least loaded one is still tried.
-        st.cool_zone("us-west1-a", T0 + ZONE_COOLDOWN_SECS);
+        st.cool_zone("us-central1-a", T0 + ZONE_COOLDOWN_SECS);
         run(&c, &mut st, T0 + 700, &heavy, &[], &[]);
         let p = run(&c, &mut st, T0 + 1300, &heavy, &[], &[]);
         assert_eq!(
             p.actions,
             [Action::Create {
-                zone: "us-west1-b".to_owned()
+                zone: "us-central1-b".to_owned()
             }]
         );
         // Cooled off: back to the first listed zone.
         let mut st = BurstState::default();
-        st.cool_zone("us-west1-b", T0 - 1);
+        st.cool_zone("us-central1-b", T0 - 1);
         run(&c, &mut st, T0, &heavy, &[], &[]);
         let p = run(&c, &mut st, T0 + 600, &heavy, &[], &[]);
         assert_eq!(
             p.actions,
             [Action::Create {
-                zone: "us-west1-b".to_owned()
+                zone: "us-central1-b".to_owned()
             }]
         );
     }
@@ -1543,10 +1819,10 @@ mod tests {
         assert_eq!(
             p.actions,
             [Action::Create {
-                zone: "us-west1-b".to_owned()
+                zone: "us-central1-b".to_owned()
             }]
         );
-        let vms = [vm("gcp-burst-qa", "us-west1-b", T0 + 600)];
+        let vms = [vm("gcp-burst-qa", "us-central1-b", T0 + 600)];
         let p = run(&c, &mut st, T0 + 601, &heavy, &[], &vms);
         assert!(p.actions.is_empty(), "{}", p.reason);
     }
@@ -1667,7 +1943,7 @@ mod tests {
         );
 
         let mut st = BurstState::default();
-        let vms = [vm("gcp-burst-qa", "us-west1-b", T0 - 60)];
+        let vms = [vm("gcp-burst-qa", "us-central1-b", T0 - 60)];
         run(&c, &mut st, T0, &heavy, &[], &vms);
         let p = run(&c, &mut st, T0 + 1000, &heavy, &[], &vms);
         assert!(
@@ -1689,10 +1965,10 @@ mod tests {
             p.actions,
             [
                 Action::Create {
-                    zone: "us-west1-b".to_owned()
+                    zone: "us-central1-b".to_owned()
                 },
                 Action::Create {
-                    zone: "us-west1-a".to_owned()
+                    zone: "us-central1-a".to_owned()
                 },
             ]
         );
@@ -1718,7 +1994,7 @@ mod tests {
 
         // Even when the hour budget permits work, a reached dollar cap
         // drains an already-running drone without deleting its live lease.
-        let running = [vm("gcp-burst-qc", "us-west1-b", T0)];
+        let running = [vm("gcp-burst-qc", "us-central1-b", T0)];
         let busy = [drone("gcp-burst-qc", true, 1)];
         let mut st = BurstState::default();
         let p = run(&c, &mut st, T0 + 5400, &heavy, &busy, &running);
@@ -1757,7 +2033,7 @@ mod tests {
         // A drone ran 1.5h today and ended: 1.5 spent + 2.0 reserve > 3.
         let past = [BurstVm {
             ended_at: Some(day + 5400),
-            ..vm("gcp-burst-qa", "us-west1-b", day)
+            ..vm("gcp-burst-qa", "us-central1-b", day)
         }];
         let mut st = BurstState::default();
         run(&c, &mut st, day + 7200, &heavy, &[], &past);
@@ -1774,7 +2050,7 @@ mod tests {
         assert_eq!(p.actions.len(), 1);
         // A live drone needs its reserve too: 0.5 spent + 2 * 2.0 > 4.
         c.budget.drone_hours_per_day = 4.0;
-        let live_vm = [vm("gcp-burst-qc", "us-west1-b", day + 7200)];
+        let live_vm = [vm("gcp-burst-qc", "us-central1-b", day + 7200)];
         let up = [drone("gcp-burst-qc", true, 2)];
         let mut st = BurstState::default();
         run(&c, &mut st, day + 7200 + 1200, &heavy, &up, &live_vm);
@@ -1786,7 +2062,7 @@ mod tests {
         );
 
         // Spent: a busy drone is drained but not deleted.
-        let running = [vm("gcp-burst-qb", "us-west1-b", day)];
+        let running = [vm("gcp-burst-qb", "us-central1-b", day)];
         let busy = [drone("gcp-burst-qb", true, 1)];
         let mut st = BurstState::default();
         let p = run(&c, &mut st, day + 5 * 3600, &heavy, &busy, &running);
@@ -1866,34 +2142,34 @@ mod tests {
             // Booted, never heartbeated, deleted at the grace period: listed.
             BurstVm {
                 ended_at: Some(now - 600),
-                ..vm("gcp-burst-a", "us-west1-b", now - 600 - 1500)
+                ..vm("gcp-burst-a", "us-central1-b", now - 600 - 1500)
             },
             // Enrolled (scrubbed), later went silent: not listed.
             BurstVm {
                 ended_at: Some(now - 300),
                 scrubbed_at: Some(now - 3000),
-                ..vm("gcp-burst-b", "us-west1-a", now - 4000)
+                ..vm("gcp-burst-b", "us-central1-a", now - 4000)
             },
             // Drained and deleted normally: not listed.
             BurstVm {
                 ended_at: Some(now - 200),
                 draining_at: Some(now - 900),
                 scrubbed_at: Some(now - 9000),
-                ..vm("gcp-burst-c", "us-west1-a", now - 10_000)
+                ..vm("gcp-burst-c", "us-central1-a", now - 10_000)
             },
             // The create failed outright in its own pass: no VM booted.
             BurstVm {
                 ended_at: Some(now - 100),
-                ..vm("gcp-burst-d", "us-west1-c", now - 100)
+                ..vm("gcp-burst-d", "us-central1-c", now - 100)
             },
             // Still provisioning: not ended.
-            vm("gcp-burst-e", "us-west1-b", now - 60),
+            vm("gcp-burst-e", "us-central1-b", now - 60),
             // Ended more than a day ago: aged out.
             BurstVm {
                 ended_at: Some(now - NEVER_ENROLLED_WINDOW_SECS - 1),
                 ..vm(
                     "gcp-burst-f",
-                    "us-west1-b",
+                    "us-central1-b",
                     now - NEVER_ENROLLED_WINDOW_SECS - 2000,
                 )
             },
@@ -1904,7 +2180,7 @@ mod tests {
             vec![NeverEnrolled {
                 drone: "gcp-burst-a".to_owned(),
                 vm: "borg-burst-a".to_owned(),
-                zone: "us-west1-b".to_owned(),
+                zone: "us-central1-b".to_owned(),
                 created_at: now - 2100,
                 ended_at: now - 600,
             }]
@@ -1928,7 +2204,7 @@ mod tests {
     #[test]
     fn an_idle_drone_is_drained_then_deleted_on_a_later_pass_and_never_while_busy() {
         let c = cfg();
-        let mut vms = vec![vm("gcp-burst-qa", "us-west1-b", T0 - 7200)];
+        let mut vms = vec![vm("gcp-burst-qa", "us-central1-b", T0 - 7200)];
         let idle = [drone("gcp-burst-qa", true, 0)];
         let mut st = BurstState::default();
         assert!(run(&c, &mut st, T0, &[], &idle, &vms).actions.is_empty());
@@ -1966,7 +2242,7 @@ mod tests {
     #[test]
     fn a_busy_drone_never_goes_idle_and_demand_resets_the_idle_clock() {
         let c = cfg();
-        let vms = [vm("gcp-burst-qa", "us-west1-b", T0 - 7200)];
+        let vms = [vm("gcp-burst-qa", "us-central1-b", T0 - 7200)];
         let mut st = BurstState::default();
         let busy = [drone("gcp-burst-qa", true, 1)];
         for t in [0, 500, 1000, 5000] {
@@ -1994,7 +2270,7 @@ mod tests {
         let heavy = [unmet(Class::Heavy, Scope::Main, 2)];
         let draining = [BurstVm {
             draining_at: Some(T0 - 30),
-            ..vm("gcp-burst-qa", "us-west1-b", T0 - 7200)
+            ..vm("gcp-burst-qa", "us-central1-b", T0 - 7200)
         }];
         let idle = [drone("gcp-burst-qa", true, 0)];
         let mut st = BurstState::default();
@@ -2010,7 +2286,7 @@ mod tests {
     #[test]
     fn a_drone_near_its_maximum_run_time_is_retired_not_replaced_without_demand() {
         let c = cfg();
-        let old = [vm("gcp-burst-qa", "us-west1-b", T0 - (12 * 3600 - 1700))];
+        let old = [vm("gcp-burst-qa", "us-central1-b", T0 - (12 * 3600 - 1700))];
         let busy = [drone("gcp-burst-qa", true, 3)];
         let mut st = BurstState::default();
         let p = run(&c, &mut st, T0, &[], &busy, &old);
@@ -2029,7 +2305,7 @@ mod tests {
         let mut c = cfg();
         c.max_drones = 1;
         let heavy = [unmet(Class::Heavy, Scope::Main, 2)];
-        let mut vms = vec![vm("gcp-burst-qa", "us-west1-b", T0 - (12 * 3600 - 1700))];
+        let mut vms = vec![vm("gcp-burst-qa", "us-central1-b", T0 - (12 * 3600 - 1700))];
         let busy = [drone("gcp-burst-qa", true, 3)];
         let mut st = BurstState {
             demand_since: Some(T0 - 600),
@@ -2083,7 +2359,7 @@ mod tests {
         // returns it to service, so it is not replaced.
         let draining = [BurstVm {
             draining_at: Some(T0 - 30),
-            ..vm("gcp-burst-qa", "us-west1-b", T0 - 7200)
+            ..vm("gcp-burst-qa", "us-central1-b", T0 - 7200)
         }];
         let idle = [drone("gcp-burst-qa", true, 0)];
         let mut st = BurstState {
@@ -2105,7 +2381,7 @@ mod tests {
         let mut c = cfg();
         c.max_drones = 1;
         let heavy = [unmet(Class::Heavy, Scope::Main, 2)];
-        let vms = [vm("gcp-burst-qa", "us-west1-b", T0 - (12 * 3600 - 1700))];
+        let vms = [vm("gcp-burst-qa", "us-central1-b", T0 - (12 * 3600 - 1700))];
         let busy = [drone("gcp-burst-qa", true, 3)];
         // The retiring drone still counts toward the budget: a day budget
         // with room for its own reserve and not for a second drone's refuses
@@ -2126,7 +2402,7 @@ mod tests {
     #[test]
     fn a_vm_that_never_enrolled_is_deleted_after_the_grace_period() {
         let c = cfg();
-        let vms = [vm("gcp-burst-qa", "us-west1-b", T0 - 1600)];
+        let vms = [vm("gcp-burst-qa", "us-central1-b", T0 - 1600)];
         let mut st = BurstState::default();
         let p = run(&c, &mut st, T0, &[], &[], &vms);
         assert_eq!(

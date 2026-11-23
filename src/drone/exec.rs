@@ -12,10 +12,33 @@ pub struct Output {
     pub stdout: String,
 }
 
+/// A finished command with what explains a failure: its exit code and its
+/// standard error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnosed {
+    pub output: Output,
+    /// The exit code; `None` when a signal ended it or the executor does not
+    /// report one.
+    pub code: Option<i32>,
+    /// Standard error, trimmed; empty when the executor does not capture it.
+    pub stderr: String,
+}
+
 pub trait Exec: Send + Sync {
     /// Run `program` with `args` to completion. `Err` means it could not be
     /// started; a non-zero exit is `Ok` with `success == false`.
     fn run(&self, program: &str, args: &[&str]) -> io::Result<Output>;
+
+    /// Like [`Exec::run`], also keeping the exit code and standard error, for
+    /// a probe whose failure must explain itself. An executor that captures
+    /// neither reports them empty.
+    fn run_diagnosed(&self, program: &str, args: &[&str]) -> io::Result<Diagnosed> {
+        self.run(program, args).map(|output| Diagnosed {
+            output,
+            code: None,
+            stderr: String::new(),
+        })
+    }
 
     /// Run in a private process group. Group-signaling supervisors must use
     /// this boundary; executors that cannot guarantee isolation fail closed.
@@ -76,6 +99,27 @@ impl SystemExec {
 impl Exec for SystemExec {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
         self.output(program, args, false)
+    }
+
+    fn run_diagnosed(&self, program: &str, args: &[&str]) -> io::Result<Diagnosed> {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "drone host commands: fixed programs and arguments built by borg, never queen-supplied"
+        )]
+        let mut command = Command::new(program);
+        let out = command
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()?;
+        Ok(Diagnosed {
+            output: Output {
+                success: out.status.success(),
+                stdout: String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+            },
+            code: out.status.code(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        })
     }
 
     fn run_grouped(&self, program: &str, args: &[&str]) -> io::Result<Output> {

@@ -285,8 +285,12 @@ impl Default for ReclaimSettings {
             enabled: true,
             dry_run: false,
             roots: Vec::new(),
-            high_water_pct: 85,
-            low_water_pct: 70,
+            // Founder 2026-11-18: "the disks should not fill up we should
+            // auto clean those". Reclaim starts at 75% and frees down to 60%,
+            // so a host keeps room for a full build between cycles
+            // (internal-runner-burst-01 sat at 94% between jobs at 85/70).
+            high_water_pct: 75,
+            low_water_pct: 60,
             critical_pct: 95,
             min_age_secs: 6 * 3600,
             critical_min_age_secs: 3600,
@@ -323,14 +327,37 @@ impl ReclaimSettings {
     }
 
     /// The block installs wrote before reclaim was on by default: off, dry
-    /// run, no roots, default thresholds.
+    /// run, no roots, default thresholds (then 85/70).
     pub(crate) fn is_legacy_default(&self) -> bool {
-        *self
-            == Self {
-                enabled: false,
-                dry_run: true,
-                ..Self::default()
-            }
+        let off = Self {
+            enabled: false,
+            dry_run: true,
+            ..Self::default()
+        };
+        *self == off || *self == off.with_previous_thresholds()
+    }
+
+    /// These settings with the thresholds every drone was installed with
+    /// before 2026-11-19 (85/70).
+    fn with_previous_thresholds(self) -> Self {
+        Self {
+            high_water_pct: 85,
+            low_water_pct: 70,
+            ..self
+        }
+    }
+
+    /// The installer serializes the whole block, so a drone installed before
+    /// the defaults moved to 75/60 keeps 85/70 on disk. A block equal to that
+    /// old installer default was never chosen by anyone: it becomes today's
+    /// default. Any other block (a host's own policy, such as dev-desktop's
+    /// dry run with its roots) is kept as written.
+    pub(crate) fn upgraded(self) -> Self {
+        if self == Self::default().with_previous_thresholds() {
+            Self::default()
+        } else {
+            self
+        }
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -1094,11 +1121,37 @@ mod tests {
     }
 
     #[test]
+    fn installer_default_blocks_from_before_75_60_move_to_the_new_defaults() {
+        // Literal: what installs wrote while the defaults were 85/70.
+        let old_installed = ReclaimSettings {
+            high_water_pct: 85,
+            low_water_pct: 70,
+            ..ReclaimSettings::default()
+        };
+        assert_eq!(old_installed.clone().upgraded(), ReclaimSettings::default());
+        let old_disabled = ReclaimSettings {
+            enabled: false,
+            dry_run: true,
+            ..old_installed.clone()
+        };
+        assert!(old_disabled.is_legacy_default());
+        // A host's own policy stays as written.
+        let own = ReclaimSettings {
+            dry_run: true,
+            free_floor_gib: 25,
+            ..old_installed
+        };
+        assert_eq!(own.clone().upgraded(), own);
+        let today = ReclaimSettings::default();
+        assert_eq!(today.clone().upgraded(), today);
+    }
+
+    #[test]
     fn pressure_frees_oldest_first_cheapest_tier_first_until_low_water() {
-        // 100 GiB disk at 90%: need to get to 70%, i.e. free 20 GiB.
+        // 100 GiB disk at 80%: need to get to 60%, i.e. free 20 GiB.
         let f = Fake::new(
             100,
-            90,
+            80,
             vec![
                 cand("/b/wt-old", Kind::Worktree, 8, 200),
                 cand("/t/a", Kind::CargoTarget, 12, 10),
@@ -1119,8 +1172,8 @@ mod tests {
         // the worktree is never reached; the 2h-old dir is below min age.
         assert_eq!(order, ["/t/b/incremental", "/t/b", "/t/a"]);
         assert!(c.reclaimed_bytes >= 20 * GIB, "{}", c.reclaimed_bytes);
-        assert!(c.usage_pct_after <= 70, "{}", c.usage_pct_after);
-        assert_eq!(c.usage_pct_before, 90);
+        assert!(c.usage_pct_after <= 60, "{}", c.usage_pct_after);
+        assert_eq!(c.usage_pct_before, 80);
     }
 
     #[test]
@@ -1354,7 +1407,7 @@ mod tests {
         assert_eq!((c.reclaimed_bytes, c.would_reclaim_bytes), (0, 25 * GIB));
         assert_eq!(c.records[0].outcome, Outcome::WouldDelete);
         assert!(
-            c.records[0].reason.contains("90% >= 85% high water"),
+            c.records[0].reason.contains("90% >= 75% high water"),
             "{}",
             c.records[0].reason
         );
@@ -1390,9 +1443,10 @@ mod tests {
 
     #[test]
     fn safety_is_probed_immediately_before_each_deletion_only_for_tried_items() {
+        // 80%: one 25 GiB deletion reaches the 60% low-water mark.
         let f = Fake::new(
             100,
-            90,
+            80,
             vec![
                 cand("/t/a", Kind::CargoTarget, 25, 100),
                 cand("/t/b", Kind::CargoTarget, 25, 90),
@@ -1440,7 +1494,7 @@ mod tests {
                 ..ReclaimSettings::default()
             },
             ReclaimSettings {
-                critical_pct: 80,
+                critical_pct: 70,
                 ..ReclaimSettings::default()
             },
             ReclaimSettings {

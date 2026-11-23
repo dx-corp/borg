@@ -1,8 +1,8 @@
 use crate::support;
 
 use borg::allocator::{
-    ActiveLease, Allocation, AllocatorInput, Demand, DroneState, HostCaps, LeaseState, PrTurn,
-    QueueAge, Rejection, allocate,
+    ActiveLease, Allocation, AllocatorInput, Demand, DroneState, HostCaps, LargerHold, LeaseState,
+    PrTurn, QueueAge, Rejection, allocate,
 };
 use borg::bid::ScoreWeights;
 use borg::classes::{Class, Classes, Scope};
@@ -27,10 +27,12 @@ fn input(drones: Vec<DroneState>, count: u32) -> AllocatorInput {
         leases: vec![],
         warm_floors: vec![],
         queue_ages: vec![],
+        served: vec![],
         starvation_after_secs: None,
         weights: ScoreWeights::default(),
         admission: None,
         pr_turn: PrTurn::default(),
+        larger_hold: LargerHold::default(),
     }
 }
 
@@ -87,6 +89,7 @@ fn traces_owner_net_capacity_blocked_environment_and_nonaccepting_hosts() {
             max_mem_mib: Some(1000),
             max_leases: Some(0),
             reserve_mem_mib: 2048,
+            ..HostCaps::default()
         },
     );
     let mut blocked = host("blocked");
@@ -143,6 +146,7 @@ fn records_reservation_and_whether_backfill_preserves_the_reserved_job() {
             class: Class::Medium,
             scope: Scope::Main,
             state: LeaseState::Running,
+            disk_mib: None,
         });
         i.queue_ages.push(QueueAge {
             class: Class::Heavy,
@@ -230,6 +234,7 @@ fn starvation_never_reserves_a_host_that_declines_the_demand() {
         class: Class::Light,
         scope: Scope::Main,
         state: LeaseState::Running,
+        disk_mib: None,
     });
     i.queue_ages.push(QueueAge {
         class: Class::Heavy,

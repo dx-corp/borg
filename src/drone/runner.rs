@@ -22,6 +22,7 @@ use crate::drone::cleanup::{docker_prefix, valid_lease_id};
 use crate::drone::exec::Exec;
 use crate::drone::fsops::FsOps;
 use crate::drone::jobuser::JobUser;
+use crate::drone::memlimit::LeaseCgroup;
 use crate::secret::Secret;
 
 const RSS_SAMPLE_EVERY: Duration = Duration::from_secs(2);
@@ -68,6 +69,16 @@ pub struct RunSpec<'a> {
     pub job_user: Option<&'a JobUser>,
     /// `/proc` (a different root is used by tests).
     pub proc_root: &'a Path,
+    /// The lease's memory-limited cgroup, when the drone made one; the job
+    /// runs in its `job` leaf with the cgroup's OOM score. The caller removes
+    /// it after the lease's Docker resources, which may live under it.
+    pub cgroup: Option<&'a LeaseCgroup>,
+    /// The lease's `oom_score_adj` from [`crate::drone::memlimit::OomOrder`]
+    /// for a lease without a cgroup, so a job never inherits a protective
+    /// score from the drone's unit.
+    pub oom_score: Option<i32>,
+    /// The lease's own Docker endpoint, exported as `DOCKER_HOST`.
+    pub docker_host: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +90,8 @@ pub struct RunOutcome {
     pub aborted: bool,
     /// The queen preempted the lease; the runner was interrupted.
     pub preempted: bool,
+    /// The kernel OOM-killed a process of the job at its memory limit.
+    pub oom_killed: bool,
 }
 
 /// Exit code reported when a job was killed (128 + SIGKILL).
@@ -207,13 +220,25 @@ pub async fn run_lease(
     let run_sh = lease_dir.join("run.sh");
     // With a job user the drone starts `setpriv ... run.sh`, which becomes the
     // runner under the job user's uid with no capabilities.
-    let (program, leading): (PathBuf, Vec<String>) = match spec.job_user {
+    let (mut program, mut leading): (PathBuf, Vec<String>) = match spec.job_user {
         Some(user) => {
             let mut args = user.setpriv_args();
             args.push(run_sh.to_string_lossy().into_owned());
             (PathBuf::from(&user.priv_bin), args)
         }
         None => (run_sh, Vec::new()),
+    };
+    // The job runs inside its own memory-limited cgroup when the drone made
+    // one; otherwise without a limit, as before, but still with its score.
+    (program, leading) = match spec.cgroup {
+        Some(cgroup) => cgroup.wrap(&program, &leading),
+        None => crate::drone::memlimit::score_wrap(
+            &program,
+            &leading,
+            spec.oom_score
+                .unwrap_or(crate::drone::memlimit::LEASE_OOM_BASE),
+            &spec.proc_root.join("self/oom_score_adj"),
+        ),
     };
     #[allow(
         clippy::disallowed_methods,
@@ -247,24 +272,39 @@ pub async fn run_lease(
         // The shared install is hard-linked into every lease; never let a
         // runner rewrite it in place.
         .env("DISABLE_RUNNER_UPDATE", "1")
+        .envs(
+            spec.docker_host
+                .map(|socket| ("DOCKER_HOST", format!("unix://{}", socket.display()))),
+        )
         .stdin(Stdio::null())
         .process_group(0)
         // With a job user the drone cannot signal the job directly; its group
         // is killed through `exec` instead.
         .kill_on_drop(spec.job_user.is_none());
     let mut child = spawn_retrying(&mut command).await?;
-    supervise(
+    let mut outcome = supervise(
         &mut child,
         exec,
         Limits {
             max_job: spec.max_job,
             preempt_grace: spec.preempt_grace,
             proc_root: spec.proc_root,
+            cgroup: spec.cgroup,
         },
         abort,
         preempt,
     )
-    .await
+    .await;
+    if let (Some(cgroup), Ok(o)) = (spec.cgroup, &mut outcome) {
+        o.oom_killed = cgroup.oom_killed();
+        if o.oom_killed {
+            tracing::warn!(
+                "lease {}: a job process was OOM-killed at its memory limit",
+                spec.lease_id
+            );
+        }
+    }
+    outcome
 }
 
 /// How long a supervised process may run and how it is stopped.
@@ -275,6 +315,9 @@ pub(crate) struct Limits<'a> {
     pub preempt_grace: Duration,
     /// `/proc` (a different root is used by tests).
     pub proc_root: &'a Path,
+    /// The lease cgroup, whose working set (the job and its containers)
+    /// counts toward the reported peak.
+    pub cgroup: Option<&'a LeaseCgroup>,
 }
 
 /// Wait for `child`, started in its own process group, to exit; kill the
@@ -330,6 +373,12 @@ pub(crate) async fn supervise(
                 if let Some(pgid) = pgid {
                     peak_kib = peak_kib.max(group_rss_kib(spec.proc_root, pgid).unwrap_or(0));
                 }
+                // The cgroup also holds the job's containers when the lease
+                // has its own Docker endpoint, so `borg report` sizes slots
+                // by what the whole job used.
+                if let Some(ws) = spec.cgroup.and_then(LeaseCgroup::working_set_bytes) {
+                    peak_kib = peak_kib.max(ws / 1024);
+                }
             }
         }
     };
@@ -348,6 +397,7 @@ pub(crate) async fn supervise(
         timed_out,
         aborted,
         preempted,
+        oom_killed: false,
     })
 }
 
@@ -384,6 +434,9 @@ mod tests {
             max_job,
             preempt_grace: Duration::from_secs(5),
             proc_root: Path::new("/proc"),
+            cgroup: None,
+            oom_score: None,
+            docker_host: None,
         };
         let (_ptx, prx) = tokio::sync::watch::channel(false);
         let out = run_lease(
@@ -503,6 +556,9 @@ mod tests {
             max_job: Duration::from_secs(60),
             preempt_grace: Duration::from_secs(5),
             proc_root: Path::new("/proc"),
+            cgroup: None,
+            oom_score: None,
+            docker_host: None,
         };
         let (_ptx, prx) = tokio::sync::watch::channel(false);
         let abort = tokio::spawn(async move {
@@ -544,6 +600,9 @@ mod tests {
             max_job: Duration::from_secs(60),
             preempt_grace: Duration::from_millis(500),
             proc_root: Path::new("/proc"),
+            cgroup: None,
+            oom_score: None,
+            docker_host: None,
         };
         let stop = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -583,6 +642,9 @@ mod tests {
             max_job: Duration::from_secs(1),
             preempt_grace: Duration::from_secs(1),
             proc_root: Path::new("/proc"),
+            cgroup: None,
+            oom_score: None,
+            docker_host: None,
         };
         let (_ptx, prx) = tokio::sync::watch::channel(false);
         assert!(
@@ -638,5 +700,71 @@ mod tests {
         fs::create_dir_all(dir.path().join("self")).unwrap();
         assert_eq!(group_rss_kib(dir.path(), 100), Some(4000));
         assert_eq!(group_rss_kib(dir.path(), 999), None);
+    }
+
+    #[tokio::test]
+    async fn a_lease_runs_in_its_memory_cgroup_and_reports_an_oom_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cgroup");
+        let service = root.join("borg-drone.service");
+        fs::create_dir_all(&service).unwrap();
+        fs::write(service.join("cgroup.controllers"), "memory\n").unwrap();
+        let cgroups =
+            crate::drone::memlimit::LeaseCgroups::detect(&root, "0::/borg-drone.service\n")
+                .unwrap();
+        let cgroup = cgroups
+            .create(
+                "lease9",
+                crate::drone::memlimit::LeaseMemory {
+                    max_bytes: 30 << 30,
+                    high_bytes: 27 << 30,
+                },
+                125,
+            )
+            .unwrap();
+        let lease_cg = service.join("lease-lease9");
+        // The job stands in for the kernel: it records an OOM kill.
+        let runner = runner_with_script(
+            dir.path(),
+            &format!("echo 'oom_kill 1' > {}/memory.events", lease_cg.display()),
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let (_ptx, prx) = tokio::sync::watch::channel(false);
+        let secret = Secret::new("jit");
+        let spec = RunSpec {
+            lease_id: "lease9",
+            jit_config: &secret,
+            runner_dir: &runner,
+            lease_dir: &dir.path().join("work/slot-0"),
+            cache_root: &dir.path().join("cache"),
+            extra_env: &[],
+            job_user: None,
+            max_job: Duration::from_secs(30),
+            preempt_grace: Duration::from_secs(5),
+            proc_root: Path::new("/proc"),
+            cgroup: Some(&cgroup),
+            oom_score: None,
+            docker_host: Some(Path::new("/srv/borg/docker-endpoints/slot-0.sock")),
+        };
+        let out = run_lease(
+            &spec,
+            &SystemExec,
+            Arc::new(crate::drone::fsops::LocalFs),
+            rx,
+            prx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert!(out.oom_killed);
+        // The limit was set and the job's shell joined the cgroup first.
+        assert_eq!(
+            fs::read_to_string(lease_cg.join("memory.max")).unwrap(),
+            (30u64 << 30).to_string()
+        );
+        assert_eq!(
+            fs::read_to_string(lease_cg.join("job/cgroup.procs")).unwrap(),
+            "0\n"
+        );
     }
 }

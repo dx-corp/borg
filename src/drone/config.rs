@@ -240,8 +240,20 @@ pub struct DroneConfig {
     pub max_mem_mib: Option<u64>,
     #[serde(default)]
     pub max_leases: Option<u32>,
+    /// Most concurrent leases per class (`{"heavy": 3}`), so `max_mem_mib`
+    /// can lend the rest of a big host to light and medium work without
+    /// adding heavy slots. Sent to the queen with the caps; omitted when
+    /// empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub max_class_leases: BTreeMap<crate::classes::Class, u32>,
     #[serde(default = "default_reserve")]
     pub reserve_mem_mib: u64,
+    /// Kill the newest lease's cgroup whenever the host's available memory
+    /// falls below this (MiB), before earlyoom or the kernel OOM killer, which
+    /// weigh memory use over age, pick a victim. Off when unset; needs lease
+    /// cgroups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_guard_mib: Option<u64>,
     /// The node's Prometheus `node_exporter` (`http://<node>:9100/metrics`)
     /// for a drone in a container, which lxcfs keeps from seeing the node's
     /// memory and pressure. Older drones can still read the config when this
@@ -249,8 +261,9 @@ pub struct DroneConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) host_metrics_url: Option<String>,
     /// Number of slot directories (`<work_root>/slot-<N>`) leases run in. A
-    /// lease takes the lowest free slot, so its path never contains the lease
-    /// id and a reused slot has an identical path. Also the most leases that
+    /// heavy lease takes the lowest free slot and any other the highest, so
+    /// its path never contains the lease id and a reused slot has an
+    /// identical path. Also the most leases that
     /// run at once. Default: `max_leases`, else 16.
     #[serde(default)]
     pub slots: Option<u32>,
@@ -306,6 +319,16 @@ pub struct DroneConfig {
     /// [`crate::drone::invariants`].
     #[serde(default)]
     pub(crate) host_invariants: crate::drone::invariants::InvariantSettings,
+    /// A Docker endpoint per lease that puts the job's containers in its
+    /// memory cgroup, labels them for cleanup and refuses host-level access
+    /// to jobs whose scope does not allow it; off by default. See
+    /// [`crate::drone::dockerproxy`]. Omitted when off, so older drones can
+    /// still read a config written by a newer one.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::drone::dockerproxy::DockerProxySettings::is_off"
+    )]
+    pub docker_proxy: crate::drone::dockerproxy::DockerProxySettings,
 }
 
 /// Slot directories when neither `slots` nor `max_leases` is set.
@@ -338,12 +361,21 @@ fn default_reserve() -> u64 {
 }
 
 impl DroneConfig {
+    /// Where the per-lease Docker endpoints listen; `None` leaves them off.
+    pub fn docker_endpoint_dir(&self) -> Option<PathBuf> {
+        self.docker_proxy
+            .socket_dir
+            .clone()
+            .or_else(|| self.state_dir.as_ref().map(|d| d.join("docker-endpoints")))
+    }
+
     pub fn load(path: &Path) -> Result<Self, DroneConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| DroneConfigError::Read {
             path: path.to_owned(),
             source,
         })?;
-        let cfg: Self = crate::configfile::parse(path, &text)?;
+        let mut cfg: Self = crate::configfile::parse(path, &text)?;
+        cfg.reclaim = cfg.reclaim.upgraded();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -375,6 +407,9 @@ impl DroneConfig {
         if self.preempt_grace_secs == 0 {
             return bad("preempt_grace_secs must be positive");
         }
+        if self.host_memory_guard_mib == Some(0) {
+            return bad("host_memory_guard_mib must be positive when set");
+        }
         if self.max_vcpu == Some(0) || self.max_mem_mib == Some(0) || self.max_leases == Some(0) {
             return bad("owner caps must be positive when set");
         }
@@ -395,6 +430,12 @@ impl DroneConfig {
         self.host_invariants
             .validate()
             .map_err(DroneConfigError::Invalid)?;
+        self.docker_proxy
+            .validate()
+            .map_err(DroneConfigError::Invalid)?;
+        if self.docker_proxy.enabled && self.docker_endpoint_dir().is_none() {
+            return bad("docker_proxy needs docker_proxy.socket_dir or state_dir");
+        }
         self.validate_caches()
     }
 
@@ -539,6 +580,7 @@ impl DroneConfig {
             max_mem_mib: self.max_mem_mib,
             max_leases: self.max_leases,
             reserve_mem_mib: self.reserve_mem_mib,
+            max_class_leases: self.max_class_leases.clone(),
         }
     }
 
