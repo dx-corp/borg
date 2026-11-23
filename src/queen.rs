@@ -2832,6 +2832,11 @@ impl Queen {
                 tracing::warn!("burst: undo enrollment of {drone}: {e}");
             }
         };
+        // The calls above took time: ask a fresh clock right before the insert.
+        if let Some(why) = cfg.create_refusal_on_wall_clock(now) {
+            undo().await;
+            return Err(format!("refused: {why}"));
+        }
         let op = match gce.insert_instance(zone, &template_ref, &body).await {
             Ok(op) => op,
             Err(e) => {
@@ -2925,9 +2930,15 @@ impl Queen {
         for (drone, l) in doomed {
             let (action, detail) = match gce.delete_instance(&l.zone, &l.vm).await {
                 Ok(_) => {
-                    let mut sim = self.lock_burst();
-                    for v in sim.vms.iter_mut().filter(|v| v.vm == l.vm) {
-                        v.ended_at.get_or_insert(now);
+                    {
+                        let mut sim = self.lock_burst();
+                        for v in sim.vms.iter_mut().filter(|v| v.vm == l.vm) {
+                            v.ended_at.get_or_insert(now);
+                        }
+                    }
+                    // Its tailnet device, if it ever joined, has the drone label's name.
+                    if l.drone.starts_with(&cfg.drone_prefix) {
+                        crate::tskey::remove_device(cfg.gce(), &l.drone).await;
                     }
                     (
                         "delete",

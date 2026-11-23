@@ -361,6 +361,14 @@ impl BurstSettings {
     }
     // formal: end burst_allowance/check_allowance.create_refusal
 
+    /// [`Self::create_refusal`] at the wall clock, never earlier than `now`
+    /// (the tick's start). The create site asks again right before the
+    /// insert: minting the join key, reading the template and enrolling take
+    /// time, and an allowance can end meanwhile.
+    pub(super) fn create_refusal_on_wall_clock(&self, now: i64) -> Option<String> {
+        self.create_refusal(OffsetDateTime::now_utc().unix_timestamp().max(now))
+    }
+
     pub(super) fn validate(&self) -> Result<(), String> {
         let bad = |m: &str| Err(format!("burst: {m}"));
         if let Some(a) = &self.allowance {
