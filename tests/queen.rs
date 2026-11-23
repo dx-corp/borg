@@ -1478,6 +1478,35 @@ async fn a_lost_standby_config_is_resent_and_a_forgotten_one_is_dropped() {
     assert_eq!(body["drop_standby"], json!(["gone1"]));
 }
 
+/// A start the queen approved under the old caps is withheld when the
+/// drone's next heartbeat lowers the class cap below what it already runs.
+#[tokio::test]
+async fn a_standby_start_approved_before_a_lowered_cap_is_not_handed_out() {
+    let h = Harness::start(standby_cfg()).await;
+    let dep = h.enroll("dep").await;
+    standby_beat(&h, &dep, &[], &[]).await;
+    h.tick().await;
+    let id = standby_beat(&h, &dep, &[], &[]).await["standby"][0]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    h.queue_job(1, "borg-ci-medium-deploy", 5);
+    h.tick().await;
+    let capped = |cap: u32| {
+        json!({
+            "trust": "deploy-only",
+            "held_standby": [&id],
+            "active_leases": [],
+            "caps": {"max_class_leases": {"medium": cap}},
+        })
+    };
+    let body = h.heartbeat_with(&dep, capped(0)).await;
+    assert_eq!(body["start_standby"], json!([]), "cap switched off");
+    // Room under the cap: the approved start is handed out.
+    let body = h.heartbeat_with(&dep, capped(1)).await;
+    assert_eq!(body["start_standby"], json!([id]));
+}
+
 #[tokio::test]
 async fn queued_deploy_demand_starts_the_standby_instead_of_minting_and_a_replacement_follows() {
     let h = Harness::start(standby_cfg()).await;

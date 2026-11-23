@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::allocator::{
-    ActiveLease, DroneState, LeaseState, Promotion, ServedAge, Unmet, free_room, free_slots,
-    max_slots,
+    ActiveLease, DroneState, LeaseState, Promotion, ServedAge, StandbyStarts, Unmet, free_room,
+    free_slots, max_slots,
 };
 use crate::classes::{Class, Classes, Scope, disk_labels_mib};
 use crate::probe::Capacity;
@@ -46,33 +46,46 @@ pub(super) fn as_placed(l: &LeaseRow, withheld: &HashMap<String, Vec<Class>>) ->
 /// The standby leases to start now: per promoted class, the oldest standby
 /// leases on fresh drones that accept work of that class (not one in its
 /// host-lost cool-down or below the class's disk floor, which the heartbeat
-/// would not hand the start to).
+/// would not hand the start to), and never more on a drone than its class
+/// cap has room to start ([`StandbyStarts`]) given everything it holds in
+/// `held` (the allocator's leases, units included and this tick's grants)
+/// among the accepting `drones`: a cap lowered below the
+/// standbys a drone already holds leaves the extra ones unstarted.
 pub(super) fn promotions(
     promote: &[Promotion],
     active: &[LeaseRow],
+    held: &[ActiveLease],
     fresh: &HashMap<String, Capacity>,
-    accepting: &BTreeMap<&str, &[Class]>,
+    drones: &[DroneState],
 ) -> BTreeSet<String> {
+    let accepting: BTreeMap<&str, &DroneState> = drones
+        .iter()
+        .filter(|d| d.accepting)
+        .map(|d| (d.id.as_str(), d))
+        .collect();
+    let mut starts = StandbyStarts::new(held);
     let mut out = BTreeSet::new();
     for p in promote {
-        let mut standby: Vec<&LeaseRow> = active
+        let mut standby: Vec<(&LeaseRow, &DroneState)> = active
             .iter()
             .filter(|l| {
                 l.state == LeaseStatus::Standby
                     && l.scope == Scope::Deploy
                     && l.class == p.class
                     && fresh.contains_key(&l.drone)
-                    && accepting
-                        .get(l.drone.as_str())
-                        .is_some_and(|blocked| !blocked.contains(&l.class))
+            })
+            .filter_map(|l| {
+                let drone = *accepting.get(l.drone.as_str())?;
+                (!drone.blocked_classes.contains(&l.class)).then_some((l, drone))
             })
             .collect();
-        standby.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        standby.sort_by(|(a, _), (b, _)| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
         out.extend(
             standby
                 .into_iter()
+                .filter(|(l, drone)| starts.take(drone, l.class))
                 .take(usize::try_from(p.count).unwrap_or(usize::MAX))
-                .map(|l| l.id.clone()),
+                .map(|(l, _)| l.id.clone()),
         );
     }
     out
@@ -298,6 +311,97 @@ mod tests {
             scope: Scope::Deploy,
             count: 1,
         }
+    }
+
+    /// A heavy cap lowered to the one heavy lease already running: the heavy
+    /// standby minted before that is not started. With room under the cap,
+    /// the oldest standbys are, up to the room.
+    #[test]
+    fn promotions_never_start_a_standby_past_its_drones_class_cap() {
+        let capacity = Capacity {
+            hostname: "h".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            kind: crate::probe::HostKind::Wsl,
+            vcpu: 8,
+            mem_mib: 30_045,
+            free_disk_mib: None,
+            docker_usable: true,
+            mise_version: None,
+            git_version: None,
+        };
+        let fresh = HashMap::from([("borg-deploy-1".to_owned(), capacity)]);
+        let active = vec![
+            row("heavy", Class::Heavy, LeaseStatus::Running),
+            row("s1", Class::Heavy, LeaseStatus::Standby),
+            row("s2", Class::Heavy, LeaseStatus::Standby),
+        ];
+        let promote = [Promotion {
+            class: Class::Heavy,
+            count: 2,
+        }];
+        let started = |cap: Option<u32>| {
+            let mut drone = deploy_1();
+            drone.class_caps = cap.map(|n| (Class::Heavy, n)).into_iter().collect();
+            let held: Vec<ActiveLease> = active.iter().map(as_active).collect();
+            promotions(&promote, &active, &held, &fresh, &[drone])
+        };
+        assert_eq!(started(Some(1)), BTreeSet::new());
+        assert_eq!(started(Some(0)), BTreeSet::new());
+        assert_eq!(started(Some(2)), BTreeSet::from(["s1".to_owned()]));
+        assert_eq!(
+            started(None),
+            BTreeSet::from(["s1".to_owned(), "s2".to_owned()])
+        );
+    }
+
+    /// A work unit fills host A's medium cap; A holds the older standby and
+    /// host B a newer one with room. The one start goes to B: the units the
+    /// allocator counted are counted here too.
+    #[test]
+    fn promotions_count_work_units_against_the_class_cap() {
+        let capacity = || Capacity {
+            hostname: "h".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            kind: crate::probe::HostKind::Wsl,
+            vcpu: 8,
+            mem_mib: 30_045,
+            free_disk_mib: None,
+            docker_usable: true,
+            mise_version: None,
+            git_version: None,
+        };
+        let on = |drone: &str, id: &str, created_at: i64| LeaseRow {
+            drone: drone.into(),
+            created_at,
+            ..row(id, Class::Medium, LeaseStatus::Standby)
+        };
+        let active = vec![on("a", "older", 1), on("b", "newer", 2)];
+        let fresh = HashMap::from([("a".to_owned(), capacity()), ("b".to_owned(), capacity())]);
+        let drone = |id: &str| {
+            let mut d = deploy_1();
+            d.id = id.into();
+            d.class_caps = [(Class::Medium, 1)].into();
+            d
+        };
+        let drones = [drone("a"), drone("b")];
+        let mut held: Vec<ActiveLease> = active.iter().map(as_active).collect();
+        held.push(ActiveLease {
+            drone_id: "a".into(),
+            class: Class::Medium,
+            scope: Scope::Deploy,
+            state: LeaseState::Held,
+            disk_mib: None,
+        });
+        let promote = [Promotion {
+            class: Class::Medium,
+            count: 1,
+        }];
+        assert_eq!(
+            promotions(&promote, &active, &held, &fresh, &drones),
+            BTreeSet::from(["newer".to_owned()])
+        );
     }
 
     /// The live shape: one heavy publish running and a medium standby leave

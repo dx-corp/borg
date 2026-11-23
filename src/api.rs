@@ -25,6 +25,7 @@ use time::OffsetDateTime;
 
 mod handoff;
 mod sanitize;
+mod standby;
 mod wire;
 pub use wire::{LeaseGrant, ResultRequest};
 
@@ -653,11 +654,10 @@ async fn heartbeat(
     // No job reaches a drone inside its host-lost cool-down: not a new
     // lease, not a standby, not a lease minted before it went quiet.
     let grants = accepting && !store.drone_suspect(&drone, now).await?;
-    let start_standby: Vec<String> = standby_rows
+    let approved = standby_rows
         .iter()
-        .filter(|l| grants && start.contains(&l.id) && !disk.classes[&l.class].blocked())
-        .map(|l| l.id.clone())
-        .collect();
+        .filter(|l| grants && start.contains(&l.id) && !disk.classes[&l.class].blocked());
+    let start_standby = standby::within_caps(&queen, &drone, &req, approved).await?;
     let drop_standby: Vec<String> = req
         .held_standby
         .iter()

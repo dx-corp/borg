@@ -1153,12 +1153,8 @@ impl Queen {
             return Err(e.into());
         }
 
-        let accepting: BTreeMap<&str, &[Class]> = placement_drones
-            .iter()
-            .filter(|d| d.accepting)
-            .map(|d| (d.id.as_str(), d.blocked_classes.as_slice()))
-            .collect();
-        let start_standby = promotions(&allocation.promote, &active, &capacities, &accepting);
+        let (promote, held) = (&allocation.promote, &runner_input.leases);
+        let start_standby = promotions(promote, &active, held, &capacities, &placement_drones);
         for id in &start_standby {
             if let Some(l) = active.iter().find(|l| &l.id == id) {
                 self.note_served(l.class, l.scope, now_ts);
