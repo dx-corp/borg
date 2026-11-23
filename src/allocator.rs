@@ -895,6 +895,55 @@ pub fn free_room(drone: &DroneState, held: &[ActiveLease], classes: &Classes) ->
     room
 }
 
+/// The standbys each drone may still start under its class caps, counted
+/// down as they are taken. A standby is a lease, so a cap stops new ones from
+/// being minted; a cap lowered afterwards (or leases of the class started
+/// since) can leave more standbys than the cap has room for. Those are not
+/// started and cover no demand: the cap is the operator's limit on how many
+/// leases of the class the host runs at once.
+pub struct StandbyStarts<'a> {
+    held: &'a [ActiveLease],
+    left: BTreeMap<(&'a str, Class), Option<u32>>,
+}
+
+impl<'a> StandbyStarts<'a> {
+    /// `held` is every lease, standbys included.
+    pub fn new(held: &'a [ActiveLease]) -> Self {
+        Self {
+            held,
+            left: BTreeMap::new(),
+        }
+    }
+
+    /// Whether `drone` may start one more standby of `class`: always without
+    /// a cap, otherwise while the cap exceeds the drone's leases of the class
+    /// that are not standbys plus the standbys already taken here.
+    pub fn take(&mut self, drone: &'a DroneState, class: Class) -> bool {
+        let held = self.held;
+        let left = self
+            .left
+            .entry((drone.id.as_str(), class))
+            .or_insert_with(|| {
+                let cap = drone.class_cap(class)?;
+                let started = held
+                    .iter()
+                    .filter(|l| {
+                        l.drone_id == drone.id && l.class == class && l.state != LeaseState::Standby
+                    })
+                    .count();
+                Some(cap.saturating_sub(u32::try_from(started).unwrap_or(u32::MAX)))
+            });
+        match left {
+            None => true,
+            Some(0) => false,
+            Some(n) => {
+                *n -= 1;
+                true
+            }
+        }
+    }
+}
+
 /// Whole leases of `class` (sized `spec`) that fit in `room` right now; 0 if
 /// the drone takes no new leases or lacks Docker for the class.
 pub fn free_slots(drone: &DroneState, room: &Room, class: Class, spec: &ClassSpec) -> u32 {
@@ -1790,6 +1839,7 @@ fn runner_need(
             .filter(|l| l.state == LeaseState::Pending && free.contains_key(l.drone_id.as_str()))
             .map(|l| (l.class, l.scope, 1)),
     );
+    let mut standby_starts = StandbyStarts::new(&input.leases);
     let standby = sum_counts(
         input
             .leases
@@ -1798,11 +1848,14 @@ fn runner_need(
             // not accepting (draining, out of disk, in its host-lost
             // cool-down) or that blocks the standby's class (below the
             // class's disk floor) is not handed it, so it must not cover
-            // demand. It still holds its room.
+            // demand. Neither does one its drone's class cap has no room to
+            // start. It still holds its room.
             .filter(|l| {
                 l.state == LeaseState::Standby
                     && free.get(l.drone_id.as_str()).is_some_and(|f| {
-                        f.drone.accepting && !f.drone.blocked_classes.contains(&l.class)
+                        f.drone.accepting
+                            && !f.drone.blocked_classes.contains(&l.class)
+                            && standby_starts.take(f.drone, l.class)
                     })
             })
             .map(|l| (l.class, l.scope, 1)),

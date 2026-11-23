@@ -192,3 +192,44 @@ fn deploy_classes_take_turns_when_neither_queue_empties() {
         );
     }
 }
+
+/// A class cap lowered after a standby was minted: the standby may not be
+/// started past the cap, so it covers no demand and the job is minted a
+/// runner on a host with room instead. Within the cap it is still promoted.
+#[test]
+fn a_standby_past_its_drones_class_cap_is_not_promoted_and_covers_no_demand() {
+    let capped = |cap| {
+        let mut dep = deploy_only_host("dep");
+        dep.class_caps = [(Class::Medium, cap)].into();
+        dep
+    };
+    let standby = || lease("dep", Class::Medium, Scope::Deploy, LeaseState::Standby);
+    let running = || lease("dep", Class::Medium, Scope::Deploy, LeaseState::Running);
+    let pass = |cap, leases: Vec<ActiveLease>| {
+        let mut i = input(
+            &[(Class::Medium, Scope::Deploy, 1)],
+            vec![capped(cap), deploy_only_host("other")],
+        );
+        i.leases = leases;
+        allocate(&i)
+    };
+    // The cap is taken by a running lease: the standby stays unstarted.
+    let a = pass(1, vec![running(), standby()]);
+    assert!(a.promote.is_empty(), "{:?}", a.promote);
+    assert_eq!(a.grants.len(), 1);
+    assert_eq!(a.grants[0].drone_id, "other");
+    // The class is switched off on the host.
+    let a = pass(0, vec![standby()]);
+    assert!(a.promote.is_empty(), "{:?}", a.promote);
+    assert_eq!(a.grants[0].drone_id, "other");
+    // Room under the cap: the standby is started, nothing is minted.
+    let a = pass(2, vec![running(), standby()]);
+    assert_eq!(
+        a.promote,
+        [Promotion {
+            class: Class::Medium,
+            count: 1
+        }]
+    );
+    assert!(a.grants.is_empty());
+}
