@@ -998,7 +998,13 @@ async fn standby_on(h: &Harness, name: &str) -> Vec<String> {
 async fn a_standby_below_its_class_floor_neither_covers_deploy_demand_nor_is_started() {
     let deploy =
         |free: u64| json!({"trust": "deploy-only", "env_facts": facts_with_cache_free(free)});
-    let t0 = OffsetDateTime::now_utc();
+    // Each pass runs ten seconds after the one before and never behind the
+    // wall clock. Jobs and heartbeats are stamped with the wall clock, so a
+    // pass timed from the start of the test would, on a slow host, run before
+    // the job it should place was queued and place nothing.
+    let after = |earlier: OffsetDateTime| {
+        (earlier + time::Duration::seconds(10)).max(OffsetDateTime::now_utc())
+    };
 
     // Two deploy drones hold heavy standbys; a-deploy's is the older one.
     let h = Harness::start(scoped_disk_cfg(json!({
@@ -1007,13 +1013,12 @@ async fn a_standby_below_its_class_floor_neither_covers_deploy_demand_nor_is_sta
     .await;
     let a = h.enroll("a-deploy").await;
     h.heartbeat_with(&a, deploy(100 * GIB)).await;
-    h.queen.tick(t0).await.unwrap();
+    let first = OffsetDateTime::now_utc();
+    h.queen.tick(first).await.unwrap();
     let b = h.enroll("b-deploy").await;
     h.heartbeat_with(&b, deploy(100 * GIB)).await;
-    h.queen
-        .tick(t0 + time::Duration::seconds(10))
-        .await
-        .unwrap();
+    let second = after(first);
+    h.queen.tick(second).await.unwrap();
     let (held_a, held_b) = (
         standby_on(&h, "a-deploy").await,
         standby_on(&h, "b-deploy").await,
@@ -1024,10 +1029,7 @@ async fn a_standby_below_its_class_floor_neither_covers_deploy_demand_nor_is_sta
     // a heavy deploy job queues: b-deploy's standby starts.
     h.heartbeat_with(&a, deploy(20 * GIB)).await;
     h.queue_job(701, "borg-ci-heavy-deploy", 1);
-    h.queen
-        .tick(t0 + time::Duration::seconds(20))
-        .await
-        .unwrap();
+    h.queen.tick(after(second)).await.unwrap();
     let mut beat = deploy(100 * GIB);
     beat["held_standby"] = json!(held_b);
     assert_eq!(
@@ -1045,16 +1047,14 @@ async fn a_standby_below_its_class_floor_neither_covers_deploy_demand_nor_is_sta
     .await;
     let a = h.enroll("a-deploy").await;
     h.heartbeat_with(&a, deploy(100 * GIB)).await;
-    h.queen.tick(t0).await.unwrap();
+    let first = OffsetDateTime::now_utc();
+    h.queen.tick(first).await.unwrap();
     assert_eq!(standby_on(&h, "a-deploy").await.len(), 1);
     h.heartbeat_with(&a, deploy(20 * GIB)).await;
     let b = h.enroll("b-deploy").await;
     h.heartbeat_with(&b, deploy(100 * GIB)).await;
     h.queue_job(702, "borg-ci-heavy-deploy", 1);
-    h.queen
-        .tick(t0 + time::Duration::seconds(10))
-        .await
-        .unwrap();
+    h.queen.tick(after(first)).await.unwrap();
     let minted: Vec<_> = h
         .queen
         .store()
