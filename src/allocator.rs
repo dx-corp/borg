@@ -490,6 +490,24 @@ pub struct QueueAge {
     pub oldest_age_secs: u64,
 }
 
+/// How long ago borg last served `(class, scope)`: minted a runner for it or
+/// started a standby of it, from the queen's memory of its own grants.
+///
+/// A queued job's age is a poor turn signal for a class whose queue never
+/// empties. GitHub hands a new runner to any queued job its labels match, not
+/// the oldest, so the old job can stay queued while younger ones of its class
+/// run, and its age keeps that class first at every pass (2026-11-22: two
+/// heavy-deploy builds queued since 21:45 kept the light-deploy IaC apply and
+/// the hourly drift check waiting from 22:37 while platform-api publishes took
+/// each heavy runner). The time since borg last granted the class measures
+/// what borg controls; see [`deploy_rank`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedAge {
+    pub class: Class,
+    pub scope: Scope,
+    pub since_granted_secs: u64,
+}
+
 /// Everything the allocator needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocatorInput {
@@ -499,6 +517,9 @@ pub struct AllocatorInput {
     pub leases: Vec<ActiveLease>,
     pub warm_floors: Vec<WarmFloor>,
     pub queue_ages: Vec<QueueAge>,
+    /// When borg last served each key; a key missing here (none since the
+    /// queen started) falls back to its oldest job's age. See [`ServedAge`].
+    pub served: Vec<ServedAge>,
     /// Demand that has waited at least this long is starving; `None` turns
     /// the guard off.
     pub starvation_after_secs: Option<u64>,
@@ -1466,11 +1487,16 @@ fn larger_waiting(
     keys
 }
 
-/// Where a deploy class goes in a pass, higher first: the age of its oldest
-/// queued job once that has waited `starvation_after_secs`, else 0. Equal ranks
-/// go larger class first.
+/// Where a deploy class goes in a pass, higher first: how long it has gone
+/// unserved once its oldest queued job has waited `starvation_after_secs`,
+/// else 0. Unserved is the oldest job's age, capped by the time since borg
+/// last granted the class ([`ServedAge`]): a class granted a runner a minute
+/// ago goes behind one that has had nothing for an hour, whichever queued job
+/// GitHub gave that runner to. Classes with waiting work so take turns, and
+/// none waits behind another class's queue that never empties. Equal ranks go
+/// larger class first.
 fn deploy_rank(input: &AllocatorInput, class: Class) -> u64 {
-    input
+    let oldest = input
         .queue_ages
         .iter()
         .filter(|a| a.class == class && a.scope == Scope::Deploy)
@@ -1481,7 +1507,14 @@ fn deploy_rank(input: &AllocatorInput, class: Class) -> u64 {
                 .starvation_after_secs
                 .is_some_and(|after| age >= after)
         })
-        .unwrap_or(0)
+        .unwrap_or(0);
+    input
+        .served
+        .iter()
+        .filter(|s| s.class == class && s.scope == Scope::Deploy)
+        .map(|s| s.since_granted_secs)
+        .min()
+        .map_or(oldest, |since| oldest.min(since))
 }
 
 /// The drones held for larger waiting work, each with the class it is held
@@ -1942,12 +1975,15 @@ fn allocate_inner(
         .map(|r| (r.drone_id.clone(), (r.class, r.scope)))
         .collect();
 
-    // Deploy keeps first claim. Its aged classes go oldest queued job first,
-    // larger first on a tie: with larger first only, a heavy deploy queue that
-    // never empties takes every slot that frees before a medium deploy job is
-    // looked at, and the medium reservation is made again each pass after
-    // heavy has refilled the room (2026-11-14: medium-deploy queued 8 h behind
-    // platform-api publishes; formal: deploy_placement/Placement.MediumPlaced).
+    // Deploy keeps first claim. Its aged classes go longest unserved first
+    // ([`deploy_rank`]), larger first on a tie: with larger first only, a
+    // heavy deploy queue that never empties takes every slot that frees before
+    // a medium deploy job is looked at, and the medium reservation is made
+    // again each pass after heavy has refilled the room (2026-11-14:
+    // medium-deploy queued 8 h behind platform-api publishes). Ordering by the
+    // oldest job's age alone failed the same way once GitHub gave each new
+    // heavy runner to a younger job (2026-11-22: light-deploy behind two heavy
+    // builds queued since 21:45; formal: deploy_placement/Placement.MediumPlaced).
     // On shared hosts, reserve larger aged work across Main and PR before a
     // smaller grant or PR turn can refill its draining host. Main stays first
     // within a class, apart from its PR turn.

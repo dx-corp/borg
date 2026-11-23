@@ -1827,6 +1827,15 @@ marks it `pending`, then `running` once GitHub shows the runner busy; the next
 tick mints a replacement standby. A standby that ended on the queen's side is
 listed in `drop_standby` and the drone forgets it.
 
+Yield rule: a standby gives its room to deploy work of another class. When a
+pass leaves deploy work of a class unmet and a deploy drone has no room for it
+only because of idle standbys of other classes (classes with no queued deploy
+work, whose runner GitHub shows neither online nor busy), the queen ends just
+enough of those standbys, largest first, deletes their registrations, and the
+drone drops them at its next heartbeat. The next pass places the waiting job.
+Standbys whose removal would not make room are kept. While deploy work it
+could run is unmet, a drone is not topped up with new standbys.
+
 Fail-open rule: the drone config key `fail_open_after_secs` (default 120, `0`
 disables it; `borg drone install --fail-open-after-secs N`) is how long the
 queen may go without answering a heartbeat. After that the drone starts all

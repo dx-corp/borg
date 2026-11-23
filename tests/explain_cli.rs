@@ -58,6 +58,7 @@ async fn record(store: &Store, kind: PlacementKind, key: &str, client: Option<&s
         leases: vec![],
         warm_floors: vec![],
         queue_ages: vec![],
+        served: vec![],
         starvation_after_secs: None,
         weights: ScoreWeights::default(),
         admission: None,

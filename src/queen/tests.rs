@@ -331,6 +331,7 @@ fn the_queued_family_picks_the_owned_host_that_runs_it_fastest() {
             leases: vec![],
             warm_floors: vec![],
             queue_ages: vec![],
+            served: vec![],
             starvation_after_secs: None,
             weights: ScoreWeights::default(),
             admission: None,

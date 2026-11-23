@@ -1,5 +1,7 @@
 use super::*;
 
+mod deploy_turns;
+
 /// 28 GiB host with 16 vCPU and Docker, already net of the OS reserve.
 fn host(id: &str) -> DroneState {
     DroneState {
@@ -38,6 +40,7 @@ fn input(demand: &[(Class, Scope, u32)], drones: Vec<DroneState>) -> AllocatorIn
         leases: vec![],
         warm_floors: vec![],
         queue_ages: vec![],
+        served: vec![],
         starvation_after_secs: None,
         weights: ScoreWeights::default(),
         admission: None,

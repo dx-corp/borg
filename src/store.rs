@@ -1582,6 +1582,21 @@ impl Store {
         row.as_ref().map(Self::lease_from_row).transpose()
     }
 
+    /// Expire a lease only while it is still an unstarted standby; false when
+    /// a heartbeat has started it (or it ended) since the caller read it.
+    pub async fn expire_standby(&self, id: &str, now: i64) -> Result<bool, StoreError> {
+        // sqlx-runtime-query: standalone-buildable SQLite store; the query! macros need a build-time database
+        let done = sqlx::query(
+            "UPDATE leases SET state = 'expired', finished_at = ?, jit_config = NULL
+             WHERE id = ? AND state = 'standby'",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
     /// Move an active lease to `to`. Finished leases never change again.
     pub async fn set_state(&self, id: &str, to: LeaseStatus, now: i64) -> Result<(), StoreError> {
         let finished = (!to.is_active()).then_some(now);
@@ -2128,6 +2143,29 @@ VALUES ('l1', 'd1', 'medium', 'pr', '[\"a\"]', 'borg-d1-l1', 7, 'jit', 'pending'
         assert_eq!(
             s.lease("l1").await.unwrap().unwrap().state,
             LeaseStatus::Expired
+        );
+    }
+
+    #[tokio::test]
+    async fn expire_standby_leaves_a_started_standby_alone() {
+        let s = store_with("d1").await;
+        for id in ["held", "started"] {
+            let mut l = lease(id, "d1");
+            l.state = LeaseStatus::Standby;
+            s.insert_lease(&l).await.unwrap();
+        }
+        s.set_state("started", LeaseStatus::Pending, 150)
+            .await
+            .unwrap();
+        assert!(s.expire_standby("held", 200).await.unwrap());
+        assert!(!s.expire_standby("started", 200).await.unwrap());
+        assert_eq!(
+            s.lease("held").await.unwrap().unwrap().state,
+            LeaseStatus::Expired
+        );
+        assert_eq!(
+            s.lease("started").await.unwrap().unwrap().state,
+            LeaseStatus::Pending
         );
     }
 

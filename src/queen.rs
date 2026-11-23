@@ -25,9 +25,9 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::allocator::{
     ActiveLease, AdmissionState, AllocatorInput, ClassIdle, Demand, DroneAdmission, DroneState,
-    LargerHold, LeaseState, PlacementDecision, PrTurn, QueueAge, Reservation, Unmet, WarmFloor,
-    allocate_reserved, allocate_reserved_with_backlog, allocate_scope, free_room, free_slots,
-    max_slots, uncovered_demand,
+    LargerHold, LeaseState, PlacementDecision, PrTurn, QueueAge, Reservation, ServedAge, Unmet,
+    WarmFloor, allocate_reserved, allocate_reserved_with_backlog, allocate_scope, free_room,
+    free_slots, max_slots, uncovered_demand,
 };
 use crate::bid::{ClassPressure, ScoreWeights};
 use crate::burst::{
@@ -141,6 +141,9 @@ struct FleetWatch {
     /// Main grants per class since that class last granted a pull request,
     /// capped at `pr_fairness.main_grants_between`.
     main_grants_since_pr: BTreeMap<Class, u32>,
+    /// When borg last served each key: minted a runner for it or started a
+    /// standby of it. Feeds [`crate::allocator::ServedAge`].
+    last_served: BTreeMap<(Class, Scope), i64>,
 }
 
 /// Account this pass's grants in the order they were placed: a pull-request
@@ -645,6 +648,20 @@ impl Queen {
         &self.cfg
     }
 
+    /// How long ago borg last served each key; see [`ServedAge`]. A lease
+    /// still pending or running counts as served at its creation, so the
+    /// first pass after a restart already knows what the fleet runs.
+    fn served(&self, now: i64, active: &[LeaseRow]) -> Vec<ServedAge> {
+        let mut w = self.watch.lock().expect("fleet watch lock");
+        served_ages(&mut w.last_served, now, active)
+    }
+
+    /// Remember that borg served `(class, scope)` at `now`.
+    fn note_served(&self, class: Class, scope: Scope, now: i64) {
+        let mut w = self.watch.lock().expect("fleet watch lock");
+        w.last_served.insert((class, scope), now);
+    }
+
     /// The pull-request turns this pass; see [`PrTurn`].
     fn pr_turn(&self) -> PrTurn {
         let Some(f) = &self.cfg.pr_fairness else {
@@ -847,6 +864,7 @@ impl Queen {
             leases,
             warm_floors: warm_floors.clone(),
             queue_ages,
+            served: self.served(now_ts, &active),
             starvation_after_secs: self.cfg.starvation_after_secs,
             weights: ScoreWeights::default(),
             admission: self.cfg.admission.as_ref().map(|a| a.thresholds()),
@@ -1110,6 +1128,7 @@ impl Queen {
                 break;
             }
             persisted.insert(order);
+            self.note_served(grant.class, grant.scope, now_ts);
         }
         for decision in &allocation.decisions {
             let key = self.cfg.classes.job_label(decision.class, decision.scope);
@@ -1140,6 +1159,64 @@ impl Queen {
             .map(|d| (d.id.as_str(), d.blocked_classes.as_slice()))
             .collect();
         let start_standby = promotions(&allocation.promote, &active, &capacities, &accepting);
+        for id in &start_standby {
+            if let Some(l) = active.iter().find(|l| &l.id == id) {
+                self.note_served(l.class, l.scope, now_ts);
+            }
+        }
+        // Idle standbys give their room to unmet deploy work of another
+        // class, and a drone that could run such work mints no new standby.
+        let queued_deploy: BTreeSet<Class> = runner_input
+            .demand
+            .iter()
+            .filter(|d| d.scope == Scope::Deploy && d.count > 0)
+            .map(|d| d.class)
+            .collect();
+        let yielded = standbys_to_yield(
+            &allocation.unmet,
+            &queued_deploy,
+            &active,
+            &placement_drones,
+            &mut held_after,
+            &self.cfg.classes,
+            |l| {
+                ours.get(l.runner_name.as_str())
+                    .is_none_or(|r| !r.busy && r.status != "online")
+            },
+        );
+        let mut freed: Vec<Class> = Vec::new();
+        for (id, for_class) in &yielded {
+            let Some(l) = active.iter().find(|l| &l.id == id) else {
+                continue;
+            };
+            // A heartbeat may have started it since the runner list was read.
+            if self.store.expire_standby(id, now_ts).await? {
+                tracing::info!(
+                    "ending {} standby {id} on {}: {for_class} deploy work needs its room",
+                    l.class,
+                    l.drone
+                );
+                if let Some(r) = ours.get(l.runner_name.as_str())
+                    && let Err(e) = self.github.delete_runner(r.id).await
+                {
+                    tracing::warn!("delete runner {} failed: {e}", r.name);
+                }
+                freed.push(*for_class);
+            }
+        }
+        // Room a released standby opened is not preempted for as well.
+        let preempt_unmet = less_freed(&unmet_placeable, &freed);
+        let standby_active: Vec<LeaseRow> = active
+            .iter()
+            .filter(|l| !yielded.iter().any(|(id, _)| id == &l.id))
+            .cloned()
+            .collect();
+        let standby_drones = standby_hosts(
+            &serves_deploy,
+            &placement_drones,
+            &allocation.unmet,
+            &self.cfg.classes,
+        );
         if mint_error.is_none()
             && let Some(st) = &self.cfg.standby
         {
@@ -1148,11 +1225,11 @@ impl Queen {
                 .top_up_standby(
                     st,
                     &StandbyView {
-                        active: &active,
+                        active: &standby_active,
                         drones: &placement_drones,
                         capacities: &capacities,
                         extra_labels: &extra_labels,
-                        serves_deploy: &serves_deploy,
+                        serves_deploy: &standby_drones,
                     },
                     held,
                     &prefix,
@@ -1175,7 +1252,7 @@ impl Queen {
                 drones: &placement_drones,
                 others: &others,
                 running: &running,
-                unmet: &unmet_placeable,
+                unmet: &preempt_unmet,
                 queue_ages: &preempt_ages,
                 now: now_ts,
             });
@@ -1768,6 +1845,7 @@ impl Queen {
                         oldest_age_secs: u64::try_from(now.saturating_sub(u.created_at))
                             .unwrap_or(0),
                     }],
+                    served: Vec::new(),
                     starvation_after_secs: self.cfg.starvation_after_secs,
                     weights: ScoreWeights::default(),
                     admission,
@@ -2905,7 +2983,9 @@ mod rollout_pass;
 #[cfg(test)]
 use admission::pressure_window_mean;
 pub use build::QueenBuild;
-use coverage::{as_active, as_placed, promotions};
+use coverage::{
+    as_active, as_placed, less_freed, promotions, served_ages, standby_hosts, standbys_to_yield,
+};
 use families::{families_by_class, placement_profiles};
 pub use pinned::jit_labels;
 

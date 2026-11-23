@@ -363,6 +363,7 @@ mod tests {
             leases,
             warm_floors: Vec::new(),
             queue_ages: Vec::new(),
+            served: Vec::new(),
             starvation_after_secs: None,
             weights: crate::bid::ScoreWeights::default(),
             admission: None,
