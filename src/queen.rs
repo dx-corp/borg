@@ -2765,6 +2765,7 @@ impl Queen {
                     match gce.delete_instance(&zone, &vm).await {
                         Ok(existed) => {
                             crate::burst::set(vms, drone, |v| v.ended_at = Some(now));
+                            crate::tskey::remove_device(cfg.gce(), drone).await;
                             if let Err(e) = self.store.remove_drone(drone).await {
                                 tracing::warn!("burst: remove drone {drone}: {e}");
                             }
@@ -2810,13 +2811,7 @@ impl Queen {
         }
         // formal: end burst_allowance/check_allowance.create_site_guard
         let g = cfg.gce();
-        let key_path = g
-            .tailscale_authkey_path
-            .as_ref()
-            .ok_or("gce.tailscale_authkey_path is not set")?;
-        let authkey = tokio::fs::read_to_string(key_path)
-            .await
-            .map_err(|e| format!("read {}: {e}", key_path.display()))?;
+        let authkey = crate::tskey::mint_for_vm(g, vm).await?;
         // Read before enrolling: with no template the queen creates nothing.
         let (template_ref, template) = gce.burst_template(g).await?;
         let token = crate::admin::enroll_drone(&self.store, drone, now)
@@ -2827,7 +2822,7 @@ impl Queen {
             &VmSpec {
                 vm,
                 drone,
-                tailscale_authkey: authkey.trim(),
+                tailscale_authkey: &authkey,
                 enroll_token: &token,
             },
             &template,

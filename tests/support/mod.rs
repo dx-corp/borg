@@ -735,6 +735,22 @@ impl Harness {
         // the instance calls the queen makes.
         let gce_app = Router::new()
             .route("/token", post(gce_token))
+            // The tailnet API the queen mints per-VM join keys from.
+            .route(
+                "/ts/oauth/token",
+                post(|| async { Json(json!({"access_token": "ts-access"})) }),
+            )
+            .route(
+                "/ts/tailnet/-/keys",
+                post(|Json(body): Json<Value>| async move {
+                    let create = body["capabilities"]["devices"]["create"].clone();
+                    Json(json!({"key": TS_AUTHKEY, "capabilities": {"devices": {"create": create}}}))
+                }),
+            )
+            .route(
+                "/ts/tailnet/-/devices",
+                get(|| async { Json(json!({"devices": []})) }),
+            )
             .route(
                 "/compute/v1/projects/{project}/zones/{zone}/instances",
                 post(gce_insert),
@@ -790,8 +806,8 @@ impl Harness {
                 .to_string(),
             )
             .unwrap();
-            let ts = dir.path().join("drone-ts.key");
-            std::fs::write(&ts, format!("{TS_AUTHKEY}\n")).unwrap();
+            let ts = dir.path().join("tailscale-oauth.json");
+            std::fs::write(&ts, r#"{"client_id": "cid", "client_secret": "secret"}"#).unwrap();
             let toolchain = dir.path().join("toolchain.sh");
             std::fs::write(&toolchain, TOOLCHAIN_SCRIPT).unwrap();
             let gce = &mut extra["burst"]["gce"];
@@ -799,7 +815,8 @@ impl Harness {
                 ("api_base", json!(format!("{gce_url}/compute/v1"))),
                 ("credentials_path", json!(key)),
                 ("queen_url", json!("https://queen.example.test")),
-                ("tailscale_authkey_path", json!(ts)),
+                ("tailscale_oauth_path", json!(ts)),
+                ("tailscale_api_base", json!(format!("{gce_url}/ts"))),
                 ("toolchain_script_path", json!(toolchain)),
                 ("instance_template", json!(GCE_TEMPLATE)),
             ] {

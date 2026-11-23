@@ -97,6 +97,10 @@ fn default_max_run() -> i64 {
 fn default_api_base() -> String {
     "https://compute.googleapis.com/compute/v1".to_owned()
 }
+fn default_tailscale_api_base() -> String {
+    crate::tskey::DEFAULT_API_BASE.to_owned()
+}
+
 fn default_tailscale_tag() -> String {
     "tag:borg-drone".to_owned()
 }
@@ -280,10 +284,20 @@ pub struct GceSettings {
     /// script fetches the drone binary from it. Required unless `dry_run`.
     #[serde(default)]
     pub(crate) queen_url: Option<String>,
-    /// File on the queen holding a reusable, ephemeral, pre-authorized
-    /// tailnet auth key for `tailscale_tag`. Required unless `dry_run`.
+    /// Accepted and ignored, for configs written before per-VM keys: the
+    /// queen never puts a reusable tailnet key in a VM's metadata.
+    #[serde(default, rename = "tailscale_authkey_path")]
+    _tailscale_authkey_path: serde::de::IgnoredAny,
+    /// JSON file on the queen with the tailnet OAuth client
+    /// (`{"client_id", "client_secret"}`). For every burst VM the queen mints
+    /// a single-use, one-hour, non-ephemeral key for `tailscale_tag` with it
+    /// ([`crate::tskey`]), and deletes the VM's tailnet device when it deletes
+    /// the VM. Required unless `dry_run`.
     #[serde(default)]
-    pub tailscale_authkey_path: Option<PathBuf>,
+    pub tailscale_oauth_path: Option<PathBuf>,
+    /// Tailscale API base; tests point it at a fake.
+    #[serde(default = "default_tailscale_api_base")]
+    pub tailscale_api_base: String,
     #[serde(default = "default_tailscale_tag")]
     pub(crate) tailscale_tag: String,
     /// File on the queen served to drones as their toolchain installer
@@ -473,10 +487,7 @@ impl BurstSettings {
             for (name, present) in [
                 ("credentials_path", gce.credentials_path.is_some()),
                 ("queen_url", gce.queen_url.is_some()),
-                (
-                    "tailscale_authkey_path",
-                    gce.tailscale_authkey_path.is_some(),
-                ),
+                ("tailscale_oauth_path", gce.tailscale_oauth_path.is_some()),
                 ("toolchain_script_path", gce.toolchain_script_path.is_some()),
             ] {
                 if !present {
@@ -1402,7 +1413,7 @@ mod tests {
         block["dry_run"] = serde_json::json!(false);
         block["gce"]["credentials_path"] = serde_json::json!("/etc/borg/gce-sa.json");
         block["gce"]["queen_url"] = serde_json::json!("https://queen.example.test");
-        block["gce"]["tailscale_authkey_path"] = serde_json::json!("/etc/borg/drone-ts.key");
+        block["gce"]["tailscale_oauth_path"] = serde_json::json!("/etc/borg/tailscale-oauth.json");
         block["gce"]["toolchain_script_path"] = serde_json::json!("/etc/borg/toolchain.sh");
         block["gce"]["instance_template"] = serde_json::json!(TEMPLATE);
         serde_json::from_value(block).unwrap()
@@ -1571,7 +1582,7 @@ mod tests {
             for (k, v) in [
                 ("credentials_path", "/k.json"),
                 ("queen_url", "https://q"),
-                ("tailscale_authkey_path", "/ts.key"),
+                ("tailscale_oauth_path", "/ts.json"),
                 ("toolchain_script_path", "/t.sh"),
             ] {
                 block["gce"][k] = serde_json::json!(v);
@@ -1612,6 +1623,25 @@ mod tests {
     }
 
     #[test]
+    fn a_reusable_key_file_is_ignored_and_never_enough() {
+        // An old config naming the shared key file still parses, but a live
+        // queen needs the OAuth client: no reusable key goes into metadata.
+        let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
+        block["dry_run"] = serde_json::json!(false);
+        for (k, v) in [
+            ("credentials_path", "/k.json"),
+            ("queen_url", "https://q"),
+            ("tailscale_authkey_path", "/ts.key"),
+            ("toolchain_script_path", "/t.sh"),
+        ] {
+            block["gce"][k] = serde_json::json!(v);
+        }
+        let parsed: BurstSettings = serde_json::from_value(block).unwrap();
+        let err = parsed.validate().unwrap_err();
+        assert!(err.contains("tailscale_oauth_path"), "{err}");
+    }
+
+    #[test]
     fn live_mode_needs_every_provisioning_input() {
         let live = live_cfg();
         assert!(live.validate().is_ok() && live.live());
@@ -1619,7 +1649,7 @@ mod tests {
         for missing in [
             "credentials_path",
             "queen_url",
-            "tailscale_authkey_path",
+            "tailscale_oauth_path",
             "toolchain_script_path",
         ] {
             let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
@@ -1627,7 +1657,7 @@ mod tests {
             for (k, v) in [
                 ("credentials_path", "/k.json"),
                 ("queen_url", "https://q"),
-                ("tailscale_authkey_path", "/ts.key"),
+                ("tailscale_oauth_path", "/ts.json"),
                 ("toolchain_script_path", "/t.sh"),
             ] {
                 if k != missing {

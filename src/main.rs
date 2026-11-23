@@ -812,7 +812,7 @@ async fn run_queen(path: &Path) -> Result<()> {
             // at the first create.
             let g = b.gce();
             for (name, path) in [
-                ("tailscale_authkey_path", g.tailscale_authkey_path.as_ref()),
+                ("tailscale_oauth_path", g.tailscale_oauth_path.as_ref()),
                 ("toolchain_script_path", g.toolchain_script_path.as_ref()),
             ] {
                 let path = path.context("burst live path missing")?;

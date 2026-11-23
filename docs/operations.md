@@ -1327,9 +1327,15 @@ The queen needs, under `burst.gce`:
   directly; no `gcloud` on the queen.
 - `queen_url`: where drones reach this queen over the tailnet: the
   queen's `https://` MagicDNS name.
-- `tailscale_authkey_path`: a reusable, ephemeral, pre-authorized key for
-  `tailscale_tag` (default `tag:borg-drone`), the one Secret Manager holds
-  for hand-made drones.
+- `tailscale_oauth_path`: a JSON file, `{"client_id", "client_secret"}`, owned
+  by `borg` with mode 0600: the tailnet OAuth client (Secret Manager
+  `tailscale-operator-client-id` and `-secret`). For each burst VM the queen
+  mints a single-use, pre-authorized, one-hour, non-ephemeral key for
+  `tailscale_tag` (default `tag:borg-drone`), puts it in that VM's metadata,
+  and removes it once the drone heartbeats. No reusable key is ever put in
+  metadata; an old `tailscale_authkey_path` is accepted and ignored. When the
+  queen deletes a burst VM it also deletes the tailnet device of that name.
+  The file is read on every create, so rotating it needs no restart.
 - `toolchain_script_path`: the iac `install-owned-runner-toolchain.sh`. The
   queen serves it at `GET /bootstrap/toolchain.sh`, and its own executable at
   `GET /bootstrap/borg`, so every burst drone runs the queen's build. Build

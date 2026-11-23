@@ -46,6 +46,7 @@ pub mod secret;
 pub mod store;
 pub mod tailnet;
 pub mod telemetry;
+pub mod tskey;
 pub mod units;
 pub mod units_api;
 pub mod update;
