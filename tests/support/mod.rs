@@ -132,8 +132,17 @@ pub struct MockState {
     /// Labeled instance listings served.
     pub gce_lists: u32,
     pub gce_token_requests: u32,
+    /// The fake token endpoint waits this long before it answers.
+    pub gce_token_delay_ms: u64,
+    /// Once the instance template is read, `gce_token_delay_ms` becomes this.
+    pub gce_token_delay_after_template_ms: Option<u64>,
+    /// Lifetime of issued Compute Engine tokens in seconds (default one
+    /// hour); 60 or less makes the client refresh before every request.
+    pub gce_token_ttl_secs: Option<i64>,
     /// The fake tailnet waits this long before it answers a key mint.
     pub ts_mint_delay_ms: u64,
+    /// Key mints the fake tailnet answered.
+    pub ts_mints: u32,
     /// Tailnet devices the fake lists, as `{id, hostname, tags}`.
     pub ts_devices: Vec<Value>,
     /// Tailnet device ids deleted, in order.
@@ -751,6 +760,7 @@ impl Harness {
                 post(|State(state): State<Shared>, Json(body): Json<Value>| async move {
                     let delay = lock(&state).ts_mint_delay_ms;
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    lock(&state).ts_mints += 1;
                     let create = body["capabilities"]["devices"]["create"].clone();
                     Json(json!({"key": TS_AUTHKEY, "capabilities": {"devices": {"create": create}}}))
                 }),
@@ -1181,9 +1191,14 @@ async fn gce_token(State(s): State<Shared>, body: String) -> Result<Json<Value>,
     {
         return Err(StatusCode::BAD_REQUEST);
     }
-    lock(&s).gce_token_requests += 1;
+    let (delay, ttl) = {
+        let mut st = lock(&s);
+        st.gce_token_requests += 1;
+        (st.gce_token_delay_ms, st.gce_token_ttl_secs.unwrap_or(3600))
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
     Ok(Json(
-        json!({"access_token": GCE_TOKEN, "expires_in": 3600, "token_type": "Bearer"}),
+        json!({"access_token": GCE_TOKEN, "expires_in": ttl, "token_type": "Bearer"}),
     ))
 }
 
@@ -1198,6 +1213,9 @@ async fn gce_template(
     gce_check(&h)?;
     let mut st = lock(&s);
     st.gce_template_reads += 1;
+    if let Some(delay) = st.gce_token_delay_after_template_ms {
+        st.gce_token_delay_ms = delay;
+    }
     if st.gce_template_missing
         || format!("projects/{project}/global/instanceTemplates/{name}") != GCE_TEMPLATE
     {

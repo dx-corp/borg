@@ -50,6 +50,9 @@ pub enum GceError {
     /// of capacity).
     #[error("operation failed: {0}")]
     Operation(String),
+    /// The caller's last check refused the request; nothing was sent.
+    #[error("refused: {0}")]
+    Refused(String),
 }
 
 /// The fields of a service-account key file the queen uses.
@@ -247,11 +250,16 @@ impl GceClient {
     /// request was refused, or the operation came back already failed. On
     /// success, returns the operation to wait on (if GCE named one); the VM
     /// may exist from here on, so callers record it before waiting.
+    ///
+    /// `admit` runs after the request is authenticated (a token refresh can
+    /// take a while) and immediately before it is sent; a reason from it
+    /// sends nothing and returns [`GceError::Refused`].
     pub(crate) async fn insert_instance(
         &self,
         zone: &str,
         template: &str,
         body: &Value,
+        admit: impl FnOnce() -> Option<String>,
     ) -> Result<Option<String>, GceError> {
         let path = self.zone_path(zone, "instances");
         let rb = self
@@ -259,7 +267,12 @@ impl GceClient {
             .await?
             .query(&[("sourceInstanceTemplate", template)])
             .json(body);
+        // formal: begin burst_allowance/check_allowance.dispatch_guard
+        if let Some(why) = admit() {
+            return Err(GceError::Refused(why));
+        }
         let (_, op) = self.send("POST", &path, rb).await?;
+        // formal: end burst_allowance/check_allowance.dispatch_guard
         if let Some(e) = operation_error(&op) {
             return Err(GceError::Operation(e));
         }

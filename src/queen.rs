@@ -2805,7 +2805,6 @@ impl Queen {
             tracing::warn!("burst: refused to create {zone}/{vm}: {why}");
             return Err(format!("refused: {why}"));
         }
-        // formal: end burst_allowance/check_allowance.create_site_guard
         let g = cfg.gce();
         let authkey = crate::tskey::mint_for_vm(g, vm).await?;
         // Read before enrolling: with no template the queen creates nothing.
@@ -2828,18 +2827,17 @@ impl Queen {
                 tracing::warn!("burst: undo enrollment of {drone}: {e}");
             }
         };
-        // The calls above took time: ask a fresh clock right before the insert.
-        if let Some(why) = cfg.create_refusal_on_wall_clock(now) {
-            undo().await;
-            return Err(format!("refused: {why}"));
-        }
-        let op = match gce.insert_instance(zone, &template_ref, &body).await {
+        // The calls above took time and the insert may refresh its token: it
+        // asks a fresh clock once authenticated, right before it is sent.
+        let admit = || cfg.create_refusal_on_wall_clock(now);
+        let op = match gce.insert_instance(zone, &template_ref, &body, admit).await {
             Ok(op) => op,
             Err(e) => {
                 undo().await;
                 return Err(short(&e));
             }
         };
+        // formal: end burst_allowance/check_allowance.create_site_guard
         vms.push(crate::burst::new_vm(
             drone.to_owned(),
             vm.to_owned(),
