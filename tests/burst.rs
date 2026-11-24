@@ -410,12 +410,10 @@ async fn a_failed_create_undoes_the_enrollment_and_moves_to_another_zone() {
     assert_eq!(h.state().gce_instances[0]["zone"], "us-central1-a");
 }
 
-#[tokio::test]
-async fn an_allowance_that_ends_while_the_join_key_is_minted_creates_no_vm() {
-    // The allowance ends three seconds from now, and the tailnet takes longer
-    // than that to answer the key mint.
-    let start = OffsetDateTime::now_utc();
-    let end = (start + time::Duration::seconds(3))
+/// A live config whose allowance ends `secs` from now (whole seconds), and
+/// that end.
+fn config_ending_in(secs: i64) -> (Value, OffsetDateTime) {
+    let end = (OffsetDateTime::now_utc() + time::Duration::seconds(secs))
         .replace_nanosecond(0)
         .unwrap();
     let mut c = live_config();
@@ -423,28 +421,114 @@ async fn an_allowance_that_ends_while_the_join_key_is_minted_creates_no_vm() {
         end.format(&time::format_description::well_known::Rfc3339)
             .unwrap()
     );
-    let h = Harness::start(c).await;
+    (c, end)
+}
+
+/// Milliseconds from now until `end`, plus `extra`: a delay that starts now
+/// and outlasts the allowance.
+fn ms_past(end: OffsetDateTime, extra: i64) -> u64 {
+    let ms = (end - OffsetDateTime::now_utc()).whole_milliseconds() + i128::from(extra);
+    u64::try_from(ms.max(0)).unwrap()
+}
+
+/// The reason the queen logged for its one failed create: an allowance
+/// refusal, not a token or Compute Engine error that also rolls back.
+fn assert_refused_as_expired(s: &Value) {
+    let reasons: Vec<&str> = s["health_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["drone"] == "burst" && e["event"] == "burst_create_failed")
+        .filter_map(|e| e["reason"].as_str())
+        .collect();
+    assert!(
+        reasons.len() == 1 && reasons[0].contains("refused: the burst allowance expired"),
+        "{reasons:?}"
+    );
+}
+
+/// Two ticks a sustained window apart, the second at `start`, so the plan
+/// asks for a create on the second.
+async fn tick_for_a_create(h: &Harness, start: OffsetDateTime) -> Value {
     h.queue_job(1, "borg-ci-heavy", 5);
     h.queue_job(2, "borg-ci-heavy", 5);
-    h.state().ts_mint_delay_ms = 3500;
-
     h.queen
         .tick(start - time::Duration::seconds(600))
         .await
         .unwrap();
     h.queen.tick(start).await.unwrap();
-    let s = status_at(&h, start).await;
-    assert_eq!(burst_events(&s), ["burst_create_failed"], "{}", s["burst"]);
-    assert!(
-        h.state().gce_instances.is_empty(),
-        "no VM is requested once the allowance has ended"
-    );
-    assert_eq!(s["burst"]["drones"]["managed"], 0);
-    assert_eq!(
-        s["drones"],
-        json!([]),
-        "the enrollment made for the VM is undone"
-    );
+    status_at(h, start).await
+}
+
+/// How long each expiry test gives its allowance, shortest first. A loaded
+/// host can take longer than the shortest to set up and reach the create, so
+/// the first check refuses and the case under test never runs; the test then
+/// tries the next one (the dx-corp/borg CI run of #25276 took 18 minutes and
+/// refused at the first check on both tests). Each stays under the 30-second
+/// timeout of the queen's tailnet and Compute Engine clients, which the fake's
+/// delays must not reach.
+const EXPIRY_MARGINS_SECS: [i64; 3] = [5, 12, 25];
+
+#[tokio::test]
+async fn an_allowance_that_ends_while_the_join_key_is_minted_creates_no_vm() {
+    for secs in EXPIRY_MARGINS_SECS {
+        let (c, end) = config_ending_in(secs);
+        let h = Harness::start(c).await;
+        // The tailnet answers the key mint only after the allowance has
+        // ended, however long the setup above took.
+        h.state().ts_mint_delay_ms = ms_past(end, 500);
+        let s = tick_for_a_create(&h, OffsetDateTime::now_utc()).await;
+        if h.state().ts_mints == 0 {
+            // Refused before the mint: this host was too slow for the margin.
+            continue;
+        }
+        assert_eq!(burst_events(&s), ["burst_create_failed"], "{}", s["burst"]);
+        assert_refused_as_expired(&s);
+        assert!(
+            h.state().gce_instances.is_empty(),
+            "no VM is requested once the allowance has ended"
+        );
+        assert_eq!(s["burst"]["drones"]["managed"], 0);
+        assert_eq!(
+            s["drones"],
+            json!([]),
+            "the enrollment made for the VM is undone"
+        );
+        return;
+    }
+    panic!("no margin let the create get past its first check and mint the key");
+}
+
+#[tokio::test]
+async fn an_allowance_that_ends_while_the_insert_refreshes_its_token_sends_no_insert() {
+    for secs in EXPIRY_MARGINS_SECS {
+        let (c, end) = config_ending_in(secs);
+        let h = Harness::start(c).await;
+        // Every Compute Engine request refreshes its token. Refreshes up to
+        // the template read are instant; the insert's outlasts the allowance,
+        // so every check before the insert passes and only the one at
+        // dispatch can stop it.
+        h.state().gce_token_ttl_secs = Some(60);
+        h.state().gce_token_delay_after_template_ms = Some(ms_past(end, 500));
+        let s = tick_for_a_create(&h, OffsetDateTime::now_utc()).await;
+        if h.state().gce_template_reads == 0 {
+            // Refused before the template read: too slow for the margin.
+            continue;
+        }
+        assert_eq!(burst_events(&s), ["burst_create_failed"], "{}", s["burst"]);
+        assert_refused_as_expired(&s);
+        assert!(
+            h.state().gce_instances.is_empty(),
+            "no insert reaches Compute Engine once the allowance has ended"
+        );
+        assert_eq!(
+            s["drones"],
+            json!([]),
+            "the enrollment made for the VM is undone"
+        );
+        return;
+    }
+    panic!("no margin let the create get past its first check and read the template");
 }
 
 #[tokio::test]
