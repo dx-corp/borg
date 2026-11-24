@@ -444,6 +444,90 @@ async fn a_new_queen_finishes_the_persisted_rollout_before_starting_its_own() {
 }
 
 #[tokio::test]
+async fn a_queen_that_just_started_does_not_halt_a_rollout_for_drones_it_could_not_hear() {
+    let mut cfg = gated();
+    // A drone may heartbeat as slowly as every 120s and still read fresh, so
+    // after a restart the queen gives it 120s of retry wait plus 120s for the
+    // next tick of its interval before its silence counts.
+    cfg["drone_stale_secs"] = json!(120);
+    cfg["rollout"]["canary_oses"] = json!(["linux"]);
+    let r = Rig::new(cfg).await;
+    // A previous queen told the canary long enough ago that the stage is past
+    // its update timeout; then this queen restarted.
+    let canary = RolloutState {
+        target: "2.0.0".into(),
+        previous: "1.0.0".into(),
+        phase: Phase::Canary,
+        canaries: vec!["l1".into()],
+        members: vec!["l1".into()],
+        wave: 0,
+        started_at: r.base - 400,
+        stage_started_at: r.base - 400,
+        update_started_at: Default::default(),
+        drain_started_at: Default::default(),
+        cordoned: Vec::new(),
+        halted_reason: None,
+    };
+    r.h.queen
+        .store()
+        .save_rollout_state(&canary, r.base - 400)
+        .await
+        .unwrap();
+    r.beat("l1", "2.0.0").await;
+    let peers_report = |at: i64| {
+        let r = &r;
+        async move {
+            for d in ["l2", "m1"] {
+                let mut cap = support::capacity();
+                if d == "m1" {
+                    cap.os = "macos".into();
+                }
+                r.h.queen
+                    .store()
+                    .record_heartbeat(d, &cap, &Default::default(), true, &[], r.base + at)
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+    let waits_for_the_canary = |st: serde_json::Value| {
+        assert_eq!(
+            st["rollout"]["gate"]["state"]["phase"], "canary",
+            "{}",
+            st["rollout"]
+        );
+        let waiting = st["rollout"]["gate"]["waiting"].as_str().unwrap_or("");
+        assert!(
+            waiting.contains("waiting for l1 to heartbeat"),
+            "{}",
+            st["rollout"]
+        );
+    };
+
+    // Nobody has reached the new queen yet.
+    r.tick(130).await;
+    waits_for_the_canary(r.h.status().await);
+
+    // A peer on a shorter interval reports while the canary is still inside
+    // its restart grace: the canary's silence is not evidence yet.
+    peers_report(200).await;
+    r.tick(200).await;
+    waits_for_the_canary(r.h.status().await);
+
+    // Past the grace, with the rest of the fleet heard, the canary's silence
+    // counts.
+    peers_report(300).await;
+    r.tick(300).await;
+    assert_eq!(r.phase().await, "halted");
+    assert!(
+        r.h.status().await["rollout"]["gate"]["state"]["halted_reason"]
+            .as_str()
+            .unwrap()
+            .contains("l1 stopped heartbeating on 2.0.0")
+    );
+}
+
+#[tokio::test]
 async fn an_explicit_target_still_replaces_an_active_rollout_immediately() {
     let mut cfg = gated();
     cfg["rollout"]["follow_queen"] = json!(true);

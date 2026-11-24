@@ -33,6 +33,13 @@ impl Queen {
             .filter(|lease| lease.state != LeaseStatus::Standby)
             .map(|lease| lease.drone.as_str())
             .collect();
+        let fresh = |t: Option<i64>| t.is_some_and(|t| now - t <= self.cfg.drone_stale_secs);
+        let queen_blind = queen_blind(
+            now,
+            self.started_at(),
+            self.cfg.drone_stale_secs,
+            rows.iter().any(|d| fresh(d.last_heartbeat)),
+        );
         let views: Vec<DroneView> = rows
             .iter()
             .map(|d| DroneView {
@@ -42,9 +49,8 @@ impl Queen {
                     .as_ref()
                     .map(|c| c.os.clone())
                     .unwrap_or_default(),
-                fresh: d
-                    .last_heartbeat
-                    .is_some_and(|t| now - t <= self.cfg.drone_stale_secs),
+                fresh: fresh(d.last_heartbeat),
+                queen_blind,
                 held: d.held(),
                 maintenance: d.hold() == crate::health::Hold::Operator,
                 has_active_leases: busy_drones.contains(d.name.as_str()),
@@ -127,5 +133,58 @@ impl Queen {
             });
         });
         Ok(())
+    }
+}
+
+/// Whether this queen could not have heard the fleet lately, so a drone's
+/// silence is no evidence against the version it runs: it hears no drone at
+/// all, or it has not listened long enough for every live drone to reach it
+/// (`listening_since` is `None` when unknown). A host-lost rerun skips a queen
+/// restart the same way ([`crate::hostlost::EndClass::QueenBlind`]).
+fn queen_blind(now: i64, listening_since: Option<i64>, stale_secs: i64, any_heard: bool) -> bool {
+    let listening_for = listening_since.map_or(i64::MAX, |t| now.saturating_sub(t));
+    listening_for <= restart_grace_secs(stale_secs) || !any_heard
+}
+
+/// How long after the queen starts listening every live drone has reached it.
+/// A drone heartbeats every `I` seconds, and `I` is at most `stale_secs`: a
+/// slower drone is never fresh, so the queen grants it nothing. After failing
+/// against a down queen it waits [`backoff`] (at most the larger of `I` and
+/// [`MAX_BACKOFF_SECS`]) and retries on its next interval tick, up to `I`
+/// later.
+///
+/// [`backoff`]: crate::drone::selfupdate::backoff
+/// [`MAX_BACKOFF_SECS`]: crate::drone::selfupdate::MAX_BACKOFF_SECS
+fn restart_grace_secs(stale_secs: i64) -> i64 {
+    let retry_cap = i64::try_from(crate::drone::selfupdate::MAX_BACKOFF_SECS).unwrap_or(i64::MAX);
+    stale_secs.max(retry_cap).saturating_add(stale_secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{queen_blind, restart_grace_secs};
+    use crate::drone::selfupdate::backoff;
+
+    #[test]
+    fn the_restart_grace_covers_the_slowest_interval_a_fresh_drone_can_have() {
+        for stale in [10_i64, 60, 120, 600] {
+            // Every interval a drone can heartbeat at and still read fresh,
+            // after any run of failures against a down queen: its retry wait
+            // plus the wait for the next tick of its interval.
+            for interval in 1..=stale {
+                for failures in 1..=10 {
+                    let wait = backoff(interval as u64, failures) as i64;
+                    let heard_by = wait + interval;
+                    assert!(
+                        heard_by <= restart_grace_secs(stale),
+                        "stale {stale}, interval {interval}, failures {failures}"
+                    );
+                }
+            }
+        }
+        assert!(queen_blind(1_240, Some(1_000), 120, true));
+        assert!(!queen_blind(1_241, Some(1_000), 120, true));
+        assert!(queen_blind(1_241, Some(1_000), 120, false));
+        assert!(!queen_blind(1_241, None, 120, true));
     }
 }

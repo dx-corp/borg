@@ -301,6 +301,11 @@ pub struct DroneView {
     pub name: String,
     pub os: String,
     pub fresh: bool,
+    /// The queen could not have heard this drone's heartbeats lately: it has
+    /// not listened long enough for a drone retrying a down queen to reach it,
+    /// or it hears no drone at all. A silence then says nothing about the
+    /// version, so it never halts a rollout.
+    pub(crate) queen_blind: bool,
     /// Quarantined or otherwise not schedulable.
     pub held: bool,
     /// Held by an operator (maintenance), not by health evidence. Such a hold
@@ -815,7 +820,7 @@ pub fn advance(
         if d.held {
             halt.get_or_insert(format!("{n} is quarantined on {target}"));
         } else if !d.fresh {
-            if overdue {
+            if overdue && !d.queen_blind {
                 halt.get_or_insert(format!("{n} stopped heartbeating on {target}"));
             } else {
                 wait.get_or_insert(format!("waiting for {n} to heartbeat on {target}"));
@@ -1053,6 +1058,7 @@ mod tests {
             name: name.into(),
             os: os.into(),
             fresh: true,
+            queen_blind: false,
             held: false,
             maintenance: false,
             has_active_leases: false,
