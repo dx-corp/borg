@@ -2515,6 +2515,10 @@ impl Queen {
             let mut sim = self.lock_burst();
             let BurstSim { state, vms, .. } = &mut *sim;
             crate::burst::prune(vms, max_run, now);
+            let held = rows.iter().filter(|r| r.quarantined);
+            let held =
+                held.filter_map(|r| Some((r.name.as_str(), r.quarantine_reason.as_deref()?)));
+            crate::burst::adopt_interrupted_drains(vms, held, now);
             if !live {
                 // Simulated drones enroll after a typical provisioning time
                 // and never hold a lease: they serve no demand, so dry-run
@@ -2712,7 +2716,7 @@ impl Queen {
                     }
                 }
                 BurstAction::Drain { drone, why } => {
-                    let reason = format!("burst: {why}");
+                    let reason = format!("{}{why}", crate::burst::DRAIN_REASON_PREFIX);
                     match self.store.set_quarantine(drone, Some(&reason)).await {
                         Ok(_) => {
                             crate::burst::set(vms, drone, |v| v.draining_at = Some(now));

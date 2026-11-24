@@ -25,8 +25,10 @@ use time::OffsetDateTime;
 
 mod handoff;
 mod sanitize;
+mod serve;
 mod standby;
 mod wire;
+pub use serve::{RUNTIME_SHUTDOWN, SHUTDOWN_GRACE, block_on_bounded, serve, serve_with_grace};
 pub use wire::{LeaseGrant, ResultRequest};
 
 use crate::allocator::{
@@ -2910,86 +2912,4 @@ async fn metrics(State(queen): State<Arc<Queen>>) -> Result<Response, ApiError> 
         render_metrics(&status),
     )
         .into_response())
-}
-
-/// Run the reconciliation loop and the HTTP server until `shutdown` resolves.
-pub async fn serve(
-    queen: Arc<Queen>,
-    listener: tokio::net::TcpListener,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()> {
-    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-    let stop_rx_janitor = stop_rx.clone();
-    let stop_rx_host_lost = stop_rx.clone();
-    let ticker = {
-        let queen = Arc::clone(&queen);
-        tokio::spawn(async move {
-            let mut every = tokio::time::interval(std::time::Duration::from_secs(
-                queen.config().poll_interval_secs,
-            ));
-            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                // Both arms are cancel-safe: `interval.tick` and `changed` hold
-                // no state that a dropped future could lose. The tick itself
-                // runs in the arm body, outside the select, so shutdown waits
-                // for an in-progress pass instead of abandoning a mint.
-                tokio::select! {
-                    _ = every.tick() => {
-                        let now = OffsetDateTime::now_utc();
-                        if let Err(e) = queen.tick(now).await {
-                            tracing::warn!("tick failed: {e}");
-                            queen.record_tick_error(now, &e);
-                        }
-                    }
-                    _ = stop_rx.changed() => break,
-                }
-            }
-        })
-    };
-    let host_lost_task = crate::hostlost::spawn_passes(Arc::clone(&queen), stop_rx_host_lost);
-    let janitor_task = queen.janitor().map(|_| {
-        let queen = Arc::clone(&queen);
-        let mut stop_rx = stop_rx_janitor;
-        tokio::spawn(async move {
-            let Some(janitor) = queen.janitor() else {
-                return;
-            };
-            let mut every = tokio::time::interval(std::time::Duration::from_secs(
-                janitor.settings().interval_secs,
-            ));
-            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                // Cancel-safe for the same reason as the ticker above.
-                tokio::select! {
-                    _ = every.tick() => {
-                        janitor.pass(janitor.settings().pass_repos(&queen.config().repos)).await;
-                        if let Some(requeuer) = queen.requeuer() {
-                            let now = OffsetDateTime::now_utc().unix_timestamp();
-                            if let Err(e) = requeuer.pass(queen.store(), now).await {
-                                tracing::warn!("requeue pass failed: {e}");
-                            }
-                        }
-                    }
-                    _ = stop_rx.changed() => break,
-                }
-            }
-        })
-    });
-    let served = axum::serve(
-        listener,
-        router(queen).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        shutdown.await;
-        let _ = stop_tx.send(true);
-    })
-    .await;
-    let _ = ticker.await;
-    if let Some(task) = janitor_task {
-        let _ = task.await;
-    }
-    if let Some(task) = host_lost_task {
-        let _ = task.await;
-    }
-    served
 }
