@@ -166,13 +166,18 @@ impl SelfUpdate {
     }
 }
 
+/// The longest a drone waits between heartbeat retries while the queen is
+/// unreachable: a queen that comes back hears every live drone within this.
+pub const MAX_BACKOFF_SECS: u64 = 60;
+
 /// Delay before the next heartbeat after `failures` consecutive failures: the
-/// normal interval, doubling per failure, capped at a minute, so a queen that
-/// is down is retried gently and one that comes back is found quickly.
+/// normal interval, doubling per failure, capped at [`MAX_BACKOFF_SECS`], so a
+/// queen that is down is retried gently and one that comes back is found
+/// quickly.
 pub fn backoff(interval_secs: u64, failures: u32) -> u64 {
     interval_secs
         .saturating_mul(1u64 << failures.min(6))
-        .min(60)
+        .min(MAX_BACKOFF_SECS)
         .max(interval_secs)
 }
 
