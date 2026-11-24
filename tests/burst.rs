@@ -447,6 +447,14 @@ fn assert_refused_as_expired(s: &Value) {
     );
 }
 
+/// Whether setup outlasted the allowance before the plan ran: the planner
+/// refuses with `no_allowance` and never starts a create, so no
+/// `burst_create_failed` is logged. The margin was too short for this host.
+fn planned_past_the_allowance(s: &Value) -> bool {
+    s["burst"]["outcome"] == "no_allowance"
+        && !burst_events(s).iter().any(|e| e == "burst_create_failed")
+}
+
 /// Two ticks a sustained window apart, the second at `start`, so the plan
 /// asks for a create on the second.
 async fn tick_for_a_create(h: &Harness, start: OffsetDateTime) -> Value {
@@ -480,6 +488,12 @@ async fn an_allowance_that_ends_while_the_join_key_is_minted_creates_no_vm() {
         let s = tick_for_a_create(&h, OffsetDateTime::now_utc()).await;
         if h.state().ts_mints == 0 {
             // Refused before the mint: this host was too slow for the margin.
+            // Either the plan already saw the allowance ended, or the create
+            // started and its first check refused. Any other failure fails
+            // the test rather than retrying with a longer margin.
+            if !planned_past_the_allowance(&s) {
+                assert_refused_as_expired(&s);
+            }
             continue;
         }
         assert_eq!(burst_events(&s), ["burst_create_failed"], "{}", s["burst"]);
@@ -513,6 +527,12 @@ async fn an_allowance_that_ends_while_the_insert_refreshes_its_token_sends_no_in
         let s = tick_for_a_create(&h, OffsetDateTime::now_utc()).await;
         if h.state().gce_template_reads == 0 {
             // Refused before the template read: too slow for the margin.
+            // Either the plan already saw the allowance ended, or the create
+            // started and its first check refused. Any other failure fails
+            // the test rather than retrying with a longer margin.
+            if !planned_past_the_allowance(&s) {
+                assert_refused_as_expired(&s);
+            }
             continue;
         }
         assert_eq!(burst_events(&s), ["burst_create_failed"], "{}", s["burst"]);
