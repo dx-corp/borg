@@ -431,6 +431,22 @@ fn ms_past(end: OffsetDateTime, extra: i64) -> u64 {
     u64::try_from(ms.max(0)).unwrap()
 }
 
+/// The reason the queen logged for its one failed create: an allowance
+/// refusal, not a token or Compute Engine error that also rolls back.
+fn assert_refused_as_expired(s: &Value) {
+    let reasons: Vec<&str> = s["health_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["drone"] == "burst" && e["event"] == "burst_create_failed")
+        .filter_map(|e| e["reason"].as_str())
+        .collect();
+    assert!(
+        reasons.len() == 1 && reasons[0].contains("refused: the burst allowance expired"),
+        "{reasons:?}"
+    );
+}
+
 /// Two ticks a sustained window apart, the second at `start`, so the plan
 /// asks for a create on the second.
 async fn tick_for_a_create(h: &Harness, start: OffsetDateTime) -> Value {
@@ -459,6 +475,7 @@ async fn an_allowance_that_ends_while_the_join_key_is_minted_creates_no_vm() {
         s["burst"]
     );
     assert_eq!(burst_events(&s), ["burst_create_failed"], "{}", s["burst"]);
+    assert_refused_as_expired(&s);
     assert!(
         h.state().gce_instances.is_empty(),
         "no VM is requested once the allowance has ended"
@@ -483,6 +500,7 @@ async fn an_allowance_that_ends_while_the_insert_refreshes_its_token_sends_no_in
     let s = tick_for_a_create(&h, OffsetDateTime::now_utc()).await;
     assert_eq!(h.state().gce_template_reads, 1, "{}", s["burst"]);
     assert_eq!(burst_events(&s), ["burst_create_failed"], "{}", s["burst"]);
+    assert_refused_as_expired(&s);
     assert!(
         h.state().gce_instances.is_empty(),
         "no insert reaches Compute Engine once the allowance has ended"
