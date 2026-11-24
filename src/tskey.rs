@@ -258,6 +258,11 @@ pub(crate) async fn mint_for_vm(g: &crate::burst::GceSettings, vm: &str) -> Resu
 /// no access.
 pub(crate) async fn remove_device(g: &crate::burst::GceSettings, drone: &str) {
     let Some(oauth) = g.tailscale_oauth_path.as_ref() else {
+        // Keep the OAuth client configured until burst drones drain to have
+        // their records removed; without it the record stays, offline.
+        tracing::warn!(
+            "burst: tailnet device {drone} left in the tailnet: gce.tailscale_oauth_path is not configured"
+        );
         return;
     };
     let removed = match TailscaleApi::new(oauth, &g.tailscale_api_base) {
