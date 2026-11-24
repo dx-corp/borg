@@ -383,6 +383,15 @@ pub(super) fn check_write(
     if let Some(k) = w.clear.iter().find(|k| sets.contains_key(k)) {
         return Err(format!("{} is both set and cleared", k.key()));
     }
+    // A queen whose burst is configured off may run without the tailnet OAuth
+    // client, but a live create needs it to mint the drone's join key. Refuse
+    // turning burst on there now, not at the first VM create.
+    if w.enabled == Some(true) && cfg.provisions() && cfg.gce().tailscale_oauth_path.is_none() {
+        return Err(
+            "burst cannot be turned on: gce.tailscale_oauth_path is not configured on this queen"
+                .to_owned(),
+        );
+    }
     let c = cfg.ceilings();
     if let Some(n) = w.max_drones
         && !(1..=c.max_drones).contains(&n)
@@ -703,6 +712,27 @@ mod tests {
         let e = effective(&c, &Overrides::default());
         assert!(e.enabled);
         assert_eq!(e.max_drones, 3);
+    }
+
+    #[test]
+    fn a_live_queen_without_tailnet_oauth_refuses_turning_burst_on() {
+        let c: BurstSettings = serde_json::from_value(json!({
+            "enabled": false, "dry_run": false, "max_drones": 3,
+            "budget": {"drone_hours_per_day": 32, "drone_hours_per_month": 150},
+            "scale_up": {"classes": ["heavy"], "weights": {"main": 3, "pr": 1},
+                         "min_weighted_unmet": 6, "sustained_secs": 600},
+            "scale_down": {"idle_secs": 900},
+            "gce": {"project": "p", "network": "n", "subnet": "s",
+                    "zones": ["us-central1-b"], "machine_type": "c2d-highcpu-56"}
+        }))
+        .unwrap();
+        assert!(c.gce().tailscale_oauth_path.is_none());
+        let ov = Overrides::default();
+        let refused = check_write(&c, &ov, &write(|w| w.enabled = Some(true))).unwrap_err();
+        assert!(refused.contains("tailscale_oauth_path"), "{refused}");
+        // Turning it off, or changing other knobs, still works without OAuth.
+        assert!(check_write(&c, &ov, &write(|w| w.enabled = Some(false))).is_ok());
+        assert!(check_write(&c, &ov, &write(|w| w.max_drones = Some(2))).is_ok());
     }
 
     #[test]
