@@ -1865,3 +1865,65 @@ async fn host_invariant_failures_a_drone_reports_are_exported_per_check() {
             .contains("borg_drone_host_invariant_failing{")
     );
 }
+
+/// A restart must not wait out a slow GitHub pass or a stalled request: the
+/// queen stops serving and exits within its grace, so drones see seconds of
+/// failed heartbeats instead of the full systemd stop timeout.
+#[tokio::test]
+async fn shutdown_exits_within_its_grace_while_a_tick_and_a_request_are_in_flight() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("d1").await;
+    h.queue_job(90, "borg-ci-medium-pr", 5);
+    // The tick's job listing never answers within the test.
+    h.state().jobs_delay_ms = 600_000;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let grace = std::time::Duration::from_millis(300);
+    let served = tokio::spawn(borg::api::serve_with_grace(
+        h.queen.clone(),
+        listener,
+        async move {
+            let _ = stopped.await;
+        },
+        grace,
+    ));
+
+    // A heartbeat whose body never arrives keeps its request in flight.
+    let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stalled
+        .write_all(
+            format!(
+                "POST /v1/heartbeat HTTP/1.1\r\nhost: queen\r\nauthorization: Bearer {token}\r\ncontent-type: application/json\r\ncontent-length: 4096\r\n\r\n{{"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while h.state().jobs_inflight == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first tick reaches the job listing");
+
+    let started = std::time::Instant::now();
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), served)
+        .await
+        .expect("shutdown is bounded by its grace")
+        .unwrap()
+        .unwrap();
+    let took = started.elapsed();
+    assert!(took >= grace, "in-flight work got its grace: {took:?}");
+    assert!(took < grace * 5, "shutdown took {took:?}");
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_err(),
+        "the queen stopped accepting connections"
+    );
+    drop(stalled);
+}

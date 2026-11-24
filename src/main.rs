@@ -1277,8 +1277,15 @@ async fn run_command(a: RunArgs) -> u8 {
     u8::try_from(code).unwrap_or(if code < 0 { 1 } else { u8::MAX })
 }
 
-#[tokio::main]
-async fn main() -> Result<std::process::ExitCode> {
+fn main() -> Result<std::process::ExitCode> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("start the async runtime")?;
+    borg::api::block_on_bounded(runtime, borg_main())
+}
+
+async fn borg_main() -> Result<std::process::ExitCode> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
     if let Command::Run(a) = cli.command {

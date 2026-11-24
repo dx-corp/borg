@@ -1379,6 +1379,35 @@ pub(super) fn apply_simulated(
     out
 }
 
+/// The quarantine reason a burst drain writes, followed by why.
+pub(super) const DRAIN_REASON_PREFIX: &str = "burst: ";
+
+/// Restore the drain marker of each live VM whose drone holds a burst drain
+/// quarantine but has no `draining_at`. A drain quarantines the drone first
+/// and records the marker when the pass's VM records are saved; a queen that
+/// stops between the two writes would otherwise leave the drone quarantined
+/// and seen as serving, so demand never undrains it and it is never deleted.
+/// `quarantined` lists each quarantined drone with its reason; an operator's
+/// quarantine (any other reason) is left alone.
+pub(super) fn adopt_interrupted_drains<'a>(
+    vms: &mut [BurstVm],
+    quarantined: impl IntoIterator<Item = (&'a str, &'a str)>,
+    now: i64,
+) {
+    for (drone, reason) in quarantined {
+        if reason.starts_with(DRAIN_REASON_PREFIX) {
+            set(vms, drone, |v| {
+                if v.ended_at.is_none() && v.draining_at.is_none() {
+                    tracing::warn!(
+                        "burst: {drone} was drained without its marker; adopting the drain"
+                    );
+                    v.draining_at = Some(now);
+                }
+            });
+        }
+    }
+}
+
 pub(super) fn set(vms: &mut [BurstVm], drone: &str, f: impl FnOnce(&mut BurstVm)) {
     if let Some(v) = vms.iter_mut().find(|v| v.drone == drone) {
         f(v);
@@ -2316,6 +2345,42 @@ mod tests {
             p.actions.is_empty(),
             "idle clock restarted by demand: {:?}",
             p.actions
+        );
+    }
+
+    #[test]
+    fn a_drain_interrupted_before_its_marker_is_adopted_and_undrained_on_demand() {
+        let c = cfg();
+        // The queen quarantined the drone, then stopped before saving the
+        // VM records: the drone is quarantined and its VM has no marker.
+        let mut vms = [
+            vm("gcp-burst-qa", "us-central1-b", T0 - 7200),
+            vm("gcp-burst-qb", "us-central1-b", T0 - 7200),
+        ];
+        adopt_interrupted_drains(
+            &mut vms,
+            [
+                ("gcp-burst-qa", "burst: idle"),
+                ("gcp-burst-qb", "operator: disk check"),
+            ],
+            T0,
+        );
+        assert_eq!(vms[0].draining_at, Some(T0));
+        assert_eq!(
+            vms[1].draining_at, None,
+            "an operator quarantine is not a drain"
+        );
+        let heavy = [unmet(Class::Heavy, Scope::Main, 2)];
+        let fleet = [
+            drone("gcp-burst-qa", true, 0),
+            drone("gcp-burst-qb", true, 1),
+        ];
+        let p = run(&c, &mut BurstState::default(), T0 + 1, &heavy, &fleet, &vms);
+        assert_eq!(
+            p.actions,
+            [Action::Undrain {
+                drone: "gcp-burst-qa".to_owned()
+            }]
         );
     }
 
