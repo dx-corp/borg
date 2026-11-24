@@ -807,15 +807,29 @@ async fn run_queen(path: &Path) -> Result<()> {
     let mut gce = None;
     if let Some(b) = cfg.burst.as_ref() {
         if b.provisions() {
-            // Validation guarantees the paths are set; they must also be
-            // readable now, so a misconfigured queen fails at start and not
-            // at the first create.
+            // Validation guarantees the paths are set (the OAuth client only
+            // while burst is configured on; a create without it is refused);
+            // they must also be readable now, so a misconfigured queen fails
+            // at start and not at the first create.
             let g = b.gce();
-            for (name, path) in [
-                ("tailscale_oauth_path", g.tailscale_oauth_path.as_ref()),
-                ("toolchain_script_path", g.toolchain_script_path.as_ref()),
+            for (name, path, required) in [
+                (
+                    "tailscale_oauth_path",
+                    g.tailscale_oauth_path.as_ref(),
+                    b.enabled,
+                ),
+                (
+                    "toolchain_script_path",
+                    g.toolchain_script_path.as_ref(),
+                    true,
+                ),
             ] {
-                let path = path.context("burst live path missing")?;
+                let Some(path) = path else {
+                    if required {
+                        anyhow::bail!("burst live path missing: burst.gce.{name}");
+                    }
+                    continue;
+                };
                 std::fs::metadata(path)
                     .with_context(|| format!("burst.gce.{name}: {}", path.display()))?;
             }
