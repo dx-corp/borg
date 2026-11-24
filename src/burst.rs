@@ -492,10 +492,21 @@ impl BurstSettings {
             return bad("gce.drone_max_vcpu and gce.drone_max_mem_mib must be positive");
         }
         if !self.dry_run {
+            // The tailnet OAuth client is only used to mint a join key when a
+            // VM is created; draining and deleting never need it, and a create
+            // without it is refused (`tskey::mint_for_vm`). So a config whose
+            // burst is off does not need it. Requiring it there wedged the
+            // queen's self-update: every newer binary rejected the installed
+            // config (burst off, no OAuth path) while the running binary
+            // rejected the new config (a key it did not know), so neither
+            // the binary nor the config could change.
             for (name, present) in [
                 ("credentials_path", gce.credentials_path.is_some()),
                 ("queen_url", gce.queen_url.is_some()),
-                ("tailscale_oauth_path", gce.tailscale_oauth_path.is_some()),
+                (
+                    "tailscale_oauth_path",
+                    gce.tailscale_oauth_path.is_some() || !self.enabled,
+                ),
                 ("toolchain_script_path", gce.toolchain_script_path.is_some()),
             ] {
                 if !present {
@@ -1647,6 +1658,42 @@ mod tests {
         let parsed: BurstSettings = serde_json::from_value(block).unwrap();
         let err = parsed.validate().unwrap_err();
         assert!(err.contains("tailscale_oauth_path"), "{err}");
+    }
+
+    #[test]
+    fn a_disabled_burst_needs_no_tailnet_oauth_client() {
+        // The config a queen ran before the OAuth client existed: burst off,
+        // not dry-run, the old shared key file. A newer binary must accept it,
+        // or it can never install over that queen.
+        let mut block: serde_json::Value = serde_json::from_str(BLOCK).unwrap();
+        block["enabled"] = serde_json::json!(false);
+        block["dry_run"] = serde_json::json!(false);
+        for (k, v) in [
+            ("credentials_path", "/k.json"),
+            ("queen_url", "https://q"),
+            ("tailscale_authkey_path", "/ts.key"),
+            ("toolchain_script_path", "/t.sh"),
+        ] {
+            block["gce"][k] = serde_json::json!(v);
+        }
+        let parsed: BurstSettings = serde_json::from_value(block.clone()).unwrap();
+        assert_eq!(parsed.validate(), Ok(()));
+        // Turned on in the file, the same config needs the OAuth client again.
+        block["enabled"] = serde_json::json!(true);
+        block["gce"]["instance_template"] = serde_json::json!(TEMPLATE);
+        let enabled: BurstSettings = serde_json::from_value(block).unwrap();
+        let err = enabled.validate().unwrap_err();
+        assert!(err.contains("tailscale_oauth_path"), "{err}");
+        // Turned on at runtime instead, a create is refused before any VM exists.
+        let refused = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(crate::tskey::mint_for_vm(parsed.gce(), "borg-burst-x"))
+            .unwrap_err();
+        assert!(
+            refused.contains("tailscale_oauth_path is not set"),
+            "{refused}"
+        );
     }
 
     #[test]
