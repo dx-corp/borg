@@ -124,6 +124,13 @@ pub struct DroneState {
     /// floor, so one free reading is never promised to several leases.
     #[serde(default)]
     pub(crate) disk_floor_mib: BTreeMap<Class, u64>,
+    /// Work-filesystem space a running lease of each class may still write,
+    /// MiB (`env_contract.running_reserve_bytes`). Free space is shared by
+    /// every job on the drone, so a lease that started keeps this much of the
+    /// reading: new work is admitted only above what the jobs already running
+    /// may still need.
+    #[serde(default)]
+    pub(crate) disk_reserve_mib: BTreeMap<Class, u64>,
 }
 
 /// A drone's measured memory facts, which size it beyond its budget:
@@ -401,6 +408,7 @@ impl DroneState {
             live: LiveFacts::default(),
             work_free_mib: capacity.free_disk_mib,
             disk_floor_mib: BTreeMap::new(),
+            disk_reserve_mib: BTreeMap::new(),
         }
     }
 }
@@ -415,12 +423,15 @@ pub enum LeaseState {
     Standby,
     /// Granted or minted, runner idle: can still absorb queued demand.
     Pending,
-    /// Runner is executing a job: only consumes capacity.
+    /// Runner is executing a job: consumes capacity and keeps its class's
+    /// running disk reserve ([`DroneState::disk_reserve_mib`]) for what the
+    /// job may still write.
     Running,
     /// Granted or placed and not started, but covering no queued demand (a
     /// lease its drone withholds, or work of another queue seen by a
     /// separate placement). Consumes capacity and, unlike `Running`, still
-    /// holds its class's disk floor: its writes are not in the free reading.
+    /// holds its class's whole disk floor: none of its writes are in the
+    /// free reading.
     Held,
 }
 
@@ -432,14 +443,14 @@ pub struct ActiveLease {
     pub scope: Scope,
     pub state: LeaseState,
     /// Free work disk this lease needs to start, MiB, when its job asked for
-    /// more than its class floor (`borg-disk-<N>g`). Until it runs it holds
-    /// the larger of the two; see [`DroneState::disk_floor_mib`].
+    /// more than its class needs (`borg-disk-<N>g`). Until it runs it holds
+    /// the larger of the two; see [`ActiveLease::disk_need_on`].
     #[serde(default)]
     pub disk_mib: Option<u64>,
 }
 
 impl ActiveLease {
-    /// A lease already running a job, with only its class's disk floor.
+    /// A lease already running a job: it holds its class's running reserve.
     pub fn running(drone_id: String, class: Class, scope: Scope) -> Self {
         Self {
             drone_id,
@@ -448,11 +459,6 @@ impl ActiveLease {
             state: LeaseState::Running,
             disk_mib: None,
         }
-    }
-
-    /// The free work disk this lease holds on `drone` until it runs, MiB.
-    fn disk_floor_on(&self, drone: &DroneState) -> u64 {
-        drone.disk_floor(self.class).max(self.disk_mib.unwrap_or(0))
     }
 }
 
@@ -853,26 +859,6 @@ impl DroneState {
     pub(crate) fn class_cap(&self, class: Class) -> Option<u32> {
         self.class_caps.get(&class).copied()
     }
-
-    /// Free work-filesystem space `class` needs to start, MiB; 0 when unset.
-    pub(crate) fn disk_floor(&self, class: Class) -> u64 {
-        self.disk_floor_mib.get(&class).copied().unwrap_or(0)
-    }
-
-    /// Whether the work filesystem, less the floors of `held` leases on this
-    /// drone not yet running, still has `class`'s floor free. True when the
-    /// drone reports no reading.
-    pub(crate) fn disk_admits(&self, held: &[ActiveLease], class: Class) -> bool {
-        let Some(free) = self.work_free_mib else {
-            return true;
-        };
-        let promised: u64 = held
-            .iter()
-            .filter(|l| l.drone_id == self.id && l.state != LeaseState::Running)
-            .map(|l| l.disk_floor_on(self))
-            .sum();
-        free.saturating_sub(promised) >= self.disk_floor(class)
-    }
 }
 
 /// The room left on `drone` after `held` (leases on other drones are ignored).
@@ -904,6 +890,8 @@ pub fn free_room(drone: &DroneState, held: &[ActiveLease], classes: &Classes) ->
 pub struct StandbyStarts<'a> {
     held: &'a [ActiveLease],
     left: BTreeMap<(&'a str, Class), Option<u32>>,
+    /// Per drone, the disk left for starts; see [`DiskLedger::for_starts`].
+    disk: BTreeMap<&'a str, DiskLedger>,
 }
 
 impl<'a> StandbyStarts<'a> {
@@ -912,14 +900,38 @@ impl<'a> StandbyStarts<'a> {
         Self {
             held,
             left: BTreeMap::new(),
+            disk: BTreeMap::new(),
         }
     }
 
-    /// Whether `drone` may start one more standby of `class`: always without
-    /// a cap, otherwise while the cap exceeds the drone's leases of the class
-    /// that are not standbys plus the standbys already taken here.
+    /// The disk `drone` has left for work it holds and has not started,
+    /// after the starts taken here. Every such start (a standby, a lease or
+    /// unit a heartbeat hands over) is charged to this one ledger.
+    pub(crate) fn disk(&mut self, drone: &'a DroneState) -> &mut DiskLedger {
+        let held = self.held;
+        self.disk
+            .entry(drone.id.as_str())
+            .or_insert_with(|| DiskLedger::for_starts(drone, held))
+    }
+
+    /// Judge `drone`'s starts against `started` alone: a heartbeat hands over
+    /// work the drone holds but has not been given yet, which must not be
+    /// charged before it is taken.
+    pub(crate) fn disk_after(&mut self, drone: &'a DroneState, started: &[ActiveLease]) {
+        self.disk
+            .insert(drone.id.as_str(), DiskLedger::for_starts(drone, started));
+    }
+
+    /// Whether `drone` may start one more standby of `class`: while its disk
+    /// still holds what the class needs to start beside the work already
+    /// started there, and, with a class cap, while the cap exceeds the
+    /// drone's leases of the class that are not standbys plus the standbys
+    /// already taken here.
     pub fn take(&mut self, drone: &'a DroneState, class: Class) -> bool {
         let held = self.held;
+        if !self.disk(drone).admits(drone.disk_need(class)) {
+            return false;
+        }
         let left = self
             .left
             .entry((drone.id.as_str(), class))
@@ -934,13 +946,12 @@ impl<'a> StandbyStarts<'a> {
                 Some(cap.saturating_sub(u32::try_from(started).unwrap_or(u32::MAX)))
             });
         match left {
-            None => true,
-            Some(0) => false,
-            Some(n) => {
-                *n -= 1;
-                true
-            }
+            None => {}
+            Some(0) => return false,
+            Some(n) => *n -= 1,
         }
+        self.disk(drone).hold(drone.disk_need(class));
+        true
     }
 }
 
@@ -982,9 +993,8 @@ struct Free<'a> {
     in_flight: u32,
     /// Of `in_flight`, the leases per class.
     in_flight_by: BTreeMap<Class, u32>,
-    /// Work-filesystem space left for new leases, MiB; see
-    /// [`DroneState::disk_floor_mib`].
-    disk_mib: Option<u64>,
+    /// Work-filesystem space left for new leases.
+    disk: DiskLedger,
     admission: AdmissionState,
     /// Grants made to this drone this pass, per key (bounds `available_slots`).
     granted: BTreeMap<(Class, Scope), u32>,
@@ -1163,7 +1173,7 @@ impl Free<'_> {
         } else if self.mem_room() < spec.mem_mib {
             reasons.push(Rejection::HostMemory);
         }
-        if self.disk_mib.is_some_and(|d| d < self.disk_floor(class)) {
+        if !self.disk.admits(self.drone.disk_need(class)) {
             reasons.push(Rejection::Disk);
         }
         if self.vcpu < spec.vcpu {
@@ -1330,23 +1340,14 @@ impl Free<'_> {
         after >= self.drained_slots(classes, larger)
     }
 
-    fn disk_floor(&self, class: Class) -> u64 {
-        self.drone.disk_floor(class)
-    }
-
     /// Whole leases of `class` the work filesystem's unpromised space holds.
     fn disk_slots(&self, class: Class) -> u32 {
-        let floor = self.disk_floor(class);
-        match self.disk_mib {
-            Some(free) if floor > 0 => u32::try_from(free / floor).unwrap_or(u32::MAX),
-            _ => u32::MAX,
-        }
+        self.disk.slots(self.drone.disk_need(class))
     }
 
-    /// Promise `class`'s disk floor to a lease.
+    /// Promise a new lease of `class` the disk it needs to start.
     fn charge_disk(&mut self, class: Class) {
-        let floor = self.disk_floor(class);
-        self.disk_mib = self.disk_mib.map(|d| d.saturating_sub(floor));
+        self.disk.hold(self.drone.disk_need(class));
     }
 
     fn take(&mut self, spec: &ClassSpec) {
@@ -1377,7 +1378,7 @@ fn free_by_drone<'a>(
             leases_left: drone.max_leases,
             in_flight: 0,
             in_flight_by: BTreeMap::new(),
-            disk_mib: drone.work_free_mib,
+            disk: DiskLedger::new(drone, []),
             admission: drone.admission(admission),
             granted: BTreeMap::new(),
         });
@@ -1389,12 +1390,7 @@ fn free_by_drone<'a>(
             f.take(spec);
             f.in_flight += 1;
             *f.in_flight_by.entry(lease.class).or_default() += 1;
-            // A running lease's writes are already in the measured free
-            // space; one not started yet will still need its floor.
-            if lease.state != LeaseState::Running {
-                let floor = lease.disk_floor_on(f.drone);
-                f.disk_mib = f.disk_mib.map(|d| d.saturating_sub(floor));
-            }
+            f.disk.hold(lease.disk_hold_on(f.drone));
             *committed.entry(f.drone.id.as_str()).or_default() += spec.mem_mib;
         }
     }
@@ -2223,6 +2219,9 @@ fn allocate_inner(
     }
     out
 }
+
+mod disk;
+pub(crate) use disk::{DiskLedger, admissible_slots};
 
 #[cfg(test)]
 mod tests;

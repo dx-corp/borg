@@ -4,15 +4,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::allocator::{
-    ActiveLease, DroneState, LeaseState, Promotion, ServedAge, StandbyStarts, Unmet, free_room,
-    free_slots, max_slots,
+    ActiveLease, DiskLedger, DroneState, LeaseState, Promotion, ServedAge, StandbyStarts, Unmet,
+    admissible_slots, max_slots,
 };
 use crate::classes::{Class, Classes, Scope, disk_labels_mib};
 use crate::probe::Capacity;
 use crate::store::{LeaseRow, LeaseStatus};
 
 /// A lease row as the allocator sees it; its disk labels set its floor.
-pub(super) fn as_active(l: &LeaseRow) -> ActiveLease {
+pub(crate) fn as_active(l: &LeaseRow) -> ActiveLease {
     ActiveLease {
         drone_id: l.drone.clone(),
         class: l.class,
@@ -41,6 +41,54 @@ pub(super) fn as_placed(l: &LeaseRow, withheld: &HashMap<String, Vec<Class>>) ->
         a.state = LeaseState::Held;
     }
     a
+}
+
+/// Every active lease as placement sees it ([`as_placed`]), then the placed
+/// `units`. A pending lease not yet delivered is also held, covering no
+/// demand, while its drone's disk no longer admits it: the heartbeat asks the
+/// same ledger in the same order and keeps it back
+/// ([`DiskLedger::for_starts`]), so the job it was minted for goes elsewhere.
+/// Units not yet acknowledged are judged first, then leases oldest first,
+/// each against what the ones before it took.
+pub(super) fn placed(
+    active: &[LeaseRow],
+    withheld: &HashMap<String, Vec<Class>>,
+    drones: &[DroneState],
+    units: &[ActiveLease],
+) -> Vec<ActiveLease> {
+    let undelivered = |l: &LeaseRow| l.state == LeaseStatus::Pending && l.jit_config.is_some();
+    let mut placed: Vec<ActiveLease> = active.iter().map(|l| as_placed(l, withheld)).collect();
+    let started: Vec<ActiveLease> = active
+        .iter()
+        .filter(|l| !undelivered(l))
+        .map(as_active)
+        .chain(
+            units
+                .iter()
+                .filter(|u| u.state == LeaseState::Running)
+                .cloned(),
+        )
+        .collect();
+    for drone in drones {
+        let mut disk = DiskLedger::for_starts(drone, &started);
+        for unit in units
+            .iter()
+            .filter(|u| u.drone_id == drone.id && u.state != LeaseState::Running)
+        {
+            disk.take(unit.disk_need_on(drone));
+        }
+        let mut waiting: Vec<usize> = (0..active.len())
+            .filter(|&i| active[i].drone == drone.id && undelivered(&active[i]))
+            .collect();
+        waiting.sort_by_key(|&i| (active[i].created_at, &active[i].id));
+        for i in waiting {
+            if !disk.take(placed[i].disk_need_on(drone)) && placed[i].state == LeaseState::Pending {
+                placed[i].state = LeaseState::Held;
+            }
+        }
+    }
+    placed.extend(units.iter().cloned());
+    placed
 }
 
 /// The standby leases to start now: per promoted class, the oldest standby
@@ -176,11 +224,7 @@ pub(super) fn standbys_to_yield(
         *left.entry(u.class).or_default() += u.count;
     }
     let slots = |drone: &DroneState, held: &[ActiveLease], k: Class| {
-        if drone.disk_admits(held, k) {
-            free_slots(drone, &free_room(drone, held, classes), k, classes.spec(k))
-        } else {
-            0
-        }
+        admissible_slots(drone, held, k, classes)
     };
     let mut ended: Vec<(String, Class)> = Vec::new();
     for drone in drones.iter().filter(|d| d.trust.serves_deploy()) {
@@ -250,6 +294,7 @@ pub(super) fn less_freed(unmet: &[Unmet], freed: &[Class]) -> Vec<Unmet> {
 mod tests {
     use super::*;
     use crate::allocator::{LiveFacts, OWNED_COST_PERMILLE};
+    use crate::allocator::{free_room, free_slots};
     use crate::classes::{ClassSpec, Trust};
 
     fn classes() -> Classes {
@@ -286,6 +331,7 @@ mod tests {
             live: LiveFacts::default(),
             work_free_mib: None,
             disk_floor_mib: BTreeMap::new(),
+            disk_reserve_mib: BTreeMap::new(),
         }
     }
 
@@ -503,6 +549,98 @@ mod tests {
             &[unmet(Class::Light)],
             &classes()
         ));
+    }
+
+    /// borg-deploy-1 with `free_gib` free, the live floors and a 4 GiB
+    /// running reserve.
+    fn deploy_1_with_disk(free_gib: u64) -> DroneState {
+        let mut drone = deploy_1();
+        drone.work_free_mib = Some(free_gib * 1024);
+        drone.disk_floor_mib = [
+            (Class::Light, 10 * 1024),
+            (Class::Medium, 10 * 1024),
+            (Class::Heavy, 32 * 1024),
+        ]
+        .into();
+        drone.disk_reserve_mib = Class::ALL.into_iter().map(|c| (c, 4 * 1024)).collect();
+        drone
+    }
+
+    #[test]
+    fn a_standby_is_promoted_only_while_the_disk_admits_it_beside_running_work() {
+        // The running medium job keeps 4 GiB: at 35 GiB free the heavy
+        // standby has 31, under its 32 GiB floor; at 36 it starts.
+        let capacity = Capacity {
+            hostname: "h".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            kind: crate::probe::HostKind::Wsl,
+            vcpu: 8,
+            mem_mib: 30_045,
+            free_disk_mib: None,
+            docker_usable: true,
+            mise_version: None,
+            git_version: None,
+        };
+        let fresh = HashMap::from([("borg-deploy-1".to_owned(), capacity)]);
+        let active = vec![
+            row("m", Class::Medium, LeaseStatus::Running),
+            row("s", Class::Heavy, LeaseStatus::Standby),
+        ];
+        let held: Vec<ActiveLease> = active.iter().map(as_active).collect();
+        let promote = [Promotion {
+            class: Class::Heavy,
+            count: 1,
+        }];
+        let started = |free| {
+            promotions(
+                &promote,
+                &active,
+                &held,
+                &fresh,
+                &[deploy_1_with_disk(free)],
+            )
+        };
+        assert_eq!(started(35), BTreeSet::new());
+        assert_eq!(started(36), BTreeSet::from(["s".to_owned()]));
+    }
+
+    #[test]
+    fn an_undelivered_lease_the_disk_no_longer_admits_covers_no_demand() {
+        // Two light jobs run (8 GiB kept), one delivered light runner holds
+        // its 10 GiB, and two more wait for the heartbeat to hand them over.
+        // 40 GiB leaves 22 for both; 35 leaves 17, the older one only; 25
+        // leaves 7, neither. A lease already delivered is never held back.
+        let waiting = |id: &str, at: i64| LeaseRow {
+            jit_config: Some(crate::secret::Secret::new("jit")),
+            created_at: at,
+            ..row(id, Class::Light, LeaseStatus::Pending)
+        };
+        let active = vec![
+            row("r1", Class::Light, LeaseStatus::Running),
+            row("r2", Class::Light, LeaseStatus::Running),
+            waiting("newer", 2),
+            waiting("older", 1),
+            row("delivered", Class::Light, LeaseStatus::Pending),
+        ];
+        let states = |free| {
+            placed(&active, &HashMap::new(), &[deploy_1_with_disk(free)], &[])
+                .into_iter()
+                .map(|l| l.state)
+                .collect::<Vec<_>>()
+        };
+        use LeaseState::{Held, Pending, Running};
+        assert_eq!(states(40), [Running, Running, Pending, Pending, Pending]);
+        assert_eq!(states(35), [Running, Running, Held, Pending, Pending]);
+        assert_eq!(states(25), [Running, Running, Held, Held, Pending]);
+        // A unit placed and not yet acknowledged is handed over first.
+        let unit = ActiveLease {
+            state: Held,
+            ..ActiveLease::running("borg-deploy-1".into(), Class::Light, Scope::Pr)
+        };
+        let with_unit = placed(&active, &HashMap::new(), &[deploy_1_with_disk(35)], &[unit]);
+        assert_eq!(with_unit.len(), 6);
+        assert!(with_unit[2..4].iter().all(|l| l.state == Held));
     }
 
     #[test]

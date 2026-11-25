@@ -26,14 +26,13 @@ use time::OffsetDateTime;
 mod handoff;
 mod sanitize;
 mod serve;
-mod standby;
 mod wire;
 pub use serve::{RUNTIME_SHUTDOWN, SHUTDOWN_GRACE, block_on_bounded, serve, serve_with_grace};
 pub use wire::{LeaseGrant, ResultRequest};
 
 use crate::allocator::{
-    ActiveLease, AdmissionState, DroneState, HostCaps, Reservation, Unmet, free_room, free_slots,
-    max_slots,
+    ActiveLease, AdmissionState, DroneState, HostCaps, Reservation, Unmet, admissible_slots,
+    free_room, max_slots,
 };
 use crate::bid::{ClassPressure, DroneBid};
 use crate::classes::{Class, Scope, Trust};
@@ -656,10 +655,16 @@ async fn heartbeat(
     // No job reaches a drone inside its host-lost cool-down: not a new
     // lease, not a standby, not a lease minted before it went quiet.
     let grants = accepting && !store.drone_suspect(&drone, now).await?;
-    let approved = standby_rows
+    // Everything this heartbeat lets the drone start is charged to one disk
+    // ledger: standby starts, then units, then undelivered leases.
+    let host = handoff::Host::read(&queen, &drone, &req).await?;
+    let mut handoff = host.handoff();
+    let start_standby: Vec<String> = standby_rows
         .iter()
-        .filter(|l| grants && start.contains(&l.id) && !disk.classes[&l.class].blocked());
-    let start_standby = standby::within_caps(&queen, &drone, &req, approved).await?;
+        .filter(|l| grants && start.contains(&l.id) && !disk.classes[&l.class].blocked())
+        .filter(|l| handoff.standby(l))
+        .map(|l| l.id.clone())
+        .collect();
     let drop_standby: Vec<String> = req
         .held_standby
         .iter()
@@ -705,6 +710,7 @@ async fn heartbeat(
             .await?
             .into_iter()
             .filter(|u| accepting && !disk.classes[&u.class].blocked())
+            .filter(|u| handoff.unit(u.class))
             .map(|u| UnitGrant {
                 unit_id: u.id,
                 repo: u.repo,
@@ -721,13 +727,12 @@ async fn heartbeat(
     } else {
         (Vec::new(), Vec::new())
     };
-    let mut disk_left = req.capacity.free_disk_mib;
     let leases = store
         .undelivered(&drone)
         .await?
         .into_iter()
         .filter(|l| grants && !disk.classes[&l.class].blocked())
-        .filter(|l| handoff::fits(&mut disk_left, &l.labels))
+        .filter(|l| handoff.lease(l))
         .filter_map(|l| {
             Some(LeaseGrant {
                 lease_id: l.id,
@@ -1260,10 +1265,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
     let rows = queen.store().drones().await?;
     let active = queen.store().active_leases().await?;
 
-    let mut held: Vec<ActiveLease> = active
-        .iter()
-        .map(|l| ActiveLease::running(l.drone.clone(), l.class, l.scope))
-        .collect();
+    let mut held: Vec<ActiveLease> = active.iter().map(crate::queen::as_active).collect();
     // Placed work units hold capacity like running leases.
     if cfg.units.enabled {
         use crate::units::UnitState;
@@ -1297,6 +1299,7 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         let mut theoretical_here = BTreeMap::new();
         if let (true, Some(cap)) = (fresh, &d.capacity) {
             let mut state = d.allocator_state(cap, now);
+            state.set_disk_rule(&cfg.env_contract);
             state.accepting &= !disk.global.blocked();
             let mut blocked = blocked_classes(
                 &cfg.env_contract,
@@ -1313,7 +1316,9 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
                 let free = if state.blocked_classes.contains(&class) {
                     0
                 } else {
-                    free_slots(&state, &room, class, spec)
+                    // The room the allocator would place in: memory, vCPU
+                    // and caps, and no more than the disk admits.
+                    admissible_slots(&state, &held, class, &cfg.classes)
                 };
                 free_slots_here.insert(class, free);
                 theoretical_here.insert(

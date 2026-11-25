@@ -263,7 +263,15 @@ pub fn default_min_disk_free_bytes() -> u64 {
     DEFAULT_MIN_DISK_FREE_BYTES
 }
 
-/// A floor guards admission; it does not reserve space for active jobs.
+/// Work-filesystem space each running lease keeps reserved unless the config
+/// says otherwise. Jobs on one drone share its free space: sixteen running at
+/// once on a 200 GB burst drone filled it while each new one still found the
+/// 10 GiB floor free.
+pub const DEFAULT_RUNNING_RESERVE_BYTES: u64 = 4 << 30;
+
+/// A floor guards one start against the reading alone. The space jobs
+/// already running may still write is held by the allocator
+/// ([`ContractSettings::running_reserve_bytes_for`]), not here.
 /// Any known low filesystem blocks. Unknown measurements retain compatibility.
 pub fn disk_admission(
     minimum_free_bytes: u64,
@@ -399,6 +407,9 @@ pub fn merge_blocked_classes(
 pub struct ClassContract {
     /// Minimum free cache-directory space required to admit this class.
     pub min_cache_dir_free_bytes: Option<u64>,
+    /// Work-filesystem space a running lease of this class keeps reserved;
+    /// replaces the global value.
+    pub running_reserve_bytes: Option<u64>,
     /// Check modes overriding the global ones.
     pub checks: BTreeMap<CheckKind, Mode>,
     /// The Rust toolchain every build of this class needs.
@@ -422,6 +433,11 @@ pub struct ContractSettings {
     pub facts_max_age_secs: i64,
     pub allowed_wrappers: Vec<String>,
     pub min_cache_dir_free_bytes: u64,
+    /// Work-filesystem space every running lease keeps reserved for what its
+    /// job may still write: the allocator starts new work on a drone only
+    /// while its free space, less this per running lease, still holds the new
+    /// lease's floor. 0 reserves nothing.
+    pub running_reserve_bytes: u64,
     /// Cache errors per thousand requests above which the store fails.
     pub max_cache_error_pm: u32,
     /// A hit rate at or below this per thousand, after `min_requests_for_hit_rate`
@@ -449,6 +465,7 @@ impl Default for ContractSettings {
             facts_max_age_secs: 180,
             allowed_wrappers: vec!["sccache".into()],
             min_cache_dir_free_bytes: DEFAULT_MIN_DISK_FREE_BYTES,
+            running_reserve_bytes: DEFAULT_RUNNING_RESERVE_BYTES,
             max_cache_error_pm: 50,
             hit_rate_warn_pm: 10,
             min_requests_for_hit_rate: 200,
@@ -479,6 +496,24 @@ impl ContractSettings {
                 .and_then(|contract| contract.min_cache_dir_free_bytes)
                 .unwrap_or_default(),
         )
+    }
+
+    /// The work-filesystem space a running lease of `class` keeps reserved:
+    /// the class's own value when it sets one, else the global one.
+    pub fn running_reserve_bytes_for(&self, class: Class) -> u64 {
+        self.classes
+            .get(&class)
+            .and_then(|contract| contract.running_reserve_bytes)
+            .unwrap_or(self.running_reserve_bytes)
+    }
+
+    /// [`Self::running_reserve_bytes_for`] of every class, MiB, as the
+    /// allocator charges it.
+    pub fn running_reserve_mib(&self) -> BTreeMap<Class, u64> {
+        Class::ALL
+            .into_iter()
+            .map(|class| (class, self.running_reserve_bytes_for(class) >> 20))
+            .collect()
     }
 
     /// The free space reclaim keeps on a drone: the largest disk floor among
@@ -1074,6 +1109,37 @@ pub fn blocked_classes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_reserve_is_per_class_with_a_global_default() {
+        let defaults = ContractSettings::default();
+        for class in Class::ALL {
+            assert_eq!(
+                defaults.running_reserve_bytes_for(class),
+                DEFAULT_RUNNING_RESERVE_BYTES
+            );
+        }
+        let settings: ContractSettings = serde_json::from_value(serde_json::json!({
+            "running_reserve_bytes": 2u64 << 30,
+            "classes": {
+                "heavy": {"running_reserve_bytes": 16u64 << 30},
+                "light": {"running_reserve_bytes": 0}
+            }
+        }))
+        .expect("settings");
+        assert_eq!(settings.running_reserve_bytes_for(Class::Medium), 2 << 30);
+        assert_eq!(settings.running_reserve_bytes_for(Class::Heavy), 16 << 30);
+        // A class may reserve less than the global value, down to nothing.
+        assert_eq!(settings.running_reserve_bytes_for(Class::Light), 0);
+        assert_eq!(
+            settings.running_reserve_mib(),
+            BTreeMap::from([
+                (Class::Light, 0),
+                (Class::Medium, 2 << 10),
+                (Class::Heavy, 16 << 10)
+            ])
+        );
+    }
 
     #[test]
     fn disk_admission_blocks_either_known_low_mount_and_keeps_unknown_explicit() {
