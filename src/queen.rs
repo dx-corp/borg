@@ -773,11 +773,7 @@ impl Queen {
                     d.env_facts.as_ref(),
                     now_ts,
                 );
-                state.disk_floor_mib = disk
-                    .classes
-                    .iter()
-                    .map(|(&c, a)| (c, a.minimum_free_bytes >> 20))
-                    .collect();
+                state.set_disk_rule(&self.cfg.env_contract);
                 state.accepting &= !disk.global.blocked();
                 state.accepting &= !cordoned.contains(&d.name);
                 withheld.insert(
@@ -844,11 +840,7 @@ impl Queen {
             tracing::warn!("unit pass failed: {e}");
         }
         let unit_leases = self.unit_leases().await;
-        let leases = active
-            .iter()
-            .map(|l| as_placed(l, &withheld))
-            .chain(unit_leases.iter().cloned())
-            .collect::<Vec<ActiveLease>>();
+        let leases = placed(&active, &withheld, &drones, &unit_leases);
         let schedule_floors = self
             .cfg
             .warm_schedule
@@ -910,11 +902,12 @@ impl Queen {
             spent_bids.extend(units.leases);
             // Re-read persisted placements; units hold capacity without
             // offsetting runner demand.
-            placement_leases = active
-                .iter()
-                .map(|l| as_placed(l, &withheld))
-                .chain(self.unit_leases().await)
-                .collect();
+            placement_leases = placed(
+                &active,
+                &withheld,
+                &placement_drones,
+                &self.unit_leases().await,
+            );
             runner_input.leases = placement_leases.clone();
             runner_input
                 .leases
@@ -1007,11 +1000,7 @@ impl Queen {
             tracing::warn!("unit placement failed: {e}");
         }
         let unit_leases = self.unit_leases().await;
-        placement_leases = active
-            .iter()
-            .map(|l| as_placed(l, &withheld))
-            .chain(unit_leases.iter().cloned())
-            .collect();
+        placement_leases = placed(&active, &withheld, &placement_drones, &unit_leases);
         // Demand that idle non-borg runners will take is not borg's to wake
         // hosts for.
         let unmet_placeable = placeable_unmet(&allocation.unmet, &statics, &self.cfg.classes);
@@ -2987,9 +2976,8 @@ mod rollout_pass;
 #[cfg(test)]
 use admission::pressure_window_mean;
 pub use build::QueenBuild;
-use coverage::{
-    as_active, as_placed, less_freed, promotions, served_ages, standby_hosts, standbys_to_yield,
-};
+pub(crate) use coverage::as_active;
+use coverage::{less_freed, placed, promotions, served_ages, standby_hosts, standbys_to_yield};
 use families::{families_by_class, placement_profiles};
 pub use pinned::jit_labels;
 

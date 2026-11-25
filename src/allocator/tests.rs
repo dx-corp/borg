@@ -1,6 +1,7 @@
 use super::*;
 
 mod deploy_turns;
+mod disk_reserve;
 
 /// 28 GiB host with 16 vCPU and Docker, already net of the OS reserve.
 fn host(id: &str) -> DroneState {
@@ -22,6 +23,7 @@ fn host(id: &str) -> DroneState {
         live: LiveFacts::default(),
         work_free_mib: None,
         disk_floor_mib: BTreeMap::new(),
+        disk_reserve_mib: BTreeMap::new(),
     }
 }
 
@@ -1016,42 +1018,16 @@ fn never_over_grants_across_a_demand_sweep() {
     let drones = vec![
         host("a"),
         DroneState {
-            id: "b".into(),
             vcpu: 4,
             mem_mib: 8 * 1024,
             docker: false,
-            accepting: true,
             max_leases: Some(2),
-            class_caps: BTreeMap::new(),
-            bids: vec![],
-            profiles: vec![],
-            blocked_classes: vec![],
-            cpu_psi_pm: None,
-            cpu_load_pm: None,
-            trust: Trust::Shared,
-            cost_permille: OWNED_COST_PERMILLE,
-            live: LiveFacts::default(),
-            work_free_mib: None,
-            disk_floor_mib: BTreeMap::new(),
+            ..host("b")
         },
         DroneState {
-            id: "c".into(),
             vcpu: 8,
             mem_mib: 14 * 1024,
-            docker: true,
-            accepting: true,
-            max_leases: None,
-            class_caps: BTreeMap::new(),
-            bids: vec![],
-            profiles: vec![],
-            blocked_classes: vec![],
-            cpu_psi_pm: None,
-            cpu_load_pm: None,
-            trust: Trust::Shared,
-            cost_permille: OWNED_COST_PERMILLE,
-            live: LiveFacts::default(),
-            work_free_mib: None,
-            disk_floor_mib: BTreeMap::new(),
+            ..host("c")
         },
     ];
     for lm in 0..3 {

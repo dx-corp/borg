@@ -490,6 +490,128 @@ async fn disk_floor_blocks_new_delivery_and_placement_with_contract_off_but_keep
     assert_eq!(h.state().mints.len(), 2, "recovery restores admission");
 }
 
+/// A heartbeat capacity with `free_gib` free on the work filesystem.
+fn capacity_with_free(free_gib: u64) -> Value {
+    let mut capacity = serde_json::to_value(support::capacity()).unwrap();
+    capacity["free_disk_mib"] = json!(free_gib * 1024);
+    capacity
+}
+
+/// Four light jobs start on one drone with 60 GiB free and write half of it;
+/// two more are then queued. Returns the runners minted in total.
+async fn mints_beside_four_running_jobs(config: Value) -> usize {
+    let h = Harness::start(config).await;
+    let token = h.enroll("shared").await;
+    h.heartbeat_with(&token, json!({"capacity": capacity_with_free(60)}))
+        .await;
+    for id in 0..4 {
+        h.queue_job(600 + id, "borg-ci-light-pr", 1);
+    }
+    h.tick().await;
+    assert_eq!(h.state().mints.len(), 4, "four 10 GiB floors fit 60 GiB");
+    h.set_runner("borg-shared-", "online", true);
+    h.state().jobs.clear();
+    h.tick().await;
+    assert_eq!(h.status().await["classes"]["light"]["leases_running"], 4);
+
+    h.heartbeat_with(&token, json!({"capacity": capacity_with_free(30)}))
+        .await;
+    h.queue_job(610, "borg-ci-light-pr", 1);
+    h.queue_job(611, "borg-ci-light-pr", 1);
+    h.tick().await;
+    let minted = h.state().mints.len();
+
+    // Once the running jobs end, the same reading admits the waiting job.
+    h.state().runners.retain(|r| r["busy"] != json!(true));
+    h.tick().await;
+    h.tick().await;
+    assert_eq!(
+        h.state().mints.len(),
+        6,
+        "finished jobs release their reserve"
+    );
+    minted
+}
+
+#[tokio::test]
+async fn running_jobs_keep_a_disk_reserve_so_new_starts_do_not_fill_a_shared_disk() {
+    // By default each running lease keeps 4 GiB: 30 GiB less 16 holds one
+    // more 10 GiB floor, not the three the reading alone would promise.
+    assert_eq!(mints_beside_four_running_jobs(json!({})).await, 5);
+    // A class's own value replaces the global one.
+    assert_eq!(
+        mints_beside_four_running_jobs(json!({"env_contract": {
+            "classes": {"light": {"running_reserve_bytes": 6u64 << 30}}
+        }}))
+        .await,
+        4
+    );
+    // Reserving nothing is the old rule: the reading alone admits both.
+    assert_eq!(
+        mints_beside_four_running_jobs(json!({"env_contract": {"running_reserve_bytes": 0}})).await,
+        6
+    );
+}
+
+#[tokio::test]
+async fn a_heartbeat_and_status_judge_disk_with_the_reserves_of_running_jobs() {
+    let h = Harness::start(json!({})).await;
+    let token = h.enroll("shared").await;
+    let beat = |free_gib: u64, active: Vec<String>| json!({"capacity": capacity_with_free(free_gib), "active_leases": active});
+    h.heartbeat_with(&token, beat(60, vec![])).await;
+    for id in 0..4 {
+        h.queue_job(620 + id, "borg-ci-light-pr", 1);
+    }
+    h.tick().await;
+    let handed = h.heartbeat_with(&token, beat(60, vec![])).await;
+    let running: Vec<String> = handed["leases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["lease_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(running.len(), 4);
+    h.set_runner("borg-shared-", "online", true);
+    h.state().jobs.clear();
+    h.heartbeat_with(&token, beat(30, running.clone())).await;
+    h.tick().await;
+
+    // `/status` counts the room placement would use: memory and vCPU hold
+    // four more light leases, the disk one (30 GiB less 16 reserved).
+    let status = h.status().await;
+    assert_eq!(drone(&status, "shared")["free_slots"]["light"], 1);
+    assert_eq!(status["classes"]["light"]["free_slots"], 1);
+
+    // A fifth runner is minted against 30 GiB. Before it is handed over the
+    // reading falls to 15: under the 16 GiB the running jobs keep, so the
+    // heartbeat keeps it back though 15 clears the 10 GiB floor alone.
+    h.queue_job(630, "borg-ci-light-pr", 1);
+    h.tick().await;
+    assert_eq!(h.state().mints.len(), 5);
+    let low = h.heartbeat_with(&token, beat(15, running.clone())).await;
+    assert!(low["leases"].as_array().unwrap().is_empty(), "{low}");
+    assert!(low["cancel_leases"].as_array().unwrap().is_empty());
+
+    // The runner kept back covers no demand: the job goes to another drone.
+    let other = h.enroll("other").await;
+    h.heartbeat_with(&other, json!({})).await;
+    h.tick().await;
+    let mints = h.state().mints.clone();
+    assert_eq!(mints.len(), 6, "the waiting job is placed elsewhere");
+    assert!(
+        mints[5]["name"]
+            .as_str()
+            .unwrap()
+            .starts_with("borg-other-"),
+        "{}",
+        mints[5]
+    );
+
+    // With the reading back, the same runner is handed over.
+    let back = h.heartbeat_with(&token, beat(30, running)).await;
+    assert_eq!(back["leases"].as_array().unwrap().len(), 1, "{back}");
+}
+
 #[tokio::test]
 async fn reclaim_floor_is_the_disk_floor_of_the_largest_class_the_drone_hosts() {
     let h = Harness::start(json!({"env_contract": {

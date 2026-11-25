@@ -642,6 +642,16 @@ admission floor. CI slot tool homes
 cargo targets and worktrees; one is busy while the drone runs any lease, because
 tools execute from it without holding a file open.
 
+Reclaim cannot free the cache slot of a lease slot in use, so on a drone
+whose slots are all busy it frees nothing while those jobs keep writing. The
+queen covers that case at admission: every running lease keeps a running
+reserve of the work filesystem (`env_contract.running_reserve_bytes`, 4 GiB by
+default, or `env_contract.classes.<class>.running_reserve_bytes`), and new work
+starts on a drone only while its free space less those reserves still holds
+the new lease's floor (`docs/operations/borg.md`, rejection `disk` in
+`/explain`). The drone's own floor and what reclaim keeps free do not include
+the reserve.
+
 **Build-cache slots** (`cache_slot`, the same tier). Jobs keep their retained
 build output under a namespace of `cache_root` they name themselves:
 `platform-ci.yml` writes `mono-ci/slots/<sha256(RUNNER_TOOL_CACHE)>/cargo-target/<week>`

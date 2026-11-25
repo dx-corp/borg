@@ -121,11 +121,13 @@ fn frees_room_for(
         .map(|(_, l)| l.clone())
         .collect();
     let room = free_room(drone, &rest, input.classes);
-    // A running victim's writes are already in the free reading, so ending
-    // it frees no promised disk: a disk shortage is never cancelled away.
+    // Disk is judged with the victim still counted. Ending it returns none
+    // of what it wrote, and its running reserve is an estimate of writes to
+    // come, not space in hand: a disk shortage is never cancelled away.
+    let all: Vec<ActiveLease> = held.iter().map(|(_, l)| l.clone()).collect();
     !drone.blocked_classes.contains(&class)
         && free_slots(drone, &room, class, input.classes.spec(class)) > 0
-        && drone.disk_admits(&rest, class)
+        && drone.disk_admits(&all, class)
 }
 
 /// Up to `max_per_pass` leases to cancel. Deterministic.
@@ -259,6 +261,7 @@ mod tests {
             live: crate::allocator::LiveFacts::default(),
             work_free_mib: None,
             disk_floor_mib: std::collections::BTreeMap::new(),
+            disk_reserve_mib: std::collections::BTreeMap::new(),
         }
     }
 
@@ -368,7 +371,13 @@ mod tests {
         let demand = starving(&[MEDIUM_MAIN], 600);
         assert!(pick(&settings(), &[d.clone()], &running, &demand).is_empty());
         d.work_free_mib = Some(20 * 1024);
-        assert_eq!(pick(&settings(), &[d], &running, &demand), ["a"]);
+        assert_eq!(pick(&settings(), &[d.clone()], &running, &demand), ["a"]);
+        // The victim's running reserve is not space in hand either: with
+        // 12 GiB free and 4 GiB reserved, 8 GiB is under the floor whether
+        // or not the lease is cancelled.
+        d.work_free_mib = Some(12 * 1024);
+        d.disk_reserve_mib = [(Class::Medium, 4 * 1024)].into_iter().collect();
+        assert!(pick(&settings(), &[d], &running, &demand).is_empty());
     }
 
     #[test]
