@@ -615,8 +615,8 @@ What `drone::reclaim` guarantees, because the policy relies on it. Every probe
 and deletion runs as the directory's owner (`setpriv`) under `timeout`, with
 global git config ignored and no optional git locks, so a probe never rewrites
 an index or leaves files owned by someone else. `probe` reports **busy** if a
-process of that owner has its working directory or an open file inside the
-path (`/proc/*/cwd` and `fd`); **dirty** if `git status --porcelain` is
+process of that owner has its working directory, its executable or an open
+file inside the path (`/proc/*/cwd`, `exe` and `fd`); **dirty** if `git status --porcelain` is
 non-empty, untracked files included; **unpushed** if `git rev-list HEAD --not
 --remotes` is non-empty; **protected** for a main checkout (git dir equals the
 common dir) or a locked worktree; **not_git** when the path is not the top of a
@@ -642,9 +642,9 @@ admission floor. CI slot tool homes
 cargo targets and worktrees; one is busy while the drone runs any lease, because
 tools execute from it without holding a file open.
 
-Reclaim cannot free the cache slot of a lease slot in use, so on a drone
-whose slots are all busy it frees nothing while those jobs keep writing. The
-queen covers that case at admission: every running lease keeps a running
+Reclaim cannot free the cache slot of a lease slot in use. It can free the
+cargo targets inside it that no process uses once they reach the mode's age
+(below). What a running job still writes, the queen covers at admission: every running lease keeps a running
 reserve of the work filesystem (`env_contract.running_reserve_bytes`, 4 GiB by
 default, or `env_contract.classes.<class>.running_reserve_bytes`), and new work
 starts on a drone only while its free space less those reserves still holds
@@ -665,7 +665,23 @@ holds (`drone::reclaim::cache_slot_key`) and touches `.borg-last-used` in it
 when the lease starts and ends: that stamp is the slot's last use (with no
 stamp, the newest file inside). A slot of a lease slot in use is **busy**, and
 so is anything inside it, whether or not a process has a file open there at
-that instant. Eviction is least recently used first: under pressure a slot is
+that instant, except its past weeks' cargo targets (`cargo-target/<week>[-<job>]`).
+A job writes only the generation of the week it runs in, so this week's stays
+busy with the slot (and last week's for the first day of a week, for a job that
+started before the week turned): the cached nextest runner builds, checks its
+result records and then runs the recorded binaries, with no process inside the
+target between those steps. An older generation is busy only while a process
+uses it, and otherwise goes by the `cargo_target` ages (6 h under pressure,
+1 h when critical, 7 days in hygiene). What it frees counts against the cache
+cap in the same cycle, so the cap pass does not evict another slot for bytes
+already gone.
+Heavy leases reuse a drone's lowest slots, so on a drone that never idles,
+such as a burst drone, those slots are always held, and before this every
+heavy job's target piled up in them: `gcp-burst-q1c8ac8f` reached 98% on
+2026-11-27, reclaim found nothing it could free, and `merge-gate` failed with
+"No space left on device". With the default roots, each cycle also picks up
+cache namespaces created since the drone started: a fresh burst drone has an
+empty cache root until its first `merge-gate` job creates `mono-ci/slots`. Eviction is least recently used first: under pressure a slot is
 eligible after `critical_min_age_secs` (1 h, not the 6 h other kinds wait),
 and when critical at any age, until free space is back at twice the floor, so
 the disk does not fill while admission still works. A heartbeat that finds

@@ -115,13 +115,13 @@ fn default_roots(
 /// (`platform-ci.yml` writes under `$BORG_CACHE_ROOT/mono-ci`, publish under
 /// `mono-publish`): every directory under `cache_root` that is not one of
 /// the drone's own managed cache kinds or its git mirrors.
-fn namespace_roots(cfg: &DroneConfig) -> Vec<PathBuf> {
+fn namespace_roots(cache_root: &Path) -> Vec<PathBuf> {
     let managed: BTreeSet<&str> = crate::drone::caches::kinds::Kind::ALL
         .iter()
         .map(|k| k.name())
         .chain(std::iter::once("git"))
         .collect();
-    let mut out: Vec<PathBuf> = std::fs::read_dir(&cfg.cache_root)
+    let mut out: Vec<PathBuf> = std::fs::read_dir(cache_root)
         .map(|it| {
             it.filter_map(Result::ok)
                 .filter(|e| e.path().is_dir())
@@ -220,6 +220,51 @@ fn slot_key_of(path: &Path) -> Option<String> {
     slot_containing(path).and_then(|s| s.file_name().map(|n| n.to_string_lossy().into_owned()))
 }
 
+/// Whether `c` is a cargo target directory (or its `incremental/`) strictly
+/// inside a CI cache slot, of a past week's generation, at unix time `now`.
+/// Holding the slot does not make such a target busy: a job writes only
+/// `cargo-target/<ISO week>[-suffix]` for the week it runs in
+/// (`platform-ci.yml`, `pr-gates.yml`, `retained_target`), so an older
+/// generation is never one the slot's job will run binaries from.
+///
+/// The current week's generation stays busy with its slot, process or not:
+/// the cached nextest runner builds, checks its result records, then runs
+/// the recorded binaries, and between those steps no process holds the
+/// target open. So does the previous week's for the first day of a week,
+/// for a job that started before the week turned.
+fn held_slot_target(c: &Candidate, now: i64) -> bool {
+    if !matches!(c.kind, Kind::CargoTarget | Kind::CargoIncremental) {
+        return false;
+    }
+    let Some(slot) = slot_containing(&c.path).filter(|slot| *slot != c.path) else {
+        return false;
+    };
+    let Some(generation) = c
+        .path
+        .strip_prefix(slot.join("cargo-target"))
+        .ok()
+        .and_then(|rest| rest.components().next())
+        .map(|g| g.as_os_str().to_string_lossy().into_owned())
+    else {
+        return false;
+    };
+    let week_of = |t: i64| {
+        time::OffsetDateTime::from_unix_timestamp(t).ok().map(|d| {
+            let (year, week, _) = d.date().to_iso_week_date();
+            format!("{year}-W{week:02}")
+        })
+    };
+    let in_use = [week_of(now), week_of(now.saturating_sub(24 * 3600))];
+    // An unreadable clock keeps every generation.
+    if in_use.iter().any(Option::is_none) {
+        return false;
+    }
+    !in_use
+        .iter()
+        .flatten()
+        .any(|week| generation == *week || generation.starts_with(&format!("{week}-")))
+}
+
 /// Name of the file a drone touches in a slot when a lease that holds it
 /// starts and ends; its modification time is the slot's last use
 /// (`NEWEST_SLOT` reads it by the same name).
@@ -228,8 +273,8 @@ const SLOT_USE_STAMP: &str = ".borg-last-used";
 /// `<cache_root>/<namespace>/slots` directories: the per-job CI cache slots
 /// whose `cargo-target/<week>` directories reclaim may remove. Namespaces are
 /// stable, so new slots under them are found on every scan.
-fn ci_slot_roots(cfg: &DroneConfig) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = std::fs::read_dir(&cfg.cache_root)
+fn ci_slot_roots(cache_root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(cache_root)
         .map(|it| {
             it.filter_map(Result::ok)
                 .map(|e| e.path().join("slots"))
@@ -483,8 +528,10 @@ const DIAG_OLDEST: &str = r#"find "$1" -type f -printf '%T@\n' 2>/dev/null | sor
 /// Per-slot tool homes: `<slots>/<slot>/mise-home`.
 const LIST_CACHE_DIRS: &str = r#"find "$1" -mindepth 2 -maxdepth 2 -type d -name mise-home -printf '%p\n' 2>/dev/null; echo .done"#;
 const LIST_INCREMENTAL: &str = r#"find "$1" -mindepth 2 -maxdepth 3 -type d -name incremental -prune -printf '%p\n' 2>/dev/null; echo .done"#;
-/// Every cwd and open file of the processes the caller may inspect.
-const OPEN_PATHS: &str = r#"find /proc -mindepth 2 -maxdepth 3 \( -path '/proc/[0-9]*/cwd' -o -path '/proc/[0-9]*/fd/*' \) -printf '%l\n' 2>/dev/null; echo .done"#;
+/// Every cwd, executable and open file of the processes the caller may
+/// inspect. The executable counts because a test binary a job runs from a
+/// cargo target directory holds no file open there.
+const OPEN_PATHS: &str = r#"find /proc -mindepth 2 -maxdepth 3 \( -path '/proc/[0-9]*/cwd' -o -path '/proc/[0-9]*/exe' -o -path '/proc/[0-9]*/fd/*' \) -printf '%l\n' 2>/dev/null; echo .done"#;
 
 fn listed(out: &str) -> Result<Vec<PathBuf>, String> {
     let mut lines: Vec<&str> = out.lines().collect();
@@ -837,6 +884,15 @@ impl ReclaimHost for LiveHost<'_> {
         }
         match self.in_held_slot(&c.path) {
             Ok(false) => {}
+            // A past week's cargo target inside a held slot is busy only
+            // while a process uses it (the scan below); its age does the
+            // rest. The current week's stays busy with the slot.
+            // Heavy leases reuse a drone's lowest slots, so on a drone that
+            // never idles those slots are always held, and every heavy job's
+            // target piled up in them until the disk filled
+            // (gcp-burst-q1c8ac8f, 2026-11-27: 98%, merge-gate failed with
+            // "No space left on device", reclaim found nothing to free).
+            Ok(true) if held_slot_target(c, time::OffsetDateTime::now_utc().unix_timestamp()) => {}
             Ok(true) => {
                 s.busy = true;
                 return s;
@@ -916,6 +972,11 @@ impl ReclaimHost for LiveHost<'_> {
         }
         if let Ok(mut m) = self.sizes.lock() {
             m.remove(&c.path);
+            // The enclosing slot's cached size is keyed by its lease-use
+            // stamp, which removing a target inside it does not move.
+            if let Some(slot) = &c.within {
+                m.remove(slot);
+            }
         }
         Ok(c.size_bytes)
     }
@@ -1026,8 +1087,8 @@ impl Reclaimer {
             // build directories from the drone itself.
             let mut roots = default_roots(
                 &host_homes(cfg),
-                &ci_slot_roots(cfg),
-                &namespace_roots(cfg),
+                &ci_slot_roots(&cfg.cache_root),
+                &namespace_roots(&cfg.cache_root),
                 |p| cmd.sh(p, PROBE_SECS, r#"test -d "$1""#).is_ok(),
             );
             // Static GitHub runners sharing the host (internal-runner-burst-01
@@ -1128,11 +1189,37 @@ impl Reclaimer {
         Some(out)
     }
 
+    /// The roots this cycle scans. With the default roots, the cache
+    /// namespaces jobs created since startup are added: a fresh burst drone
+    /// starts with an empty cache root, and `merge-gate` creates
+    /// `mono-ci/slots` on its first job, so roots read once at startup would
+    /// never cover the slots that fill its disk.
+    fn cycle_roots(&self) -> Vec<Root> {
+        let mut roots = self.roots.clone();
+        if !self.settings.roots.is_empty() {
+            return roots;
+        }
+        for r in default_roots(
+            &[],
+            &ci_slot_roots(&self.cache_root),
+            &namespace_roots(&self.cache_root),
+            |p| self.cmd.sh(p, PROBE_SECS, r#"test -d "$1""#).is_ok(),
+        ) {
+            if !roots
+                .iter()
+                .any(|have| have.path == r.path && have.kind == r.kind)
+            {
+                roots.push(r);
+            }
+        }
+        roots
+    }
+
     /// One reclaim run over every filesystem the roots live on.
     fn run_once(&self) {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let mut groups: BTreeMap<String, (PathBuf, Vec<Root>)> = BTreeMap::new();
-        for r in &self.roots {
+        for r in &self.cycle_roots() {
             match self.cmd.disk(&r.path) {
                 Ok((_, mount)) => groups
                     .entry(mount)
@@ -1364,6 +1451,64 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn only_past_week_cargo_targets_strictly_inside_a_slot_skip_the_held_slot_rule() {
+        let c = |path: &str, kind: Kind| Candidate {
+            path: PathBuf::from(path),
+            kind,
+            size_bytes: 1,
+            idle_secs: 0,
+            within: None,
+            cache: None,
+        };
+        let slot = "/c/mono-ci/slots/abc";
+        let target = |generation: &str| {
+            c(
+                &format!("{slot}/cargo-target/{generation}"),
+                Kind::CargoTarget,
+            )
+        };
+        // Friday 2026-11-27 12:00 UTC, ISO week 2026-W48.
+        let friday = 1795780800;
+        // The week the slot's job writes stays with the held slot.
+        assert!(!held_slot_target(&target("2026-W48"), friday));
+        assert!(!held_slot_target(&target("2026-W48-merge-gate"), friday));
+        assert!(!held_slot_target(
+            &c(
+                &format!("{slot}/cargo-target/2026-W48/debug/incremental"),
+                Kind::CargoIncremental
+            ),
+            friday
+        ));
+        // Past generations no job writes or runs from.
+        assert!(held_slot_target(&target("2026-W47"), friday));
+        assert!(held_slot_target(&target("2026-W46-merge-gate"), friday));
+        assert!(held_slot_target(
+            &c(
+                &format!("{slot}/cargo-target/2026-W45/debug/incremental"),
+                Kind::CargoIncremental
+            ),
+            friday
+        ));
+        // Monday 01:00 UTC (W49): last week's job may still be running.
+        assert!(!held_slot_target(
+            &target("2026-W48-merge-gate"),
+            1796000400
+        ));
+        // Tuesday: it is past.
+        assert!(held_slot_target(&target("2026-W48-merge-gate"), 1796126400));
+        // Not a slot's cargo target.
+        assert!(!held_slot_target(&c(slot, Kind::CacheSlot), friday));
+        assert!(!held_slot_target(
+            &c(&format!("{slot}/mise-home"), Kind::CacheDir),
+            friday
+        ));
+        assert!(!held_slot_target(
+            &c("/home/dev/target", Kind::CargoTarget),
+            friday
+        ));
     }
 
     /// The key `platform-ci.yml` derives from `RUNNER_TOOL_CACHE`
@@ -1759,7 +1904,8 @@ mod tests {
     }
 
     /// A lease that starts while a long scan is paused owns its slot by the
-    /// immediate pre-delete probe, even with no process inside the slot.
+    /// immediate pre-delete probe, even with no process inside the slot. A
+    /// cargo target inside that slot is busy only while a process uses it.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_slot_guard_acquired_after_scan_is_busy_at_the_predelete_probe() {
@@ -1819,7 +1965,58 @@ mod tests {
             within: None,
             cache: None,
         };
-        assert!(host.probe(&target).busy);
+        // The held slot's cargo target is busy only while a process uses it.
+        let target_probe = host.probe(&target);
+        assert!(
+            !target_probe.busy && target_probe.unknown.is_none(),
+            "{target_probe:?}"
+        );
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "test: a process whose cwd is inside the target"
+        )]
+        let mut user = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(slot.join("cargo-target/2026-W46"))
+            .spawn()
+            .unwrap();
+        let in_use = host.probe(&target);
+        user.kill().unwrap();
+        user.wait().unwrap();
+        assert!(in_use.busy, "{in_use:?}");
+        // So is one a process runs its executable from (a test binary).
+        // Keep the name `sleep`: a multi-call coreutils (uutils, Ubuntu
+        // 26.04) picks the program from the executable's file name.
+        let bin = slot.join("cargo-target/2026-W46/debug/deps");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("sleep");
+        std::fs::copy("/bin/sleep", &exe).unwrap();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "test: a process whose executable is inside the target"
+        )]
+        let mut test_bin = std::process::Command::new(&exe)
+            .arg("30")
+            .current_dir(&other)
+            .spawn()
+            .unwrap();
+        let running = host.probe(&target);
+        test_bin.kill().unwrap();
+        test_bin.wait().unwrap();
+        assert!(running.busy, "{running:?}");
+        // This week's target is the one the slot's job builds and runs
+        // from, between steps with no process inside it: busy with the slot.
+        let (year, week, _) = time::OffsetDateTime::now_utc().date().to_iso_week_date();
+        let current = Candidate {
+            path: slot.join(format!("cargo-target/{year}-W{week:02}-merge-gate")),
+            ..target.clone()
+        };
+        std::fs::create_dir_all(&current.path).unwrap();
+        assert!(host.probe(&current).busy);
+        drop(pause);
+        leases.lock().unwrap().clear();
+        let released = host.probe(&current);
+        assert!(!released.busy && released.unknown.is_none(), "{released:?}");
         let free = host.probe(unrelated);
         assert!(!free.busy && free.unknown.is_none(), "{free:?}");
     }
