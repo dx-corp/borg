@@ -106,6 +106,17 @@ pub struct JanitorSettings {
     /// red publish run was cancelled before its catch-up re-dispatch ran).
     #[serde(default)]
     pub(crate) superseded_push_workflows: Vec<String>,
+    /// Delivery workflows (image publication, releases), by file path or
+    /// name, whose push runs on `superseded_push_branches` are cancelled when
+    /// a newer run of the same workflow on the branch is queued or running,
+    /// but only while none of their jobs has started. A started delivery run
+    /// is never cancelled here, whatever `cancel_running` says: its
+    /// supersession and catch-up jobs run only if it is left to finish
+    /// (2026-11-09). List a workflow only when its newest run covers what an
+    /// older one would publish (for publish.yml: images selected by a missing
+    /// registry closure tag, Maestro included since #26522).
+    #[serde(default)]
+    pub(crate) superseded_unstarted_workflows: Vec<String>,
     /// Jobs of those workflows, by name (a parenthesized matrix or display
     /// suffix also matches: `full-rust-test-shard` covers
     /// `full-rust-test-shard (platform-api)`), that attest closure verdicts

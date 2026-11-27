@@ -3,7 +3,10 @@
 //! were closed or merged (any workflow once a pull-request read credential is
 //! configured; `closed_pr_workflows` without one), and queued push runs on
 //! listed branches that a newer run of the same workflow supersedes
-//! (`superseded_push_branches`). A superseded push run that already started
+//! (`superseded_push_branches`). Delivery workflows listed in
+//! `superseded_unstarted_workflows` are superseded the same way but only
+//! while no job of theirs has started: a running publish or release is
+//! never cancelled. A superseded push run that already started
 //! (one of its jobs is running or has concluded, even while GitHub still
 //! reports the run `queued` because every other job waits for a runner) is
 //! the batch verdict for every push since the previous one; it is cancelled
@@ -542,6 +545,26 @@ impl Janitor {
         let mut runs = self.list_runs(repo, "queued", event).await?;
         if st.cancel_running || st.dedupe_same_sha {
             runs.extend(self.list_runs(repo, "in_progress", event).await?);
+        } else if !st.superseded_unstarted_workflows.is_empty()
+            && !st.superseded_push_branches.is_empty()
+        {
+            // A running delivery run is never cancelled, but it is the newer
+            // run an unstarted one is superseded by: without it a queued run
+            // whose only successor has already started is kept. Only matching
+            // delivery push runs are added, so no other rule sees running runs
+            // it would not have listed.
+            runs.extend(
+                self.list_runs(repo, "in_progress", event)
+                    .await?
+                    .into_iter()
+                    .filter(|r| {
+                        r.event == "push"
+                            && r.head_branch
+                                .as_ref()
+                                .is_some_and(|b| st.superseded_push_branches.contains(b))
+                            && listed(&st.superseded_unstarted_workflows, r)
+                    }),
+            );
         }
         if !st.superseded_push_branches.is_empty() {
             // A push run waiting for its concurrency group is `pending`, not
@@ -641,11 +664,13 @@ impl Janitor {
                 .await;
             tally(report, budget, repo, run.id, kind, outcome);
         }
-        for (run, newer) in superseded_pushes(
-            &runs,
-            &st.superseded_push_branches,
-            &st.superseded_push_workflows,
-        ) {
+        let mut push_workflows = st.superseded_push_workflows.clone();
+        if !push_workflows.is_empty() {
+            push_workflows.extend(st.superseded_unstarted_workflows.iter().cloned());
+        }
+        for (run, newer) in superseded_pushes(&runs, &st.superseded_push_branches, &push_workflows)
+        {
+            let unstarted_only = listed(&st.superseded_unstarted_workflows, run);
             report.superseded_push += 1;
             stale.insert(run.id);
             if *budget == 0 {
@@ -660,7 +685,8 @@ impl Janitor {
                     continue;
                 }
             };
-            let Some((mut why, kind)) = superseded_push_action(run, newer, jobs, st.cancel_running)
+            let Some((mut why, kind)) =
+                push_action(run, newer, jobs, st.cancel_running, unstarted_only)
             else {
                 report.started_push += 1;
                 continue;
@@ -681,7 +707,7 @@ impl Janitor {
                 }
             }
             let outcome = self
-                .cancel_if_unchanged(repo, run, &why, self.settings.dry_run)
+                .cancel_checked(repo, run, &why, self.settings.dry_run, unstarted_only)
                 .await;
             tally(report, budget, repo, run.id, kind, outcome);
         }
@@ -916,6 +942,23 @@ impl Janitor {
         why: &str,
         dry_run: bool,
     ) -> Result<Outcome, GithubError> {
+        self.cancel_checked(repo, run, why, dry_run, false).await
+    }
+
+    /// [`Self::cancel_if_unchanged`]; with `unstarted_only` (a delivery run)
+    /// the run's jobs are read once more after the run itself, and a job that
+    /// started since the first read keeps the run (`Raced`). A run can stay
+    /// `queued` while a job starts, so the run fields alone miss it. The
+    /// cancel request is still a separate call: this narrows the window to
+    /// the time between this read and GitHub processing the cancel.
+    async fn cancel_checked(
+        &self,
+        repo: &str,
+        run: &Run,
+        why: &str,
+        dry_run: bool,
+        unstarted_only: bool,
+    ) -> Result<Outcome, GithubError> {
         let fresh: Run = self
             .get(&format!("/repos/{repo}/actions/runs/{}", run.id))
             .await?;
@@ -925,6 +968,9 @@ impl Janitor {
             || fresh.run_attempt != run.run_attempt
             || fresh.run_started_at != run.run_started_at
         {
+            return Ok(Outcome::Raced);
+        }
+        if unstarted_only && self.has_started_job(repo, run.id).await? {
             return Ok(Outcome::Raced);
         }
         let state = &run.status;
@@ -1185,6 +1231,29 @@ fn superseded_push_action(
     }
 }
 
+/// [`superseded_push_action`], except that a run of a delivery workflow
+/// (`unstarted_only`) goes only while none of its jobs has started, and then
+/// the reason says so.
+fn push_action(
+    run: &Run,
+    newer: u64,
+    jobs: JobStates,
+    cancel_running: bool,
+    unstarted_only: bool,
+) -> Option<(String, Kind)> {
+    if !unstarted_only {
+        return superseded_push_action(run, newer, jobs, cancel_running);
+    }
+    superseded_push_action(run, newer, jobs, false)
+        .filter(|(_, kind)| *kind == Kind::Stale)
+        .map(|(why, kind)| (format!("{why} (delivery run, no job started)"), kind))
+}
+
+/// Whether `run`'s workflow is in `workflows`, by file path or name.
+fn listed(workflows: &[String], run: &Run) -> bool {
+    workflows.iter().any(|w| *w == run.path || *w == run.name)
+}
+
 /// Queued, running and pending `push` runs on `branches` (of `workflows`,
 /// by path or name, when that list is not empty), each with the id of the
 /// newest such run of the same workflow on the same branch, when that newer
@@ -1364,6 +1433,36 @@ mod tests {
         );
         // Without cancel_running a started run is never cancelled.
         assert_eq!(superseded_push_action(&running, 3, red, false), None);
+    }
+
+    #[test]
+    fn a_delivery_run_is_superseded_only_before_any_job_starts() {
+        // 2026-11-27: 192 queued "Publish Images" runs on main, one per
+        // commit; each newer one selects every image missing from the
+        // registry, so an unstarted older one does nothing the newest won't.
+        let queued = run(1, 7, "queued", "push", "a", &[]);
+        let running = run(2, 7, "in_progress", "push", "b", &[]);
+        let idle = JobStates::default();
+        let red = JobStates {
+            started: true,
+            nonpassing: true,
+            ..JobStates::default()
+        };
+        let (why, kind) = push_action(&queued, 3, idle, true, true).unwrap();
+        assert_eq!(kind, Kind::Stale);
+        assert!(why.ends_with("(delivery run, no job started)"), "{why}");
+        // Started, even red and with cancel_running: never cancelled mid-flight.
+        assert_eq!(push_action(&running, 3, red, true, true), None);
+        assert_eq!(
+            push_action(&queued, 3, red, true, true),
+            None,
+            "a started job"
+        );
+        // Non-delivery workflows keep the batch-verdict rule.
+        assert_eq!(
+            push_action(&running, 3, red, true, false).map(|(_, k)| k),
+            Some(Kind::Running)
+        );
     }
 
     #[test]
