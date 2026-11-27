@@ -32,7 +32,9 @@
 //!   `critical_min_age_secs` and when critical at any age: slots go least
 //!   recently used first until free space is back at the target, so the disk
 //!   never fills while admission still works. A slot a live lease holds is
-//!   busy and never goes (`ReclaimHost::probe`).
+//!   busy and never goes (`ReclaimHost::probe`); the cargo targets inside
+//!   it are busy only while a process uses them, and otherwise go by their
+//!   own ages.
 //! * **Cap.** `cache_slot_cap_gib` (0: none) bounds the slots of one cache
 //!   (`<cache_root>/<namespace>`) together; above it the least recently used
 //!   slots go in any mode.
@@ -983,8 +985,14 @@ pub fn run_cycle(
                 by_cache.entry(cache.clone()).or_default().push(c);
             }
         }
+        // A slot counts what is left of it: targets this cycle removed (or,
+        // dry run, would) from inside it are already off the disk.
+        let left = |run: &Deletions<'_>, c: &Candidate| {
+            c.size_bytes
+                .saturating_sub(run.freed_within.get(&c.path).copied().unwrap_or(0))
+        };
         for (cache, mut slots) in by_cache {
-            let mut total: u64 = slots.iter().map(|c| c.size_bytes).sum();
+            let mut total: u64 = slots.iter().map(|c| left(&run, c)).sum();
             if total <= cap {
                 continue;
             }
@@ -1000,8 +1008,9 @@ pub fn run_cycle(
                     gib(cap),
                     hours(c.idle_secs)
                 );
+                let size = left(&run, c);
                 if run.attempt(c, &eligible).is_some() {
-                    total = total.saturating_sub(c.size_bytes);
+                    total = total.saturating_sub(size);
                 }
             }
         }
@@ -1611,6 +1620,53 @@ mod tests {
             f.deleted.borrow().as_slice(),
             [PathBuf::from("/c/ci/slots/old")]
         );
+    }
+
+    #[test]
+    fn a_target_removed_inside_a_held_slot_counts_against_the_cap() {
+        // A 100 GiB cap: a held 90 GiB slot and an idle 30 GiB one. Hygiene
+        // removes a 25 GiB week-old target from the held slot, which leaves
+        // the cache at 95 GiB, so the idle slot stays.
+        for dry_run in [false, true] {
+            let mut f = Fake::new(
+                1000,
+                500,
+                vec![
+                    slot("/c/ci/slots/held", "/c/ci", 90, 0),
+                    slot("/c/ci/slots/idle", "/c/ci", 30, 2),
+                    Candidate {
+                        within: Some(PathBuf::from("/c/ci/slots/held")),
+                        ..cand(
+                            "/c/ci/slots/held/cargo-target/2026-W40",
+                            Kind::CargoTarget,
+                            25,
+                            24 * 8,
+                        )
+                    },
+                ],
+            );
+            f.safety.insert(
+                PathBuf::from("/c/ci/slots/held"),
+                Safety {
+                    busy: true,
+                    ..Safety::default()
+                },
+            );
+            let s = ReclaimSettings {
+                cache_slot_cap_gib: 100,
+                dry_run,
+                ..live(ReclaimSettings::default())
+            };
+            let c = run(&f, &s);
+            assert_eq!(c.mode, Mode::Hygiene);
+            let touched: Vec<&str> = c.records.iter().map(|r| r.path.as_str()).collect();
+            assert_eq!(
+                touched,
+                ["/c/ci/slots/held/cargo-target/2026-W40"],
+                "dry run {dry_run}: {:?}",
+                c.records
+            );
+        }
     }
 
     #[test]
