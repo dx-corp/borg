@@ -1916,6 +1916,28 @@ fn memory_pressure_sheds_heavy_work_then_closes_the_drone() {
     assert_eq!(a.admission[0].mem_psi_pm, Some(150));
 }
 
+#[test]
+fn memory_pressure_with_a_quarter_free_does_not_close_the_drone() {
+    // gcp-burst-q1c8af7f, 2026-11-27 07:03Z: three leases, 59 GiB of 104 GiB
+    // free, memory some 678 permille from jobs at their own lease limits.
+    let t = Some(thresholds());
+    let mut d = host("burst");
+    d.mem_mib = 104 * 1024;
+    d.live.mem_psi_pm = Some(678);
+    d.live.mem_used_mib = Some(45 * 1024);
+    assert_eq!(d.admission(t), AdmissionState::Open);
+    // Under a quarter free, the pressure is the host's own.
+    d.live.mem_used_mib = Some(80 * 1024);
+    assert_eq!(d.admission(t), AdmissionState::Closed);
+    // Unmeasured use: the pressure counts, as before.
+    d.live.mem_used_mib = None;
+    assert_eq!(d.admission(t), AdmissionState::Closed);
+    // A shared node that is short counts even when the drone itself is not.
+    let mut n = on_node("lxc", 8 * 1024);
+    n.live.mem_psi_pm = Some(678);
+    assert_eq!(n.admission(t), AdmissionState::Closed);
+}
+
 /// The class sizes the live queen runs (`config/borg/queen.json`): light
 /// 2 GiB, medium 8 GiB, heavy 14 GiB.
 fn queen_classes() -> Classes {

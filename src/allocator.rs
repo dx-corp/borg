@@ -358,11 +358,32 @@ impl DroneState {
         self.cpu_psi_pm.or(self.cpu_load_pm)
     }
 
+    /// The memory pressure admission uses: the reported PSI, unless at least
+    /// a quarter of the drone's memory (and of its node's, with a host view)
+    /// is measured free. `memory some` counts every task the kernel stalls,
+    /// including a job throttled at its own lease's `memory.high`, so one job
+    /// at its limit read as pressure on the whole host. On 2026-11-27 four of
+    /// six burst drones (104 GiB each) were closed at 542 to 827 permille with
+    /// 12 to 59 GiB free, while 627 light jobs queued.
+    fn admission_mem_psi_pm(&self) -> Option<u16> {
+        let quarter = self.mem_mib / 4;
+        let roomy = self
+            .live
+            .mem_used_mib
+            .is_some_and(|used| self.mem_mib.saturating_sub(used) >= quarter)
+            && self
+                .live
+                .host
+                .as_ref()
+                .is_none_or(|h| h.available_mib.saturating_sub(h.reserve_mib) >= quarter);
+        if roomy { None } else { self.live.mem_psi_pm }
+    }
+
     /// This pass's admission state, including the pressure hysteresis.
     pub(crate) fn admission(&self, t: Option<AdmissionThresholds>) -> AdmissionState {
         AdmissionState::settle(
             self.admission_pressure_pm(),
-            self.live.mem_psi_pm,
+            self.admission_mem_psi_pm(),
             self.live.admission_prev,
             t,
         )

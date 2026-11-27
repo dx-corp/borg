@@ -313,6 +313,27 @@ impl Drone {
         ids
     }
 
+    /// Retry fouled slots no lease holds, so a drone whose every slot is
+    /// fouled recovers without a lease finishing.
+    async fn retry_fouled_slots(&self) {
+        if !self.slots.any_fouled() {
+            return;
+        }
+        let (slots, fs_ops, work_root) = (
+            Arc::clone(&self.slots),
+            Arc::clone(&self.fs_ops),
+            self.cfg.work_root.clone(),
+        );
+        if let Ok(cleared) =
+            tokio::task::spawn_blocking(move || slots.retry_fouled(fs_ops.as_ref(), &work_root))
+                .await
+        {
+            for i in cleared {
+                tracing::info!("slot {i} removed; leases may use it again");
+            }
+        }
+    }
+
     /// Remove leftovers of a previous run: no lease is held yet, so every
     /// lease directory and borg-labelled docker resource is stale.
     pub async fn startup_sweep(&self) {
@@ -348,6 +369,17 @@ impl Drone {
                 );
             }
             Err(e) => tracing::warn!("startup sweep failed: {e}"),
+        }
+        // A slot directory the sweep could not remove is fouled, so no lease
+        // fails on it; heartbeats retry it.
+        for index in 0..self.slots.capacity() {
+            if slot_dir(&self.cfg.work_root, index)
+                .symlink_metadata()
+                .is_ok()
+            {
+                self.slots.foul(index);
+                tracing::warn!("startup sweep left slot {index}; fouled until it is removed");
+            }
         }
     }
 
@@ -915,6 +947,7 @@ impl Drone {
                     if tokio::time::Instant::now() < retry_at {
                         continue;
                     }
+                    self.retry_fouled_slots().await;
                     match self.heartbeat_once(self.cfg.accept_leases, &mut tasks).await {
                         Ok(_) => {
                             failures = 0;
@@ -1046,10 +1079,12 @@ async fn sample_host(ctx: &LeaseContext) -> Option<crate::hostdiag::HostSample> 
 /// directory and, when it is the last job running, the job user's
 /// credentials.
 async fn cleanup_slot(ctx: &LeaseContext, id: &str) {
+    let index = ctx.slot.index();
+    let slots = Arc::clone(ctx.slot.slots());
     let (work_root, owned_id, slot_name, docker, exec, fs_ops) = (
         ctx.cfg.work_root.clone(),
         id.to_owned(),
-        slot_name(ctx.slot.index()),
+        slot_name(index),
         ctx.cfg.docker_bin.clone(),
         Arc::clone(&ctx.exec),
         Arc::clone(&ctx.fs_ops),
@@ -1058,19 +1093,31 @@ async fn cleanup_slot(ctx: &LeaseContext, id: &str) {
     // when this is the last lease running.
     let last_lease = ctx.held.held.lock().is_ok_and(|h| h.len() <= 1);
     let wiper = ctx.credwipe.clone().filter(|_| last_lease);
+    let retry_slots = Arc::clone(&slots);
     let cleaned = tokio::task::spawn_blocking(move || {
         let docker = cleanup_docker(exec.as_ref(), &docker, Scope::Lease(&owned_id));
         let dir = remove_lease_dir(fs_ops.as_ref(), &work_root, &slot_name);
+        // This lease still holds its own slot, so the retry skips it.
+        let cleared = retry_slots.retry_fouled(fs_ops.as_ref(), &work_root);
         if let Some(w) = wiper {
             w.wipe_job_home();
         }
-        (dir, docker)
+        (dir, docker, cleared)
     })
     .await;
     match cleaned {
-        Ok((dir, docker)) => {
-            if let Err(e) = dir {
-                tracing::warn!("lease {id} work dir cleanup failed: {e}");
+        Ok((dir, docker, cleared)) => {
+            for i in cleared {
+                tracing::info!("slot {i} removed; leases may use it again");
+            }
+            match dir {
+                Ok(_) => slots.clear(index),
+                Err(e) => {
+                    slots.foul(index);
+                    tracing::warn!(
+                        "lease {id} work dir cleanup failed: {e}; slot {index} fouled, no lease takes it until it is removed"
+                    );
+                }
             }
             for err in docker.errors {
                 tracing::warn!("lease {id} docker cleanup: {err}");
@@ -1185,6 +1232,10 @@ async fn handle_lease(ctx: LeaseContext, grant: LeaseGrant) {
     extra_env.push(("BORG_SLOT".to_owned(), slot.to_string()));
     let oom_score = ctx.oom_order.assign(&grant.lease_id);
     let cgroup = lease_cgroup(&ctx, &grant, oom_score);
+    // Only a lease whose limit a cgroup enforces needs git kept under it.
+    if cgroup.is_some() {
+        memlimit::add_git_threads(&mut extra_env, grant.memory.as_ref());
+    }
     let endpoint = start_docker_endpoint(&ctx, &grant, slot, cgroup.as_ref()).await;
     // With docker_proxy on, a job reaches dockerd only through its endpoint;
     // when the endpoint could not start, only a job whose scope has host
