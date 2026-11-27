@@ -314,6 +314,64 @@ async fn a_rollout_gives_the_canary_its_full_update_window_after_the_lease_drain
 }
 
 #[tokio::test]
+async fn a_canary_running_a_work_unit_is_busy_until_the_unit_finishes() {
+    // A drone updates only once its held jobs finish, work units included: the
+    // update clock must not start while a unit runs, or a long remote build
+    // halts the rollout and rolls the fleet back.
+    let mut cfg = gated();
+    cfg["rollout"]["canary_oses"] = json!(["linux"]);
+    let r = Rig::new(cfg).await;
+    let submit: borg::units::SubmitUnit = serde_json::from_value(json!({
+        "repo": "example-org/app",
+        "tree_sha": "0123456789abcdef0123456789abcdef01234567",
+        "argv": ["cargo", "build"],
+        "platform": "linux-x86_64",
+        "class": "light"
+    }))
+    .unwrap();
+    let store = r.h.queen.store();
+    store
+        .submit_unit(&submit, "agent", "u-build", 3600, 0, r.base)
+        .await
+        .unwrap();
+    assert!(store.lease_unit("u-build", "l1", r.base).await.unwrap());
+    store
+        .ack_units("l1", &["u-build".to_owned()], r.base)
+        .await
+        .unwrap();
+    let mut cap = serde_json::to_value(support::capacity()).unwrap();
+    cap["os"] = json!("linux");
+    let beat_l1 = || {
+        r.h.heartbeat_with(
+            r.token("l1"),
+            json!({"capacity": cap.clone(), "version": "1.0.0", "active_units": ["u-build"]}),
+        )
+    };
+
+    r.tick(0).await;
+    assert_eq!(beat_l1().await["desired_version"], "2.0.0");
+    r.tick(301).await;
+    assert_eq!(r.phase().await, "canary", "the unit is still running");
+    assert!(
+        r.h.status().await["rollout"]["gate"]["waiting"]
+            .as_str()
+            .unwrap()
+            .contains("drain")
+    );
+
+    // The unit finishes; only now does the update window start.
+    store
+        .finish_unit("u-build", "l1", 0, 30, r.base + 302)
+        .await
+        .unwrap();
+    r.tick(302).await;
+    r.tick(602).await;
+    assert_eq!(r.phase().await, "canary");
+    r.tick(603).await;
+    assert_eq!(r.phase().await, "halted");
+}
+
+#[tokio::test]
 async fn without_a_previous_version_the_target_is_only_reported_and_everyone_is_told_it() {
     let r = Rig::new(json!({
         "drone_stale_secs": 1_000_000_000,
