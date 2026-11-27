@@ -762,7 +762,7 @@ self-update carries the drones with it through the same canary and wave gate.
 A queen self-update during a canary or wave keeps the persisted rollout target
 until it completes or halts, including every wave's observation period. The next
 pass then adopts the current queen build. A rollout whose stage has not moved
-for `soak_secs` plus `supersede_stalled_after_secs` is stalled, and the current
+for `soak_secs` plus `supersede_stalled_after_secs` (default 900) is stalled, and the current
 queen build supersedes it with a fresh canary. An explicit `rollout_target_version`
 still overrides the active rollout immediately.
 The previous version (what a halt rolls back to) is fixed when each rollout
