@@ -197,6 +197,59 @@ async fn a_superseded_main_push_with_a_running_job_is_kept() {
     assert!(h.state().cancelled.is_empty());
 }
 
+const PUBLISH: &str = ".github/workflows/publish.yml";
+
+fn delivery_rule() -> serde_json::Value {
+    with(json!({"superseded_push_branches": ["main"],
+                "superseded_unstarted_workflows": [PUBLISH]}))
+}
+
+fn publish_run(id: u64, status: &str, sha: &str) -> serde_json::Value {
+    json!({"id": id, "workflow_id": 7, "status": status, "event": "push", "path": PUBLISH,
+        "name": "Publish Images", "head_sha": sha, "head_branch": "main", "pull_requests": []})
+}
+
+#[tokio::test]
+async fn an_unstarted_delivery_run_is_superseded_by_a_newer_run_already_running() {
+    // cancel_running and dedupe_same_sha are off, so the running replacement
+    // is listed for the delivery rule alone.
+    let h = Harness::start(delivery_rule()).await;
+    {
+        let mut st = h.state();
+        st.pr_runs.push(publish_run(1, "queued", "a"));
+        st.pr_runs.push(publish_run(2, "in_progress", "b"));
+    }
+    let r = h.janitor_pass().await;
+    assert_eq!((r.superseded_push, r.cancelled), (1, 1), "{r:?}");
+    assert_eq!(h.state().cancelled, [1]);
+}
+
+#[tokio::test]
+async fn a_delivery_run_whose_job_starts_before_the_cancel_is_kept() {
+    let h = Harness::start(delivery_rule()).await;
+    {
+        let mut st = h.state();
+        st.pr_runs.push(publish_run(1, "queued", "a"));
+        st.pr_runs.push(publish_run(2, "queued", "b"));
+    }
+    // The run still reads `queued` when its first job starts, after the jobs
+    // were first read and while the janitor rereads the run.
+    let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    h.state().hold_run_read = Some((reached.clone(), release.clone()));
+    let queen = h.queen.clone();
+    let repos = queen.config().repos.clone();
+    let pass = tokio::spawn(async move { queen.janitor().unwrap().pass(&repos).await });
+    reached.notified().await;
+    h.state()
+        .jobs
+        .push(json!({"id": 10, "run_id": 1, "status": "in_progress"}));
+    release.notify_one();
+    let r = pass.await.unwrap();
+    assert_eq!((r.raced, r.cancelled), (1, 0), "{r:?}");
+    assert!(h.state().cancelled.is_empty());
+}
+
 #[tokio::test]
 async fn a_red_superseded_main_run_finishes_its_verdict_jobs_before_it_is_cancelled() {
     // 2026-11-20: 97 of the last 100 main platform-ci runs were cancelled
