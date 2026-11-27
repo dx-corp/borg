@@ -94,7 +94,10 @@ pub struct RolloutSettings {
     /// it (grants it nothing new) so that it drains. Running jobs finish.
     pub drain_timeout_secs: u64,
     /// A stage that has not moved for `soak_secs` plus this long is stalled: a
-    /// newer queen build then supersedes the rollout in flight.
+    /// newer queen build then supersedes the rollout in flight, starting a
+    /// fresh canary. 15 minutes since 2026-11-27 (was an hour): a rollout of
+    /// a queen-only change sat paused behind the light backlog while the
+    /// drone-side slot and git fixes waited for it and one more rollout.
     pub supersede_stalled_after_secs: u64,
     pub max_host_failure_increase_pm: u32,
     pub max_success_drop_pm: u32,
@@ -124,7 +127,7 @@ impl Default for RolloutSettings {
             soak_secs: 1800,
             update_timeout_secs: 900,
             drain_timeout_secs: 900,
-            supersede_stalled_after_secs: 3600,
+            supersede_stalled_after_secs: 900,
             max_host_failure_increase_pm: 20,
             max_success_drop_pm: 50,
             absolute_host_failure_pm: 100,
@@ -1666,8 +1669,12 @@ mod tests {
     fn a_newer_build_supersedes_only_a_stalled_rollout() {
         let s = settings();
         let (_, st) = promoted_to_wave();
-        // The wave started at 140; soak 100 + supersede 3600.
-        let limit = 140 + 100 + 3600;
+        // The wave started at 140; soak 100 plus the supersede delay.
+        assert_eq!(
+            s.supersede_stalled_after_secs, 900,
+            "15 minutes past the soak"
+        );
+        let limit = 140 + 100 + 900;
         assert_eq!(settled_target("3.0.0".into(), Some(&st), limit, &s), NEW);
         assert_eq!(
             settled_target("3.0.0".into(), Some(&st), limit + 1, &s),
