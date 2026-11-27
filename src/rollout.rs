@@ -48,7 +48,9 @@
 //! `max_unavailable_pct` of every class it can run. One drone may always be in
 //! flight, so the rollout cannot deadlock. And while the queue of a class has
 //! waited `pause_when_queued_secs`, no drone that can run that class is told,
-//! for at most `max_pause_secs` of a stage. The canary stage is unchanged.
+//! for at most `max_pause_secs` of a stage, except a drone holding no active
+//! runner lease or work unit: it has nothing to drain and updates at once. The canary stage is
+//! unchanged.
 //!
 //! Any failing check **halts** the rollout and **rolls back**: every drone is
 //! told the previous version. A halted rollout stays halted until an operator
@@ -109,7 +111,8 @@ pub struct RolloutSettings {
     /// that may be out of service while a wave tells another drone.
     pub max_unavailable_pct: u32,
     /// A queue of a class that has waited this long holds back telling any
-    /// drone that can run the class. `null` turns the pause off.
+    /// busy drone that can run the class; an idle drone (no active runner
+    /// lease or work unit) is still told. `null` turns the pause off.
     pub pause_when_queued_secs: Option<u64>,
     /// How long into a stage queues may hold telling drones back.
     pub max_pause_secs: u64,
@@ -494,7 +497,14 @@ fn tell_within_capacity(
         // A drone already on the target takes nothing out of service.
         if !on_target {
             let runs = |c: &Class| d.slots.get(c).is_some_and(|&n| n > 0);
-            if let Some(c) = paused.iter().find(|c| runs(c)) {
+            // An idle drone drains nothing, so a backlog does not hold it
+            // back (2026-11-27: a rollout of a queen-only change sat in wave 0
+            // behind the light backlog, holding the drone-side fixes after it).
+            if let Some(c) = paused
+                .iter()
+                .find(|c| runs(c))
+                .filter(|_| d.has_active_leases)
+            {
                 why.get_or_insert(format!(
                     "{} waits: {} jobs have queued for {}s or more",
                     d.name,
@@ -1916,6 +1926,10 @@ mod tests {
     fn aged_queues_hold_back_drones_that_run_their_class_for_a_bounded_time() {
         let mut f = morning_fleet();
         set_version(&mut f, &["pve-a"], NEW, 0);
+        // Busy drones: telling one would drain work.
+        for d in &mut f {
+            d.has_active_leases = true;
+        }
         let s = RolloutSettings {
             canary_oses: vec!["linux".into()],
             ..settings()
@@ -1956,6 +1970,45 @@ mod tests {
             &heavy_queue,
         );
         assert_eq!(told_heavy(&b.state, &f), ["borg-heavy-1"]);
+    }
+
+    #[test]
+    fn an_idle_drone_updates_through_a_backlog_pause() {
+        // 2026-11-27: wave 0 waited behind 600 s light queues while idle
+        // drones could have updated without draining anything.
+        let mut f = morning_fleet();
+        set_version(&mut f, &["pve-a"], NEW, 0);
+        for d in &mut f {
+            d.has_active_leases = d.name != "borg-heavy-1";
+        }
+        let s = RolloutSettings {
+            canary_oses: vec!["linux".into()],
+            ..settings()
+        };
+        let heavy_queue = [QueueAge {
+            class: Class::Heavy,
+            scope: crate::classes::Scope::Main,
+            oldest_age_secs: 4877,
+        }];
+        let a = advance(
+            1000,
+            &s,
+            OLD,
+            NEW,
+            Some(last_wave(1000)),
+            &f,
+            &[],
+            &heavy_queue,
+        );
+        // borg-heavy-1 holds no lease, so the heavy backlog does not hold it;
+        // busy borg-heavy-2 still waits.
+        assert_eq!(told_heavy(&a.state, &f), ["borg-heavy-1"]);
+        assert!(
+            a.waiting
+                .as_deref()
+                .unwrap()
+                .contains("borg-heavy-2 waits: heavy jobs have queued")
+        );
     }
 
     #[test]

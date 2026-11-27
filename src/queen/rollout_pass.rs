@@ -9,6 +9,7 @@ use crate::classes::Class;
 use crate::health::Outcome;
 use crate::rollout::{DroneView, advance};
 use crate::store::{LeaseRow, LeaseStatus};
+use crate::units::UnitState;
 
 impl Queen {
     /// One pass of the quorum rollout gate (only when both the target and
@@ -28,10 +29,18 @@ impl Queen {
         let stored = self.store.rollout_state().await?;
         let target = self.settled_target(target, stored.as_ref(), now);
         let rows = self.store.drones().await?;
+        // A drone is busy while it holds a runner lease or a work unit: it
+        // updates only once all of its held jobs finish, so both keep the
+        // update clock from starting and both hold it out of a paused wave.
+        let units = self
+            .store
+            .units_in(&[UnitState::Leased, UnitState::Running])
+            .await?;
         let busy_drones: HashSet<&str> = active
             .iter()
             .filter(|lease| lease.state != LeaseStatus::Standby)
             .map(|lease| lease.drone.as_str())
+            .chain(units.iter().filter_map(|u| u.drone.as_deref()))
             .collect();
         let fresh = |t: Option<i64>| t.is_some_and(|t| now - t <= self.cfg.drone_stale_secs);
         let queen_blind = queen_blind(
