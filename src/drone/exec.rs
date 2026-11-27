@@ -4,6 +4,7 @@
 
 use std::io;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Result of a finished command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +50,16 @@ pub trait Exec: Send + Sync {
         ))
     }
 
+    /// Like [`Exec::run`], but the command and every process it starts run
+    /// in a private process group that gets SIGTERM at `limit` and SIGKILL
+    /// [`KILL_GRACE`] later; then `Err` with [`io::ErrorKind::TimedOut`].
+    /// Standard output is not kept. Executors without process groups run it
+    /// to completion, as [`Exec::run`] does.
+    fn run_timed(&self, program: &str, args: &[&str], limit: Duration) -> io::Result<Output> {
+        let _ = limit;
+        self.run(program, args)
+    }
+
     /// Run to completion with `input` on standard input, so binary data
     /// reaches a command running as another user without a temporary file
     /// anyone else could read. Executors that cannot feed input fail closed.
@@ -64,6 +75,9 @@ pub trait Exec: Send + Sync {
 /// this crate (and the operator's config for the docker binary), never taken
 /// from the queen.
 pub struct SystemExec;
+
+/// How long [`Exec::run_timed`] waits after SIGTERM before SIGKILL.
+pub const KILL_GRACE: Duration = Duration::from_secs(10);
 
 impl SystemExec {
     fn output(&self, program: &str, args: &[&str], grouped: bool) -> io::Result<Output> {
@@ -126,6 +140,49 @@ impl Exec for SystemExec {
         self.output(program, args, true)
     }
 
+    #[cfg(unix)]
+    fn run_timed(&self, program: &str, args: &[&str], limit: Duration) -> io::Result<Output> {
+        use std::os::unix::process::CommandExt;
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "drone host commands: fixed programs and arguments built by borg, never queen-supplied"
+        )]
+        let mut command = Command::new(program);
+        let mut child = command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?;
+        let group = format!("-{}", child.id());
+        let wait_until = |child: &mut std::process::Child, until: Instant| loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() >= until => return None,
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) => return None,
+            }
+        };
+        if let Some(status) = wait_until(&mut child, Instant::now() + limit) {
+            return Ok(Output {
+                success: status.success(),
+                stdout: String::new(),
+            });
+        }
+        // The whole group: git fetch runs index-pack and remote helpers as
+        // children, and those hold the mirror's pack files.
+        let _ = self.run("kill", &["-TERM", "--", &group]);
+        if wait_until(&mut child, Instant::now() + KILL_GRACE).is_none() {
+            let _ = self.run("kill", &["-KILL", "--", &group]);
+            let _ = child.wait();
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{program} killed after {}s", limit.as_secs()),
+        ))
+    }
+
     fn run_input(&self, program: &str, args: &[&str], input: &[u8]) -> io::Result<Output> {
         use std::io::Write;
         #[allow(
@@ -163,6 +220,44 @@ impl Exec for SystemExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_command_and_its_children_are_killed_at_the_limit() {
+        // git fetch runs index-pack as a child: the whole group must go.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-alive");
+        let script = format!("(sleep 3; touch {}) & sleep 30", marker.display());
+        let started = std::time::Instant::now();
+        let err = SystemExec
+            .run_timed("sh", &["-c", &script], Duration::from_millis(300))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < KILL_GRACE,
+            "SIGTERM ended it: {:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(!marker.exists(), "the child in the group was killed too");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_command_that_finishes_reports_its_status() {
+        assert!(
+            SystemExec
+                .run_timed("true", &[], Duration::from_secs(5))
+                .unwrap()
+                .success
+        );
+        assert!(
+            !SystemExec
+                .run_timed("false", &[], Duration::from_secs(5))
+                .unwrap()
+                .success
+        );
+    }
 
     #[test]
     fn an_executor_must_explicitly_opt_in_to_grouped_execution() {

@@ -49,6 +49,45 @@ pub struct LeaseMemory {
     pub high_bytes: u64,
 }
 
+/// Add git's pack threads for a job under `memory` to `env`: one per GiB of
+/// the lease's `memory.max`, at least 1 and at most 20 (git's own cap). Git
+/// sizes `index-pack` and `pack-objects` by the host's CPUs, not the lease's,
+/// and each thread keeps its own delta base cache. On 52-vCPU burst drones a
+/// light lease (3 GiB) running a full `actions/checkout` fetch of mono hit
+/// its limit, the kernel killed `index-pack`, and git reported
+/// "fetch-pack: invalid index-pack output" (scope and affected-scope jobs on
+/// 2026-11-26 and 11-27).
+///
+/// The pair is appended after any `GIT_CONFIG_COUNT` entries already in `env`
+/// (an operator's `runner_env`), and nothing is added when those already set
+/// `pack.threads`. `GIT_CONFIG_*` entries outrank git's config files; a job
+/// overrides the value with `git -c pack.threads=N` or its own `GIT_CONFIG_*`.
+pub fn add_git_threads(env: &mut Vec<(String, String)>, memory: Option<&LeaseMemory>) {
+    let Some(m) = memory else {
+        return;
+    };
+    let get = |env: &[(String, String)], key: &str| {
+        env.iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    let count: usize = get(env, "GIT_CONFIG_COUNT")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let already = (0..count).any(|i| {
+        get(env, &format!("GIT_CONFIG_KEY_{i}"))
+            .is_some_and(|k| k.trim().eq_ignore_ascii_case("pack.threads"))
+    });
+    if already {
+        return;
+    }
+    let threads = (m.max_bytes >> 30).clamp(1, 20);
+    env.push(("GIT_CONFIG_COUNT".to_owned(), (count + 1).to_string()));
+    env.push((format!("GIT_CONFIG_KEY_{count}"), "pack.threads".to_owned()));
+    env.push((format!("GIT_CONFIG_VALUE_{count}"), threads.to_string()));
+}
+
 /// The leaf cgroup the drone process itself lives in.
 pub(crate) const DRONE_LEAF: &str = "drone";
 /// The leaf of a lease cgroup its job's processes live in.
@@ -404,6 +443,72 @@ fn remove_tree(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_threads_follow_the_lease_memory_limit() {
+        let lim = |gib: u64| LeaseMemory {
+            max_bytes: gib << 30,
+            high_bytes: (gib << 30) / 10 * 9,
+        };
+        let threads = |m: Option<&LeaseMemory>| {
+            let mut env = Vec::new();
+            add_git_threads(&mut env, m);
+            env.into_iter()
+                .find(|(k, _)| k == "GIT_CONFIG_VALUE_0")
+                .map(|(_, v)| v)
+        };
+        assert_eq!(
+            threads(Some(&lim(3))).as_deref(),
+            Some("3"),
+            "light: 2 GiB + 50%"
+        );
+        assert_eq!(threads(Some(&lim(30))).as_deref(), Some("20"), "git's cap");
+        let tiny = LeaseMemory {
+            max_bytes: 512 << 20,
+            high_bytes: 400 << 20,
+        };
+        assert_eq!(threads(Some(&tiny)).as_deref(), Some("1"));
+        assert_eq!(threads(None), None, "no limit, no override");
+    }
+
+    #[test]
+    fn git_threads_keep_an_operator_s_git_config_entries() {
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        let lim = LeaseMemory {
+            max_bytes: 3 << 30,
+            high_bytes: 2 << 30,
+        };
+        let mut env = vec![
+            pair("GIT_CONFIG_COUNT", "2"),
+            pair("GIT_CONFIG_KEY_0", "http.sslCAInfo"),
+            pair("GIT_CONFIG_VALUE_0", "/etc/ssl/ca.pem"),
+            pair("GIT_CONFIG_KEY_1", "fetch.prune"),
+            pair("GIT_CONFIG_VALUE_1", "true"),
+        ];
+        add_git_threads(&mut env, Some(&lim));
+        // The runner applies entries in order: the last count wins.
+        let last = |k: &str| {
+            env.iter()
+                .rev()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(last("GIT_CONFIG_COUNT"), Some("3"));
+        assert_eq!(last("GIT_CONFIG_KEY_0"), Some("http.sslCAInfo"));
+        assert_eq!(last("GIT_CONFIG_KEY_1"), Some("fetch.prune"));
+        assert_eq!(last("GIT_CONFIG_KEY_2"), Some("pack.threads"));
+        assert_eq!(last("GIT_CONFIG_VALUE_2"), Some("3"));
+
+        // An operator's own pack.threads is kept.
+        let mut set = vec![
+            pair("GIT_CONFIG_COUNT", "1"),
+            pair("GIT_CONFIG_KEY_0", "pack.threads"),
+            pair("GIT_CONFIG_VALUE_0", "8"),
+        ];
+        let before = set.clone();
+        add_git_threads(&mut set, Some(&lim));
+        assert_eq!(set, before);
+    }
 
     /// A directory standing in for a delegated service cgroup.
     fn service(root: &Path) -> LeaseCgroups {

@@ -122,8 +122,15 @@ fn auth_header_config(token: &str) -> String {
     format!("{EXTRAHEADER}AUTHORIZATION: basic {basic}")
 }
 
-fn run_git(exec: &dyn Exec, git: &str, args: &[&str]) -> Result<(), String> {
-    match exec.run(git, args) {
+fn run_git(exec: &dyn Exec, git: &str, args: &[&str], deadline: Instant) -> Result<(), String> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(format!(
+            "`git {}` not started: refresh deadline passed",
+            redacted(args)
+        ));
+    }
+    match exec.run_timed(git, args, left) {
         Ok(out) if out.success => Ok(()),
         Ok(_) => Err(format!("`git {}` failed", redacted(args))),
         Err(e) => Err(format!("{git}: {e}")),
@@ -145,6 +152,7 @@ fn refresh_mirror(
     path: &Path,
     url: &str,
     auth: Option<&str>,
+    deadline: Instant,
 ) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs_ops
@@ -153,9 +161,14 @@ fn refresh_mirror(
     }
     let p = path.to_string_lossy();
     if !path.join("HEAD").exists() {
-        run_git(exec, git, &["init", "--bare", "--quiet", &p])?;
+        run_git(exec, git, &["init", "--bare", "--quiet", &p], deadline)?;
     }
-    run_git(exec, git, &["-C", &p, "config", "remote.origin.url", url])?;
+    run_git(
+        exec,
+        git,
+        &["-C", &p, "config", "remote.origin.url", url],
+        deadline,
+    )?;
     run_git(
         exec,
         git,
@@ -166,10 +179,11 @@ fn refresh_mirror(
             "remote.origin.fetch",
             "+refs/heads/*:refs/heads/*",
         ],
+        deadline,
     )?;
     // Objects only accumulate: a job borrowing them via alternates must never
     // see them pruned underneath it.
-    run_git(exec, git, &["-C", &p, "config", "gc.auto", "0"])?;
+    run_git(exec, git, &["-C", &p, "config", "gc.auto", "0"], deadline)?;
     let mut args = vec![
         "-C",
         &p,
@@ -182,7 +196,7 @@ fn refresh_mirror(
         args.extend(["-c", header]);
     }
     args.extend(["fetch", "--prune", "--tags", "--force", "--quiet", "origin"]);
-    run_git(exec, git, &args)
+    run_git(exec, git, &args, deadline)
 }
 
 struct Mirror {
@@ -296,6 +310,12 @@ impl GitMirrors {
             mirror.url.clone(),
             self.auth_for(&mirror.repo),
         );
+        // The deadline is enforced on git itself: a timed-out fetch is
+        // killed with its process group, and the refresh waits for that
+        // while it still holds the mirror's lock. Before 2026-11-27 the wait
+        // gave up at 30 minutes but git ran on, the lock was released, and
+        // the next pass started a second full fetch of the same mirror.
+        let deadline = Instant::now() + REFRESH_TIMEOUT;
         let job = tokio::task::spawn_blocking(move || {
             refresh_mirror(
                 exec.as_ref(),
@@ -304,13 +324,13 @@ impl GitMirrors {
                 &path,
                 &url,
                 auth.as_deref(),
+                deadline,
             )
         });
-        match tokio::time::timeout(REFRESH_TIMEOUT, job).await {
-            Ok(Ok(Ok(()))) => *last = Some(Instant::now()),
-            Ok(Ok(Err(e))) => tracing::warn!("git mirror {} refresh failed: {e}", mirror.repo),
-            Ok(Err(e)) => tracing::warn!("git mirror {} refresh task failed: {e}", mirror.repo),
-            Err(_) => tracing::warn!("git mirror {} refresh timed out", mirror.repo),
+        match job.await {
+            Ok(Ok(())) => *last = Some(Instant::now()),
+            Ok(Err(e)) => tracing::warn!("git mirror {} refresh failed: {e}", mirror.repo),
+            Err(e) => tracing::warn!("git mirror {} refresh task failed: {e}", mirror.repo),
         }
     }
 
