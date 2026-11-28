@@ -1463,25 +1463,62 @@ fn charge_live_memory(free: &mut BTreeMap<&str, Free<'_>>, committed: &BTreeMap<
 /// CPU pressure, or blocking the class by its environment, has no idle slot
 /// for this purpose.
 fn class_idle(free: &BTreeMap<&str, Free<'_>>, class: Class, spec: &ClassSpec) -> u32 {
+    class_idle_by_drone(free, class, spec, true)
+        .into_iter()
+        .fold(0u32, |sum, (_, n)| sum.saturating_add(n))
+}
+
+/// [`class_idle`] per drone, in drone order. With `every_scope`, a drone
+/// that sheds any scope of the class counts zero; without it, only a drone
+/// whose admission is closed does, and the caller applies scope admission.
+fn class_idle_by_drone<'a>(
+    free: &BTreeMap<&'a str, Free<'_>>,
+    class: Class,
+    spec: &ClassSpec,
+    every_scope: bool,
+) -> Vec<(&'a str, u32)> {
     // A node pool is drawn down as its drones are counted, so its memory is
     // not offered once per drone.
     let mut pools: BTreeMap<*const Cell<u64>, u64> = BTreeMap::new();
-    let mut idle = 0u32;
-    for f in free.values().filter(|f| {
-        f.fits(class, spec)
-            && !f.drone.blocked_classes.contains(&class)
-            && Scope::ALL.iter().all(|s| f.admission.admits(class, *s))
-    }) {
-        // Room the disk floors have already promised away is not idle.
-        let mut slots = f.slots(class, spec).min(f.disk_slots(class));
-        if let Some(p) = &f.pool {
-            let left = pools.entry(Rc::as_ptr(p)).or_insert_with(|| p.get());
-            slots = slots.min(u32::try_from(*left / spec.mem_mib.max(1)).unwrap_or(u32::MAX));
-            *left = left.saturating_sub(u64::from(slots) * spec.mem_mib);
+    free.iter()
+        .map(|(id, f)| {
+            let admits = f.fits(class, spec)
+                && !f.drone.blocked_classes.contains(&class)
+                && (!every_scope || Scope::ALL.iter().all(|s| f.admission.admits(class, *s)));
+            if !admits {
+                return (*id, 0);
+            }
+            // Room the disk floors have already promised away is not idle.
+            let mut slots = f.slots(class, spec).min(f.disk_slots(class));
+            if let Some(p) = &f.pool {
+                let left = pools.entry(Rc::as_ptr(p)).or_insert_with(|| p.get());
+                slots = slots.min(u32::try_from(*left / spec.mem_mib.max(1)).unwrap_or(u32::MAX));
+                *left = left.saturating_sub(u64::from(slots) * spec.mem_mib);
+            }
+            (*id, slots)
+        })
+        .collect()
+}
+
+/// Slots per drone and class that a job could be placed in once `leases`
+/// hold their room: live memory, the node memory pool, closed CPU-pressure
+/// admission, the disk floors and blocked classes, by the rule [`idle_after`]
+/// sums (which also drops a drone shedding any one scope). `/status` reports
+/// these as each drone's free slots.
+pub(crate) fn admitting_by_drone(
+    drones: &[DroneState],
+    leases: &[ActiveLease],
+    classes: &Classes,
+    admission: Option<AdmissionThresholds>,
+) -> BTreeMap<String, BTreeMap<Class, u32>> {
+    let free = free_by_drone(drones, leases, classes, admission);
+    let mut out: BTreeMap<String, BTreeMap<Class, u32>> = BTreeMap::new();
+    for class in Class::ALL {
+        for (id, n) in class_idle_by_drone(&free, class, classes.spec(class), false) {
+            out.entry(id.to_owned()).or_default().insert(class, n);
         }
-        idle = idle.saturating_add(slots);
     }
-    idle
+    out
 }
 
 /// Idle slots per class once `leases` hold their room, by the same rule the

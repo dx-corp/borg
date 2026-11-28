@@ -346,3 +346,48 @@ async fn a_drone_shedding_under_pressure_has_no_free_slot_for_the_alarm() {
     assert_eq!(s["capacity"]["heavy"]["alarm"], false);
     assert!(events(&s).contains(&("fleet".into(), "capacity_restored".into())));
 }
+
+#[tokio::test]
+async fn status_free_slots_follow_the_drones_live_memory() {
+    // 2026-11-27: `/status` counted free light slots on drones whose live
+    // memory had no room for a 2 GiB light job. The heartbeat's readings are
+    // what the allocation pass sizes the drone by, so status reads them too.
+    let h = Harness::start(json!({
+        "admission": {"psi_soft_pm": 300, "psi_light_only_pm": 500, "psi_hard_pm": 600,
+                      "facts_max_age_secs": 100_000}
+    }))
+    .await;
+    let t0 = OffsetDateTime::now_utc();
+    let token = h.enroll("full").await;
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": {"observed_at": t0.unix_timestamp(),
+                             "cpu_psi_some_avg10_pm": 50, "mem_available_mib": 1000}}),
+    )
+    .await;
+    h.queen.tick(t0).await.unwrap();
+    let s = status_at(&h, t0).await;
+    let d = drone(&s, "full");
+    // The empty drone has room for light jobs by its budget, but none in the
+    // memory it reports available.
+    assert!(
+        d["theoretical_slots"]["light"].as_u64() > Some(0),
+        "28 GiB budget, empty: {d}"
+    );
+    assert_eq!(d["free_slots"]["light"], 0, "1000 MiB available");
+    assert_eq!(s["classes"]["light"]["free_slots"], 0);
+
+    // The same drone reporting its memory free again offers its slots.
+    h.heartbeat_with(
+        &token,
+        json!({"env_facts": {"observed_at": t0.unix_timestamp(),
+                             "cpu_psi_some_avg10_pm": 50, "mem_available_mib": 30_000}}),
+    )
+    .await;
+    h.queen.tick(t0).await.unwrap();
+    let s = status_at(&h, t0).await;
+    assert!(
+        drone(&s, "full")["free_slots"]["light"].as_u64() > Some(0),
+        "{s}"
+    );
+}

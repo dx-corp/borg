@@ -793,19 +793,7 @@ impl Queen {
                 );
                 merge_blocked_classes(&mut blocked, disk.blocked_classes);
                 state.blocked_classes = blocked;
-                if let Some(a) = &self.cfg.admission
-                    && let Some(f) = d
-                        .env_facts
-                        .as_ref()
-                        .filter(|f| now_ts - f.observed_at <= a.facts_max_age_secs)
-                {
-                    state.cpu_psi_pm = self
-                        .cpu_pressure_mean(&d.name, now_ts, a.facts_max_age_secs)
-                        .or(f.cpu_psi_some_avg10_pm);
-                    state.cpu_load_pm =
-                        crate::allocator::load_pressure_pm(f.load_per_cpu_pm, f.cpu_busy_pm);
-                    state.live = self.live_facts(d, cap, f, a, state.mem_mib);
-                }
+                self.load_live_admission(&mut state, d, cap, now_ts);
                 state.profiles = placement_profiles(
                     &profiles,
                     &d.name,
@@ -1044,9 +1032,6 @@ impl Queen {
                 &unmet_placeable,
             )
             .await;
-        let burst = self
-            .burst_pass(now_ts, &drone_rows, &held_after, &burst_unmet, &idle_after)
-            .await;
         let mut mint_error = None;
         let mut lease_error = None;
         let mut persisted = BTreeSet::new();
@@ -1138,6 +1123,13 @@ impl Queen {
             })
             .await;
         }
+        // Burst runs after this tick's grants are written. Its creates wait on
+        // Compute Engine operations one VM at a time (up to 150 s each), and a
+        // lease expires `lease_ttl_secs` after `now_ts`: run first, a batch of
+        // four creates could publish grants already past their startup window.
+        let burst = self
+            .burst_pass(now_ts, &drone_rows, &held_after, &burst_unmet, &idle_after)
+            .await;
         if let Some(e) = lease_error {
             return Err(e.into());
         }

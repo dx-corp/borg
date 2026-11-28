@@ -80,6 +80,19 @@ pub struct SystemExec;
 pub const KILL_GRACE: Duration = Duration::from_secs(10);
 
 impl SystemExec {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn spawn_reclaim_sleep(
+        program: &std::path::Path,
+        cwd: &std::path::Path,
+    ) -> io::Result<std::process::Child> {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "reclaim test: run the system sleep executable or its fixture copy with a fixed duration and fixture cwd"
+        )]
+        let mut command = Command::new(program);
+        command.arg("30").current_dir(cwd).spawn()
+    }
+
     fn output(&self, program: &str, args: &[&str], grouped: bool) -> io::Result<Output> {
         #[cfg(not(unix))]
         if grouped {

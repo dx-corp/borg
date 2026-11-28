@@ -1,5 +1,6 @@
 use super::*;
 
+mod admitting;
 mod deploy_turns;
 mod disk_reserve;
 

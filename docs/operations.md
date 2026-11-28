@@ -1285,8 +1285,11 @@ Each pass it:
 - weighs the unmet jobs borg must place in `scale_up.classes` (`main` and `pr`
   weights; deploy jobs never count, because burst drones have shared trust),
   ignoring a class with more than `max_free_slots` free slots;
-- would create one drone (`step`) once that weight stays at or above
-  `min_weighted_unmet` for `sustained_secs`, unless a drone is still
+- would create `step` drones, or one per ten times `min_weighted_unmet` of
+  weight when that is more, once that weight stays at or above
+  `min_weighted_unmet` for `sustained_secs`. A create does not restart the
+  window, so while demand holds the next pass after the new drones enroll
+  may create more. Nothing is created while a drone is still
   provisioning, `max_drones` is reached (drones made by hand with the burst
   prefix count), or the day or month drone-hour budget lacks `reserve_hours`
   of headroom for every live drone plus the new one;

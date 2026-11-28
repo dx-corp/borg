@@ -13,9 +13,15 @@
 //!   `scale_up.min_weighted_unmet` for `scale_up.sustained_secs`, counting
 //!   classes in `scale_up.classes`. A class with more than `max_free_slots`
 //!   free slots counts only the jobs those slots cannot take (the
-//!   lowest-weight scope is absorbed first). After each create the timer restarts, so every further drone needs
-//!   its own sustained window. Nothing is created while a drone is still
-//!   provisioning, at `max_drones`, or without budget headroom. Deploy jobs
+//!   lowest-weight scope is absorbed first). A pass creates `step` drones,
+//!   or one per ten times `min_weighted_unmet` of weight when that is more,
+//!   up to `max_drones`. The window is not restarted by a create: while
+//!   demand holds, the next pass after the new drones enroll may create
+//!   more. Before 2026-11-27 every create restarted it, so with `step` 1 a
+//!   fleet of six took an hour to rebuild after its drones reached their run
+//!   limit together, while weight 704 waited. Nothing is created while a
+//!   drone is still provisioning, at `max_drones`, or without budget
+//!   headroom. Deploy jobs
 //!   never count: burst drones enroll with shared trust and cannot take them.
 //! * **Scale down** when no demand rule holds and a drone this queen created
 //!   has held no lease for `scale_down.idle_secs`. It is drained first (it
@@ -224,7 +230,9 @@ pub struct ScaleUpSettings {
     /// A class with more free slots than this has no unmet demand to serve.
     #[serde(default)]
     max_free_slots: u32,
-    /// Most drones created in one pass.
+    /// Fewest drones a pass creates once demand is sustained. Heavier demand
+    /// creates one per ten times `min_weighted_unmet` of weight when that is
+    /// more (`drones_for`); `max_drones` and the budget bound both.
     #[serde(default = "default_step")]
     step: u32,
 }
@@ -807,6 +815,15 @@ fn weighted_unmet(cfg: &ScaleUpSettings, unmet: &[Unmet], idle: &[ClassIdle]) ->
         .fold(0u32, u32::saturating_add)
 }
 
+/// Drones one pass may create for `weighted`: `step`, or one per ten times
+/// `min_weighted_unmet` when that is more. `max_drones` and the budget bound
+/// it further in [`plan`].
+fn drones_for(cfg: &ScaleUpSettings, weighted: u32) -> usize {
+    let per_drone = cfg.min_weighted_unmet.saturating_mul(10).max(1);
+    let by_weight = weighted.div_ceil(per_drone);
+    usize::try_from(cfg.step.max(by_weight)).unwrap_or(usize::MAX)
+}
+
 /// The zone with the fewest live burst VMs; ties go to the first listed. A
 /// zone cooling down after a failed create is skipped while another is open.
 fn pick_zone(
@@ -1006,7 +1023,7 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
         )
     } else {
         let mut zones: Vec<String> = Vec::new();
-        let mut n = room.min(usize::try_from(up.step).unwrap_or(usize::MAX));
+        let mut n = room.min(drones_for(up, weighted));
         // Reserve headroom for every drone that would then be live.
         let (day, month) = (
             cfg.budget.drone_hours_per_day,
@@ -1045,7 +1062,6 @@ pub(super) fn plan(cfg: &BurstSettings, st: &mut BurstState, obs: &Observed<'_>)
         } else {
             let made = zones.len();
             actions.extend(zones.into_iter().map(|zone| Action::Create { zone }));
-            st.demand_since = Some(now);
             ("create", format!("creating {made}"))
         }
     };
@@ -1891,7 +1907,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_only_after_demand_is_sustained_and_restarts_the_clock() {
+    fn creates_only_after_demand_is_sustained_and_keeps_the_clock() {
         let c = cfg();
         let mut st = BurstState::default();
         let heavy = [unmet(Class::Heavy, Scope::Main, 2)]; // weighted 6
@@ -1909,6 +1925,37 @@ mod tests {
         let vms = [vm("gcp-burst-qa", "us-central1-b", T0 + 600)];
         let p = run(&c, &mut st, T0 + 601, &heavy, &[], &vms);
         assert!(p.actions.is_empty(), "{}", p.reason);
+        assert_eq!(p.outcome, "provisioning");
+        // Enrolled, demand still holds: the next drone needs no new window.
+        let up = [drone("gcp-burst-qa", true, 1)];
+        let p = run(&c, &mut st, T0 + 900, &heavy, &up, &vms);
+        assert_eq!(p.outcome, "create", "{}", p.reason);
+        assert_eq!(p.actions.iter().filter(|a| a.kind() == "create").count(), 1);
+    }
+
+    #[test]
+    fn heavy_demand_creates_a_drone_per_ten_thresholds_up_to_max_drones() {
+        // 2026-11-27 06:13Z: weight 704 against a threshold of 6, two drones
+        // live and room for four, and the queen made one per 600s window.
+        let mut c = cfg();
+        c.max_drones = 6;
+        c.budget.drone_hours_per_day = 1000.0;
+        c.budget.drone_hours_per_month = 10_000.0;
+        let creates = |queued: u32| {
+            let mut st = BurstState::default();
+            let jobs = [unmet(Class::Heavy, Scope::Main, queued)];
+            run(&c, &mut st, T0, &jobs, &[], &[]);
+            run(&c, &mut st, T0 + 600, &jobs, &[], &[])
+                .actions
+                .iter()
+                .filter(|a| a.kind() == "create")
+                .count()
+        };
+        assert_eq!(creates(2), 1, "weight 6: step");
+        assert_eq!(creates(20), 1, "weight 60: ten thresholds, one drone");
+        assert_eq!(creates(21), 2, "weight 63: past ten thresholds");
+        assert_eq!(creates(60), 3, "weight 180");
+        assert_eq!(creates(235), 6, "weight 705: capped at max_drones");
     }
 
     #[test]
