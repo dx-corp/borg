@@ -97,6 +97,36 @@ impl Queen {
         pressure_window_mean(&samples, now, max_age_secs)
     }
 
+    /// Load `drone`'s fresh pressure and live memory readings into `state`,
+    /// the inputs CPU-pressure admission, live memory accounting and the
+    /// node memory pool need. The allocation pass and `/status` both call
+    /// this, so status free slots follow the room a pass would place in. No
+    /// admission settings, or facts older than `facts_max_age_secs`, leave
+    /// the inputs unset.
+    pub(crate) fn load_live_admission(
+        &self,
+        state: &mut crate::allocator::DroneState,
+        drone: &crate::store::DroneRow,
+        cap: &Capacity,
+        now_ts: i64,
+    ) {
+        let Some(a) = &self.cfg.admission else {
+            return;
+        };
+        let Some(f) = drone
+            .env_facts
+            .as_ref()
+            .filter(|f| now_ts - f.observed_at <= a.facts_max_age_secs)
+        else {
+            return;
+        };
+        state.cpu_psi_pm = self
+            .cpu_pressure_mean(&drone.name, now_ts, a.facts_max_age_secs)
+            .or(f.cpu_psi_some_avg10_pm);
+        state.cpu_load_pm = crate::allocator::load_pressure_pm(f.load_per_cpu_pm, f.cpu_busy_pm);
+        state.live = self.live_facts(drone, cap, f, a, state.mem_mib);
+    }
+
     /// What fresh `facts` say about `drone`'s memory; see [`LiveFacts`].
     /// `budget_mib` is the drone's memory budget (net of reserve and caps).
     pub(super) fn live_facts(

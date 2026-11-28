@@ -972,7 +972,8 @@ pub struct DroneStatus {
     /// Budget minus the leases the drone holds right now.
     pub free_mem_mib: Option<u64>,
     pub free_vcpu: Option<u32>,
-    /// Leases per class that fit right now / that would fit if it were empty.
+    /// Leases per class that could be placed now, after live memory, the
+    /// node memory pool and closed admission / that would fit if it were empty.
     pub free_slots: BTreeMap<Class, u32>,
     pub theoretical_slots: BTreeMap<Class, u32>,
     pub active_leases: u32,
@@ -1310,6 +1311,10 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
             );
             merge_blocked_classes(&mut blocked, disk.blocked_classes.iter().copied());
             state.blocked_classes = blocked;
+            // The readings the allocation pass loads: without them the
+            // allocator rule below sees no live memory, node pool or CPU
+            // pressure, and counts slots no pass would place in.
+            queen.load_live_admission(&mut state, d, cap, now);
             let room = free_room(&state, &held, &cfg.classes);
             for class in Class::ALL {
                 let spec = cfg.classes.spec(class);
@@ -1419,6 +1424,27 @@ pub async fn build_status(queen: &Queen, now: i64) -> Result<Status, StoreError>
         });
     }
 
+    // Free slots by the allocator's own rule: live memory and the node pool,
+    // not only the class sizes of held leases. On 2026-11-27 the status
+    // counted 25 free light slots while about 2 light leases could start:
+    // pve50-vm240/242/245 have 2360 MiB budgets with about 1.5 GiB live free,
+    // and a light job needs 2048 MiB.
+    let admitting = crate::allocator::admitting_by_drone(
+        &states,
+        &held,
+        &cfg.classes,
+        cfg.admission.as_ref().map(|a| a.thresholds()),
+    );
+    free_by_class.clear();
+    for d in &mut drones {
+        let Some(live) = admitting.get(&d.name) else {
+            continue;
+        };
+        for (class, free) in &mut d.free_slots {
+            *free = (*free).min(live.get(class).copied().unwrap_or(0));
+            *free_by_class.entry(*class).or_default() += *free;
+        }
+    }
     let slots = queen.class_slots(&states);
     let unmet_of = |class: Class, scope: Scope| -> u32 {
         snap.unmet_placeable

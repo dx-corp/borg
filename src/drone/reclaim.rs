@@ -1971,15 +1971,11 @@ mod tests {
             !target_probe.busy && target_probe.unknown.is_none(),
             "{target_probe:?}"
         );
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "test: a process whose cwd is inside the target"
-        )]
-        let mut user = std::process::Command::new("sleep")
-            .arg("30")
-            .current_dir(slot.join("cargo-target/2026-W46"))
-            .spawn()
-            .unwrap();
+        let mut user = SystemExec::spawn_reclaim_sleep(
+            Path::new("/bin/sleep"),
+            &slot.join("cargo-target/2026-W46"),
+        )
+        .unwrap();
         let in_use = host.probe(&target);
         user.kill().unwrap();
         user.wait().unwrap();
@@ -1991,15 +1987,7 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let exe = bin.join("sleep");
         std::fs::copy("/bin/sleep", &exe).unwrap();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "test: a process whose executable is inside the target"
-        )]
-        let mut test_bin = std::process::Command::new(&exe)
-            .arg("30")
-            .current_dir(&other)
-            .spawn()
-            .unwrap();
+        let mut test_bin = SystemExec::spawn_reclaim_sleep(&exe, &other).unwrap();
         let running = host.probe(&target);
         test_bin.kill().unwrap();
         test_bin.wait().unwrap();
